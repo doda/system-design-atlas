@@ -1,0 +1,1713 @@
+==========================================
+Generating (v2): Collaborative Document Editing
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2bf9-7bb0-9969-9a88e3f420f7
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Collaborative Document Editing
+**Category**: Real-Time & Media
+
+**Problem Statement**:
+Design a system (like Google Docs) using Operational Transformation (OT) or CRDTs to handle concurrent edits and offline reconciliation.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+thinking
+**Planning collaborative document architecture**
+
+I need to create a document in the required markdown format without using tool calls while ensuring depth but not overly verbose. The user wants complete sections, which means I should provide clear choices. I'm opting for CRDT, specifically a Yjs-like approach with server relay and snapshotting. 
+
+Key challenges include offline reconciliation and state growth, plus snapshotting with compaction. I'll consider a WebSocket for real-time capabilities, Postgres for metadata, and Redis for presence, while avoiding Kafka unless necessary. Keeping it simple seems best!
+thinking
+**Designing a scalable document system**
+
+I’m considering using Postgres with LISTEN/NOTIFY, but that likely won’t scale well. Instead, Redis pubsub seems better for fanout, while using Postgres for persistence. Compaction through periodic snapshots to S3 sounds good, keeping deltas since the last snapshot. 
+
+I’ll explore a delta log with snapshot compaction using vector clocks. Clients can maintain a state vector for efficient syncing. For offline functionality, clients can reconnect and request missing updates. I also want to address presence awareness and other requirements while targeting around 10 million daily active users and 1 million concurrent users.
+thinking
+**Assessing failure modes**
+
+I’m considering the potential failure modes like Redis outages, slow Postgres response, gateway overload, and issues from multi-region operations. Creating a trade-offs table seems helpful. 
+
+I’ll decide on using CRDT over OT due to its offline capability and the absence of central ordering, which makes Yjs-compatible CRDT a great fit. The architecture will incorporate WebSocket, Redis, Postgres, S3, CDN, and Auth services. 
+
+Now, it’s time to move forward with this comprehensive plan!
+codex
+```markdown
+---
+title: "Collaborative Document Editing"
+category: "Real-Time & Media"
+difficulty: "Hard"
+tags: ["crdt", "realtime", "websockets", "offline-first", "consistency", "presence"]
+---
+
+## Overview
+
+This system is a Google Docs–style collaborative editor that supports concurrent edits, low-latency typing, and true offline work with later reconciliation. The core idea is to make *the client* authoritative for editing semantics (via a proven CRDT), while the backend focuses on three boring jobs: secure session/auth, efficient fanout, and durable persistence with compaction.
+
+The elegant move is **separating “document truth” from “document storage.”** We don’t ask the server to understand rich-text operations or do transforms. Instead, clients exchange CRDT deltas; the server simply relays deltas to collaborators and persists them as an append-only log with periodic snapshots. Offline reconciliation becomes a sync problem (missing deltas), not a concurrency problem (transforms).
+
+I’d implement this with a Yjs-style CRDT model: fast local edits, binary deltas, and state-vector based catch-up. Everything else—auth, permissions, audit/versioning, exports—can be layered without touching the concurrency core.
+
+## What Makes This Hard
+
+Naive designs centralize ordering: “send ops to server, serialize, broadcast.” That feels safe until you add offline edits, flaky mobile networks, and multi-tab sessions. Then you either lose edits, invent complex retry/transform logic, or accidentally introduce subtle divergence bugs.
+
+The real trap is **unbounded growth and sync cost**. CRDTs are correct-but-not-free: if you just “store all updates forever,” documents become slower to load, reconnect storms hammer your database, and compacting incorrectly can silently corrupt state. The hardest part isn’t merging—it’s keeping the mergeable history *bounded* while preserving correctness and fast catch-up.
+
+## Requirements
+
+### Functional Requirements
+- Real-time coauthoring with sub-150ms perceived latency for local edits (remote <300ms typical).
+- Offline-first: edits made offline must reconcile without conflicts or manual merge.
+- Multiple devices/tabs per user; must not duplicate or reorder a user’s own edits incorrectly.
+- Presence (“who’s here”, cursors) must be real-time but not durable; it must not block editing.
+- Access control (view/comment/edit) enforced on every connection and every persisted update.
+- Version history and “restore” built from snapshots + update log (not from bespoke save states).
+
+### Scale Targets
+- 10M DAU, 1M peak concurrent editors.
+- Median doc: 1–5 active editors; p95 doc: 20 editors; rare spikes: 200 (all-hands).
+- Edit rate: ~2–5 logical ops/sec/editor while typing; bursty (paste/format creates spikes).
+- Fanout: worst-case doc 200 editors → one update becomes 199 outbound messages.
+- Storage: assume 50KB–5MB snapshot per doc (rich-text) + deltas between snapshots.
+Why these numbers matter: fanout drives gateway CPU/network; snapshot+delta strategy drives database I/O and reconnect performance.
+
+## Key Design Decisions
+
+- **Choose CRDT deltas + state-vector sync (Yjs-like)**
+  - Rejected: server-serialized OT as the primary truth.
+  - Why: CRDT gives local-first latency and offline reconciliation without a central transform bottleneck; state vectors make catch-up efficient (send only what’s missing).
+
+- **Persist an append-only update log + periodic snapshots**
+  - Rejected: “store only latest doc JSON” or “store infinite op history without compaction.”
+  - Why: append-only is easy to make correct and auditable; snapshots bound replay time and database reads; together they enable fast cold start and robust recovery.
+
+- **Separate “editing channel” from “presence channel”**
+  - Rejected: storing cursors/presence in the same durable stream as edits.
+  - Why: presence is high-churn and ephemeral; coupling it to durability increases cost and makes outages user-visible in the worst way (“typing blocked because cursor service is down”).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[Clients] -->|HTTPS| A["Auth & Permissions"]
+  U -->|WebSocket| G["Collab Gateway"]
+  G --> R["Realtime PubSub"]
+  G --> D["Doc Sync API"]
+  D --> P["Postgres (Log+Meta)"]
+  D --> S["Object Storage (Snapshots)"]
+  P --> J["Compactor Jobs"]
+  J --> S
+```
+
+### Components
+
+- `Clients`
+  - Run the CRDT engine, apply local edits instantly, buffer offline updates, and sync via state vectors.
+  - This is where complexity belongs: it’s closest to user intent and easiest to test end-to-end.
+
+- `Auth & Permissions`
+  - Issues short-lived tokens scoped to a doc and role (view/comment/edit).
+  - Keeps the gateway stateless and prevents “open websocket, then check later” security gaps.
+
+- `Collab Gateway`
+  - Terminates WebSockets, authenticates, rate-limits, and does fanout via pubsub.
+  - Stateless so it scales horizontally; it does not interpret document operations.
+
+- `Realtime PubSub` (Redis Cluster)
+  - Provides low-latency fanout per document channel.
+  - If it hiccups, editing still proceeds locally; users temporarily stop seeing others’ updates (degraded but safe).
+
+- `Doc Sync API`
+  - The durable edge: accepts CRDT updates for persistence, serves catch-up (missing updates), and manages snapshots.
+  - This is where idempotency and correctness checks live.
+
+- `Postgres (Log+Meta)`
+  - Stores doc metadata (owner, ACL pointers, latest snapshot pointer) and an append-only updates table partitioned by doc.
+  - Postgres is boring, consistent, and operationally straightforward for this access pattern.
+
+- `Object Storage (Snapshots)`
+  - Stores compressed CRDT snapshots (and optional exports like PDF) cheaply.
+  - Snapshots are the fast-path for cold loads and compaction.
+
+- `Compactor Jobs`
+  - Periodically materialize a new snapshot and mark old deltas as compacted.
+  - The job is the lever that keeps performance stable over time.
+
+## Deep Dive: Offline Reconciliation Without Server Transforms
+
+The winning trick is **state-vector synchronization**, which turns “offline merge” into “what updates am I missing?” Each client maintains a CRDT state and a compact “state vector” summarizing what it has seen (e.g., per-client logical clocks). When reconnecting, the client sends its state vector to `Doc Sync API`.
+
+The server does not compute transforms. It responds with:
+1) The latest snapshot pointer (if the client is far behind), and
+2) Only the deltas the client lacks since that snapshot (computed by comparing the client state vector to stored updates).
+
+A concrete flow:
+- On connect, client fetches `snapshot_id` + snapshot bytes from `Object Storage`, loads into CRDT, then asks for deltas after `snapshot_id`.
+- While online, client sends updates as binary deltas tagged with `(doc_id, author_device_id, monotonic_seq)`.
+- Server persists updates idempotently (unique constraint on `(doc_id, author_device_id, monotonic_seq)`), then publishes them to the doc channel.
+- Offline edits accumulate locally; on reconnect, client sends its state vector; server returns only missing deltas; client merges locally (CRDT guarantees convergence).
+
+Bounding growth (the part teams get wrong):
+- The updates table grows without limit unless compacted. Compaction produces a new snapshot that subsumes older deltas.
+- Compaction must be careful: it can only prune deltas older than a “safe point” (e.g., once a snapshot includes them and you keep a tail window for late clients). Practically: keep deltas for N days or last K updates even after snapshotting.
+- Clients that are *too* stale (older than retention) must be forced to reload from the latest snapshot, not replay missing deltas that no longer exist.
+
+This yields a system that is correct under concurrency, resilient to offline, and operationally predictable because replay costs are bounded by snapshot interval and delta retention.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Offline-first correctness | More client complexity |
+| Low-latency local edits | Harder server-side “validation” of intent |
+| Simple, stateless gateway | Reliance on robust client CRDT library |
+| Bounded load via snapshots | Background compaction pipeline |
+
+## Failure Modes
+
+- **Redis/pubsub outage**
+  - What happens: users can edit locally; remote edits stop appearing in real time.
+  - Detect: gateway publish failures, doc channels with sudden drop in outbound messages.
+  - Recover: gateway falls back to “persist-only” mode; clients poll `Doc Sync API` for deltas every few seconds until pubsub returns.
+
+- **Postgres slow / write amplification (hot docs)**
+  - What happens: updates queue up; increased end-to-end latency; risk of disconnects.
+  - Detect: p95 insert latency, connection pool saturation, per-doc partition hotspots.
+  - Recover: shed load with per-doc rate limits, prioritize “persist then broadcast,” increase snapshot frequency for hot docs, and partition updates table by `(doc_id hash)` to spread I/O.
+
+- **Client duplication / out-of-order retries**
+  - What happens: without idempotency, the log bloats and remote viewers see repeated updates.
+  - Detect: rising conflict on unique constraints, repeated `(author_device_id, seq)` attempts.
+  - Recover: enforce idempotent inserts; gateway can also dedupe in-memory per connection as a best-effort optimization.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Move from Redis PubSub to a sharded realtime layer with sticky routing per `doc_id` (still boring), so a single doc’s fanout stays on one shard and cross-node chatter drops.
+  - Add regional read replicas for snapshot metadata and keep WebSockets region-local.
+
+- **100x scale:**
+  - Replace Postgres update-log with a purpose-built append log (Kafka/Pulsar) *per doc shard* and keep Postgres for metadata only.
+  - Multi-region active-active becomes the hard problem: you’ll need region-local gateways with CRDT still safe, but you must design for cross-region pubsub and snapshot consistency (and accept higher inter-region latency).
+
+## Operational Notes
+
+- Snapshot interval is your main cost/perf knob; tune based on “time-to-open doc” and “reconnect storm” metrics.
+- Keep presence separate and lossy; never page on “cursor desync.”
+- Instrument per-doc hotness (edit rate, fanout) and apply doc-level rate limits before global ones.
+- Enforce strict token scoping to `doc_id` and role on the WebSocket handshake; do not rely on client behavior for access control.
+- Have a clear “stale client” policy: if state is older than delta retention, force snapshot reload rather than attempting partial recovery.
+```
+tokens used
+3,590
+```markdown
+---
+title: "Collaborative Document Editing"
+category: "Real-Time & Media"
+difficulty: "Hard"
+tags: ["crdt", "realtime", "websockets", "offline-first", "consistency", "presence"]
+---
+
+## Overview
+
+This system is a Google Docs–style collaborative editor that supports concurrent edits, low-latency typing, and true offline work with later reconciliation. The core idea is to make *the client* authoritative for editing semantics (via a proven CRDT), while the backend focuses on three boring jobs: secure session/auth, efficient fanout, and durable persistence with compaction.
+
+The elegant move is **separating “document truth” from “document storage.”** We don’t ask the server to understand rich-text operations or do transforms. Instead, clients exchange CRDT deltas; the server simply relays deltas to collaborators and persists them as an append-only log with periodic snapshots. Offline reconciliation becomes a sync problem (missing deltas), not a concurrency problem (transforms).
+
+I’d implement this with a Yjs-style CRDT model: fast local edits, binary deltas, and state-vector based catch-up. Everything else—auth, permissions, audit/versioning, exports—can be layered without touching the concurrency core.
+
+## What Makes This Hard
+
+Naive designs centralize ordering: “send ops to server, serialize, broadcast.” That feels safe until you add offline edits, flaky mobile networks, and multi-tab sessions. Then you either lose edits, invent complex retry/transform logic, or accidentally introduce subtle divergence bugs.
+
+The real trap is **unbounded growth and sync cost**. CRDTs are correct-but-not-free: if you just “store all updates forever,” documents become slower to load, reconnect storms hammer your database, and compacting incorrectly can silently corrupt state. The hardest part isn’t merging—it’s keeping the mergeable history *bounded* while preserving correctness and fast catch-up.
+
+## Requirements
+
+### Functional Requirements
+- Real-time coauthoring with sub-150ms perceived latency for local edits (remote <300ms typical).
+- Offline-first: edits made offline must reconcile without conflicts or manual merge.
+- Multiple devices/tabs per user; must not duplicate or reorder a user’s own edits incorrectly.
+- Presence (“who’s here”, cursors) must be real-time but not durable; it must not block editing.
+- Access control (view/comment/edit) enforced on every connection and every persisted update.
+- Version history and “restore” built from snapshots + update log (not from bespoke save states).
+
+### Scale Targets
+- 10M DAU, 1M peak concurrent editors.
+- Median doc: 1–5 active editors; p95 doc: 20 editors; rare spikes: 200 (all-hands).
+- Edit rate: ~2–5 logical ops/sec/editor while typing; bursty (paste/format creates spikes).
+- Fanout: worst-case doc 200 editors → one update becomes 199 outbound messages.
+- Storage: assume 50KB–5MB snapshot per doc (rich-text) + deltas between snapshots.
+Why these numbers matter: fanout drives gateway CPU/network; snapshot+delta strategy drives database I/O and reconnect performance.
+
+## Key Design Decisions
+
+- **Choose CRDT deltas + state-vector sync (Yjs-like)**
+  - Rejected: server-serialized OT as the primary truth.
+  - Why: CRDT gives local-first latency and offline reconciliation without a central transform bottleneck; state vectors make catch-up efficient (send only what’s missing).
+
+- **Persist an append-only update log + periodic snapshots**
+  - Rejected: “store only latest doc JSON” or “store infinite op history without compaction.”
+  - Why: append-only is easy to make correct and auditable; snapshots bound replay time and database reads; together they enable fast cold start and robust recovery.
+
+- **Separate “editing channel” from “presence channel”**
+  - Rejected: storing cursors/presence in the same durable stream as edits.
+  - Why: presence is high-churn and ephemeral; coupling it to durability increases cost and makes outages user-visible in the worst way (“typing blocked because cursor service is down”).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[Clients] -->|HTTPS| A["Auth & Permissions"]
+  U -->|WebSocket| G["Collab Gateway"]
+  G --> R["Realtime PubSub"]
+  G --> D["Doc Sync API"]
+  D --> P["Postgres (Log+Meta)"]
+  D --> S["Object Storage (Snapshots)"]
+  P --> J["Compactor Jobs"]
+  J --> S
+```
+
+### Components
+
+- `Clients`
+  - Run the CRDT engine, apply local edits instantly, buffer offline updates, and sync via state vectors.
+  - This is where complexity belongs: it’s closest to user intent and easiest to test end-to-end.
+
+- `Auth & Permissions`
+  - Issues short-lived tokens scoped to a doc and role (view/comment/edit).
+  - Keeps the gateway stateless and prevents “open websocket, then check later” security gaps.
+
+- `Collab Gateway`
+  - Terminates WebSockets, authenticates, rate-limits, and does fanout via pubsub.
+  - Stateless so it scales horizontally; it does not interpret document operations.
+
+- `Realtime PubSub` (Redis Cluster)
+  - Provides low-latency fanout per document channel.
+  - If it hiccups, editing still proceeds locally; users temporarily stop seeing others’ updates (degraded but safe).
+
+- `Doc Sync API`
+  - The durable edge: accepts CRDT updates for persistence, serves catch-up (missing updates), and manages snapshots.
+  - This is where idempotency and correctness checks live.
+
+- `Postgres (Log+Meta)`
+  - Stores doc metadata (owner, ACL pointers, latest snapshot pointer) and an append-only updates table partitioned by doc.
+  - Postgres is boring, consistent, and operationally straightforward for this access pattern.
+
+- `Object Storage (Snapshots)`
+  - Stores compressed CRDT snapshots (and optional exports like PDF) cheaply.
+  - Snapshots are the fast-path for cold loads and compaction.
+
+- `Compactor Jobs`
+  - Periodically materialize a new snapshot and mark old deltas as compacted.
+  - The job is the lever that keeps performance stable over time.
+
+## Deep Dive: Offline Reconciliation Without Server Transforms
+
+The winning trick is **state-vector synchronization**, which turns “offline merge” into “what updates am I missing?” Each client maintains a CRDT state and a compact “state vector” summarizing what it has seen (e.g., per-client logical clocks). When reconnecting, the client sends its state vector to `Doc Sync API`.
+
+The server does not compute transforms. It responds with:
+1) The latest snapshot pointer (if the client is far behind), and
+2) Only the deltas the client lacks since that snapshot (computed by comparing the client state vector to stored updates).
+
+A concrete flow:
+- On connect, client fetches `snapshot_id` + snapshot bytes from `Object Storage`, loads into CRDT, then asks for deltas after `snapshot_id`.
+- While online, client sends updates as binary deltas tagged with `(doc_id, author_device_id, monotonic_seq)`.
+- Server persists updates idempotently (unique constraint on `(doc_id, author_device_id, monotonic_seq)`), then publishes them to the doc channel.
+- Offline edits accumulate locally; on reconnect, client sends its state vector; server returns only missing deltas; client merges locally (CRDT guarantees convergence).
+
+Bounding growth (the part teams get wrong):
+- The updates table grows without limit unless compacted. Compaction produces a new snapshot that subsumes older deltas.
+- Compaction must be careful: it can only prune deltas older than a “safe point” (e.g., once a snapshot includes them and you keep a tail window for late clients). Practically: keep deltas for N days or last K updates even after snapshotting.
+- Clients that are *too* stale (older than retention) must be forced to reload from the latest snapshot, not replay missing deltas that no longer exist.
+
+This yields a system that is correct under concurrency, resilient to offline, and operationally predictable because replay costs are bounded by snapshot interval and delta retention.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Offline-first correctness | More client complexity |
+| Low-latency local edits | Harder server-side “validation” of intent |
+| Simple, stateless gateway | Reliance on robust client CRDT library |
+| Bounded load via snapshots | Background compaction pipeline |
+
+## Failure Modes
+
+- **Redis/pubsub outage**
+  - What happens: users can edit locally; remote edits stop appearing in real time.
+  - Detect: gateway publish failures, doc channels with sudden drop in outbound messages.
+  - Recover: gateway falls back to “persist-only” mode; clients poll `Doc Sync API` for deltas every few seconds until pubsub returns.
+
+- **Postgres slow / write amplification (hot docs)**
+  - What happens: updates queue up; increased end-to-end latency; risk of disconnects.
+  - Detect: p95 insert latency, connection pool saturation, per-doc partition hotspots.
+  - Recover: shed load with per-doc rate limits, prioritize “persist then broadcast,” increase snapshot frequency for hot docs, and partition updates table by `(doc_id hash)` to spread I/O.
+
+- **Client duplication / out-of-order retries**
+  - What happens: without idempotency, the log bloats and remote viewers see repeated updates.
+  - Detect: rising conflict on unique constraints, repeated `(author_device_id, seq)` attempts.
+  - Recover: enforce idempotent inserts; gateway can also dedupe in-memory per connection as a best-effort optimization.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Move from Redis PubSub to a sharded realtime layer with sticky routing per `doc_id` (still boring), so a single doc’s fanout stays on one shard and cross-node chatter drops.
+  - Add regional read replicas for snapshot metadata and keep WebSockets region-local.
+
+- **100x scale:**
+  - Replace Postgres update-log with a purpose-built append log (Kafka/Pulsar) *per doc shard* and keep Postgres for metadata only.
+  - Multi-region active-active becomes the hard problem: you’ll need region-local gateways with CRDT still safe, but you must design for cross-region pubsub and snapshot consistency (and accept higher inter-region latency).
+
+## Operational Notes
+
+- Snapshot interval is your main cost/perf knob; tune based on “time-to-open doc” and “reconnect storm” metrics.
+- Keep presence separate and lossy; never page on “cursor desync.”
+- Instrument per-doc hotness (edit rate, fanout) and apply doc-level rate limits before global ones.
+- Enforce strict token scoping to `doc_id` and role on the WebSocket handshake; do not rely on client behavior for access control.
+- Have a clear “stale client” policy: if state is older than delta retention, force snapshot reload rather than attempting partial recovery.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/collaborative-document-editing.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-6eca-7000-bc41-9047e84dc3a0
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Collaborative Document Editing"
+category: "Real-Time & Media"
+difficulty: "Hard"
+tags: ["crdt", "realtime", "websockets", "offline-first", "consistency", "presence"]
+---
+
+## Overview
+
+This system is a Google Docs–style collaborative editor that supports concurrent edits, low-latency typing, and true offline work with later reconciliation. The core idea is to make *the client* authoritative for editing semantics (via a proven CRDT), while the backend focuses on three boring jobs: secure session/auth, efficient fanout, and durable persistence with compaction.
+
+The elegant move is **separating “document truth” from “document storage.”** We don’t ask the server to understand rich-text operations or do transforms. Instead, clients exchange CRDT deltas; the server simply relays deltas to collaborators and persists them as an append-only log with periodic snapshots. Offline reconciliation becomes a sync problem (missing deltas), not a concurrency problem (transforms).
+
+I’d implement this with a Yjs-style CRDT model: fast local edits, binary deltas, and state-vector based catch-up. Everything else—auth, permissions, audit/versioning, exports—can be layered without touching the concurrency core.
+
+## What Makes This Hard
+
+Naive designs centralize ordering: “send ops to server, serialize, broadcast.” That feels safe until you add offline edits, flaky mobile networks, and multi-tab sessions. Then you either lose edits, invent complex retry/transform logic, or accidentally introduce subtle divergence bugs.
+
+The real trap is **unbounded growth and sync cost**. CRDTs are correct-but-not-free: if you just “store all updates forever,” documents become slower to load, reconnect storms hammer your database, and compacting incorrectly can silently corrupt state. The hardest part isn’t merging—it’s keeping the mergeable history *bounded* while preserving correctness and fast catch-up.
+
+## Requirements
+
+### Functional Requirements
+- Real-time coauthoring with sub-150ms perceived latency for local edits (remote <300ms typical).
+- Offline-first: edits made offline must reconcile without conflicts or manual merge.
+- Multiple devices/tabs per user; must not duplicate or reorder a user’s own edits incorrectly.
+- Presence (“who’s here”, cursors) must be real-time but not durable; it must not block editing.
+- Access control (view/comment/edit) enforced on every connection and every persisted update.
+- Version history and “restore” built from snapshots + update log (not from bespoke save states).
+
+### Scale Targets
+- 10M DAU, 1M peak concurrent editors.
+- Median doc: 1–5 active editors; p95 doc: 20 editors; rare spikes: 200 (all-hands).
+- Edit rate: ~2–5 logical ops/sec/editor while typing; bursty (paste/format creates spikes).
+- Fanout: worst-case doc 200 editors → one update becomes 199 outbound messages.
+- Storage: assume 50KB–5MB snapshot per doc (rich-text) + deltas between snapshots.
+Why these numbers matter: fanout drives gateway CPU/network; snapshot+delta strategy drives database I/O and reconnect performance.
+
+## Key Design Decisions
+
+- **Choose CRDT deltas + state-vector sync (Yjs-like)**
+  - Rejected: server-serialized OT as the primary truth.
+  - Why: CRDT gives local-first latency and offline reconciliation without a central transform bottleneck; state vectors make catch-up efficient (send only what’s missing).
+
+- **Persist an append-only update log + periodic snapshots**
+  - Rejected: “store only latest doc JSON” or “store infinite op history without compaction.”
+  - Why: append-only is easy to make correct and auditable; snapshots bound replay time and database reads; together they enable fast cold start and robust recovery.
+
+- **Separate “editing channel” from “presence channel”**
+  - Rejected: storing cursors/presence in the same durable stream as edits.
+  - Why: presence is high-churn and ephemeral; coupling it to durability increases cost and makes outages user-visible in the worst way (“typing blocked because cursor service is down”).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[Clients] -->|HTTPS| A["Auth & Permissions"]
+  U -->|WebSocket| G["Collab Gateway"]
+  G --> R["Realtime PubSub"]
+  G --> D["Doc Sync API"]
+  D --> P["Postgres (Log+Meta)"]
+  D --> S["Object Storage (Snapshots)"]
+  P --> J["Compactor Jobs"]
+  J --> S
+```
+
+### Components
+
+- `Clients`
+  - Run the CRDT engine, apply local edits instantly, buffer offline updates, and sync via state vectors.
+  - This is where complexity belongs: it’s closest to user intent and easiest to test end-to-end.
+
+- `Auth & Permissions`
+  - Issues short-lived tokens scoped to a doc and role (view/comment/edit).
+  - Keeps the gateway stateless and prevents “open websocket, then check later” security gaps.
+
+- `Collab Gateway`
+  - Terminates WebSockets, authenticates, rate-limits, and does fanout via pubsub.
+  - Stateless so it scales horizontally; it does not interpret document operations.
+
+- `Realtime PubSub` (Redis Cluster)
+  - Provides low-latency fanout per document channel.
+  - If it hiccups, editing still proceeds locally; users temporarily stop seeing others’ updates (degraded but safe).
+
+- `Doc Sync API`
+  - The durable edge: accepts CRDT updates for persistence, serves catch-up (missing updates), and manages snapshots.
+  - This is where idempotency and correctness checks live.
+
+- `Postgres (Log+Meta)`
+  - Stores doc metadata (owner, ACL pointers, latest snapshot pointer) and an append-only updates table partitioned by doc.
+  - Postgres is boring, consistent, and operationally straightforward for this access pattern.
+
+- `Object Storage (Snapshots)`
+  - Stores compressed CRDT snapshots (and optional exports like PDF) cheaply.
+  - Snapshots are the fast-path for cold loads and compaction.
+
+- `Compactor Jobs`
+  - Periodically materialize a new snapshot and mark old deltas as compacted.
+  - The job is the lever that keeps performance stable over time.
+
+## Deep Dive: Offline Reconciliation Without Server Transforms
+
+The winning trick is **state-vector synchronization**, which turns “offline merge” into “what updates am I missing?” Each client maintains a CRDT state and a compact “state vector” summarizing what it has seen (e.g., per-client logical clocks). When reconnecting, the client sends its state vector to `Doc Sync API`.
+
+The server does not compute transforms. It responds with:
+1) The latest snapshot pointer (if the client is far behind), and
+2) Only the deltas the client lacks since that snapshot (computed by comparing the client state vector to stored updates).
+
+A concrete flow:
+- On connect, client fetches `snapshot_id` + snapshot bytes from `Object Storage`, loads into CRDT, then asks for deltas after `snapshot_id`.
+- While online, client sends updates as binary deltas tagged with `(doc_id, author_device_id, monotonic_seq)`.
+- Server persists updates idempotently (unique constraint on `(doc_id, author_device_id, monotonic_seq)`), then publishes them to the doc channel.
+- Offline edits accumulate locally; on reconnect, client sends its state vector; server returns only missing deltas; client merges locally (CRDT guarantees convergence).
+
+Bounding growth (the part teams get wrong):
+- The updates table grows without limit unless compacted. Compaction produces a new snapshot that subsumes older deltas.
+- Compaction must be careful: it can only prune deltas older than a “safe point” (e.g., once a snapshot includes them and you keep a tail window for late clients). Practically: keep deltas for N days or last K updates even after snapshotting.
+- Clients that are *too* stale (older than retention) must be forced to reload from the latest snapshot, not replay missing deltas that no longer exist.
+
+This yields a system that is correct under concurrency, resilient to offline, and operationally predictable because replay costs are bounded by snapshot interval and delta retention.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Offline-first correctness | More client complexity |
+| Low-latency local edits | Harder server-side “validation” of intent |
+| Simple, stateless gateway | Reliance on robust client CRDT library |
+| Bounded load via snapshots | Background compaction pipeline |
+
+## Failure Modes
+
+- **Redis/pubsub outage**
+  - What happens: users can edit locally; remote edits stop appearing in real time.
+  - Detect: gateway publish failures, doc channels with sudden drop in outbound messages.
+  - Recover: gateway falls back to “persist-only” mode; clients poll `Doc Sync API` for deltas every few seconds until pubsub returns.
+
+- **Postgres slow / write amplification (hot docs)**
+  - What happens: updates queue up; increased end-to-end latency; risk of disconnects.
+  - Detect: p95 insert latency, connection pool saturation, per-doc partition hotspots.
+  - Recover: shed load with per-doc rate limits, prioritize “persist then broadcast,” increase snapshot frequency for hot docs, and partition updates table by `(doc_id hash)` to spread I/O.
+
+- **Client duplication / out-of-order retries**
+  - What happens: without idempotency, the log bloats and remote viewers see repeated updates.
+  - Detect: rising conflict on unique constraints, repeated `(author_device_id, seq)` attempts.
+  - Recover: enforce idempotent inserts; gateway can also dedupe in-memory per connection as a best-effort optimization.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Move from Redis PubSub to a sharded realtime layer with sticky routing per `doc_id` (still boring), so a single doc’s fanout stays on one shard and cross-node chatter drops.
+  - Add regional read replicas for snapshot metadata and keep WebSockets region-local.
+
+- **100x scale:**
+  - Replace Postgres update-log with a purpose-built append log (Kafka/Pulsar) *per doc shard* and keep Postgres for metadata only.
+  - Multi-region active-active becomes the hard problem: you’ll need region-local gateways with CRDT still safe, but you must design for cross-region pubsub and snapshot consistency (and accept higher inter-region latency).
+
+## Operational Notes
+
+- Snapshot interval is your main cost/perf knob; tune based on “time-to-open doc” and “reconnect storm” metrics.
+- Keep presence separate and lossy; never page on “cursor desync.”
+- Instrument per-doc hotness (edit rate, fanout) and apply doc-level rate limits before global ones.
+- Enforce strict token scoping to `doc_id` and role on the WebSocket handshake; do not rely on client behavior for access control.
+- Have a clear “stale client” policy: if state is older than delta retention, force snapshot reload rather than attempting partial recovery.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+thinking
+**Evaluating design choices**
+
+I'm thinking about simplifying our approach by removing Realtime PubSub and using sticky connections with in-memory per-document fanout. However, that brings up risks related to multi-gateway connections. I might consider using NATS as a simpler option, but the design suggests sticking to a Redis cluster while leveraging managed services. The user asked for a structured critique, so I’ll need to provide a detailed table of components, their necessity, alongside security measures and permissions for document updates.
+thinking
+**Analyzing Yjs update strategies**
+
+I’m considering how Yjs updates can be applied blindly, which could lead to a denial-of-service (DoS) issue. To mitigate this, I think about adding a maximum update size and using zstd compression, but that raises concerns about decompression bombs. Snapshots need consistency, so we should store a snapshot alongside a state vector or update clock. Compaction must be atomic, ensuring the new snapshot and metadata updates are handled transactionally. While the server can't compute differences easily, it can manage deltas since the snapshot—a clever strategy!
+thinking
+**Examining Yjs update efficiency**
+
+I’m realizing that efficiency drops when clients already have many updates. To prevent sending duplicates, the server must compute which update blocks correspond to which clocks or store "sv" information for each update. Typically, Yjs updates are logged, and the server should send the state vector to sync. In the Yjs sync protocol, the client sends its state vector, and peers reply with missing updates. However, if the server doesn't maintain document state, it can't compute the exact missing updates. It poses a tricky challenge!
+thinking
+**Evaluating synchronization strategies**
+
+I’m weighing two options for elegance in update management: either accept sending all updates since the last snapshot, which is simple but less optimal, or have a Doc Sync API maintain an in-memory Yjs document. The latter could break the "server doesn't interpret" rule, so using a y-redis/y-websocket approach might help. I’m also considering presence management channels, which could simplify things by combining the Doc Sync API and gateway. We should be cautious about data loss while ensuring correct delivery for large user bases.
+thinking
+**Addressing Failure Modes**
+
+I’m thinking about how to handle various failure modes, like when Postgres is down for five minutes. Clients can still edit, but updates might not be saved, and remote users wouldn't get them. I wonder if we should buffer at the gateway, even though it's stateless. While it could lead to a local-only degradation, it's essential for real-time collaboration. Allowing ephemeral fanout might help maintain interaction despite temporary persistence failures, but risks divergence if some clients are missed. 
+
+I need to emphasize durable semantics, like "persist-ack," where clients send updates and await acknowledgment before they're marked as durable.
+codex
+## Elegance Check
+
+### The Core Insight
+Make the client authoritative for edit semantics (CRDT), and keep the backend “boring”: authenticate, fanout, and durably persist an append-only update stream with bounded replay via snapshots/compaction.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Clients (CRDT) | Only place that can guarantee sub-150ms local edits + offline-first merge correctness. |
+| Auth & Permissions | Tight doc-scoped tokens on handshake is the cleanest way to keep the gateway stateless without security footguns. |
+| Collab Gateway | WebSocket termination + rate limiting + fanout is its own scaling problem; keeping it stateless is the right instinct. |
+| Doc Sync API | Single “durable edge” where idempotency, retention policy, and snapshot pointers live; avoids mixing durability concerns into the gateway. |
+| Postgres (log+meta) | Boring correctness for metadata + unique constraints for idempotency; good default until the write rate forces a log system. |
+| Object Storage (snapshots) | Cheapest way to store large immutable blobs; the right place for snapshots/exports. |
+| Compactor Jobs | The mechanism that makes CRDT history bounded and keeps reconnect/cold-start predictable. |
+| Realtime PubSub (Redis) | Low-latency broadcast primitive that’s operationally familiar (but see simplifications below). |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Redis PubSub for fanout | Sticky routing per `doc_id` + in-gateway in-memory fanout (Redis only for cross-node or not at all initially) | Simpler data plane, but you need consistent hashing + connection draining discipline; cross-node presence requires more thought. |
+| “State-vector catch-up” while server is operation-agnostic | Either (A) accept “send all deltas since snapshot” or (B) let `Doc Sync API` keep per-doc CRDT state in-memory to compute true diffs | (A) simpler but higher bandwidth; (B) more complexity but matches the promise of state-vector efficiency. |
+| Separate `Collab Gateway` and `Doc Sync API` hops for every update | Combine them (gateway persists directly) with an outbox/transactional publish | Fewer moving parts/latency, but harder to keep codebase clean; you must get “persist vs publish” ordering right. |
+| Postgres update log partitions per doc | Start with coarse sharding (hash buckets) + append-only table + BRIN indexes | Less partition management complexity; might sacrifice some per-doc locality. |
+| Custom compaction correctness | Treat compaction as “build new snapshot + validate + switch pointer” and keep old snapshots/deltas for a safety window | Uses more storage, but dramatically reduces risk of irreversible corruption. |
+| Presence as “another channel” | Redis keys with TTL + periodic heartbeats (or gateway-only ephemeral presence) | Loses some real-time fidelity across gateway nodes unless you add cross-node gossip/Redis. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres is down for 5 minutes**
+   - Design’s answer: partially addressed (mentions Postgres slow, not hard-down)
+   - Recommendation: Strengthen — define a durability contract: do clients require an ACK from `Doc Sync API` to consider an edit “saved”? If DB is down, either (a) reject with clear “offline/unsaved” UX while still allowing local edits, or (b) accept into a bounded gateway buffer (risky) with explicit backpressure and loss semantics.
+
+2. **Publish succeeds but persistence fails (or vice versa)**
+   - Design’s answer: not addressed explicitly
+   - Recommendation: Must fix — choose one:  
+     - **Persist-then-publish** (strong consistency for “what others saw will reload”), or  
+     - **Publish-then-persist** with explicit “ephemeral until committed” semantics and client reconciliation to avoid “ghost edits” after reload.  
+     A transactional outbox pattern (or a per-doc sequencer shard) is the cleanest way to avoid split-brain between realtime and durability.
+
+3. **Network partition: gateway ↔ Redis, but gateway ↔ clients is fine**
+   - Design’s answer: addressed (fallback to persist-only + client polling)
+   - Recommendation: Acceptable — add guardrails: polling jitter/backoff to avoid thundering herds, and a “doc-level slow mode” when pubsub is degraded.
+
+4. **Compactor bug produces a bad snapshot (silent divergence)**
+   - Design’s answer: not addressed
+   - Recommendation: Must fix — compaction is the highest-risk component. Add: snapshot checksums, “apply snapshot + tail updates” verification in the job, keep previous snapshot pointer for quick rollback, and delay deletion of old deltas (safety window) so you can recover.
+
+5. **Hot doc spike (200 editors, paste storms) causes backpressure**
+   - Design’s answer: partially addressed (rate limits, snapshot frequency)
+   - Recommendation: Strengthen — add explicit per-doc backpressure behavior: bounded outbound queues per connection, drop/merge presence updates first, and a clear policy for when to disconnect vs degrade (and how clients resync cleanly).
+
+## Recommendations
+
+### Must Fix
+- Reconcile the tension between “server doesn’t understand ops” and “state-vector selective catch-up”: either accept replay-since-snapshot, or explicitly run CRDT state in `Doc Sync API` (even if only on compactor/shards).
+- Define ordering/atomicity between persistence and broadcast (avoid ghost edits) and document the client’s “saved vs seen” semantics.
+- Make compaction safe-by-design: validate snapshots, keep rollback pointers, and don’t delete deltas immediately.
+- Harden abuse/DoS edges: cap update size, protect against compression bombs, rate-limit per doc/user, and ensure `author_device_id` is server-minted/bound (not client-chosen).
+
+### Should Consider
+- Collapse components early (gateway + sync) to reduce operational surface area, then split only when metrics demand it.
+- Consider Postgres `LISTEN/NOTIFY` (or a single-region “good enough” pubsub) for earlier stages to remove Redis until scale forces it.
+- Add an explicit “stale client” UX path: forced snapshot reload with clear messaging and automatic recovery.
+
+### Nice to Have
+- “3am tools”: per-doc timeline inspector (snapshot ids, update counts, last compaction), one-click disable compactor, and replay/verify tooling.
+- Canary compaction + gradual rollout of CRDT library upgrades (client and server) to avoid format/version mismatch incidents.
+
+## What's Working Well
+- The separation of durable edits vs ephemeral presence is exactly the right reliability boundary.
+- Idempotent writes with `(doc_id, author_device_id, monotonic_seq)` is a solid foundation for retries and flaky networks.
+- Snapshot + append-only log framing is operationally legible and gives you clean knobs (snapshot interval, retention).
+- You’re explicit about the real hard part (bounded history/compaction) and treat it as a first-class design axis, not an afterthought.
+tokens used
+6,522
+## Elegance Check
+
+### The Core Insight
+Make the client authoritative for edit semantics (CRDT), and keep the backend “boring”: authenticate, fanout, and durably persist an append-only update stream with bounded replay via snapshots/compaction.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Clients (CRDT) | Only place that can guarantee sub-150ms local edits + offline-first merge correctness. |
+| Auth & Permissions | Tight doc-scoped tokens on handshake is the cleanest way to keep the gateway stateless without security footguns. |
+| Collab Gateway | WebSocket termination + rate limiting + fanout is its own scaling problem; keeping it stateless is the right instinct. |
+| Doc Sync API | Single “durable edge” where idempotency, retention policy, and snapshot pointers live; avoids mixing durability concerns into the gateway. |
+| Postgres (log+meta) | Boring correctness for metadata + unique constraints for idempotency; good default until the write rate forces a log system. |
+| Object Storage (snapshots) | Cheapest way to store large immutable blobs; the right place for snapshots/exports. |
+| Compactor Jobs | The mechanism that makes CRDT history bounded and keeps reconnect/cold-start predictable. |
+| Realtime PubSub (Redis) | Low-latency broadcast primitive that’s operationally familiar (but see simplifications below). |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Redis PubSub for fanout | Sticky routing per `doc_id` + in-gateway in-memory fanout (Redis only for cross-node or not at all initially) | Simpler data plane, but you need consistent hashing + connection draining discipline; cross-node presence requires more thought. |
+| “State-vector catch-up” while server is operation-agnostic | Either (A) accept “send all deltas since snapshot” or (B) let `Doc Sync API` keep per-doc CRDT state in-memory to compute true diffs | (A) simpler but higher bandwidth; (B) more complexity but matches the promise of state-vector efficiency. |
+| Separate `Collab Gateway` and `Doc Sync API` hops for every update | Combine them (gateway persists directly) with an outbox/transactional publish | Fewer moving parts/latency, but harder to keep codebase clean; you must get “persist vs publish” ordering right. |
+| Postgres update log partitions per doc | Start with coarse sharding (hash buckets) + append-only table + BRIN indexes | Less partition management complexity; might sacrifice some per-doc locality. |
+| Custom compaction correctness | Treat compaction as “build new snapshot + validate + switch pointer” and keep old snapshots/deltas for a safety window | Uses more storage, but dramatically reduces risk of irreversible corruption. |
+| Presence as “another channel” | Redis keys with TTL + periodic heartbeats (or gateway-only ephemeral presence) | Loses some real-time fidelity across gateway nodes unless you add cross-node gossip/Redis. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres is down for 5 minutes**
+   - Design’s answer: partially addressed (mentions Postgres slow, not hard-down)
+   - Recommendation: Strengthen — define a durability contract: do clients require an ACK from `Doc Sync API` to consider an edit “saved”? If DB is down, either (a) reject with clear “offline/unsaved” UX while still allowing local edits, or (b) accept into a bounded gateway buffer (risky) with explicit backpressure and loss semantics.
+
+2. **Publish succeeds but persistence fails (or vice versa)**
+   - Design’s answer: not addressed explicitly
+   - Recommendation: Must fix — choose one:  
+     - **Persist-then-publish** (strong consistency for “what others saw will reload”), or  
+     - **Publish-then-persist** with explicit “ephemeral until committed” semantics and client reconciliation to avoid “ghost edits” after reload.  
+     A transactional outbox pattern (or a per-doc sequencer shard) is the cleanest way to avoid split-brain between realtime and durability.
+
+3. **Network partition: gateway ↔ Redis, but gateway ↔ clients is fine**
+   - Design’s answer: addressed (fallback to persist-only + client polling)
+   - Recommendation: Acceptable — add guardrails: polling jitter/backoff to avoid thundering herds, and a “doc-level slow mode” when pubsub is degraded.
+
+4. **Compactor bug produces a bad snapshot (silent divergence)**
+   - Design’s answer: not addressed
+   - Recommendation: Must fix — compaction is the highest-risk component. Add: snapshot checksums, “apply snapshot + tail updates” verification in the job, keep previous snapshot pointer for quick rollback, and delay deletion of old deltas (safety window) so you can recover.
+
+5. **Hot doc spike (200 editors, paste storms) causes backpressure**
+   - Design’s answer: partially addressed (rate limits, snapshot frequency)
+   - Recommendation: Strengthen — add explicit per-doc backpressure behavior: bounded outbound queues per connection, drop/merge presence updates first, and a clear policy for when to disconnect vs degrade (and how clients resync cleanly).
+
+## Recommendations
+
+### Must Fix
+- Reconcile the tension between “server doesn’t understand ops” and “state-vector selective catch-up”: either accept replay-since-snapshot, or explicitly run CRDT state in `Doc Sync API` (even if only on compactor/shards).
+- Define ordering/atomicity between persistence and broadcast (avoid ghost edits) and document the client’s “saved vs seen” semantics.
+- Make compaction safe-by-design: validate snapshots, keep rollback pointers, and don’t delete deltas immediately.
+- Harden abuse/DoS edges: cap update size, protect against compression bombs, rate-limit per doc/user, and ensure `author_device_id` is server-minted/bound (not client-chosen).
+
+### Should Consider
+- Collapse components early (gateway + sync) to reduce operational surface area, then split only when metrics demand it.
+- Consider Postgres `LISTEN/NOTIFY` (or a single-region “good enough” pubsub) for earlier stages to remove Redis until scale forces it.
+- Add an explicit “stale client” UX path: forced snapshot reload with clear messaging and automatic recovery.
+
+### Nice to Have
+- “3am tools”: per-doc timeline inspector (snapshot ids, update counts, last compaction), one-click disable compactor, and replay/verify tooling.
+- Canary compaction + gradual rollout of CRDT library upgrades (client and server) to avoid format/version mismatch incidents.
+
+## What's Working Well
+- The separation of durable edits vs ephemeral presence is exactly the right reliability boundary.
+- Idempotent writes with `(doc_id, author_device_id, monotonic_seq)` is a solid foundation for retries and flaky networks.
+- Snapshot + append-only log framing is operationally legible and gives you clean knobs (snapshot interval, retention).
+- You’re explicit about the real hard part (bounded history/compaction) and treat it as a first-class design axis, not an afterthought.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/collaborative-document-editing.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afc-bef5-7570-bd56-abfcf1eeda2b
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Collaborative Document Editing"
+category: "Real-Time & Media"
+difficulty: "Hard"
+tags: ["crdt", "realtime", "websockets", "offline-first", "consistency", "presence"]
+---
+
+## Overview
+
+This system is a Google Docs–style collaborative editor that supports concurrent edits, low-latency typing, and true offline work with later reconciliation. The core idea is to make *the client* authoritative for editing semantics (via a proven CRDT), while the backend focuses on three boring jobs: secure session/auth, efficient fanout, and durable persistence with compaction.
+
+The elegant move is **separating “document truth” from “document storage.”** We don’t ask the server to understand rich-text operations or do transforms. Instead, clients exchange CRDT deltas; the server simply relays deltas to collaborators and persists them as an append-only log with periodic snapshots. Offline reconciliation becomes a sync problem (missing deltas), not a concurrency problem (transforms).
+
+I’d implement this with a Yjs-style CRDT model: fast local edits, binary deltas, and state-vector based catch-up. Everything else—auth, permissions, audit/versioning, exports—can be layered without touching the concurrency core.
+
+## What Makes This Hard
+
+Naive designs centralize ordering: “send ops to server, serialize, broadcast.” That feels safe until you add offline edits, flaky mobile networks, and multi-tab sessions. Then you either lose edits, invent complex retry/transform logic, or accidentally introduce subtle divergence bugs.
+
+The real trap is **unbounded growth and sync cost**. CRDTs are correct-but-not-free: if you just “store all updates forever,” documents become slower to load, reconnect storms hammer your database, and compacting incorrectly can silently corrupt state. The hardest part isn’t merging—it’s keeping the mergeable history *bounded* while preserving correctness and fast catch-up.
+
+## Requirements
+
+### Functional Requirements
+- Real-time coauthoring with sub-150ms perceived latency for local edits (remote <300ms typical).
+- Offline-first: edits made offline must reconcile without conflicts or manual merge.
+- Multiple devices/tabs per user; must not duplicate or reorder a user’s own edits incorrectly.
+- Presence (“who’s here”, cursors) must be real-time but not durable; it must not block editing.
+- Access control (view/comment/edit) enforced on every connection and every persisted update.
+- Version history and “restore” built from snapshots + update log (not from bespoke save states).
+
+### Scale Targets
+- 10M DAU, 1M peak concurrent editors.
+- Median doc: 1–5 active editors; p95 doc: 20 editors; rare spikes: 200 (all-hands).
+- Edit rate: ~2–5 logical ops/sec/editor while typing; bursty (paste/format creates spikes).
+- Fanout: worst-case doc 200 editors → one update becomes 199 outbound messages.
+- Storage: assume 50KB–5MB snapshot per doc (rich-text) + deltas between snapshots.
+Why these numbers matter: fanout drives gateway CPU/network; snapshot+delta strategy drives database I/O and reconnect performance.
+
+## Key Design Decisions
+
+- **Choose CRDT deltas + state-vector sync (Yjs-like)**
+  - Rejected: server-serialized OT as the primary truth.
+  - Why: CRDT gives local-first latency and offline reconciliation without a central transform bottleneck; state vectors make catch-up efficient (send only what’s missing).
+
+- **Persist an append-only update log + periodic snapshots**
+  - Rejected: “store only latest doc JSON” or “store infinite op history without compaction.”
+  - Why: append-only is easy to make correct and auditable; snapshots bound replay time and database reads; together they enable fast cold start and robust recovery.
+
+- **Separate “editing channel” from “presence channel”**
+  - Rejected: storing cursors/presence in the same durable stream as edits.
+  - Why: presence is high-churn and ephemeral; coupling it to durability increases cost and makes outages user-visible in the worst way (“typing blocked because cursor service is down”).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[Clients] -->|HTTPS| A["Auth & Permissions"]
+  U -->|WebSocket| G["Collab Gateway"]
+  G --> R["Realtime PubSub"]
+  G --> D["Doc Sync API"]
+  D --> P["Postgres (Log+Meta)"]
+  D --> S["Object Storage (Snapshots)"]
+  P --> J["Compactor Jobs"]
+  J --> S
+```
+
+### Components
+
+- `Clients`
+  - Run the CRDT engine, apply local edits instantly, buffer offline updates, and sync via state vectors.
+  - This is where complexity belongs: it’s closest to user intent and easiest to test end-to-end.
+
+- `Auth & Permissions`
+  - Issues short-lived tokens scoped to a doc and role (view/comment/edit).
+  - Keeps the gateway stateless and prevents “open websocket, then check later” security gaps.
+
+- `Collab Gateway`
+  - Terminates WebSockets, authenticates, rate-limits, and does fanout via pubsub.
+  - Stateless so it scales horizontally; it does not interpret document operations.
+
+- `Realtime PubSub` (Redis Cluster)
+  - Provides low-latency fanout per document channel.
+  - If it hiccups, editing still proceeds locally; users temporarily stop seeing others’ updates (degraded but safe).
+
+- `Doc Sync API`
+  - The durable edge: accepts CRDT updates for persistence, serves catch-up (missing updates), and manages snapshots.
+  - This is where idempotency and correctness checks live.
+
+- `Postgres (Log+Meta)`
+  - Stores doc metadata (owner, ACL pointers, latest snapshot pointer) and an append-only updates table partitioned by doc.
+  - Postgres is boring, consistent, and operationally straightforward for this access pattern.
+
+- `Object Storage (Snapshots)`
+  - Stores compressed CRDT snapshots (and optional exports like PDF) cheaply.
+  - Snapshots are the fast-path for cold loads and compaction.
+
+- `Compactor Jobs`
+  - Periodically materialize a new snapshot and mark old deltas as compacted.
+  - The job is the lever that keeps performance stable over time.
+
+## Deep Dive: Offline Reconciliation Without Server Transforms
+
+The winning trick is **state-vector synchronization**, which turns “offline merge” into “what updates am I missing?” Each client maintains a CRDT state and a compact “state vector” summarizing what it has seen (e.g., per-client logical clocks). When reconnecting, the client sends its state vector to `Doc Sync API`.
+
+The server does not compute transforms. It responds with:
+1) The latest snapshot pointer (if the client is far behind), and
+2) Only the deltas the client lacks since that snapshot (computed by comparing the client state vector to stored updates).
+
+A concrete flow:
+- On connect, client fetches `snapshot_id` + snapshot bytes from `Object Storage`, loads into CRDT, then asks for deltas after `snapshot_id`.
+- While online, client sends updates as binary deltas tagged with `(doc_id, author_device_id, monotonic_seq)`.
+- Server persists updates idempotently (unique constraint on `(doc_id, author_device_id, monotonic_seq)`), then publishes them to the doc channel.
+- Offline edits accumulate locally; on reconnect, client sends its state vector; server returns only missing deltas; client merges locally (CRDT guarantees convergence).
+
+Bounding growth (the part teams get wrong):
+- The updates table grows without limit unless compacted. Compaction produces a new snapshot that subsumes older deltas.
+- Compaction must be careful: it can only prune deltas older than a “safe point” (e.g., once a snapshot includes them and you keep a tail window for late clients). Practically: keep deltas for N days or last K updates even after snapshotting.
+- Clients that are *too* stale (older than retention) must be forced to reload from the latest snapshot, not replay missing deltas that no longer exist.
+
+This yields a system that is correct under concurrency, resilient to offline, and operationally predictable because replay costs are bounded by snapshot interval and delta retention.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Offline-first correctness | More client complexity |
+| Low-latency local edits | Harder server-side “validation” of intent |
+| Simple, stateless gateway | Reliance on robust client CRDT library |
+| Bounded load via snapshots | Background compaction pipeline |
+
+## Failure Modes
+
+- **Redis/pubsub outage**
+  - What happens: users can edit locally; remote edits stop appearing in real time.
+  - Detect: gateway publish failures, doc channels with sudden drop in outbound messages.
+  - Recover: gateway falls back to “persist-only” mode; clients poll `Doc Sync API` for deltas every few seconds until pubsub returns.
+
+- **Postgres slow / write amplification (hot docs)**
+  - What happens: updates queue up; increased end-to-end latency; risk of disconnects.
+  - Detect: p95 insert latency, connection pool saturation, per-doc partition hotspots.
+  - Recover: shed load with per-doc rate limits, prioritize “persist then broadcast,” increase snapshot frequency for hot docs, and partition updates table by `(doc_id hash)` to spread I/O.
+
+- **Client duplication / out-of-order retries**
+  - What happens: without idempotency, the log bloats and remote viewers see repeated updates.
+  - Detect: rising conflict on unique constraints, repeated `(author_device_id, seq)` attempts.
+  - Recover: enforce idempotent inserts; gateway can also dedupe in-memory per connection as a best-effort optimization.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Move from Redis PubSub to a sharded realtime layer with sticky routing per `doc_id` (still boring), so a single doc’s fanout stays on one shard and cross-node chatter drops.
+  - Add regional read replicas for snapshot metadata and keep WebSockets region-local.
+
+- **100x scale:**
+  - Replace Postgres update-log with a purpose-built append log (Kafka/Pulsar) *per doc shard* and keep Postgres for metadata only.
+  - Multi-region active-active becomes the hard problem: you’ll need region-local gateways with CRDT still safe, but you must design for cross-region pubsub and snapshot consistency (and accept higher inter-region latency).
+
+## Operational Notes
+
+- Snapshot interval is your main cost/perf knob; tune based on “time-to-open doc” and “reconnect storm” metrics.
+- Keep presence separate and lossy; never page on “cursor desync.”
+- Instrument per-doc hotness (edit rate, fanout) and apply doc-level rate limits before global ones.
+- Enforce strict token scoping to `doc_id` and role on the WebSocket handshake; do not rely on client behavior for access control.
+- Have a clear “stale client” policy: if state is older than delta retention, force snapshot reload rather than attempting partial recovery.
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Make the client authoritative for edit semantics (CRDT), and keep the backend “boring”: authenticate, fanout, and durably persist an append-only update stream with bounded replay via snapshots/compaction.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Clients (CRDT) | Only place that can guarantee sub-150ms local edits + offline-first merge correctness. |
+| Auth & Permissions | Tight doc-scoped tokens on handshake is the cleanest way to keep the gateway stateless without security footguns. |
+| Collab Gateway | WebSocket termination + rate limiting + fanout is its own scaling problem; keeping it stateless is the right instinct. |
+| Doc Sync API | Single “durable edge” where idempotency, retention policy, and snapshot pointers live; avoids mixing durability concerns into the gateway. |
+| Postgres (log+meta) | Boring correctness for metadata + unique constraints for idempotency; good default until the write rate forces a log system. |
+| Object Storage (snapshots) | Cheapest way to store large immutable blobs; the right place for snapshots/exports. |
+| Compactor Jobs | The mechanism that makes CRDT history bounded and keeps reconnect/cold-start predictable. |
+| Realtime PubSub (Redis) | Low-latency broadcast primitive that’s operationally familiar (but see simplifications below). |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Redis PubSub for fanout | Sticky routing per `doc_id` + in-gateway in-memory fanout (Redis only for cross-node or not at all initially) | Simpler data plane, but you need consistent hashing + connection draining discipline; cross-node presence requires more thought. |
+| “State-vector catch-up” while server is operation-agnostic | Either (A) accept “send all deltas since snapshot” or (B) let `Doc Sync API` keep per-doc CRDT state in-memory to compute true diffs | (A) simpler but higher bandwidth; (B) more complexity but matches the promise of state-vector efficiency. |
+| Separate `Collab Gateway` and `Doc Sync API` hops for every update | Combine them (gateway persists directly) with an outbox/transactional publish | Fewer moving parts/latency, but harder to keep codebase clean; you must get “persist vs publish” ordering right. |
+| Postgres update log partitions per doc | Start with coarse sharding (hash buckets) + append-only table + BRIN indexes | Less partition management complexity; might sacrifice some per-doc locality. |
+| Custom compaction correctness | Treat compaction as “build new snapshot + validate + switch pointer” and keep old snapshots/deltas for a safety window | Uses more storage, but dramatically reduces risk of irreversible corruption. |
+| Presence as “another channel” | Redis keys with TTL + periodic heartbeats (or gateway-only ephemeral presence) | Loses some real-time fidelity across gateway nodes unless you add cross-node gossip/Redis. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres is down for 5 minutes**
+   - Design’s answer: partially addressed (mentions Postgres slow, not hard-down)
+   - Recommendation: Strengthen — define a durability contract: do clients require an ACK from `Doc Sync API` to consider an edit “saved”? If DB is down, either (a) reject with clear “offline/unsaved” UX while still allowing local edits, or (b) accept into a bounded gateway buffer (risky) with explicit backpressure and loss semantics.
+
+2. **Publish succeeds but persistence fails (or vice versa)**
+   - Design’s answer: not addressed explicitly
+   - Recommendation: Must fix — choose one:  
+     - **Persist-then-publish** (strong consistency for “what others saw will reload”), or  
+     - **Publish-then-persist** with explicit “ephemeral until committed” semantics and client reconciliation to avoid “ghost edits” after reload.  
+     A transactional outbox pattern (or a per-doc sequencer shard) is the cleanest way to avoid split-brain between realtime and durability.
+
+3. **Network partition: gateway ↔ Redis, but gateway ↔ clients is fine**
+   - Design’s answer: addressed (fallback to persist-only + client polling)
+   - Recommendation: Acceptable — add guardrails: polling jitter/backoff to avoid thundering herds, and a “doc-level slow mode” when pubsub is degraded.
+
+4. **Compactor bug produces a bad snapshot (silent divergence)**
+   - Design’s answer: not addressed
+   - Recommendation: Must fix — compaction is the highest-risk component. Add: snapshot checksums, “apply snapshot + tail updates” verification in the job, keep previous snapshot pointer for quick rollback, and delay deletion of old deltas (safety window) so you can recover.
+
+5. **Hot doc spike (200 editors, paste storms) causes backpressure**
+   - Design’s answer: partially addressed (rate limits, snapshot frequency)
+   - Recommendation: Strengthen — add explicit per-doc backpressure behavior: bounded outbound queues per connection, drop/merge presence updates first, and a clear policy for when to disconnect vs degrade (and how clients resync cleanly).
+
+## Recommendations
+
+### Must Fix
+- Reconcile the tension between “server doesn’t understand ops” and “state-vector selective catch-up”: either accept replay-since-snapshot, or explicitly run CRDT state in `Doc Sync API` (even if only on compactor/shards).
+- Define ordering/atomicity between persistence and broadcast (avoid ghost edits) and document the client’s “saved vs seen” semantics.
+- Make compaction safe-by-design: validate snapshots, keep rollback pointers, and don’t delete deltas immediately.
+- Harden abuse/DoS edges: cap update size, protect against compression bombs, rate-limit per doc/user, and ensure `author_device_id` is server-minted/bound (not client-chosen).
+
+### Should Consider
+- Collapse components early (gateway + sync) to reduce operational surface area, then split only when metrics demand it.
+- Consider Postgres `LISTEN/NOTIFY` (or a single-region “good enough” pubsub) for earlier stages to remove Redis until scale forces it.
+- Add an explicit “stale client” UX path: forced snapshot reload with clear messaging and automatic recovery.
+
+### Nice to Have
+- “3am tools”: per-doc timeline inspector (snapshot ids, update counts, last compaction), one-click disable compactor, and replay/verify tooling.
+- Canary compaction + gradual rollout of CRDT library upgrades (client and server) to avoid format/version mismatch incidents.
+
+## What's Working Well
+- The separation of durable edits vs ephemeral presence is exactly the right reliability boundary.
+- Idempotent writes with `(doc_id, author_device_id, monotonic_seq)` is a solid foundation for retries and flaky networks.
+- Snapshot + append-only log framing is operationally legible and gives you clean knobs (snapshot interval, retention).
+- You’re explicit about the real hard part (bounded history/compaction) and treat it as a first-class design axis, not an afterthought.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+thinking
+**Evaluating section modification**
+
+I see the instruction says "Do NOT add sections - only cut or condense." I'm unsure if renaming counts as modifying the title. It seems best to incorporate "What We Removed" content within the existing "What I'd Do Differently At..." section without changing the header. However, they want an explicit "What We Removed" section. I could use a bolded phrase within that section, but it could feel like adding a new element. Maybe a bullet point under "Operational Notes" could work?
+thinking
+**Considering document restructuring**
+
+I noticed there's already a section called "What I'd Do Differently At...", which I think could be renamed to "What We Removed" without actually adding a new section. However, since there are rules about not modifying titles or tags, maybe I'll keep the same number of headings and just rename one while possibly shortening another. I also see a chance to simplify components, like collapsing Collab Gateway and Doc Sync API. I think if I use sticky routing per doc_id with in-memory fanout, it could streamline things too!
+thinking
+**Simplifying component integration**
+
+It seems I want to keep things simple, avoiding new components. For persistence and broadcast ordering, I think using Postgres as a durable log makes sense, leveraging its LISTEN/NOTIFY feature. However, the critique suggested that Postgres could replace Redis, which could simplify things. If we remove pubsub, I'd need a way to deliver remote edits to other nodes. But with sticky routing, that might not be necessary. If there's a connection issue, mobile devices can resync by pulling from Postgres. The goal is to ensure the same document routes to the same gateway node.
+thinking
+**Addressing compactor safety and updates**
+
+For the compactor's safety, I should build a snapshot, verify it by replaying tail updates, and use checksums while keeping a previous pointer. I want to implement a safety window for deltas and avoid immediate deletions. I can simplify the state-vector catch-up by only sending deltas since the snapshot ID, allowing clients to request updates later. To support offline updates, I think it's best to store all deltas with a sequence number. This way, clients can request from their last_seen_seq, enhancing efficiency while meeting requirements for multiple devices and ordering edits. For idempotency, a client-generated unique update ID like a UUID can help avoid duplicates, simplifying tracking.
+thinking
+**Finalizing component removals and service updates**
+
+I’m ensuring we follow the directive to “not add components” while focusing on removing them. I plan to remove Redis PubSub and Doc Sync API. Merging Auth and Permissions into the Collab Service seems acceptable since it removes a component rather than adding one. For access control, validating JWT tokens signed by the existing auth provider should fit. I'll keep the architecture like: Clients -> Collab Service using WebSocket/HTTPS. Each connection will still enforce access control based on the ACL from Postgres. 
+
+I'll also ensure version history comes from both the snapshot and log. Overall, I need to keep documents clear and concise while retaining original categories and difficulty levels. It’s crucial to address component removals like Redis pubsub and the separate Doc Sync API in the new document!
+codex
+```markdown
+---
+title: "Collaborative Document Editing"
+category: "Real-Time & Media"
+difficulty: "Hard"
+tags: ["crdt", "realtime", "websockets", "offline-first", "consistency", "presence"]
+---
+
+## Overview
+
+A Google Docs–style editor where the **client CRDT is authoritative** for edit semantics and offline merges. The backend does four boring things: authenticate, accept updates, broadcast to other connected editors, and durably store an append-only update log with periodic snapshots for fast reload.
+
+Edits are **local-first** (apply instantly), and “sync” is simply: load the latest snapshot, then fetch and apply updates since that snapshot.
+
+## What Makes This Hard
+
+Correctness is easy to get and easy to make unusably slow. The real problem is keeping **reconnect/open costs bounded** as updates accumulate, without introducing “ghost edits” (seen live but missing after reload) or silent corruption from compaction.
+
+## Requirements
+
+### Functional Requirements
+- Real-time coauthoring with sub-150ms perceived latency for local edits (remote <300ms typical).
+- Offline-first: edits made offline must reconcile without conflicts or manual merge.
+- Multiple devices/tabs per user; retries must not duplicate updates.
+- Presence (“who’s here”, cursors) must be real-time but not durable; it must not block editing.
+- Access control (view/comment/edit) enforced on every connection and every persisted update.
+- Version history and “restore” built from snapshots + update log.
+
+### Scale Targets
+- 10M DAU, 1M peak concurrent editors.
+- Median doc: 1–5 active editors; p95 doc: 20 editors; rare spikes: 200.
+- Edit rate: ~2–5 ops/sec/editor; bursty.
+- Fanout: doc 200 editors → 199 outbound messages per update.
+- Storage: snapshots 50KB–5MB/doc + deltas between snapshots.
+
+## Key Design Decisions
+
+- **Client CRDT + binary deltas**
+  - Clients apply local edits immediately and send deltas to the server.
+  - The server never interprets rich-text operations.
+
+- **Persist-then-broadcast**
+  - An update is only broadcast after it is durably written.
+  - “Seen by others” implies “will be there after reload.”
+
+- **Append-only updates + periodic snapshots**
+  - Updates stay cheap to write and easy to audit.
+  - Snapshots bound load/reconnect time.
+
+- **Presence is gateway-memory only**
+  - Presence is best-effort and disappears on disconnect.
+  - Presence never depends on the database.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[Clients] -->|HTTPS + WebSocket| C["Collab Service (Auth + WebSocket + Persistence)"]
+  C --> P["Postgres (Meta + Update Log)"]
+  C --> S["Object Storage (Snapshots)"]
+  P --> J["Compactor Job"]
+  J --> S
+  J --> P
+```
+
+### Components
+
+- `Clients`
+  - Run the CRDT, apply edits instantly, buffer offline deltas, and resync by loading a snapshot then applying missing updates.
+  - Justification: this is the only place that can guarantee local-first latency and offline merge correctness.
+
+- `Collab Service (Auth + WebSocket + Persistence)`
+  - Verifies user auth, checks doc ACLs, accepts deltas, writes them durably, then fans out to other connected editors of the same doc.
+  - Maintains ephemeral presence (cursors/active users) in memory and drops it under load.
+  - Justification: one stateless service keeps the data plane simple; persistence and broadcast ordering is enforced in one place.
+
+- `Postgres (Meta + Update Log)`
+  - Stores doc metadata (owner/ACL, current snapshot pointer) and an append-only updates table with idempotency constraints.
+  - Justification: transactional durability + uniqueness guarantees for retries, with minimal operational surface area.
+
+- `Object Storage (Snapshots)`
+  - Stores immutable compressed snapshot blobs keyed by `snapshot_id`.
+  - Justification: cheapest reliable blob store; snapshots are the fast-path for opening stale/large docs.
+
+- `Compactor Job`
+  - Periodically builds a new snapshot from the latest snapshot + a tail of updates, validates it, then atomically flips the snapshot pointer.
+  - Justification: the mechanism that keeps replay bounded and performance stable.
+
+## Deep Dive: Offline Reconciliation Without Server Transforms
+
+Sync is snapshot + replay:
+
+- Open doc:
+  1) Fetch `snapshot_id` from Postgres.
+  2) Download snapshot bytes from Object Storage and load into the CRDT.
+  3) Fetch updates newer than that snapshot and apply them in order.
+
+- While online:
+  - Client sends binary deltas with a `client_update_id` (unique per doc) and size-bounded payload.
+  - Server checks ACL, writes `(doc_id, client_update_id, delta_bytes, created_at)` with a unique constraint on `(doc_id, client_update_id)`, ACKs the writer, then broadcasts the delta to other connected editors.
+
+- Reconnect:
+  - Client repeats “open doc” and replays whatever it missed since the snapshot.
+  - Offline edits are uploaded on reconnect; duplicates are ignored via idempotency.
+
+Bounding growth:
+- Compaction produces new snapshots; the server keeps only a retention window of recent deltas beyond the current snapshot.
+- If a client is older than retention, it is forced onto the latest snapshot (full reload), not partial replay.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Minimal moving parts | Higher bandwidth on reconnect than state-vector diffs |
+| Strong “no ghost edits” guarantee | Live fanout waits on durable write latency |
+| Operational simplicity (Postgres + object store) | A hot doc can stress a single DB and a single service shard |
+| Safe compaction | More storage due to safety windows |
+
+## Failure Modes
+
+- **Postgres down**
+  - What happens: live collaboration stops; presence may still show connected users, but no edits can be “saved.”
+  - Recover: the service rejects update writes; clients continue local editing and show “unsaved/offline,” then resync on recovery.
+
+- **Persistence succeeds, broadcast fails**
+  - What happens: some collaborators don’t see an update immediately.
+  - Recover: clients periodically fetch missing updates while connected (with jitter/backoff); on any reconnect they replay from the snapshot.
+
+- **Network partition: service ↔ clients OK, service ↔ Postgres degraded**
+  - What happens: updates cannot be ACKed/saved; clients keep local edits.
+  - Recover: explicit backpressure (reject writes fast); clients resync when the DB is reachable.
+
+- **Compactor produces a bad snapshot**
+  - What happens: opening a doc could diverge if the bad snapshot becomes current.
+  - Recover: compactor validates by loading the previous snapshot, applying the same tail of updates, and comparing a checksum; only then flips the pointer. Old snapshots and deltas remain for a safety window to roll back immediately.
+
+- **Hot doc spike (200 editors, paste storms)**
+  - What happens: outbound queues grow; latency rises.
+  - Recover: per-doc rate limits, bounded per-connection send buffers, drop/merge presence first, and if needed disconnect slow consumers and force resync.
+
+## What We Removed
+
+- `Realtime PubSub (Redis Cluster)`; fanout is in-memory for connected editors of a doc, and everyone can always recover from Postgres via replay.
+- Separate `Doc Sync API`; persistence and realtime are one service to enforce persist-then-broadcast without cross-service split-brain.
+- State-vector selective catch-up; reconnect uses snapshot + replay-since-snapshot.
+- Fine-grained per-doc partition management as a starting point; a single append-only table plus indexing is the baseline.
+
+## Operational Notes
+
+- Define the durability contract in the UI: edits are “saved” only after server ACK; collaborators only see ACKed edits.
+- Cap delta size, reject compressed payloads, and rate-limit per doc/user to prevent abuse.
+- Snapshot safety: build → verify → flip pointer; delay deletion of old deltas/snapshots for rollback.
+- Presence is best-effort: store only in memory, heartbeat-based, and drop it under load before dropping edits.
+- Stale client policy: if older than delta retention, force snapshot reload and replay from there.
+```
+tokens used
+9,228
+```markdown
+---
+title: "Collaborative Document Editing"
+category: "Real-Time & Media"
+difficulty: "Hard"
+tags: ["crdt", "realtime", "websockets", "offline-first", "consistency", "presence"]
+---
+
+## Overview
+
+A Google Docs–style editor where the **client CRDT is authoritative** for edit semantics and offline merges. The backend does four boring things: authenticate, accept updates, broadcast to other connected editors, and durably store an append-only update log with periodic snapshots for fast reload.
+
+Edits are **local-first** (apply instantly), and “sync” is simply: load the latest snapshot, then fetch and apply updates since that snapshot.
+
+## What Makes This Hard
+
+Correctness is easy to get and easy to make unusably slow. The real problem is keeping **reconnect/open costs bounded** as updates accumulate, without introducing “ghost edits” (seen live but missing after reload) or silent corruption from compaction.
+
+## Requirements
+
+### Functional Requirements
+- Real-time coauthoring with sub-150ms perceived latency for local edits (remote <300ms typical).
+- Offline-first: edits made offline must reconcile without conflicts or manual merge.
+- Multiple devices/tabs per user; retries must not duplicate updates.
+- Presence (“who’s here”, cursors) must be real-time but not durable; it must not block editing.
+- Access control (view/comment/edit) enforced on every connection and every persisted update.
+- Version history and “restore” built from snapshots + update log.
+
+### Scale Targets
+- 10M DAU, 1M peak concurrent editors.
+- Median doc: 1–5 active editors; p95 doc: 20 editors; rare spikes: 200.
+- Edit rate: ~2–5 ops/sec/editor; bursty.
+- Fanout: doc 200 editors → 199 outbound messages per update.
+- Storage: snapshots 50KB–5MB/doc + deltas between snapshots.
+
+## Key Design Decisions
+
+- **Client CRDT + binary deltas**
+  - Clients apply local edits immediately and send deltas to the server.
+  - The server never interprets rich-text operations.
+
+- **Persist-then-broadcast**
+  - An update is only broadcast after it is durably written.
+  - “Seen by others” implies “will be there after reload.”
+
+- **Append-only updates + periodic snapshots**
+  - Updates stay cheap to write and easy to audit.
+  - Snapshots bound load/reconnect time.
+
+- **Presence is gateway-memory only**
+  - Presence is best-effort and disappears on disconnect.
+  - Presence never depends on the database.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[Clients] -->|HTTPS + WebSocket| C["Collab Service (Auth + WebSocket + Persistence)"]
+  C --> P["Postgres (Meta + Update Log)"]
+  C --> S["Object Storage (Snapshots)"]
+  P --> J["Compactor Job"]
+  J --> S
+  J --> P
+```
+
+### Components
+
+- `Clients`
+  - Run the CRDT, apply edits instantly, buffer offline deltas, and resync by loading a snapshot then applying missing updates.
+  - Justification: this is the only place that can guarantee local-first latency and offline merge correctness.
+
+- `Collab Service (Auth + WebSocket + Persistence)`
+  - Verifies user auth, checks doc ACLs, accepts deltas, writes them durably, then fans out to other connected editors of the same doc.
+  - Maintains ephemeral presence (cursors/active users) in memory and drops it under load.
+  - Justification: one stateless service keeps the data plane simple; persistence and broadcast ordering is enforced in one place.
+
+- `Postgres (Meta + Update Log)`
+  - Stores doc metadata (owner/ACL, current snapshot pointer) and an append-only updates table with idempotency constraints.
+  - Justification: transactional durability + uniqueness guarantees for retries, with minimal operational surface area.
+
+- `Object Storage (Snapshots)`
+  - Stores immutable compressed snapshot blobs keyed by `snapshot_id`.
+  - Justification: cheapest reliable blob store; snapshots are the fast-path for opening stale/large docs.
+
+- `Compactor Job`
+  - Periodically builds a new snapshot from the latest snapshot + a tail of updates, validates it, then atomically flips the snapshot pointer.
+  - Justification: the mechanism that keeps replay bounded and performance stable.
+
+## Deep Dive: Offline Reconciliation Without Server Transforms
+
+Sync is snapshot + replay:
+
+- Open doc:
+  1) Fetch `snapshot_id` from Postgres.
+  2) Download snapshot bytes from Object Storage and load into the CRDT.
+  3) Fetch updates newer than that snapshot and apply them in order.
+
+- While online:
+  - Client sends binary deltas with a `client_update_id` (unique per doc) and size-bounded payload.
+  - Server checks ACL, writes `(doc_id, client_update_id, delta_bytes, created_at)` with a unique constraint on `(doc_id, client_update_id)`, ACKs the writer, then broadcasts the delta to other connected editors.
+
+- Reconnect:
+  - Client repeats “open doc” and replays whatever it missed since the snapshot.
+  - Offline edits are uploaded on reconnect; duplicates are ignored via idempotency.
+
+Bounding growth:
+- Compaction produces new snapshots; the server keeps only a retention window of recent deltas beyond the current snapshot.
+- If a client is older than retention, it is forced onto the latest snapshot (full reload), not partial replay.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Minimal moving parts | Higher bandwidth on reconnect than state-vector diffs |
+| Strong “no ghost edits” guarantee | Live fanout waits on durable write latency |
+| Operational simplicity (Postgres + object store) | A hot doc can stress a single DB and a single service shard |
+| Safe compaction | More storage due to safety windows |
+
+## Failure Modes
+
+- **Postgres down**
+  - What happens: live collaboration stops; presence may still show connected users, but no edits can be “saved.”
+  - Recover: the service rejects update writes; clients continue local editing and show “unsaved/offline,” then resync on recovery.
+
+- **Persistence succeeds, broadcast fails**
+  - What happens: some collaborators don’t see an update immediately.
+  - Recover: clients periodically fetch missing updates while connected (with jitter/backoff); on any reconnect they replay from the snapshot.
+
+- **Network partition: service ↔ clients OK, service ↔ Postgres degraded**
+  - What happens: updates cannot be ACKed/saved; clients keep local edits.
+  - Recover: explicit backpressure (reject writes fast); clients resync when the DB is reachable.
+
+- **Compactor produces a bad snapshot**
+  - What happens: opening a doc could diverge if the bad snapshot becomes current.
+  - Recover: compactor validates by loading the previous snapshot, applying the same tail of updates, and comparing a checksum; only then flips the pointer. Old snapshots and deltas remain for a safety window to roll back immediately.
+
+- **Hot doc spike (200 editors, paste storms)**
+  - What happens: outbound queues grow; latency rises.
+  - Recover: per-doc rate limits, bounded per-connection send buffers, drop/merge presence first, and if needed disconnect slow consumers and force resync.
+
+## What We Removed
+
+- `Realtime PubSub (Redis Cluster)`; fanout is in-memory for connected editors of a doc, and everyone can always recover from Postgres via replay.
+- Separate `Doc Sync API`; persistence and realtime are one service to enforce persist-then-broadcast without cross-service split-brain.
+- State-vector selective catch-up; reconnect uses snapshot + replay-since-snapshot.
+- Fine-grained per-doc partition management as a starting point; a single append-only table plus indexing is the baseline.
+
+## Operational Notes
+
+- Define the durability contract in the UI: edits are “saved” only after server ACK; collaborators only see ACKed edits.
+- Cap delta size, reject compressed payloads, and rate-limit per doc/user to prevent abuse.
+- Snapshot safety: build → verify → flip pointer; delay deletion of old deltas/snapshots for rollback.
+- Presence is best-effort: store only in memory, heartbeat-based, and drop it under load before dropping edits.
+- Stale client policy: if older than delta retention, force snapshot reload and replay from there.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/04-realtime-media/collaborative-document-editing.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Collaborative Document Editing
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/collaborative-document-editing.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/collaborative-document-editing.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/04-realtime-media/collaborative-document-editing.md

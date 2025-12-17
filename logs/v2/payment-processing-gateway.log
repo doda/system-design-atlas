@@ -1,0 +1,1529 @@
+==========================================
+Generating (v2): Payment Processing Gateway
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2bc4-7d71-97db-e8e99607f622
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Payment Processing Gateway
+**Category**: Commerce & Fintech
+
+**Problem Statement**:
+Design a platform handling ledger reconciliation, idempotency keys, chargebacks, and PCI-DSS compliance constraints.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+codex
+```markdown
+---
+title: "Payment Processing Gateway"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["payments", "ledger", "reconciliation", "idempotency", "chargebacks", "pci-dss", "double-entry"]
+---
+
+## Overview
+
+This system is a payment gateway that accepts merchant payment intents, talks to external PSPs/acquirers, and maintains a **financially correct internal ledger** that survives retries, partial failures, chargebacks, and delayed settlement. The key insight is to separate **money truth** (an append-only double-entry ledger) from **money movement** (best-effort integration with PSPs) and connect them with a small number of well-defined state machines.
+
+Most payment platforms fail by treating the PSP response as the “source of truth.” That works until timeouts, duplicate webhooks, partial captures, fee adjustments, and disputes arrive days later. This design instead makes the ledger the only durable truth, and treats PSPs as external facts that must be reconciled and, when needed, corrected via compensating ledger entries.
+
+## What Makes This Hard
+
+Naive implementations optimize for the happy path: “authorize → capture → done.” The trap is that **timeouts and retries** create ambiguous outcomes (“did the PSP capture or not?”), while webhooks are duplicated and reordered. If you “just retry,” you eventually double-charge or double-credit.
+
+The second trap is **settlement reality**: settlement amounts differ from authorizations due to partial captures, interchange/PSP fees, FX, and chargebacks. If you don’t model this as an evolving ledger with adjustments, you end up with brittle ad-hoc fixes and reconciliation that’s impossible to trust.
+
+## Requirements
+
+### Functional Requirements
+- Create payment intents and execute `authorize`, `capture`, `refund`, `void`.
+- Provide **idempotency** for all mutating APIs (merchant retries) and for PSP calls (PSP retries/timeouts).
+- Maintain an **append-only double-entry ledger**; no in-place balance mutation.
+- Support **chargebacks/disputes**: ingest dispute events, manage evidence, apply provisional and final ledger impacts.
+- Perform **ledger reconciliation** against PSP settlement reports and event streams; detect and resolve drift.
+- Enforce **PCI-DSS constraints**: minimize card-data scope, strong isolation for any PCI systems, auditability.
+
+### Scale Targets
+- **Peak 2,000 rps** payment operations (authorize/capture/refund), **p95 < 300ms** added latency (PSP time excluded).
+- **100M ledger postings/year** (including fees, adjustments, disputes) → drives append-only storage, partitioning, and query patterns.
+- **Reconciliation**: daily settlement files totaling **1–10M rows/day** with a 2-hour completion SLO → drives bulk ingestion + matching strategy.
+- **Availability**: 99.99% for API accept + durable recording; downstream execution can be async during PSP issues.
+
+## Key Design Decisions
+
+- **Chose:** Internal **double-entry ledger in Postgres** as the only source of truth  
+  **Rejected:** “Balances table + statuses” as primary record  
+  **Why:** You can’t make disputes, fees, FX, partials, and corrections auditable without an append-only model.
+
+- **Chose:** **Outbox-driven execution** to PSP + **inbox-deduped webhooks**  
+  **Rejected:** Synchronous “call PSP then write DB”  
+  **Why:** The hard failures happen between those two steps; outbox/inbox makes outcomes durable and replayable.
+
+- **Chose:** **PCI scope minimization** via PSP tokenization/hosted fields + isolated vault for rare PAN needs  
+  **Rejected:** Storing PAN (even encrypted) in core services  
+  **Why:** PCI operational burden dominates engineering time; reduce scope to keep the system buildable and operable.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  M[Merchant] --> A[API Gateway]
+  A --> P[Payments API]
+  P --> L[(Ledger DB)]
+  P --> Q[Outbox Queue]
+  Q --> C[PSP Connector]
+  C --> X[PSP/Acquirer]
+  X --> W[Webhook Ingest]
+  W --> P
+  X --> R[Recon Worker]
+  R --> L
+```
+
+### Components
+
+- **API Gateway**: AuthN/Z, rate limits, request signing; protects the payment surface area.
+- **Payments API**: Owns payment state machine, idempotency, and creation of ledger postings; never “assumes” PSP outcomes.
+- **Ledger DB (Postgres)**: Append-only double-entry postings + immutable journal; provides audit trails and deterministic balances.
+- **Outbox Queue**: Executes PSP-side actions asynchronously from durable intent; absorbs PSP slowness without losing correctness.
+- **PSP Connector**: Encapsulates PSP quirks, maps internal commands to PSP APIs, and enforces PSP idempotency keys.
+- **Webhook Ingest**: Verifies signatures, dedupes, orders per-payment when possible, and translates external facts into internal events.
+- **Recon Worker**: Ingests settlement reports, matches to internal references, posts fees/adjustments, and produces drift alerts.
+
+## Deep Dive: Idempotency + “Exactly-Once” Money Semantics
+
+The core goal is: **a merchant can retry any call**, the PSP can duplicate callbacks, and we still produce **one** logical financial outcome in our ledger.
+
+**1) Two identifiers, two idempotency layers**
+- **Merchant idempotency key**: `(merchant_id, idempotency_key, operation)` with a uniqueness constraint. Store a hash of the request payload + the final response pointer. If the same key is reused with a different payload, return `409` (prevents “key reuse” bugs).
+- **PSP idempotency key**: derived from our immutable `payment_attempt_id` (not from merchant input). This ensures PSP retries and our retries converge to one PSP-side operation.
+
+**2) Durable intent before side effects (outbox)**
+- The Payments API writes, in one DB transaction:
+  - `payment_attempt` state = `REQUESTED_AUTH` (or capture/refund command)
+  - an **outbox row** describing the PSP call to make
+  - initial ledger postings only for *internal* holds/reserves if needed (optional), but not “settled money”
+- A worker publishes outbox rows to the queue and marks them sent. If anything crashes, replay is safe because the outbox row is immutable and the PSP idempotency key is stable.
+
+**3) Treat timeouts as “unknown,” not “failed”**
+- If the PSP call times out, we do **not** flip to “failed.” We move to `PENDING_EXTERNAL` and wait for:
+  - webhook confirmation, or
+  - explicit PSP query by reference, or
+  - reconciliation discovery from settlement files
+This avoids the worst bug in payments: retrying after a timeout and double-charging.
+
+**4) Inbox-deduped webhooks become facts**
+- Webhooks are ingested into an **inbox table** keyed by `(psp_event_id)` with a uniqueness constraint.
+- Processing is idempotent: each PSP fact transitions the payment attempt state machine forward only if it is a valid next step (rejects reordering and duplicates).
+- Ledger postings are created only on validated state transitions (e.g., `AUTHORIZED`, `CAPTURED`, `REFUNDED`, `CHARGEBACKED`) and always as balanced entries.
+
+**5) Ledger model that absorbs reality**
+Use accounts like:
+- `CustomerFunds (PSP clearing)`, `MerchantPayable`, `GatewayFeesRevenue`, `PSPFeesExpense`, `ChargebackReserve`, `DisputeLoss`
+When settlement arrives with fees/FX, reconciliation posts **adjustments** rather than mutating prior entries. This preserves auditability and makes drift explainable.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Financial correctness and auditability | Simplicity of “single status field” |
+| Safe retries and replayability | More state-machine complexity |
+| Reduced PCI footprint | Less control over raw card data flows |
+| Operational debuggability (outbox/inbox) | Slightly higher end-to-end latency in some paths |
+
+## Failure Modes
+
+- **PSP timeout during capture (unknown outcome)**
+  - Happens: client sees timeout; naive retry would double-capture.
+  - Detect: attempt stuck in `PENDING_EXTERNAL` beyond SLO.
+  - Recover: query PSP by idempotency key/reference; accept webhook; if discovered later in settlement, reconcile and notify merchant.
+
+- **Webhook storm / duplication / reordering**
+  - Happens: PSP retries events; delivery out of order.
+  - Detect: inbox dedupe metrics, “invalid transition” counters.
+  - Recover: inbox uniqueness drops duplicates; state machine ignores/records out-of-order facts and reprocesses when prerequisites arrive.
+
+- **Reconciliation drift (ledger ≠ settlement)**
+  - Happens: missing events, fee schedule changes, FX rounding, partial captures, or a bug.
+  - Detect: daily drift report by merchant/currency; unmatched settlement rows; unexplained variance thresholds.
+  - Recover: post compensating entries with explicit reason codes; open incident when variance crosses policy; block payouts for affected merchant if needed.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Partition ledger tables by month + merchant, move reconciliation ingestion to bulk COPY pipelines, add read replicas for reporting.
+- **100x scale:** Split ledger into a dedicated ledger service with append-only log + derived balance projections; adopt a streaming backbone (Kafka/Pulsar) for event fan-out; formalize a reconciliation “truth pipeline” with warehouse-backed analytics.
+
+## Operational Notes
+
+- The on-call “golden rule”: **never retry an external money movement after a timeout without checking** (webhook/PSP query/recon).
+- Monitor: outbox lag, inbox dedupe rate, pending-external aging, reconciliation backlog, drift variance by merchant/currency.
+- PCI: keep Payments API out of PCI scope via tokenization; isolate any vault/HSM usage, strict network segmentation, immutable audit logs, and regular key rotation with tested rollback.
+- Runbooks should include: “stuck pending external,” “replay outbox safely,” “reprocess webhooks from inbox,” and “post a compensating ledger entry with reason code.”
+```
+tokens used
+3,115
+```markdown
+---
+title: "Payment Processing Gateway"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["payments", "ledger", "reconciliation", "idempotency", "chargebacks", "pci-dss", "double-entry"]
+---
+
+## Overview
+
+This system is a payment gateway that accepts merchant payment intents, talks to external PSPs/acquirers, and maintains a **financially correct internal ledger** that survives retries, partial failures, chargebacks, and delayed settlement. The key insight is to separate **money truth** (an append-only double-entry ledger) from **money movement** (best-effort integration with PSPs) and connect them with a small number of well-defined state machines.
+
+Most payment platforms fail by treating the PSP response as the “source of truth.” That works until timeouts, duplicate webhooks, partial captures, fee adjustments, and disputes arrive days later. This design instead makes the ledger the only durable truth, and treats PSPs as external facts that must be reconciled and, when needed, corrected via compensating ledger entries.
+
+## What Makes This Hard
+
+Naive implementations optimize for the happy path: “authorize → capture → done.” The trap is that **timeouts and retries** create ambiguous outcomes (“did the PSP capture or not?”), while webhooks are duplicated and reordered. If you “just retry,” you eventually double-charge or double-credit.
+
+The second trap is **settlement reality**: settlement amounts differ from authorizations due to partial captures, interchange/PSP fees, FX, and chargebacks. If you don’t model this as an evolving ledger with adjustments, you end up with brittle ad-hoc fixes and reconciliation that’s impossible to trust.
+
+## Requirements
+
+### Functional Requirements
+- Create payment intents and execute `authorize`, `capture`, `refund`, `void`.
+- Provide **idempotency** for all mutating APIs (merchant retries) and for PSP calls (PSP retries/timeouts).
+- Maintain an **append-only double-entry ledger**; no in-place balance mutation.
+- Support **chargebacks/disputes**: ingest dispute events, manage evidence, apply provisional and final ledger impacts.
+- Perform **ledger reconciliation** against PSP settlement reports and event streams; detect and resolve drift.
+- Enforce **PCI-DSS constraints**: minimize card-data scope, strong isolation for any PCI systems, auditability.
+
+### Scale Targets
+- **Peak 2,000 rps** payment operations (authorize/capture/refund), **p95 < 300ms** added latency (PSP time excluded).
+- **100M ledger postings/year** (including fees, adjustments, disputes) → drives append-only storage, partitioning, and query patterns.
+- **Reconciliation**: daily settlement files totaling **1–10M rows/day** with a 2-hour completion SLO → drives bulk ingestion + matching strategy.
+- **Availability**: 99.99% for API accept + durable recording; downstream execution can be async during PSP issues.
+
+## Key Design Decisions
+
+- **Chose:** Internal **double-entry ledger in Postgres** as the only source of truth  
+  **Rejected:** “Balances table + statuses” as primary record  
+  **Why:** You can’t make disputes, fees, FX, partials, and corrections auditable without an append-only model.
+
+- **Chose:** **Outbox-driven execution** to PSP + **inbox-deduped webhooks**  
+  **Rejected:** Synchronous “call PSP then write DB”  
+  **Why:** The hard failures happen between those two steps; outbox/inbox makes outcomes durable and replayable.
+
+- **Chose:** **PCI scope minimization** via PSP tokenization/hosted fields + isolated vault for rare PAN needs  
+  **Rejected:** Storing PAN (even encrypted) in core services  
+  **Why:** PCI operational burden dominates engineering time; reduce scope to keep the system buildable and operable.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  M[Merchant] --> A[API Gateway]
+  A --> P[Payments API]
+  P --> L[(Ledger DB)]
+  P --> Q[Outbox Queue]
+  Q --> C[PSP Connector]
+  C --> X[PSP/Acquirer]
+  X --> W[Webhook Ingest]
+  W --> P
+  X --> R[Recon Worker]
+  R --> L
+```
+
+### Components
+
+- **API Gateway**: AuthN/Z, rate limits, request signing; protects the payment surface area.
+- **Payments API**: Owns payment state machine, idempotency, and creation of ledger postings; never “assumes” PSP outcomes.
+- **Ledger DB (Postgres)**: Append-only double-entry postings + immutable journal; provides audit trails and deterministic balances.
+- **Outbox Queue**: Executes PSP-side actions asynchronously from durable intent; absorbs PSP slowness without losing correctness.
+- **PSP Connector**: Encapsulates PSP quirks, maps internal commands to PSP APIs, and enforces PSP idempotency keys.
+- **Webhook Ingest**: Verifies signatures, dedupes, orders per-payment when possible, and translates external facts into internal events.
+- **Recon Worker**: Ingests settlement reports, matches to internal references, posts fees/adjustments, and produces drift alerts.
+
+## Deep Dive: Idempotency + “Exactly-Once” Money Semantics
+
+The core goal is: **a merchant can retry any call**, the PSP can duplicate callbacks, and we still produce **one** logical financial outcome in our ledger.
+
+**1) Two identifiers, two idempotency layers**
+- **Merchant idempotency key**: `(merchant_id, idempotency_key, operation)` with a uniqueness constraint. Store a hash of the request payload + the final response pointer. If the same key is reused with a different payload, return `409` (prevents “key reuse” bugs).
+- **PSP idempotency key**: derived from our immutable `payment_attempt_id` (not from merchant input). This ensures PSP retries and our retries converge to one PSP-side operation.
+
+**2) Durable intent before side effects (outbox)**
+- The Payments API writes, in one DB transaction:
+  - `payment_attempt` state = `REQUESTED_AUTH` (or capture/refund command)
+  - an **outbox row** describing the PSP call to make
+  - initial ledger postings only for *internal* holds/reserves if needed (optional), but not “settled money”
+- A worker publishes outbox rows to the queue and marks them sent. If anything crashes, replay is safe because the outbox row is immutable and the PSP idempotency key is stable.
+
+**3) Treat timeouts as “unknown,” not “failed”**
+- If the PSP call times out, we do **not** flip to “failed.” We move to `PENDING_EXTERNAL` and wait for:
+  - webhook confirmation, or
+  - explicit PSP query by reference, or
+  - reconciliation discovery from settlement files
+This avoids the worst bug in payments: retrying after a timeout and double-charging.
+
+**4) Inbox-deduped webhooks become facts**
+- Webhooks are ingested into an **inbox table** keyed by `(psp_event_id)` with a uniqueness constraint.
+- Processing is idempotent: each PSP fact transitions the payment attempt state machine forward only if it is a valid next step (rejects reordering and duplicates).
+- Ledger postings are created only on validated state transitions (e.g., `AUTHORIZED`, `CAPTURED`, `REFUNDED`, `CHARGEBACKED`) and always as balanced entries.
+
+**5) Ledger model that absorbs reality**
+Use accounts like:
+- `CustomerFunds (PSP clearing)`, `MerchantPayable`, `GatewayFeesRevenue`, `PSPFeesExpense`, `ChargebackReserve`, `DisputeLoss`
+When settlement arrives with fees/FX, reconciliation posts **adjustments** rather than mutating prior entries. This preserves auditability and makes drift explainable.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Financial correctness and auditability | Simplicity of “single status field” |
+| Safe retries and replayability | More state-machine complexity |
+| Reduced PCI footprint | Less control over raw card data flows |
+| Operational debuggability (outbox/inbox) | Slightly higher end-to-end latency in some paths |
+
+## Failure Modes
+
+- **PSP timeout during capture (unknown outcome)**
+  - Happens: client sees timeout; naive retry would double-capture.
+  - Detect: attempt stuck in `PENDING_EXTERNAL` beyond SLO.
+  - Recover: query PSP by idempotency key/reference; accept webhook; if discovered later in settlement, reconcile and notify merchant.
+
+- **Webhook storm / duplication / reordering**
+  - Happens: PSP retries events; delivery out of order.
+  - Detect: inbox dedupe metrics, “invalid transition” counters.
+  - Recover: inbox uniqueness drops duplicates; state machine ignores/records out-of-order facts and reprocesses when prerequisites arrive.
+
+- **Reconciliation drift (ledger ≠ settlement)**
+  - Happens: missing events, fee schedule changes, FX rounding, partial captures, or a bug.
+  - Detect: daily drift report by merchant/currency; unmatched settlement rows; unexplained variance thresholds.
+  - Recover: post compensating entries with explicit reason codes; open incident when variance crosses policy; block payouts for affected merchant if needed.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Partition ledger tables by month + merchant, move reconciliation ingestion to bulk COPY pipelines, add read replicas for reporting.
+- **100x scale:** Split ledger into a dedicated ledger service with append-only log + derived balance projections; adopt a streaming backbone (Kafka/Pulsar) for event fan-out; formalize a reconciliation “truth pipeline” with warehouse-backed analytics.
+
+## Operational Notes
+
+- The on-call “golden rule”: **never retry an external money movement after a timeout without checking** (webhook/PSP query/recon).
+- Monitor: outbox lag, inbox dedupe rate, pending-external aging, reconciliation backlog, drift variance by merchant/currency.
+- PCI: keep Payments API out of PCI scope via tokenization; isolate any vault/HSM usage, strict network segmentation, immutable audit logs, and regular key rotation with tested rollback.
+- Runbooks should include: “stuck pending external,” “replay outbox safely,” “reprocess webhooks from inbox,” and “post a compensating ledger entry with reason code.”
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/payment-processing-gateway.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-3a1e-7710-9bf3-18e008e083aa
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Payment Processing Gateway"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["payments", "ledger", "reconciliation", "idempotency", "chargebacks", "pci-dss", "double-entry"]
+---
+
+## Overview
+
+This system is a payment gateway that accepts merchant payment intents, talks to external PSPs/acquirers, and maintains a **financially correct internal ledger** that survives retries, partial failures, chargebacks, and delayed settlement. The key insight is to separate **money truth** (an append-only double-entry ledger) from **money movement** (best-effort integration with PSPs) and connect them with a small number of well-defined state machines.
+
+Most payment platforms fail by treating the PSP response as the “source of truth.” That works until timeouts, duplicate webhooks, partial captures, fee adjustments, and disputes arrive days later. This design instead makes the ledger the only durable truth, and treats PSPs as external facts that must be reconciled and, when needed, corrected via compensating ledger entries.
+
+## What Makes This Hard
+
+Naive implementations optimize for the happy path: “authorize → capture → done.” The trap is that **timeouts and retries** create ambiguous outcomes (“did the PSP capture or not?”), while webhooks are duplicated and reordered. If you “just retry,” you eventually double-charge or double-credit.
+
+The second trap is **settlement reality**: settlement amounts differ from authorizations due to partial captures, interchange/PSP fees, FX, and chargebacks. If you don’t model this as an evolving ledger with adjustments, you end up with brittle ad-hoc fixes and reconciliation that’s impossible to trust.
+
+## Requirements
+
+### Functional Requirements
+- Create payment intents and execute `authorize`, `capture`, `refund`, `void`.
+- Provide **idempotency** for all mutating APIs (merchant retries) and for PSP calls (PSP retries/timeouts).
+- Maintain an **append-only double-entry ledger**; no in-place balance mutation.
+- Support **chargebacks/disputes**: ingest dispute events, manage evidence, apply provisional and final ledger impacts.
+- Perform **ledger reconciliation** against PSP settlement reports and event streams; detect and resolve drift.
+- Enforce **PCI-DSS constraints**: minimize card-data scope, strong isolation for any PCI systems, auditability.
+
+### Scale Targets
+- **Peak 2,000 rps** payment operations (authorize/capture/refund), **p95 < 300ms** added latency (PSP time excluded).
+- **100M ledger postings/year** (including fees, adjustments, disputes) → drives append-only storage, partitioning, and query patterns.
+- **Reconciliation**: daily settlement files totaling **1–10M rows/day** with a 2-hour completion SLO → drives bulk ingestion + matching strategy.
+- **Availability**: 99.99% for API accept + durable recording; downstream execution can be async during PSP issues.
+
+## Key Design Decisions
+
+- **Chose:** Internal **double-entry ledger in Postgres** as the only source of truth  
+  **Rejected:** “Balances table + statuses” as primary record  
+  **Why:** You can’t make disputes, fees, FX, partials, and corrections auditable without an append-only model.
+
+- **Chose:** **Outbox-driven execution** to PSP + **inbox-deduped webhooks**  
+  **Rejected:** Synchronous “call PSP then write DB”  
+  **Why:** The hard failures happen between those two steps; outbox/inbox makes outcomes durable and replayable.
+
+- **Chose:** **PCI scope minimization** via PSP tokenization/hosted fields + isolated vault for rare PAN needs  
+  **Rejected:** Storing PAN (even encrypted) in core services  
+  **Why:** PCI operational burden dominates engineering time; reduce scope to keep the system buildable and operable.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  M[Merchant] --> A[API Gateway]
+  A --> P[Payments API]
+  P --> L[(Ledger DB)]
+  P --> Q[Outbox Queue]
+  Q --> C[PSP Connector]
+  C --> X[PSP/Acquirer]
+  X --> W[Webhook Ingest]
+  W --> P
+  X --> R[Recon Worker]
+  R --> L
+```
+
+### Components
+
+- **API Gateway**: AuthN/Z, rate limits, request signing; protects the payment surface area.
+- **Payments API**: Owns payment state machine, idempotency, and creation of ledger postings; never “assumes” PSP outcomes.
+- **Ledger DB (Postgres)**: Append-only double-entry postings + immutable journal; provides audit trails and deterministic balances.
+- **Outbox Queue**: Executes PSP-side actions asynchronously from durable intent; absorbs PSP slowness without losing correctness.
+- **PSP Connector**: Encapsulates PSP quirks, maps internal commands to PSP APIs, and enforces PSP idempotency keys.
+- **Webhook Ingest**: Verifies signatures, dedupes, orders per-payment when possible, and translates external facts into internal events.
+- **Recon Worker**: Ingests settlement reports, matches to internal references, posts fees/adjustments, and produces drift alerts.
+
+## Deep Dive: Idempotency + “Exactly-Once” Money Semantics
+
+The core goal is: **a merchant can retry any call**, the PSP can duplicate callbacks, and we still produce **one** logical financial outcome in our ledger.
+
+**1) Two identifiers, two idempotency layers**
+- **Merchant idempotency key**: `(merchant_id, idempotency_key, operation)` with a uniqueness constraint. Store a hash of the request payload + the final response pointer. If the same key is reused with a different payload, return `409` (prevents “key reuse” bugs).
+- **PSP idempotency key**: derived from our immutable `payment_attempt_id` (not from merchant input). This ensures PSP retries and our retries converge to one PSP-side operation.
+
+**2) Durable intent before side effects (outbox)**
+- The Payments API writes, in one DB transaction:
+  - `payment_attempt` state = `REQUESTED_AUTH` (or capture/refund command)
+  - an **outbox row** describing the PSP call to make
+  - initial ledger postings only for *internal* holds/reserves if needed (optional), but not “settled money”
+- A worker publishes outbox rows to the queue and marks them sent. If anything crashes, replay is safe because the outbox row is immutable and the PSP idempotency key is stable.
+
+**3) Treat timeouts as “unknown,” not “failed”**
+- If the PSP call times out, we do **not** flip to “failed.” We move to `PENDING_EXTERNAL` and wait for:
+  - webhook confirmation, or
+  - explicit PSP query by reference, or
+  - reconciliation discovery from settlement files
+This avoids the worst bug in payments: retrying after a timeout and double-charging.
+
+**4) Inbox-deduped webhooks become facts**
+- Webhooks are ingested into an **inbox table** keyed by `(psp_event_id)` with a uniqueness constraint.
+- Processing is idempotent: each PSP fact transitions the payment attempt state machine forward only if it is a valid next step (rejects reordering and duplicates).
+- Ledger postings are created only on validated state transitions (e.g., `AUTHORIZED`, `CAPTURED`, `REFUNDED`, `CHARGEBACKED`) and always as balanced entries.
+
+**5) Ledger model that absorbs reality**
+Use accounts like:
+- `CustomerFunds (PSP clearing)`, `MerchantPayable`, `GatewayFeesRevenue`, `PSPFeesExpense`, `ChargebackReserve`, `DisputeLoss`
+When settlement arrives with fees/FX, reconciliation posts **adjustments** rather than mutating prior entries. This preserves auditability and makes drift explainable.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Financial correctness and auditability | Simplicity of “single status field” |
+| Safe retries and replayability | More state-machine complexity |
+| Reduced PCI footprint | Less control over raw card data flows |
+| Operational debuggability (outbox/inbox) | Slightly higher end-to-end latency in some paths |
+
+## Failure Modes
+
+- **PSP timeout during capture (unknown outcome)**
+  - Happens: client sees timeout; naive retry would double-capture.
+  - Detect: attempt stuck in `PENDING_EXTERNAL` beyond SLO.
+  - Recover: query PSP by idempotency key/reference; accept webhook; if discovered later in settlement, reconcile and notify merchant.
+
+- **Webhook storm / duplication / reordering**
+  - Happens: PSP retries events; delivery out of order.
+  - Detect: inbox dedupe metrics, “invalid transition” counters.
+  - Recover: inbox uniqueness drops duplicates; state machine ignores/records out-of-order facts and reprocesses when prerequisites arrive.
+
+- **Reconciliation drift (ledger ≠ settlement)**
+  - Happens: missing events, fee schedule changes, FX rounding, partial captures, or a bug.
+  - Detect: daily drift report by merchant/currency; unmatched settlement rows; unexplained variance thresholds.
+  - Recover: post compensating entries with explicit reason codes; open incident when variance crosses policy; block payouts for affected merchant if needed.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Partition ledger tables by month + merchant, move reconciliation ingestion to bulk COPY pipelines, add read replicas for reporting.
+- **100x scale:** Split ledger into a dedicated ledger service with append-only log + derived balance projections; adopt a streaming backbone (Kafka/Pulsar) for event fan-out; formalize a reconciliation “truth pipeline” with warehouse-backed analytics.
+
+## Operational Notes
+
+- The on-call “golden rule”: **never retry an external money movement after a timeout without checking** (webhook/PSP query/recon).
+- Monitor: outbox lag, inbox dedupe rate, pending-external aging, reconciliation backlog, drift variance by merchant/currency.
+- PCI: keep Payments API out of PCI scope via tokenization; isolate any vault/HSM usage, strict network segmentation, immutable audit logs, and regular key rotation with tested rollback.
+- Runbooks should include: “stuck pending external,” “replay outbox safely,” “reprocess webhooks from inbox,” and “post a compensating ledger entry with reason code.”
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+thinking
+**Evaluating system architecture**
+
+I don't need to make changes to the repo; this is purely a critique. I want a structured output based on the template. I should think about whether to use Postgres LISTEN/NOTIFY or an existing queue like SQS/Kafka, perhaps with a Temporal workflow engine. There are important scenarios to stress, like handling a database failure or slow payment service provider responses, along with maintaining consistency and proper data retention for auditing.
+thinking
+**Crafting a structured critique**
+
+I'm thinking of offering a simpler approach by using a workflow engine and directly integrating PSP webhooks. However, I want to critique the outbox queue aspect, which isn’t specified; I could suggest using Postgres with a worker since a dedicated queue isn't necessary for a small team, but could be useful at scale. I should clarify the importance of "exactly-once money semantics" since that's tricky and involves at-least-once processing with idempotent handlers. I also need to address performance metrics like 2k requests per second and provide a components table with trade-offs while keeping the response concise yet thorough. Let's organize everything with proper markdown headings!
+codex
+## Elegance Check
+
+### The Core Insight
+Making the internal **append-only double-entry ledger** the only durable truth, and treating PSP outcomes (API responses, webhooks, settlement files) as **external facts that reconcile into compensating postings**—so retries/ambiguity never directly mutate “money truth.”
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Ledger DB (Postgres) | Auditable, deterministic money truth; supports corrections via compensating entries. |
+| Payments API state machine | Centralizes invariants: idempotency, valid transitions, and when ledger postings are allowed. |
+| Inbox (webhook dedupe) | Converts at-least-once/duplicated PSP delivery into exactly-once internal fact processing. |
+| Outbox (durable intent) | Prevents “DB wrote but PSP call didn’t / PSP call happened but DB didn’t” gaps; enables safe replay. |
+| Reconciliation worker | Settlement is the long-tail truth; required for fees/FX/chargebacks and drift detection. |
+| PSP Connector | Isolates PSP quirks and keeps PSP idempotency stable and testable. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| “Outbox Queue” as a separate component | Keep outbox in Postgres and run a poller (or LISTEN/NOTIFY) that executes directly (no external queue) | Less infra; harder to smooth spikes / backpressure; LISTEN/NOTIFY is best-effort so still need polling. |
+| Custom state orchestration | Use a workflow engine (Temporal) for attempt lifecycle + retries + timeouts | Faster correctness; adds a major dependency and operational surface area. |
+| “Order per-payment when possible” in webhook ingest | Use DB row locking (`SELECT … FOR UPDATE`) or advisory locks keyed by `payment_attempt_id` to serialize transitions | Very simple; can reduce concurrency on hot keys; needs careful timeout handling. |
+| Reconciliation matching implied | Store a normalized “PSP reference map” table (psp_charge_id, auth_id, capture_id, payout_id) with unique constraints | Clearer matching; extra write path and schema. |
+| Ledger used for balances implicitly | Maintain explicit derived projections (materialized views / tables) for “available/held/settled” per merchant & currency | Better performance and APIs; adds projection lag and backfill complexity. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres down for 5 minutes**
+   - Design’s answer: partially addressed (“API accept + durable recording” implies DB is required, so accept likely fails)
+   - Recommendation: Strengthen — be explicit: if Postgres is unavailable, return `503` (no “accept without durability”); add runbook for backlog catch-up and ensure outbox/inbox workers stop safely.
+
+2. **Network partition: Payments API ↔ PSP (timeouts/unknown outcomes)**
+   - Design’s answer: addressed (`PENDING_EXTERNAL`, wait for webhook/query/recon)
+   - Recommendation: Acceptable — add hard limits: when to auto-query PSP, exponential backoff, and when to escalate to manual review to avoid indefinite limbo.
+
+3. **One component slow but not failing (webhook ingest lag or outbox lag)**
+   - Design’s answer: partially addressed (metrics like outbox lag/pending aging)
+   - Recommendation: Strengthen — define SLO-based automation: e.g., if webhook lag > X, switch to active PSP polling; if outbox lag > Y, shed non-critical work (e.g., evidence uploads) to protect core capture/refund processing.
+
+4. **Bad config deploy (wrong PSP endpoint/keys, wrong fee schedule, wrong FX rounding)**
+   - Design’s answer: not addressed
+   - Recommendation: Strengthen — add config versioning + canaries per PSP account, and “ledger posting guardrails” (limits/thresholds) so a bad fee config can’t silently post massive adjustments.
+
+5. **3am human error (engineer retries a timed-out capture manually)**
+   - Design’s answer: addressed as a “golden rule,” but relies on discipline
+   - Recommendation: Strengthen — enforce in tooling: a “safe retry” command that first checks webhook/inbox/PSP query/recon and only then enqueues an outbox action; block ad-hoc replay without a recorded reason code and peer approval.
+
+## Recommendations
+
+### Must Fix
+- Clarify the claim: this is **at-least-once processing with idempotent handlers**, not true exactly-once across PSP boundaries; document the precise guarantees per boundary (API, outbox worker, webhook ingest, recon).
+- Define **ledger invariants and posting schemas per transition** (authorize/partial capture/refund/chargeback) including multi-currency and FX rate source-of-truth; ambiguity here is where “financially correct” designs usually fail.
+- Specify **concurrency control** for state transitions (locks/advisory locks/version columns) so two workers/webhooks can’t race and produce double postings.
+
+### Should Consider
+- Collapse “Outbox Queue” into a simpler first version: Postgres outbox + poller, and introduce an external queue only when backpressure demands it.
+- Add a small **reference-mapping layer** (unique constraints on PSP identifiers) to make reconciliation matching deterministic and to prevent “same PSP event maps to two internal attempts.”
+- Make “manual ops” a first-class workflow: reason-coded compensating entries, approval gates, and audit trails integrated with runbooks.
+
+### Nice to Have
+- Separate **derived balance projections** (available/held/settled) from the journal early to keep API latency stable while the journal grows.
+- Define a clear **data retention + reprocessing** policy (how long inbox is kept, how to re-run recon safely, how to rebuild projections).
+
+## What's Working Well
+- The separation of **money truth (ledger)** from **money movement (PSP integration)** is the right abstraction and sets you up for disputes/fees/settlement reality.
+- The timeout stance (“unknown, not failed”) and inbox/outbox approach targets the real failure modes instead of the happy path.
+- Operational thinking is strong: you call out the “never retry blindly” rule and the right metrics (lag, pending aging, drift variance).
+tokens used
+4,886
+## Elegance Check
+
+### The Core Insight
+Making the internal **append-only double-entry ledger** the only durable truth, and treating PSP outcomes (API responses, webhooks, settlement files) as **external facts that reconcile into compensating postings**—so retries/ambiguity never directly mutate “money truth.”
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Ledger DB (Postgres) | Auditable, deterministic money truth; supports corrections via compensating entries. |
+| Payments API state machine | Centralizes invariants: idempotency, valid transitions, and when ledger postings are allowed. |
+| Inbox (webhook dedupe) | Converts at-least-once/duplicated PSP delivery into exactly-once internal fact processing. |
+| Outbox (durable intent) | Prevents “DB wrote but PSP call didn’t / PSP call happened but DB didn’t” gaps; enables safe replay. |
+| Reconciliation worker | Settlement is the long-tail truth; required for fees/FX/chargebacks and drift detection. |
+| PSP Connector | Isolates PSP quirks and keeps PSP idempotency stable and testable. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| “Outbox Queue” as a separate component | Keep outbox in Postgres and run a poller (or LISTEN/NOTIFY) that executes directly (no external queue) | Less infra; harder to smooth spikes / backpressure; LISTEN/NOTIFY is best-effort so still need polling. |
+| Custom state orchestration | Use a workflow engine (Temporal) for attempt lifecycle + retries + timeouts | Faster correctness; adds a major dependency and operational surface area. |
+| “Order per-payment when possible” in webhook ingest | Use DB row locking (`SELECT … FOR UPDATE`) or advisory locks keyed by `payment_attempt_id` to serialize transitions | Very simple; can reduce concurrency on hot keys; needs careful timeout handling. |
+| Reconciliation matching implied | Store a normalized “PSP reference map” table (psp_charge_id, auth_id, capture_id, payout_id) with unique constraints | Clearer matching; extra write path and schema. |
+| Ledger used for balances implicitly | Maintain explicit derived projections (materialized views / tables) for “available/held/settled” per merchant & currency | Better performance and APIs; adds projection lag and backfill complexity. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres down for 5 minutes**
+   - Design’s answer: partially addressed (“API accept + durable recording” implies DB is required, so accept likely fails)
+   - Recommendation: Strengthen — be explicit: if Postgres is unavailable, return `503` (no “accept without durability”); add runbook for backlog catch-up and ensure outbox/inbox workers stop safely.
+
+2. **Network partition: Payments API ↔ PSP (timeouts/unknown outcomes)**
+   - Design’s answer: addressed (`PENDING_EXTERNAL`, wait for webhook/query/recon)
+   - Recommendation: Acceptable — add hard limits: when to auto-query PSP, exponential backoff, and when to escalate to manual review to avoid indefinite limbo.
+
+3. **One component slow but not failing (webhook ingest lag or outbox lag)**
+   - Design’s answer: partially addressed (metrics like outbox lag/pending aging)
+   - Recommendation: Strengthen — define SLO-based automation: e.g., if webhook lag > X, switch to active PSP polling; if outbox lag > Y, shed non-critical work (e.g., evidence uploads) to protect core capture/refund processing.
+
+4. **Bad config deploy (wrong PSP endpoint/keys, wrong fee schedule, wrong FX rounding)**
+   - Design’s answer: not addressed
+   - Recommendation: Strengthen — add config versioning + canaries per PSP account, and “ledger posting guardrails” (limits/thresholds) so a bad fee config can’t silently post massive adjustments.
+
+5. **3am human error (engineer retries a timed-out capture manually)**
+   - Design’s answer: addressed as a “golden rule,” but relies on discipline
+   - Recommendation: Strengthen — enforce in tooling: a “safe retry” command that first checks webhook/inbox/PSP query/recon and only then enqueues an outbox action; block ad-hoc replay without a recorded reason code and peer approval.
+
+## Recommendations
+
+### Must Fix
+- Clarify the claim: this is **at-least-once processing with idempotent handlers**, not true exactly-once across PSP boundaries; document the precise guarantees per boundary (API, outbox worker, webhook ingest, recon).
+- Define **ledger invariants and posting schemas per transition** (authorize/partial capture/refund/chargeback) including multi-currency and FX rate source-of-truth; ambiguity here is where “financially correct” designs usually fail.
+- Specify **concurrency control** for state transitions (locks/advisory locks/version columns) so two workers/webhooks can’t race and produce double postings.
+
+### Should Consider
+- Collapse “Outbox Queue” into a simpler first version: Postgres outbox + poller, and introduce an external queue only when backpressure demands it.
+- Add a small **reference-mapping layer** (unique constraints on PSP identifiers) to make reconciliation matching deterministic and to prevent “same PSP event maps to two internal attempts.”
+- Make “manual ops” a first-class workflow: reason-coded compensating entries, approval gates, and audit trails integrated with runbooks.
+
+### Nice to Have
+- Separate **derived balance projections** (available/held/settled) from the journal early to keep API latency stable while the journal grows.
+- Define a clear **data retention + reprocessing** policy (how long inbox is kept, how to re-run recon safely, how to rebuild projections).
+
+## What's Working Well
+- The separation of **money truth (ledger)** from **money movement (PSP integration)** is the right abstraction and sets you up for disputes/fees/settlement reality.
+- The timeout stance (“unknown, not failed”) and inbox/outbox approach targets the real failure modes instead of the happy path.
+- Operational thinking is strong: you call out the “never retry blindly” rule and the right metrics (lag, pending aging, drift variance).
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/payment-processing-gateway.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-dc4c-70f3-b27c-444731eb26c6
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Payment Processing Gateway"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["payments", "ledger", "reconciliation", "idempotency", "chargebacks", "pci-dss", "double-entry"]
+---
+
+## Overview
+
+This system is a payment gateway that accepts merchant payment intents, talks to external PSPs/acquirers, and maintains a **financially correct internal ledger** that survives retries, partial failures, chargebacks, and delayed settlement. The key insight is to separate **money truth** (an append-only double-entry ledger) from **money movement** (best-effort integration with PSPs) and connect them with a small number of well-defined state machines.
+
+Most payment platforms fail by treating the PSP response as the “source of truth.” That works until timeouts, duplicate webhooks, partial captures, fee adjustments, and disputes arrive days later. This design instead makes the ledger the only durable truth, and treats PSPs as external facts that must be reconciled and, when needed, corrected via compensating ledger entries.
+
+## What Makes This Hard
+
+Naive implementations optimize for the happy path: “authorize → capture → done.” The trap is that **timeouts and retries** create ambiguous outcomes (“did the PSP capture or not?”), while webhooks are duplicated and reordered. If you “just retry,” you eventually double-charge or double-credit.
+
+The second trap is **settlement reality**: settlement amounts differ from authorizations due to partial captures, interchange/PSP fees, FX, and chargebacks. If you don’t model this as an evolving ledger with adjustments, you end up with brittle ad-hoc fixes and reconciliation that’s impossible to trust.
+
+## Requirements
+
+### Functional Requirements
+- Create payment intents and execute `authorize`, `capture`, `refund`, `void`.
+- Provide **idempotency** for all mutating APIs (merchant retries) and for PSP calls (PSP retries/timeouts).
+- Maintain an **append-only double-entry ledger**; no in-place balance mutation.
+- Support **chargebacks/disputes**: ingest dispute events, manage evidence, apply provisional and final ledger impacts.
+- Perform **ledger reconciliation** against PSP settlement reports and event streams; detect and resolve drift.
+- Enforce **PCI-DSS constraints**: minimize card-data scope, strong isolation for any PCI systems, auditability.
+
+### Scale Targets
+- **Peak 2,000 rps** payment operations (authorize/capture/refund), **p95 < 300ms** added latency (PSP time excluded).
+- **100M ledger postings/year** (including fees, adjustments, disputes) → drives append-only storage, partitioning, and query patterns.
+- **Reconciliation**: daily settlement files totaling **1–10M rows/day** with a 2-hour completion SLO → drives bulk ingestion + matching strategy.
+- **Availability**: 99.99% for API accept + durable recording; downstream execution can be async during PSP issues.
+
+## Key Design Decisions
+
+- **Chose:** Internal **double-entry ledger in Postgres** as the only source of truth  
+  **Rejected:** “Balances table + statuses” as primary record  
+  **Why:** You can’t make disputes, fees, FX, partials, and corrections auditable without an append-only model.
+
+- **Chose:** **Outbox-driven execution** to PSP + **inbox-deduped webhooks**  
+  **Rejected:** Synchronous “call PSP then write DB”  
+  **Why:** The hard failures happen between those two steps; outbox/inbox makes outcomes durable and replayable.
+
+- **Chose:** **PCI scope minimization** via PSP tokenization/hosted fields + isolated vault for rare PAN needs  
+  **Rejected:** Storing PAN (even encrypted) in core services  
+  **Why:** PCI operational burden dominates engineering time; reduce scope to keep the system buildable and operable.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  M[Merchant] --> A[API Gateway]
+  A --> P[Payments API]
+  P --> L[(Ledger DB)]
+  P --> Q[Outbox Queue]
+  Q --> C[PSP Connector]
+  C --> X[PSP/Acquirer]
+  X --> W[Webhook Ingest]
+  W --> P
+  X --> R[Recon Worker]
+  R --> L
+```
+
+### Components
+
+- **API Gateway**: AuthN/Z, rate limits, request signing; protects the payment surface area.
+- **Payments API**: Owns payment state machine, idempotency, and creation of ledger postings; never “assumes” PSP outcomes.
+- **Ledger DB (Postgres)**: Append-only double-entry postings + immutable journal; provides audit trails and deterministic balances.
+- **Outbox Queue**: Executes PSP-side actions asynchronously from durable intent; absorbs PSP slowness without losing correctness.
+- **PSP Connector**: Encapsulates PSP quirks, maps internal commands to PSP APIs, and enforces PSP idempotency keys.
+- **Webhook Ingest**: Verifies signatures, dedupes, orders per-payment when possible, and translates external facts into internal events.
+- **Recon Worker**: Ingests settlement reports, matches to internal references, posts fees/adjustments, and produces drift alerts.
+
+## Deep Dive: Idempotency + “Exactly-Once” Money Semantics
+
+The core goal is: **a merchant can retry any call**, the PSP can duplicate callbacks, and we still produce **one** logical financial outcome in our ledger.
+
+**1) Two identifiers, two idempotency layers**
+- **Merchant idempotency key**: `(merchant_id, idempotency_key, operation)` with a uniqueness constraint. Store a hash of the request payload + the final response pointer. If the same key is reused with a different payload, return `409` (prevents “key reuse” bugs).
+- **PSP idempotency key**: derived from our immutable `payment_attempt_id` (not from merchant input). This ensures PSP retries and our retries converge to one PSP-side operation.
+
+**2) Durable intent before side effects (outbox)**
+- The Payments API writes, in one DB transaction:
+  - `payment_attempt` state = `REQUESTED_AUTH` (or capture/refund command)
+  - an **outbox row** describing the PSP call to make
+  - initial ledger postings only for *internal* holds/reserves if needed (optional), but not “settled money”
+- A worker publishes outbox rows to the queue and marks them sent. If anything crashes, replay is safe because the outbox row is immutable and the PSP idempotency key is stable.
+
+**3) Treat timeouts as “unknown,” not “failed”**
+- If the PSP call times out, we do **not** flip to “failed.” We move to `PENDING_EXTERNAL` and wait for:
+  - webhook confirmation, or
+  - explicit PSP query by reference, or
+  - reconciliation discovery from settlement files
+This avoids the worst bug in payments: retrying after a timeout and double-charging.
+
+**4) Inbox-deduped webhooks become facts**
+- Webhooks are ingested into an **inbox table** keyed by `(psp_event_id)` with a uniqueness constraint.
+- Processing is idempotent: each PSP fact transitions the payment attempt state machine forward only if it is a valid next step (rejects reordering and duplicates).
+- Ledger postings are created only on validated state transitions (e.g., `AUTHORIZED`, `CAPTURED`, `REFUNDED`, `CHARGEBACKED`) and always as balanced entries.
+
+**5) Ledger model that absorbs reality**
+Use accounts like:
+- `CustomerFunds (PSP clearing)`, `MerchantPayable`, `GatewayFeesRevenue`, `PSPFeesExpense`, `ChargebackReserve`, `DisputeLoss`
+When settlement arrives with fees/FX, reconciliation posts **adjustments** rather than mutating prior entries. This preserves auditability and makes drift explainable.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Financial correctness and auditability | Simplicity of “single status field” |
+| Safe retries and replayability | More state-machine complexity |
+| Reduced PCI footprint | Less control over raw card data flows |
+| Operational debuggability (outbox/inbox) | Slightly higher end-to-end latency in some paths |
+
+## Failure Modes
+
+- **PSP timeout during capture (unknown outcome)**
+  - Happens: client sees timeout; naive retry would double-capture.
+  - Detect: attempt stuck in `PENDING_EXTERNAL` beyond SLO.
+  - Recover: query PSP by idempotency key/reference; accept webhook; if discovered later in settlement, reconcile and notify merchant.
+
+- **Webhook storm / duplication / reordering**
+  - Happens: PSP retries events; delivery out of order.
+  - Detect: inbox dedupe metrics, “invalid transition” counters.
+  - Recover: inbox uniqueness drops duplicates; state machine ignores/records out-of-order facts and reprocesses when prerequisites arrive.
+
+- **Reconciliation drift (ledger ≠ settlement)**
+  - Happens: missing events, fee schedule changes, FX rounding, partial captures, or a bug.
+  - Detect: daily drift report by merchant/currency; unmatched settlement rows; unexplained variance thresholds.
+  - Recover: post compensating entries with explicit reason codes; open incident when variance crosses policy; block payouts for affected merchant if needed.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Partition ledger tables by month + merchant, move reconciliation ingestion to bulk COPY pipelines, add read replicas for reporting.
+- **100x scale:** Split ledger into a dedicated ledger service with append-only log + derived balance projections; adopt a streaming backbone (Kafka/Pulsar) for event fan-out; formalize a reconciliation “truth pipeline” with warehouse-backed analytics.
+
+## Operational Notes
+
+- The on-call “golden rule”: **never retry an external money movement after a timeout without checking** (webhook/PSP query/recon).
+- Monitor: outbox lag, inbox dedupe rate, pending-external aging, reconciliation backlog, drift variance by merchant/currency.
+- PCI: keep Payments API out of PCI scope via tokenization; isolate any vault/HSM usage, strict network segmentation, immutable audit logs, and regular key rotation with tested rollback.
+- Runbooks should include: “stuck pending external,” “replay outbox safely,” “reprocess webhooks from inbox,” and “post a compensating ledger entry with reason code.”
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Making the internal **append-only double-entry ledger** the only durable truth, and treating PSP outcomes (API responses, webhooks, settlement files) as **external facts that reconcile into compensating postings**—so retries/ambiguity never directly mutate “money truth.”
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Ledger DB (Postgres) | Auditable, deterministic money truth; supports corrections via compensating entries. |
+| Payments API state machine | Centralizes invariants: idempotency, valid transitions, and when ledger postings are allowed. |
+| Inbox (webhook dedupe) | Converts at-least-once/duplicated PSP delivery into exactly-once internal fact processing. |
+| Outbox (durable intent) | Prevents “DB wrote but PSP call didn’t / PSP call happened but DB didn’t” gaps; enables safe replay. |
+| Reconciliation worker | Settlement is the long-tail truth; required for fees/FX/chargebacks and drift detection. |
+| PSP Connector | Isolates PSP quirks and keeps PSP idempotency stable and testable. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| “Outbox Queue” as a separate component | Keep outbox in Postgres and run a poller (or LISTEN/NOTIFY) that executes directly (no external queue) | Less infra; harder to smooth spikes / backpressure; LISTEN/NOTIFY is best-effort so still need polling. |
+| Custom state orchestration | Use a workflow engine (Temporal) for attempt lifecycle + retries + timeouts | Faster correctness; adds a major dependency and operational surface area. |
+| “Order per-payment when possible” in webhook ingest | Use DB row locking (`SELECT … FOR UPDATE`) or advisory locks keyed by `payment_attempt_id` to serialize transitions | Very simple; can reduce concurrency on hot keys; needs careful timeout handling. |
+| Reconciliation matching implied | Store a normalized “PSP reference map” table (psp_charge_id, auth_id, capture_id, payout_id) with unique constraints | Clearer matching; extra write path and schema. |
+| Ledger used for balances implicitly | Maintain explicit derived projections (materialized views / tables) for “available/held/settled” per merchant & currency | Better performance and APIs; adds projection lag and backfill complexity. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres down for 5 minutes**
+   - Design’s answer: partially addressed (“API accept + durable recording” implies DB is required, so accept likely fails)
+   - Recommendation: Strengthen — be explicit: if Postgres is unavailable, return `503` (no “accept without durability”); add runbook for backlog catch-up and ensure outbox/inbox workers stop safely.
+
+2. **Network partition: Payments API ↔ PSP (timeouts/unknown outcomes)**
+   - Design’s answer: addressed (`PENDING_EXTERNAL`, wait for webhook/query/recon)
+   - Recommendation: Acceptable — add hard limits: when to auto-query PSP, exponential backoff, and when to escalate to manual review to avoid indefinite limbo.
+
+3. **One component slow but not failing (webhook ingest lag or outbox lag)**
+   - Design’s answer: partially addressed (metrics like outbox lag/pending aging)
+   - Recommendation: Strengthen — define SLO-based automation: e.g., if webhook lag > X, switch to active PSP polling; if outbox lag > Y, shed non-critical work (e.g., evidence uploads) to protect core capture/refund processing.
+
+4. **Bad config deploy (wrong PSP endpoint/keys, wrong fee schedule, wrong FX rounding)**
+   - Design’s answer: not addressed
+   - Recommendation: Strengthen — add config versioning + canaries per PSP account, and “ledger posting guardrails” (limits/thresholds) so a bad fee config can’t silently post massive adjustments.
+
+5. **3am human error (engineer retries a timed-out capture manually)**
+   - Design’s answer: addressed as a “golden rule,” but relies on discipline
+   - Recommendation: Strengthen — enforce in tooling: a “safe retry” command that first checks webhook/inbox/PSP query/recon and only then enqueues an outbox action; block ad-hoc replay without a recorded reason code and peer approval.
+
+## Recommendations
+
+### Must Fix
+- Clarify the claim: this is **at-least-once processing with idempotent handlers**, not true exactly-once across PSP boundaries; document the precise guarantees per boundary (API, outbox worker, webhook ingest, recon).
+- Define **ledger invariants and posting schemas per transition** (authorize/partial capture/refund/chargeback) including multi-currency and FX rate source-of-truth; ambiguity here is where “financially correct” designs usually fail.
+- Specify **concurrency control** for state transitions (locks/advisory locks/version columns) so two workers/webhooks can’t race and produce double postings.
+
+### Should Consider
+- Collapse “Outbox Queue” into a simpler first version: Postgres outbox + poller, and introduce an external queue only when backpressure demands it.
+- Add a small **reference-mapping layer** (unique constraints on PSP identifiers) to make reconciliation matching deterministic and to prevent “same PSP event maps to two internal attempts.”
+- Make “manual ops” a first-class workflow: reason-coded compensating entries, approval gates, and audit trails integrated with runbooks.
+
+### Nice to Have
+- Separate **derived balance projections** (available/held/settled) from the journal early to keep API latency stable while the journal grows.
+- Define a clear **data retention + reprocessing** policy (how long inbox is kept, how to re-run recon safely, how to rebuild projections).
+
+## What's Working Well
+- The separation of **money truth (ledger)** from **money movement (PSP integration)** is the right abstraction and sets you up for disputes/fees/settlement reality.
+- The timeout stance (“unknown, not failed”) and inbox/outbox approach targets the real failure modes instead of the happy path.
+- Operational thinking is strong: you call out the “never retry blindly” rule and the right metrics (lag, pending aging, drift variance).
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+thinking
+**Evaluating API and Payment Structure**
+
+I’m thinking about streamlining the Payments API by integrating the webhook ingestion as an endpoint and possibly eliminating the separate recon worker. Instead, I could set up a cron job within the Payments API service that uses the same database, which seems more efficient for a small team. I want to make sure I avoid complexities like storing PAN and rely solely on PSP tokens for PCI compliance. Also considering removing the workflow engine to keep it simple.
+thinking
+**Addressing Failure Scenarios**
+
+I need to cover various failure scenarios, like if Postgres is down, I’d return a 503. For network partitions, pending external attempts could be mentioned. When components are slow, SLO-based automation might be complex, but I could suggest polling the PSP for pending webhooks. For bad configuration deployments, versioning and canaries are key, though I can't add new components. I think I could use subsections and bullet points for clarity, while ensuring things stay simple!
+thinking
+**Reconciling Section Guidelines**
+
+I’m trying to figure out how to create a "What We Removed" section while following the user instructions that say no new sections should be added. It seems like I’m dealing with a contradiction: I need to include this section based on the required output format, but the rules discourage adding new sections. Maybe I can rename an existing section to incorporate the "What We Removed" content without violating the guidelines. I need to work this out!
+thinking
+**Navigating Section Modifications**
+
+I'm grappling with how to address the directive of "Do NOT add sections - only cut or condense." The user wants a dedicated "What We Removed" section, but I'm considering repurposing existing sections like "Trade-offs" or "Architecture" to accommodate that. If I rename an existing section to "What We Removed," it doesn't technically add a section, but I’m not sure if that conflicts with the guideline. I could also drop a less critical section to maintain the count while fulfilling the user's request. This is a bit tricky!
+thinking
+**Finalizing Document Structure**
+
+I’m working on how to present the document effectively while adhering to guidelines about sections. I want to keep headings but might add a "What We Removed" subsection under "Architecture." But since the user explicitly requests that as a separate section, I need to think about how to balance that with the rule against adding sections. One idea is to replace "What I'd Do Differently At..." with "What We Removed." 
+
+I also need to ensure minimal components listed, incorporate justifications, and simplify diagrams while removing unnecessary elements. Mentioning PCI compliance is crucial too. The final output needs to present everything clearly and effectively while adhering to this structure.
+codex
+```markdown
+---
+title: "Payment Processing Gateway"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["payments", "ledger", "reconciliation", "idempotency", "chargebacks", "pci-dss", "double-entry"]
+---
+
+## Overview
+
+This is a payment gateway that accepts merchant payment intents, executes best-effort actions against external PSPs/acquirers, and maintains a financially correct internal ledger that survives retries, partial failures, disputes, and delayed settlement.
+
+The ledger is the only durable truth. PSP API responses, webhooks, and settlement reports are treated as external facts that advance a small state machine and produce compensating ledger entries when reality differs from earlier assumptions.
+
+## What Makes This Hard
+
+Retries and timeouts create ambiguous outcomes (“did the PSP capture or not?”). Webhooks are duplicated and reordered. If you treat the PSP response as truth and “just retry,” you eventually double-charge or double-credit.
+
+Settlement arrives later and often differs from authorization/capture due to fees, FX, rounding, partials, and chargebacks. If you don’t model this as append-only corrections, reconciliation becomes untrustworthy.
+
+## Requirements
+
+### Functional Requirements
+- Create payment intents and execute `authorize`, `capture`, `refund`, `void`.
+- Provide idempotency for all mutating APIs and for PSP calls.
+- Maintain an append-only double-entry ledger; no in-place balance mutation.
+- Support chargebacks/disputes: ingest dispute events and apply provisional/final ledger impacts.
+- Perform ledger reconciliation against PSP settlement reports; detect drift and correct via compensating entries.
+- Enforce PCI-DSS constraints by keeping core systems out of card-data scope (tokenization/hosted fields).
+
+### Scale Targets
+- Peak 2,000 rps payment operations; p95 < 300ms added latency (PSP time excluded).
+- 100M ledger postings/year.
+- Reconciliation: 1–10M rows/day; complete within 2 hours.
+- 99.99% for API accept + durable recording (no accept-without-durability).
+
+## Key Design Decisions
+
+- **Ledger is truth (Postgres):** append-only double-entry journal; balances are derived from postings.
+- **At-least-once handlers, not “exactly-once”:** every boundary (API retries, webhook delivery, worker restarts) is handled with uniqueness constraints + idempotent processing.
+- **Durable intent before side effects (Postgres outbox):** PSP actions are recorded in the same transaction as state changes; a poller executes them.
+- **Webhook facts are deduped (Postgres inbox):** every PSP event is recorded once, then applied under a serialized transition lock.
+- **PCI scope minimization:** Payments API only handles PSP tokens (no PAN storage, no PAN transit).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  M[Merchant] --> P[Payments API]
+  P --> L[(Postgres: Ledger + State + Outbox + Inbox)]
+  P --> X[PSP/Acquirer]
+  X --> P
+```
+
+### Components
+
+- **Payments API**: One service that owns the payment attempt state machine, idempotency, webhook intake, and reconciliation jobs. This is the only custom runtime component.
+- **Postgres (Ledger + State + Outbox + Inbox)**: Single durable store for payment attempts, append-only postings, inbox/outbox tables, and reconciliation imports; guarantees idempotency via unique constraints and transactional writes.
+- **PSP/Acquirer**: External system that moves money and emits facts (API responses, webhooks, settlement reports).
+
+## Deep Dive: Idempotency + “Exactly-Once” Money Semantics
+
+Goal: merchants can retry, webhooks can duplicate/reorder, workers can restart, and the ledger still records one logical outcome.
+
+**1) Merchant idempotency**
+- Key: `(merchant_id, idempotency_key, operation)` unique.
+- Store request hash + response pointer. Same key with different payload returns `409`.
+
+**2) PSP idempotency**
+- PSP idempotency key derives from immutable `payment_attempt_id` (not merchant input).
+- Every PSP call includes this key so timeouts and retries converge.
+
+**3) One transaction establishes intent**
+On every mutating operation, the Payments API writes in one Postgres transaction:
+- Lock the `payment_attempt` row (`SELECT ... FOR UPDATE`) to serialize transitions.
+- Validate state transition (reject invalid/out-of-order moves).
+- Insert ledger postings only for the transition being finalized (balanced entries).
+- Insert an outbox row if an external action must be executed (authorize/capture/refund/void).
+
+**4) Outbox poller executes money movement**
+- A poller claims outbox rows (row lock + status) and calls the PSP.
+- Timeouts become `PENDING_EXTERNAL` (unknown), not failed.
+- The poller may schedule a PSP query-by-reference for long-stuck `PENDING_EXTERNAL` attempts (same idempotency key).
+
+**5) Inbox dedupes webhooks into facts**
+- Webhooks are inserted into an inbox table keyed by `(psp_event_id)` unique.
+- Processing is idempotent: apply the fact under a `payment_attempt` row lock, advance state if valid, and post ledger entries for the transition.
+
+**6) Reconciliation is the long-tail truth**
+- Settlement rows are bulk imported into Postgres and matched by stored PSP identifiers (unique constraints on PSP charge/auth/capture IDs per PSP account).
+- Differences (fees, FX, rounding, missing events) are recorded as explicit adjusting postings with reason codes; prior entries are never mutated.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Financial correctness and auditability | “Single status field” simplicity |
+| Safe retries under ambiguity | Some state-machine rigor |
+| Minimal infrastructure (one service + Postgres) | Less smoothing/backpressure than an external queue |
+| Reduced PCI footprint | Less control over raw card flows |
+
+## Failure Modes
+
+- **Postgres down**
+  - Behavior: API returns `503`; no “accept without durability.”
+  - Recovery: workers stop safely; when DB returns, outbox/inbox processing resumes from tables.
+
+- **Network partition: Payments API ↔ PSP (timeouts/unknown outcomes)**
+  - Behavior: attempts move to `PENDING_EXTERNAL`, not failed.
+  - Recovery: prefer webhook; otherwise query PSP by idempotency key/reference; reconcile from settlement if still unknown.
+
+- **Webhook lag or outbox lag**
+  - Behavior: correctness remains; completion is delayed.
+  - Recovery: alert on lag and pending-external age; poll PSP for stuck attempts and continue draining inbox/outbox from Postgres.
+
+- **Bad config deploy (wrong PSP keys/endpoint, bad fee/FX rules)**
+  - Behavior: guarded writes—posting rules enforce currency/account invariants and per-merchant thresholds; reconciliation will surface drift quickly.
+  - Recovery: rollback config version; post compensating entries with explicit reason codes when corrections are required.
+
+- **Human error (manual “retry capture” after timeout)**
+  - Behavior: retries only occur via the same idempotent operation path; ad-hoc replay is not a separate mechanism.
+  - Recovery: state machine rejects unsafe transitions; unknown outcomes require PSP query/webhook/recon before any new money movement is attempted.
+
+## What We Removed
+
+- **External queue:** outbox is a Postgres table with a poller; no separate “Outbox Queue” component.
+- **Separate webhook service:** webhook endpoint and inbox processing live inside the Payments API.
+- **Separate reconciliation service:** reconciliation runs as a job inside the Payments API against Postgres imports.
+- **PAN vault/HSM path:** core design assumes PSP tokenization/hosted fields only; no PAN storage in this system.
+- **Future-scale split/projection systems:** no dedicated ledger service, streaming backbone, or derived balance projections in the base design.
+
+## Operational Notes
+
+- Golden rule: never repeat an external money movement after a timeout without first resolving outcome (webhook, PSP query, or reconciliation).
+- Monitor: outbox lag, inbox dedupe rate, `PENDING_EXTERNAL` age, reconciliation backlog, drift variance by merchant/currency.
+- Runbooks: “DB unavailable (503)”, “stuck pending external”, “drain outbox safely”, “reprocess inbox”, “post compensating entry with reason code.”
+```
+tokens used
+8,203
+```markdown
+---
+title: "Payment Processing Gateway"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["payments", "ledger", "reconciliation", "idempotency", "chargebacks", "pci-dss", "double-entry"]
+---
+
+## Overview
+
+This is a payment gateway that accepts merchant payment intents, executes best-effort actions against external PSPs/acquirers, and maintains a financially correct internal ledger that survives retries, partial failures, disputes, and delayed settlement.
+
+The ledger is the only durable truth. PSP API responses, webhooks, and settlement reports are treated as external facts that advance a small state machine and produce compensating ledger entries when reality differs from earlier assumptions.
+
+## What Makes This Hard
+
+Retries and timeouts create ambiguous outcomes (“did the PSP capture or not?”). Webhooks are duplicated and reordered. If you treat the PSP response as truth and “just retry,” you eventually double-charge or double-credit.
+
+Settlement arrives later and often differs from authorization/capture due to fees, FX, rounding, partials, and chargebacks. If you don’t model this as append-only corrections, reconciliation becomes untrustworthy.
+
+## Requirements
+
+### Functional Requirements
+- Create payment intents and execute `authorize`, `capture`, `refund`, `void`.
+- Provide idempotency for all mutating APIs and for PSP calls.
+- Maintain an append-only double-entry ledger; no in-place balance mutation.
+- Support chargebacks/disputes: ingest dispute events and apply provisional/final ledger impacts.
+- Perform ledger reconciliation against PSP settlement reports; detect drift and correct via compensating entries.
+- Enforce PCI-DSS constraints by keeping core systems out of card-data scope (tokenization/hosted fields).
+
+### Scale Targets
+- Peak 2,000 rps payment operations; p95 < 300ms added latency (PSP time excluded).
+- 100M ledger postings/year.
+- Reconciliation: 1–10M rows/day; complete within 2 hours.
+- 99.99% for API accept + durable recording (no accept-without-durability).
+
+## Key Design Decisions
+
+- **Ledger is truth (Postgres):** append-only double-entry journal; balances are derived from postings.
+- **At-least-once handlers, not “exactly-once”:** every boundary (API retries, webhook delivery, worker restarts) is handled with uniqueness constraints + idempotent processing.
+- **Durable intent before side effects (Postgres outbox):** PSP actions are recorded in the same transaction as state changes; a poller executes them.
+- **Webhook facts are deduped (Postgres inbox):** every PSP event is recorded once, then applied under a serialized transition lock.
+- **PCI scope minimization:** Payments API only handles PSP tokens (no PAN storage, no PAN transit).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  M[Merchant] --> P[Payments API]
+  P --> L[(Postgres: Ledger + State + Outbox + Inbox)]
+  P --> X[PSP/Acquirer]
+  X --> P
+```
+
+### Components
+
+- **Payments API**: One service that owns the payment attempt state machine, idempotency, webhook intake, and reconciliation jobs. This is the only custom runtime component.
+- **Postgres (Ledger + State + Outbox + Inbox)**: Single durable store for payment attempts, append-only postings, inbox/outbox tables, and reconciliation imports; guarantees idempotency via unique constraints and transactional writes.
+- **PSP/Acquirer**: External system that moves money and emits facts (API responses, webhooks, settlement reports).
+
+## Deep Dive: Idempotency + “Exactly-Once” Money Semantics
+
+Goal: merchants can retry, webhooks can duplicate/reorder, workers can restart, and the ledger still records one logical outcome.
+
+**1) Merchant idempotency**
+- Key: `(merchant_id, idempotency_key, operation)` unique.
+- Store request hash + response pointer. Same key with different payload returns `409`.
+
+**2) PSP idempotency**
+- PSP idempotency key derives from immutable `payment_attempt_id` (not merchant input).
+- Every PSP call includes this key so timeouts and retries converge.
+
+**3) One transaction establishes intent**
+On every mutating operation, the Payments API writes in one Postgres transaction:
+- Lock the `payment_attempt` row (`SELECT ... FOR UPDATE`) to serialize transitions.
+- Validate state transition (reject invalid/out-of-order moves).
+- Insert ledger postings only for the transition being finalized (balanced entries).
+- Insert an outbox row if an external action must be executed (authorize/capture/refund/void).
+
+**4) Outbox poller executes money movement**
+- A poller claims outbox rows (row lock + status) and calls the PSP.
+- Timeouts become `PENDING_EXTERNAL` (unknown), not failed.
+- The poller may schedule a PSP query-by-reference for long-stuck `PENDING_EXTERNAL` attempts (same idempotency key).
+
+**5) Inbox dedupes webhooks into facts**
+- Webhooks are inserted into an inbox table keyed by `(psp_event_id)` unique.
+- Processing is idempotent: apply the fact under a `payment_attempt` row lock, advance state if valid, and post ledger entries for the transition.
+
+**6) Reconciliation is the long-tail truth**
+- Settlement rows are bulk imported into Postgres and matched by stored PSP identifiers (unique constraints on PSP charge/auth/capture IDs per PSP account).
+- Differences (fees, FX, rounding, missing events) are recorded as explicit adjusting postings with reason codes; prior entries are never mutated.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Financial correctness and auditability | “Single status field” simplicity |
+| Safe retries under ambiguity | Some state-machine rigor |
+| Minimal infrastructure (one service + Postgres) | Less smoothing/backpressure than an external queue |
+| Reduced PCI footprint | Less control over raw card flows |
+
+## Failure Modes
+
+- **Postgres down**
+  - Behavior: API returns `503`; no “accept without durability.”
+  - Recovery: workers stop safely; when DB returns, outbox/inbox processing resumes from tables.
+
+- **Network partition: Payments API ↔ PSP (timeouts/unknown outcomes)**
+  - Behavior: attempts move to `PENDING_EXTERNAL`, not failed.
+  - Recovery: prefer webhook; otherwise query PSP by idempotency key/reference; reconcile from settlement if still unknown.
+
+- **Webhook lag or outbox lag**
+  - Behavior: correctness remains; completion is delayed.
+  - Recovery: alert on lag and pending-external age; poll PSP for stuck attempts and continue draining inbox/outbox from Postgres.
+
+- **Bad config deploy (wrong PSP keys/endpoint, bad fee/FX rules)**
+  - Behavior: guarded writes—posting rules enforce currency/account invariants and per-merchant thresholds; reconciliation will surface drift quickly.
+  - Recovery: rollback config version; post compensating entries with explicit reason codes when corrections are required.
+
+- **Human error (manual “retry capture” after timeout)**
+  - Behavior: retries only occur via the same idempotent operation path; ad-hoc replay is not a separate mechanism.
+  - Recovery: state machine rejects unsafe transitions; unknown outcomes require PSP query/webhook/recon before any new money movement is attempted.
+
+## What We Removed
+
+- **External queue:** outbox is a Postgres table with a poller; no separate “Outbox Queue” component.
+- **Separate webhook service:** webhook endpoint and inbox processing live inside the Payments API.
+- **Separate reconciliation service:** reconciliation runs as a job inside the Payments API against Postgres imports.
+- **PAN vault/HSM path:** core design assumes PSP tokenization/hosted fields only; no PAN storage in this system.
+- **Future-scale split/projection systems:** no dedicated ledger service, streaming backbone, or derived balance projections in the base design.
+
+## Operational Notes
+
+- Golden rule: never repeat an external money movement after a timeout without first resolving outcome (webhook, PSP query, or reconciliation).
+- Monitor: outbox lag, inbox dedupe rate, `PENDING_EXTERNAL` age, reconciliation backlog, drift variance by merchant/currency.
+- Runbooks: “DB unavailable (503)”, “stuck pending external”, “drain outbox safely”, “reprocess inbox”, “post compensating entry with reason code.”
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/06-commerce-fintech/payment-processing-gateway.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Payment Processing Gateway
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/payment-processing-gateway.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/payment-processing-gateway.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/06-commerce-fintech/payment-processing-gateway.md

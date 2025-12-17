@@ -1,0 +1,1661 @@
+==========================================
+Generating (v2): Authorization Service (Zanzibar-style)
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2d88-76a2-babc-7958bc1943eb
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Authorization Service (Zanzibar-style)
+**Category**: Security & Access Control
+
+**Problem Statement**:
+Design a global relationship-based access control (ReBAC) system for resolving permissions at low latency.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+thinking
+**Considering database options**
+
+The user needs a document and doesn't want any repository changes or tools used. They want a markdown format and prefer a clear choice for technology. For a Zanzibar-style authorization service with low latency and consistency challenges, I'd suggest either CockroachDB or Google Spanner, both offering global consistency. CockroachDB is mature but can be complex, while there's also FoundationDB as an alternative. My final choice would be CockroachDB with multi-region, serializable, and geo-partitioned configurations for optimal performance.
+thinking
+**Designing an authorization framework**
+
+I'm looking to create a system with an API layer for Check, Write, Expand, and Lookup functions, using CockroachDB for storage and Redis for caching. I want to set up materialized indexes and a watch service with Kafka. To ensure data consistency, I'll implement "consistency tokens" for each request. The trickiest part will be managing cache invalidation while maintaining low latency. We need to ensure the framework scales effectively, possibly aiming for around 10,000 checks per second per region. I'll start with 100 million tuples for evaluation.
+thinking
+**Designing the architecture**
+
+I’m outlining an architecture diagram that flows from clients to an authz API, passing through a Check Engine, with caching in Redis, tuple storage in CockroachDB, and event logging in Kafka. I need to consider possible issues like cache stampedes and stale frontiers. I’ll ensure we implement monotonic snapshot reads using MVCC, with each request including a revision token. It’s important to allow checks to specify tokens for consistency while maintaining low latency. Key decisions will focus on MVCC, revision tokens, and regional pinning for writes to optimize performance.
+codex
+```markdown
+---
+title: "Authorization Service (Zanzibar-style)"
+category: "Security & Access Control"
+difficulty: "Hard"
+tags: ["authorization", "rebac", "zanzibar", "global", "low-latency", "consistency"]
+---
+
+## Overview
+
+This system is a global relationship-based access control (ReBAC) service in the Zanzibar family: you write relationship tuples (e.g., `doc:123#viewer@user:7`) and query whether a principal has a permission on an object. The elegance comes from treating authorization like a *versioned database query problem*, not a distributed caching problem: every check runs against a well-defined **authorization revision** (a consistent snapshot), and caches become safe because they’re keyed by revision.
+
+The key insight is a simple contract: **writes mint a new revision token; reads declare the minimum revision they require**. That single mechanism solves the two traps that make most authz services fail in production—stale decisions after writes, and cache invalidation chaos—without requiring global locks, custom consensus, or “best effort” semantics that leak into product behavior.
+
+Everything else is deliberately boring: a small stateless API tier, a query engine with aggressive memoization, a tuple store with MVCC, and an append-only change stream to drive invalidation and replication observability.
+
+## What Makes This Hard
+
+Naive implementations optimize the wrong thing: they build fast graph traversal, then bolt on caching, then discover that *correct invalidation* is harder than authorization itself. The trap is subtle: permission checks are read-heavy and latency-sensitive, so you cache; but writes must take effect quickly and globally, so caches must invalidate; and once you add multi-region, you’ve built a distributed consistency system by accident.
+
+The second trap is that ReBAC graphs amplify worst cases. A single permission can expand into many edges through groups/roles/nesting. Without strict query limits, cycle handling, and memoization, one pathological object turns into a thundering herd on storage and takes down your authz service—which then takes down every downstream service that depends on it.
+
+## Requirements
+
+### Functional Requirements
+- **Tuple writes**: create/delete relationships with idempotency.
+- **Schema (model) management**: define types/relations/permissions (computed usersets, unions, intersections, exclusions) with safe rollout.
+- **Permission checks**: `Check(subject, permission, object)` returns allow/deny at low latency.
+- **Bulk checks**: evaluate many `(subject, object)` pairs efficiently (critical for listing pages).
+- **Lookup**:
+  - `LookupResources(subject, permission, resourceType)` (e.g., “docs I can view”).
+  - `LookupSubjects(object, permission, subjectType)` (e.g., “who can edit this doc”).
+- **Watch**: stream tuple changes by revision for cache invalidation, replication verification, and debugging.
+- **Consistency controls**:
+  - Default: low-latency reads at a stable “safe” revision.
+  - Optional: client supplies a minimum revision for read-your-writes and monotonic reads.
+
+### Scale Targets
+- **Tuples**: 100M active tuples (enough to force real indexing and storage decisions).
+- **Read QPS**: 50k checks/s globally, p95 ≤ 15ms at region-local edge.
+- **Write QPS**: 2k tuple writes/s globally with p99 commit ≤ 100ms.
+- **Fanout**: typical check touches 10–200 tuples; worst-case bounded by hard limits.
+- **Tenancy**: 10k tenants, with isolation for noisy neighbors (quotas + shard routing).
+
+These numbers matter because they force: (1) cache correctness under high read load, (2) strict evaluation limits to prevent graph explosions, and (3) multi-region latency strategy that doesn’t depend on “invalidate everything fast enough”.
+
+## Key Design Decisions
+
+- **Decision 1: MVCC tuple store + revision tokens**
+  - **Chose:** CockroachDB as the tuple store (serializable transactions, MVCC, multi-region, operationally proven).
+  - **Rejected:** DynamoDB-only + global tables (latency is fine; correctness under multi-region read-your-writes becomes policy leakage), and “custom KV + consensus” (complexity theater).
+  - **Why:** Zanzibar-style authz needs a first-class notion of *consistent snapshot*. MVCC gives revisions almost for free; tokens make consistency explicit and debuggable.
+
+- **Decision 2: Revision-keyed caching (not invalidation-by-guessing)**
+  - **Chose:** in-process memoization + Redis for shared cache, both keyed by `(tenant, revision, subproblem)`.
+  - **Rejected:** time-based TTL-only caching and “invalidate on write” as the primary correctness mechanism.
+  - **Why:** TTLs turn correctness into luck. Revision keys make stale answers impossible by construction; invalidation becomes a cost optimization, not a correctness requirement.
+
+- **Decision 3: Default reads at a “stable” revision frontier**
+  - **Chose:** serve checks by default at the latest **stable revision** per region (a bounded-lag snapshot), with opt-in minimum revision for strictness.
+  - **Rejected:** “always read latest committed globally” (multi-region tail latency tax) and “eventual by default with no token” (debugging nightmare).
+  - **Why:** most product flows tolerate sub-second propagation, but some flows (post-share confirmation) need read-your-writes. One API supports both without punishing every request.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Clients] --> E[Edge gRPC]
+  E --> A[Authz API]
+  A --> Q[Check Engine]
+  Q --> R[Redis Cache]
+  Q --> T[CockroachDB]
+  T --> K[Kafka Log]
+  K --> W[Watch/Frontier]
+  W --> Q
+```
+
+### Components
+
+- **Edge gRPC**
+  - Terminates TLS, enforces authn, rate limits by tenant, and attaches caller identity and requested consistency mode.
+  - Keeps the authz API stateless and horizontally scalable.
+
+- **Authz API**
+  - Implements `WriteTuples`, `Check`, `BulkCheck`, `Lookup*`, `ReadSchema`, `WriteSchema`, `Watch`.
+  - Owns request shaping: max depth, max expansions, time budgets, and per-tenant quotas.
+
+- **Check Engine**
+  - Compiles schema to an executable plan and evaluates requests as a graph query.
+  - Uses aggressive memoization and batched storage reads; it never “walks edges one at a time” over the network.
+
+- **Redis Cache**
+  - Shared cache for common subproblems (e.g., group membership expansions) keyed by revision.
+  - Treated as a performance layer; correctness does not depend on it.
+
+- **CockroachDB (Tuple + Schema Store)**
+  - Source of truth for tuples and schema versions.
+  - MVCC timestamps act as authorization revisions; transactions mint new revisions on write.
+
+- **Kafka Log**
+  - Append-only stream of tuple mutations `(tenant, revision, changes...)`.
+  - Powers watch, cache invalidation hints, replication observability, and forensic debugging.
+
+- **Watch/Frontier**
+  - Maintains per-tenant regional “stable revision” (a frontier that is known to be present and queryable locally).
+  - Feeds the check engine the default revision to use for low-latency reads.
+
+## Deep Dive: Consistent, Low-Latency Checks (Revisions + Frontier)
+
+The hardest part is making checks fast *and* correct after writes across regions. The design hinges on three related mechanisms:
+
+1) **Revision tokens are the contract.**  
+Every tuple write transaction commits at a specific MVCC timestamp (the revision). The API returns that revision token to the caller. Reads accept `min_revision`; the service guarantees the snapshot it uses is `>= min_revision`. This makes “read-your-writes” explicit: the caller who just shared a document passes the token into the subsequent check/UI refresh.
+
+2) **Default reads use a stable frontier, not “latest”.**  
+If every check demanded the newest committed revision, multi-region reality shows up as tail latency: your local region might not have applied the newest writes or might need cross-region coordination. Instead, `Watch/Frontier` tracks a per-tenant stable revision that is safely queryable locally (bounded lag, e.g., hundreds of ms). Most reads use this frontier and get predictable low latency. Strict callers pass `min_revision` and accept the (rare) cost of waiting until the frontier advances or routing to the write region.
+
+3) **Caches are safe because they’re revision-scoped.**  
+The check engine decomposes evaluation into subproblems (e.g., “is user:7 in group:9?”) and memoizes results keyed by `(tenant, revision, node)`. If a tuple changes, the revision changes; old cached answers remain correct for old revisions and are never used for newer ones. The Kafka change stream is used to *evict* old revision keys to control memory, not to prevent incorrect decisions.
+
+On the execution side, the check engine evaluates permissions as a DAG of userset expressions with strict limits:
+- **Cycle safety**: track visited `(relation, object)` nodes per request; break cycles deterministically.
+- **Batching**: fetch adjacency lists in sets (one round-trip per layer), not per edge.
+- **Short-circuit**: unions return on first allow; intersections fail on first deny; exclusions evaluate deny-set early to avoid wasted work.
+- **Budgets**: enforce max depth, max nodes expanded, and a wall-clock deadline—then fail closed with a typed error so callers can degrade gracefully.
+
+This combination is what makes the system “Zanzibar-style” in practice: correctness comes from snapshot semantics, not heroic cache invalidation.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness you can reason about (snapshot checks) | “Always latest” reads everywhere |
+| Predictable p95 latency via stable frontier | Extra complexity in consistency modes |
+| Operational debuggability (revisions, watch) | Higher storage cost for MVCC/history |
+| Simple stateless scaling at API tier | Heavier tuple store requirements |
+
+## Failure Modes
+
+- **Frontier stalls (writes succeed but reads look stale)**
+  - **What happens:** default checks keep using an old stable revision; product appears “permissions didn’t apply”.
+  - **Detect:** frontier lag metrics per tenant/region; watch consumer offsets; alarms on lag > threshold.
+  - **Recover:** fail over watch consumers; throttle heavy tenants; if needed, route strict reads to the write region until frontier catches up.
+
+- **Cache stampede on hot objects**
+  - **What happens:** a popular resource triggers many identical subproblems after cache eviction; tuple store sees a spike.
+  - **Detect:** elevated Redis miss rates + tuple-store read amplification per check.
+  - **Recover:** singleflight/coalescing per `(tenant, revision, key)` in the check engine; serve stale-at-same-revision from in-process cache; add targeted prewarm for hot groups.
+
+- **Pathological graph expansion (accidental or malicious)**
+  - **What happens:** checks hit expansion limits, time out, or overload storage.
+  - **Detect:** per-tenant expansion counters, top-N objects by expanded nodes, elevated “limit exceeded” errors.
+  - **Recover:** enforce schema guardrails (cap nesting depth, cap group size for certain relations), quarantine tenants via quotas, provide tooling to explain/check “why denied/allowed” with bounded traces.
+
+## What I'd Do Differently At...
+
+- **10x scale:** add a dedicated “membership index” table/materialization for the hottest computed relationships (still revisioned), and introduce regional read pools tuned for the check engine’s access patterns.
+- **100x scale:** move from general-purpose SQL to a purpose-built, sharded KV tuple store with MVCC-like revisions and locality controls; keep the revision/token API unchanged so callers and higher layers don’t notice the replatform.
+
+## Operational Notes
+
+- **Consistency is a product decision:** document which flows must pass `min_revision` (post-write confirmation, admin tooling) and keep everything else on default frontier reads for latency.
+- **Always ship “explain” tooling:** a bounded “why allowed/denied” trace is the difference between an on-call fixing an incident in 10 minutes vs 2 hours.
+- **Quotas are non-negotiable:** enforce per-tenant limits on tuple count, write rate, and max expansion per check; authz is an attack surface.
+- **Schema rollout must be safe:** validate new schema versions offline against sampled tuples; gate activation per tenant; keep old versions queryable for rollback.
+```
+tokens used
+3,542
+```markdown
+---
+title: "Authorization Service (Zanzibar-style)"
+category: "Security & Access Control"
+difficulty: "Hard"
+tags: ["authorization", "rebac", "zanzibar", "global", "low-latency", "consistency"]
+---
+
+## Overview
+
+This system is a global relationship-based access control (ReBAC) service in the Zanzibar family: you write relationship tuples (e.g., `doc:123#viewer@user:7`) and query whether a principal has a permission on an object. The elegance comes from treating authorization like a *versioned database query problem*, not a distributed caching problem: every check runs against a well-defined **authorization revision** (a consistent snapshot), and caches become safe because they’re keyed by revision.
+
+The key insight is a simple contract: **writes mint a new revision token; reads declare the minimum revision they require**. That single mechanism solves the two traps that make most authz services fail in production—stale decisions after writes, and cache invalidation chaos—without requiring global locks, custom consensus, or “best effort” semantics that leak into product behavior.
+
+Everything else is deliberately boring: a small stateless API tier, a query engine with aggressive memoization, a tuple store with MVCC, and an append-only change stream to drive invalidation and replication observability.
+
+## What Makes This Hard
+
+Naive implementations optimize the wrong thing: they build fast graph traversal, then bolt on caching, then discover that *correct invalidation* is harder than authorization itself. The trap is subtle: permission checks are read-heavy and latency-sensitive, so you cache; but writes must take effect quickly and globally, so caches must invalidate; and once you add multi-region, you’ve built a distributed consistency system by accident.
+
+The second trap is that ReBAC graphs amplify worst cases. A single permission can expand into many edges through groups/roles/nesting. Without strict query limits, cycle handling, and memoization, one pathological object turns into a thundering herd on storage and takes down your authz service—which then takes down every downstream service that depends on it.
+
+## Requirements
+
+### Functional Requirements
+- **Tuple writes**: create/delete relationships with idempotency.
+- **Schema (model) management**: define types/relations/permissions (computed usersets, unions, intersections, exclusions) with safe rollout.
+- **Permission checks**: `Check(subject, permission, object)` returns allow/deny at low latency.
+- **Bulk checks**: evaluate many `(subject, object)` pairs efficiently (critical for listing pages).
+- **Lookup**:
+  - `LookupResources(subject, permission, resourceType)` (e.g., “docs I can view”).
+  - `LookupSubjects(object, permission, subjectType)` (e.g., “who can edit this doc”).
+- **Watch**: stream tuple changes by revision for cache invalidation, replication verification, and debugging.
+- **Consistency controls**:
+  - Default: low-latency reads at a stable “safe” revision.
+  - Optional: client supplies a minimum revision for read-your-writes and monotonic reads.
+
+### Scale Targets
+- **Tuples**: 100M active tuples (enough to force real indexing and storage decisions).
+- **Read QPS**: 50k checks/s globally, p95 ≤ 15ms at region-local edge.
+- **Write QPS**: 2k tuple writes/s globally with p99 commit ≤ 100ms.
+- **Fanout**: typical check touches 10–200 tuples; worst-case bounded by hard limits.
+- **Tenancy**: 10k tenants, with isolation for noisy neighbors (quotas + shard routing).
+
+These numbers matter because they force: (1) cache correctness under high read load, (2) strict evaluation limits to prevent graph explosions, and (3) multi-region latency strategy that doesn’t depend on “invalidate everything fast enough”.
+
+## Key Design Decisions
+
+- **Decision 1: MVCC tuple store + revision tokens**
+  - **Chose:** CockroachDB as the tuple store (serializable transactions, MVCC, multi-region, operationally proven).
+  - **Rejected:** DynamoDB-only + global tables (latency is fine; correctness under multi-region read-your-writes becomes policy leakage), and “custom KV + consensus” (complexity theater).
+  - **Why:** Zanzibar-style authz needs a first-class notion of *consistent snapshot*. MVCC gives revisions almost for free; tokens make consistency explicit and debuggable.
+
+- **Decision 2: Revision-keyed caching (not invalidation-by-guessing)**
+  - **Chose:** in-process memoization + Redis for shared cache, both keyed by `(tenant, revision, subproblem)`.
+  - **Rejected:** time-based TTL-only caching and “invalidate on write” as the primary correctness mechanism.
+  - **Why:** TTLs turn correctness into luck. Revision keys make stale answers impossible by construction; invalidation becomes a cost optimization, not a correctness requirement.
+
+- **Decision 3: Default reads at a “stable” revision frontier**
+  - **Chose:** serve checks by default at the latest **stable revision** per region (a bounded-lag snapshot), with opt-in minimum revision for strictness.
+  - **Rejected:** “always read latest committed globally” (multi-region tail latency tax) and “eventual by default with no token” (debugging nightmare).
+  - **Why:** most product flows tolerate sub-second propagation, but some flows (post-share confirmation) need read-your-writes. One API supports both without punishing every request.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Clients] --> E[Edge gRPC]
+  E --> A[Authz API]
+  A --> Q[Check Engine]
+  Q --> R[Redis Cache]
+  Q --> T[CockroachDB]
+  T --> K[Kafka Log]
+  K --> W[Watch/Frontier]
+  W --> Q
+```
+
+### Components
+
+- **Edge gRPC**
+  - Terminates TLS, enforces authn, rate limits by tenant, and attaches caller identity and requested consistency mode.
+  - Keeps the authz API stateless and horizontally scalable.
+
+- **Authz API**
+  - Implements `WriteTuples`, `Check`, `BulkCheck`, `Lookup*`, `ReadSchema`, `WriteSchema`, `Watch`.
+  - Owns request shaping: max depth, max expansions, time budgets, and per-tenant quotas.
+
+- **Check Engine**
+  - Compiles schema to an executable plan and evaluates requests as a graph query.
+  - Uses aggressive memoization and batched storage reads; it never “walks edges one at a time” over the network.
+
+- **Redis Cache**
+  - Shared cache for common subproblems (e.g., group membership expansions) keyed by revision.
+  - Treated as a performance layer; correctness does not depend on it.
+
+- **CockroachDB (Tuple + Schema Store)**
+  - Source of truth for tuples and schema versions.
+  - MVCC timestamps act as authorization revisions; transactions mint new revisions on write.
+
+- **Kafka Log**
+  - Append-only stream of tuple mutations `(tenant, revision, changes...)`.
+  - Powers watch, cache invalidation hints, replication observability, and forensic debugging.
+
+- **Watch/Frontier**
+  - Maintains per-tenant regional “stable revision” (a frontier that is known to be present and queryable locally).
+  - Feeds the check engine the default revision to use for low-latency reads.
+
+## Deep Dive: Consistent, Low-Latency Checks (Revisions + Frontier)
+
+The hardest part is making checks fast *and* correct after writes across regions. The design hinges on three related mechanisms:
+
+1) **Revision tokens are the contract.**  
+Every tuple write transaction commits at a specific MVCC timestamp (the revision). The API returns that revision token to the caller. Reads accept `min_revision`; the service guarantees the snapshot it uses is `>= min_revision`. This makes “read-your-writes” explicit: the caller who just shared a document passes the token into the subsequent check/UI refresh.
+
+2) **Default reads use a stable frontier, not “latest”.**  
+If every check demanded the newest committed revision, multi-region reality shows up as tail latency: your local region might not have applied the newest writes or might need cross-region coordination. Instead, `Watch/Frontier` tracks a per-tenant stable revision that is safely queryable locally (bounded lag, e.g., hundreds of ms). Most reads use this frontier and get predictable low latency. Strict callers pass `min_revision` and accept the (rare) cost of waiting until the frontier advances or routing to the write region.
+
+3) **Caches are safe because they’re revision-scoped.**  
+The check engine decomposes evaluation into subproblems (e.g., “is user:7 in group:9?”) and memoizes results keyed by `(tenant, revision, node)`. If a tuple changes, the revision changes; old cached answers remain correct for old revisions and are never used for newer ones. The Kafka change stream is used to *evict* old revision keys to control memory, not to prevent incorrect decisions.
+
+On the execution side, the check engine evaluates permissions as a DAG of userset expressions with strict limits:
+- **Cycle safety**: track visited `(relation, object)` nodes per request; break cycles deterministically.
+- **Batching**: fetch adjacency lists in sets (one round-trip per layer), not per edge.
+- **Short-circuit**: unions return on first allow; intersections fail on first deny; exclusions evaluate deny-set early to avoid wasted work.
+- **Budgets**: enforce max depth, max nodes expanded, and a wall-clock deadline—then fail closed with a typed error so callers can degrade gracefully.
+
+This combination is what makes the system “Zanzibar-style” in practice: correctness comes from snapshot semantics, not heroic cache invalidation.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness you can reason about (snapshot checks) | “Always latest” reads everywhere |
+| Predictable p95 latency via stable frontier | Extra complexity in consistency modes |
+| Operational debuggability (revisions, watch) | Higher storage cost for MVCC/history |
+| Simple stateless scaling at API tier | Heavier tuple store requirements |
+
+## Failure Modes
+
+- **Frontier stalls (writes succeed but reads look stale)**
+  - **What happens:** default checks keep using an old stable revision; product appears “permissions didn’t apply”.
+  - **Detect:** frontier lag metrics per tenant/region; watch consumer offsets; alarms on lag > threshold.
+  - **Recover:** fail over watch consumers; throttle heavy tenants; if needed, route strict reads to the write region until frontier catches up.
+
+- **Cache stampede on hot objects**
+  - **What happens:** a popular resource triggers many identical subproblems after cache eviction; tuple store sees a spike.
+  - **Detect:** elevated Redis miss rates + tuple-store read amplification per check.
+  - **Recover:** singleflight/coalescing per `(tenant, revision, key)` in the check engine; serve stale-at-same-revision from in-process cache; add targeted prewarm for hot groups.
+
+- **Pathological graph expansion (accidental or malicious)**
+  - **What happens:** checks hit expansion limits, time out, or overload storage.
+  - **Detect:** per-tenant expansion counters, top-N objects by expanded nodes, elevated “limit exceeded” errors.
+  - **Recover:** enforce schema guardrails (cap nesting depth, cap group size for certain relations), quarantine tenants via quotas, provide tooling to explain/check “why denied/allowed” with bounded traces.
+
+## What I'd Do Differently At...
+
+- **10x scale:** add a dedicated “membership index” table/materialization for the hottest computed relationships (still revisioned), and introduce regional read pools tuned for the check engine’s access patterns.
+- **100x scale:** move from general-purpose SQL to a purpose-built, sharded KV tuple store with MVCC-like revisions and locality controls; keep the revision/token API unchanged so callers and higher layers don’t notice the replatform.
+
+## Operational Notes
+
+- **Consistency is a product decision:** document which flows must pass `min_revision` (post-write confirmation, admin tooling) and keep everything else on default frontier reads for latency.
+- **Always ship “explain” tooling:** a bounded “why allowed/denied” trace is the difference between an on-call fixing an incident in 10 minutes vs 2 hours.
+- **Quotas are non-negotiable:** enforce per-tenant limits on tuple count, write rate, and max expansion per check; authz is an attack surface.
+- **Schema rollout must be safe:** validate new schema versions offline against sampled tuples; gate activation per tenant; keep old versions queryable for rollback.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/authorization-service-zanzibar.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-66e1-76d1-8df0-ab0212fc0931
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Authorization Service (Zanzibar-style)"
+category: "Security & Access Control"
+difficulty: "Hard"
+tags: ["authorization", "rebac", "zanzibar", "global", "low-latency", "consistency"]
+---
+
+## Overview
+
+This system is a global relationship-based access control (ReBAC) service in the Zanzibar family: you write relationship tuples (e.g., `doc:123#viewer@user:7`) and query whether a principal has a permission on an object. The elegance comes from treating authorization like a *versioned database query problem*, not a distributed caching problem: every check runs against a well-defined **authorization revision** (a consistent snapshot), and caches become safe because they’re keyed by revision.
+
+The key insight is a simple contract: **writes mint a new revision token; reads declare the minimum revision they require**. That single mechanism solves the two traps that make most authz services fail in production—stale decisions after writes, and cache invalidation chaos—without requiring global locks, custom consensus, or “best effort” semantics that leak into product behavior.
+
+Everything else is deliberately boring: a small stateless API tier, a query engine with aggressive memoization, a tuple store with MVCC, and an append-only change stream to drive invalidation and replication observability.
+
+## What Makes This Hard
+
+Naive implementations optimize the wrong thing: they build fast graph traversal, then bolt on caching, then discover that *correct invalidation* is harder than authorization itself. The trap is subtle: permission checks are read-heavy and latency-sensitive, so you cache; but writes must take effect quickly and globally, so caches must invalidate; and once you add multi-region, you’ve built a distributed consistency system by accident.
+
+The second trap is that ReBAC graphs amplify worst cases. A single permission can expand into many edges through groups/roles/nesting. Without strict query limits, cycle handling, and memoization, one pathological object turns into a thundering herd on storage and takes down your authz service—which then takes down every downstream service that depends on it.
+
+## Requirements
+
+### Functional Requirements
+- **Tuple writes**: create/delete relationships with idempotency.
+- **Schema (model) management**: define types/relations/permissions (computed usersets, unions, intersections, exclusions) with safe rollout.
+- **Permission checks**: `Check(subject, permission, object)` returns allow/deny at low latency.
+- **Bulk checks**: evaluate many `(subject, object)` pairs efficiently (critical for listing pages).
+- **Lookup**:
+  - `LookupResources(subject, permission, resourceType)` (e.g., “docs I can view”).
+  - `LookupSubjects(object, permission, subjectType)` (e.g., “who can edit this doc”).
+- **Watch**: stream tuple changes by revision for cache invalidation, replication verification, and debugging.
+- **Consistency controls**:
+  - Default: low-latency reads at a stable “safe” revision.
+  - Optional: client supplies a minimum revision for read-your-writes and monotonic reads.
+
+### Scale Targets
+- **Tuples**: 100M active tuples (enough to force real indexing and storage decisions).
+- **Read QPS**: 50k checks/s globally, p95 ≤ 15ms at region-local edge.
+- **Write QPS**: 2k tuple writes/s globally with p99 commit ≤ 100ms.
+- **Fanout**: typical check touches 10–200 tuples; worst-case bounded by hard limits.
+- **Tenancy**: 10k tenants, with isolation for noisy neighbors (quotas + shard routing).
+
+These numbers matter because they force: (1) cache correctness under high read load, (2) strict evaluation limits to prevent graph explosions, and (3) multi-region latency strategy that doesn’t depend on “invalidate everything fast enough”.
+
+## Key Design Decisions
+
+- **Decision 1: MVCC tuple store + revision tokens**
+  - **Chose:** CockroachDB as the tuple store (serializable transactions, MVCC, multi-region, operationally proven).
+  - **Rejected:** DynamoDB-only + global tables (latency is fine; correctness under multi-region read-your-writes becomes policy leakage), and “custom KV + consensus” (complexity theater).
+  - **Why:** Zanzibar-style authz needs a first-class notion of *consistent snapshot*. MVCC gives revisions almost for free; tokens make consistency explicit and debuggable.
+
+- **Decision 2: Revision-keyed caching (not invalidation-by-guessing)**
+  - **Chose:** in-process memoization + Redis for shared cache, both keyed by `(tenant, revision, subproblem)`.
+  - **Rejected:** time-based TTL-only caching and “invalidate on write” as the primary correctness mechanism.
+  - **Why:** TTLs turn correctness into luck. Revision keys make stale answers impossible by construction; invalidation becomes a cost optimization, not a correctness requirement.
+
+- **Decision 3: Default reads at a “stable” revision frontier**
+  - **Chose:** serve checks by default at the latest **stable revision** per region (a bounded-lag snapshot), with opt-in minimum revision for strictness.
+  - **Rejected:** “always read latest committed globally” (multi-region tail latency tax) and “eventual by default with no token” (debugging nightmare).
+  - **Why:** most product flows tolerate sub-second propagation, but some flows (post-share confirmation) need read-your-writes. One API supports both without punishing every request.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Clients] --> E[Edge gRPC]
+  E --> A[Authz API]
+  A --> Q[Check Engine]
+  Q --> R[Redis Cache]
+  Q --> T[CockroachDB]
+  T --> K[Kafka Log]
+  K --> W[Watch/Frontier]
+  W --> Q
+```
+
+### Components
+
+- **Edge gRPC**
+  - Terminates TLS, enforces authn, rate limits by tenant, and attaches caller identity and requested consistency mode.
+  - Keeps the authz API stateless and horizontally scalable.
+
+- **Authz API**
+  - Implements `WriteTuples`, `Check`, `BulkCheck`, `Lookup*`, `ReadSchema`, `WriteSchema`, `Watch`.
+  - Owns request shaping: max depth, max expansions, time budgets, and per-tenant quotas.
+
+- **Check Engine**
+  - Compiles schema to an executable plan and evaluates requests as a graph query.
+  - Uses aggressive memoization and batched storage reads; it never “walks edges one at a time” over the network.
+
+- **Redis Cache**
+  - Shared cache for common subproblems (e.g., group membership expansions) keyed by revision.
+  - Treated as a performance layer; correctness does not depend on it.
+
+- **CockroachDB (Tuple + Schema Store)**
+  - Source of truth for tuples and schema versions.
+  - MVCC timestamps act as authorization revisions; transactions mint new revisions on write.
+
+- **Kafka Log**
+  - Append-only stream of tuple mutations `(tenant, revision, changes...)`.
+  - Powers watch, cache invalidation hints, replication observability, and forensic debugging.
+
+- **Watch/Frontier**
+  - Maintains per-tenant regional “stable revision” (a frontier that is known to be present and queryable locally).
+  - Feeds the check engine the default revision to use for low-latency reads.
+
+## Deep Dive: Consistent, Low-Latency Checks (Revisions + Frontier)
+
+The hardest part is making checks fast *and* correct after writes across regions. The design hinges on three related mechanisms:
+
+1) **Revision tokens are the contract.**  
+Every tuple write transaction commits at a specific MVCC timestamp (the revision). The API returns that revision token to the caller. Reads accept `min_revision`; the service guarantees the snapshot it uses is `>= min_revision`. This makes “read-your-writes” explicit: the caller who just shared a document passes the token into the subsequent check/UI refresh.
+
+2) **Default reads use a stable frontier, not “latest”.**  
+If every check demanded the newest committed revision, multi-region reality shows up as tail latency: your local region might not have applied the newest writes or might need cross-region coordination. Instead, `Watch/Frontier` tracks a per-tenant stable revision that is safely queryable locally (bounded lag, e.g., hundreds of ms). Most reads use this frontier and get predictable low latency. Strict callers pass `min_revision` and accept the (rare) cost of waiting until the frontier advances or routing to the write region.
+
+3) **Caches are safe because they’re revision-scoped.**  
+The check engine decomposes evaluation into subproblems (e.g., “is user:7 in group:9?”) and memoizes results keyed by `(tenant, revision, node)`. If a tuple changes, the revision changes; old cached answers remain correct for old revisions and are never used for newer ones. The Kafka change stream is used to *evict* old revision keys to control memory, not to prevent incorrect decisions.
+
+On the execution side, the check engine evaluates permissions as a DAG of userset expressions with strict limits:
+- **Cycle safety**: track visited `(relation, object)` nodes per request; break cycles deterministically.
+- **Batching**: fetch adjacency lists in sets (one round-trip per layer), not per edge.
+- **Short-circuit**: unions return on first allow; intersections fail on first deny; exclusions evaluate deny-set early to avoid wasted work.
+- **Budgets**: enforce max depth, max nodes expanded, and a wall-clock deadline—then fail closed with a typed error so callers can degrade gracefully.
+
+This combination is what makes the system “Zanzibar-style” in practice: correctness comes from snapshot semantics, not heroic cache invalidation.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness you can reason about (snapshot checks) | “Always latest” reads everywhere |
+| Predictable p95 latency via stable frontier | Extra complexity in consistency modes |
+| Operational debuggability (revisions, watch) | Higher storage cost for MVCC/history |
+| Simple stateless scaling at API tier | Heavier tuple store requirements |
+
+## Failure Modes
+
+- **Frontier stalls (writes succeed but reads look stale)**
+  - **What happens:** default checks keep using an old stable revision; product appears “permissions didn’t apply”.
+  - **Detect:** frontier lag metrics per tenant/region; watch consumer offsets; alarms on lag > threshold.
+  - **Recover:** fail over watch consumers; throttle heavy tenants; if needed, route strict reads to the write region until frontier catches up.
+
+- **Cache stampede on hot objects**
+  - **What happens:** a popular resource triggers many identical subproblems after cache eviction; tuple store sees a spike.
+  - **Detect:** elevated Redis miss rates + tuple-store read amplification per check.
+  - **Recover:** singleflight/coalescing per `(tenant, revision, key)` in the check engine; serve stale-at-same-revision from in-process cache; add targeted prewarm for hot groups.
+
+- **Pathological graph expansion (accidental or malicious)**
+  - **What happens:** checks hit expansion limits, time out, or overload storage.
+  - **Detect:** per-tenant expansion counters, top-N objects by expanded nodes, elevated “limit exceeded” errors.
+  - **Recover:** enforce schema guardrails (cap nesting depth, cap group size for certain relations), quarantine tenants via quotas, provide tooling to explain/check “why denied/allowed” with bounded traces.
+
+## What I'd Do Differently At...
+
+- **10x scale:** add a dedicated “membership index” table/materialization for the hottest computed relationships (still revisioned), and introduce regional read pools tuned for the check engine’s access patterns.
+- **100x scale:** move from general-purpose SQL to a purpose-built, sharded KV tuple store with MVCC-like revisions and locality controls; keep the revision/token API unchanged so callers and higher layers don’t notice the replatform.
+
+## Operational Notes
+
+- **Consistency is a product decision:** document which flows must pass `min_revision` (post-write confirmation, admin tooling) and keep everything else on default frontier reads for latency.
+- **Always ship “explain” tooling:** a bounded “why allowed/denied” trace is the difference between an on-call fixing an incident in 10 minutes vs 2 hours.
+- **Quotas are non-negotiable:** enforce per-tenant limits on tuple count, write rate, and max expansion per check; authz is an attack surface.
+- **Schema rollout must be safe:** validate new schema versions offline against sampled tuples; gate activation per tenant; keep old versions queryable for rollback.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+thinking
+**Planning caching strategies**
+
+I'm considering TTL/eviction and coalescing revisions into coarse buckets. It might help to use stable revisions just for caching, while for strict reads, in-process memoization could work better. Another idea I have is "revision window caching," where revisions are rounded down.
+
+Also, caching at the relation level could help with membership expansions, avoiding revision invalidation. Caching by stable frontiers seems wise, since it changes more slowly, and dealing with indexes in CRDB adds complexity. I'll need to think about efficient modeling for bulk reads.
+thinking
+**Drafting operational strategy**
+
+I'm considering tenancy options with around 10k tenants in CRDB. Should I store everything in one table using tenant_id or explore hash-sharded indexes or even separate databases for each tenant? That could get heavy, especially with range splits and frontiers per tenant or region.
+
+I want to ensure a safe schema rollout and think about validating offline through static analysis and backcompat. For the critique, I'll need sections like an elegance check, stress tests with failure scenarios, and recommendations to maintain a constructive tone while being concise. I'll focus on essential items in each table.
+thinking
+**Focusing on simplification**
+
+I'm thinking about how to simplify by utilizing CockroachDB features like changefeeds, closed timestamps for follower reads, and multi-region tables. It might help to remove Kafka and watch/frontier components in favor of a "resolved timestamp" stream from changefeeds, along with a stable revision from the closed timestamp.
+
+Another idea is to store the schema in a separate table and consider a single store for schema migrations instead of multiple versions. I should explore using open-source options like SpiceDB or OpenFGA, especially if the team size is small. 
+
+Lastly, I’ll need to address quotas and tenant complexity metrics and consider using singleflight for caching issues.
+thinking
+**Clarifying failure handling**
+
+I'm recognizing that "fail closed" means to deny requests, but for graceful degradation, I should return errors like `UNAVAILABLE` or `DEADLINE_EXCEEDED`, allowing callers to interpret these as denials if they choose. It’s important to note that the watch feature is critical for replication observability, especially when using CRDB with changefeeds.
+
+As for read-your-writes, I could set up a min_revision across regions, potentially routing to the write region or waiting for the local region to catch up. But that waiting could lead to long tails. 
+
+Finally, I'll implement the stable frontier concept by ensuring monotonic behavior per client, returning `served_revision` in every response. Clients can then set `min_revision` to the maximum of the tokens they've encountered, ensuring clear and consistent token propagation.
+codex
+## Elegance Check
+
+### The Core Insight
+Treat authz as a **versioned snapshot query** with an explicit **revision contract** (`write -> revision`, `read(min_revision)`) so correctness and caching fall out naturally.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| MVCC tuple store (CockroachDB) | Makes “check at revision” a real, debuggable guarantee instead of a cache-invalidation guessing game |
+| Check engine (memoized, batched) | ReBAC worst-cases are query-shape problems; you need controlled expansion, batching, and short-circuiting |
+| Revision tokens in API | Turns consistency into an explicit product/API choice; enables read-your-writes without punishing all reads |
+| Per-tenant quotas/limits | Authz is an attack surface; guardrails prevent one tenant/object from taking down the fleet |
+| Watch (some form) | Required for operability: debugging, replication verification, and “what changed?” workflows |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Kafka log + Watch/Frontier service | Use **CockroachDB changefeeds** (resolved timestamps) to drive watch + frontier directly | Less generic pipeline than Kafka; ties you more tightly to CRDB primitives |
+| Separate “Edge gRPC” + “Authz API” | Collapse into one service (or keep a standard Envoy edge and treat it as infrastructure) | Slightly less explicit separation; fewer moving parts for on-call |
+| Redis cache keyed by exact `(tenant, revision, key)` | Cache primarily at the **stable frontier revision** (or a coarse “revision window”), keep per-request memoization for strict reads | Strict reads may benefit less from shared cache; needs careful correctness story for coarsening |
+| Custom Zanzibar implementation | Consider **SpiceDB/OpenFGA** as a baseline (even if you still choose custom) | You inherit their constraints/opinions; but you buy years of edge-case hardening |
+| Frontier “known queryable locally” as a bespoke concept | Align terminology/behavior with CRDB **follower reads / closed timestamps** | Might constrain how you model “stable”; but reduces bespoke consistency machinery |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **CockroachDB unavailable for 5 minutes**
+   - Design’s answer: not addressed (implicitly “checks hit tuple store if cache misses”)
+   - Recommendation: **Strengthen** — define explicit behavior: return typed `UNAVAILABLE` (not “deny”), shed load early, and publish an on-call playbook (what degrades, what hard-fails, which clients retry).
+
+2. **Kafka (or watch pipeline) is down but DB is up**
+   - Design’s answer: cache correctness doesn’t depend on invalidation; frontier may stall and reads look stale
+   - Recommendation: **Strengthen** — make “default stable revision” derivable from the DB (e.g., changefeed resolved timestamps / closed timestamp) so the watch pipeline failure doesn’t silently turn into “permissions didn’t apply”.
+
+3. **Cross-region partition: writes succeed in Region A, reads happen in Region B**
+   - Design’s answer: strict callers either wait for frontier or route to write region
+   - Recommendation: **Strengthen** — specify the policy knobs: max-wait before error, when to route vs wait, and how clients learn the “home region” for a tenant to avoid surprise tail latency.
+
+4. **Bad schema rollout (semantic change breaks checks or explodes expansions)**
+   - Design’s answer: “validate offline, gate per tenant, keep old versions queryable”
+   - Recommendation: **Strengthen** — add a hard “schema safety” contract: max expansion constraints enforced at compile-time, canary checks against recorded real queries, and a fast rollback path that doesn’t require tuple rewrites.
+
+5. **10x read traffic + hot object stampede**
+   - Design’s answer: singleflight/coalescing + prewarm + quotas
+   - Recommendation: **Acceptable**, with one caveat: revision-keyed shared caching can thrash if revisions advance quickly; bias caching toward the stable frontier to keep keys reusable across requests.
+
+## Recommendations
+
+### Must Fix
+- Clarify error semantics: “fail closed” vs “typed error” is contradictory; prefer **return errors** and let callers decide whether to treat authz `UNAVAILABLE` as deny for their risk model.
+- Define strict-read behavior under lag: max wait, routing rules, and what token is returned on every response (`served_revision`) so clients can enforce monotonic reads safely.
+- Address revision-key explosion: with high write rates, exact-revision Redis keys can become unbounded churn; constrain caching to stable frontier (or introduce a bounded revision window strategy).
+
+### Should Consider
+- Remove Kafka if it’s only there for watch/frontier/invalidation: CRDB changefeeds can cover most of this with fewer operational surfaces.
+- Make tenancy/sharding concrete: how tenants map to CRDB ranges/partitions, and how noisy-neighbor isolation works beyond quotas (routing + physical locality).
+- Add an explicit “consistency product matrix”: which user flows must pass `min_revision`, which must never block, and what UX you expect when strict reads can’t be satisfied.
+
+### Nice to Have
+- “Break-glass” tooling: immutable audit log of tuple writes, fast revert mechanism for accidental mass grants, and operator-safe bulk operations.
+- Golden-query suite: a small set of representative checks/lookups that run continuously per region to catch frontier/caching regressions early.
+
+## What’s Working Well
+- The revision-token contract is the right center of gravity: it makes correctness explainable and testable.
+- You treat graph blowups as a first-class reliability problem (limits, budgets, cycle handling) rather than an afterthought.
+- Operational concerns are baked in (explain tooling, quotas, schema rollout), which is where most Zanzibar-like systems fail in practice.
+tokens used
+6,252
+## Elegance Check
+
+### The Core Insight
+Treat authz as a **versioned snapshot query** with an explicit **revision contract** (`write -> revision`, `read(min_revision)`) so correctness and caching fall out naturally.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| MVCC tuple store (CockroachDB) | Makes “check at revision” a real, debuggable guarantee instead of a cache-invalidation guessing game |
+| Check engine (memoized, batched) | ReBAC worst-cases are query-shape problems; you need controlled expansion, batching, and short-circuiting |
+| Revision tokens in API | Turns consistency into an explicit product/API choice; enables read-your-writes without punishing all reads |
+| Per-tenant quotas/limits | Authz is an attack surface; guardrails prevent one tenant/object from taking down the fleet |
+| Watch (some form) | Required for operability: debugging, replication verification, and “what changed?” workflows |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Kafka log + Watch/Frontier service | Use **CockroachDB changefeeds** (resolved timestamps) to drive watch + frontier directly | Less generic pipeline than Kafka; ties you more tightly to CRDB primitives |
+| Separate “Edge gRPC” + “Authz API” | Collapse into one service (or keep a standard Envoy edge and treat it as infrastructure) | Slightly less explicit separation; fewer moving parts for on-call |
+| Redis cache keyed by exact `(tenant, revision, key)` | Cache primarily at the **stable frontier revision** (or a coarse “revision window”), keep per-request memoization for strict reads | Strict reads may benefit less from shared cache; needs careful correctness story for coarsening |
+| Custom Zanzibar implementation | Consider **SpiceDB/OpenFGA** as a baseline (even if you still choose custom) | You inherit their constraints/opinions; but you buy years of edge-case hardening |
+| Frontier “known queryable locally” as a bespoke concept | Align terminology/behavior with CRDB **follower reads / closed timestamps** | Might constrain how you model “stable”; but reduces bespoke consistency machinery |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **CockroachDB unavailable for 5 minutes**
+   - Design’s answer: not addressed (implicitly “checks hit tuple store if cache misses”)
+   - Recommendation: **Strengthen** — define explicit behavior: return typed `UNAVAILABLE` (not “deny”), shed load early, and publish an on-call playbook (what degrades, what hard-fails, which clients retry).
+
+2. **Kafka (or watch pipeline) is down but DB is up**
+   - Design’s answer: cache correctness doesn’t depend on invalidation; frontier may stall and reads look stale
+   - Recommendation: **Strengthen** — make “default stable revision” derivable from the DB (e.g., changefeed resolved timestamps / closed timestamp) so the watch pipeline failure doesn’t silently turn into “permissions didn’t apply”.
+
+3. **Cross-region partition: writes succeed in Region A, reads happen in Region B**
+   - Design’s answer: strict callers either wait for frontier or route to write region
+   - Recommendation: **Strengthen** — specify the policy knobs: max-wait before error, when to route vs wait, and how clients learn the “home region” for a tenant to avoid surprise tail latency.
+
+4. **Bad schema rollout (semantic change breaks checks or explodes expansions)**
+   - Design’s answer: “validate offline, gate per tenant, keep old versions queryable”
+   - Recommendation: **Strengthen** — add a hard “schema safety” contract: max expansion constraints enforced at compile-time, canary checks against recorded real queries, and a fast rollback path that doesn’t require tuple rewrites.
+
+5. **10x read traffic + hot object stampede**
+   - Design’s answer: singleflight/coalescing + prewarm + quotas
+   - Recommendation: **Acceptable**, with one caveat: revision-keyed shared caching can thrash if revisions advance quickly; bias caching toward the stable frontier to keep keys reusable across requests.
+
+## Recommendations
+
+### Must Fix
+- Clarify error semantics: “fail closed” vs “typed error” is contradictory; prefer **return errors** and let callers decide whether to treat authz `UNAVAILABLE` as deny for their risk model.
+- Define strict-read behavior under lag: max wait, routing rules, and what token is returned on every response (`served_revision`) so clients can enforce monotonic reads safely.
+- Address revision-key explosion: with high write rates, exact-revision Redis keys can become unbounded churn; constrain caching to stable frontier (or introduce a bounded revision window strategy).
+
+### Should Consider
+- Remove Kafka if it’s only there for watch/frontier/invalidation: CRDB changefeeds can cover most of this with fewer operational surfaces.
+- Make tenancy/sharding concrete: how tenants map to CRDB ranges/partitions, and how noisy-neighbor isolation works beyond quotas (routing + physical locality).
+- Add an explicit “consistency product matrix”: which user flows must pass `min_revision`, which must never block, and what UX you expect when strict reads can’t be satisfied.
+
+### Nice to Have
+- “Break-glass” tooling: immutable audit log of tuple writes, fast revert mechanism for accidental mass grants, and operator-safe bulk operations.
+- Golden-query suite: a small set of representative checks/lookups that run continuously per region to catch frontier/caching regressions early.
+
+## What’s Working Well
+- The revision-token contract is the right center of gravity: it makes correctness explainable and testable.
+- You treat graph blowups as a first-class reliability problem (limits, budgets, cycle handling) rather than an afterthought.
+- Operational concerns are baked in (explain tooling, quotas, schema rollout), which is where most Zanzibar-like systems fail in practice.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/authorization-service-zanzibar.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afc-588e-7c43-8a84-0566de5b511c
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Authorization Service (Zanzibar-style)"
+category: "Security & Access Control"
+difficulty: "Hard"
+tags: ["authorization", "rebac", "zanzibar", "global", "low-latency", "consistency"]
+---
+
+## Overview
+
+This system is a global relationship-based access control (ReBAC) service in the Zanzibar family: you write relationship tuples (e.g., `doc:123#viewer@user:7`) and query whether a principal has a permission on an object. The elegance comes from treating authorization like a *versioned database query problem*, not a distributed caching problem: every check runs against a well-defined **authorization revision** (a consistent snapshot), and caches become safe because they’re keyed by revision.
+
+The key insight is a simple contract: **writes mint a new revision token; reads declare the minimum revision they require**. That single mechanism solves the two traps that make most authz services fail in production—stale decisions after writes, and cache invalidation chaos—without requiring global locks, custom consensus, or “best effort” semantics that leak into product behavior.
+
+Everything else is deliberately boring: a small stateless API tier, a query engine with aggressive memoization, a tuple store with MVCC, and an append-only change stream to drive invalidation and replication observability.
+
+## What Makes This Hard
+
+Naive implementations optimize the wrong thing: they build fast graph traversal, then bolt on caching, then discover that *correct invalidation* is harder than authorization itself. The trap is subtle: permission checks are read-heavy and latency-sensitive, so you cache; but writes must take effect quickly and globally, so caches must invalidate; and once you add multi-region, you’ve built a distributed consistency system by accident.
+
+The second trap is that ReBAC graphs amplify worst cases. A single permission can expand into many edges through groups/roles/nesting. Without strict query limits, cycle handling, and memoization, one pathological object turns into a thundering herd on storage and takes down your authz service—which then takes down every downstream service that depends on it.
+
+## Requirements
+
+### Functional Requirements
+- **Tuple writes**: create/delete relationships with idempotency.
+- **Schema (model) management**: define types/relations/permissions (computed usersets, unions, intersections, exclusions) with safe rollout.
+- **Permission checks**: `Check(subject, permission, object)` returns allow/deny at low latency.
+- **Bulk checks**: evaluate many `(subject, object)` pairs efficiently (critical for listing pages).
+- **Lookup**:
+  - `LookupResources(subject, permission, resourceType)` (e.g., “docs I can view”).
+  - `LookupSubjects(object, permission, subjectType)` (e.g., “who can edit this doc”).
+- **Watch**: stream tuple changes by revision for cache invalidation, replication verification, and debugging.
+- **Consistency controls**:
+  - Default: low-latency reads at a stable “safe” revision.
+  - Optional: client supplies a minimum revision for read-your-writes and monotonic reads.
+
+### Scale Targets
+- **Tuples**: 100M active tuples (enough to force real indexing and storage decisions).
+- **Read QPS**: 50k checks/s globally, p95 ≤ 15ms at region-local edge.
+- **Write QPS**: 2k tuple writes/s globally with p99 commit ≤ 100ms.
+- **Fanout**: typical check touches 10–200 tuples; worst-case bounded by hard limits.
+- **Tenancy**: 10k tenants, with isolation for noisy neighbors (quotas + shard routing).
+
+These numbers matter because they force: (1) cache correctness under high read load, (2) strict evaluation limits to prevent graph explosions, and (3) multi-region latency strategy that doesn’t depend on “invalidate everything fast enough”.
+
+## Key Design Decisions
+
+- **Decision 1: MVCC tuple store + revision tokens**
+  - **Chose:** CockroachDB as the tuple store (serializable transactions, MVCC, multi-region, operationally proven).
+  - **Rejected:** DynamoDB-only + global tables (latency is fine; correctness under multi-region read-your-writes becomes policy leakage), and “custom KV + consensus” (complexity theater).
+  - **Why:** Zanzibar-style authz needs a first-class notion of *consistent snapshot*. MVCC gives revisions almost for free; tokens make consistency explicit and debuggable.
+
+- **Decision 2: Revision-keyed caching (not invalidation-by-guessing)**
+  - **Chose:** in-process memoization + Redis for shared cache, both keyed by `(tenant, revision, subproblem)`.
+  - **Rejected:** time-based TTL-only caching and “invalidate on write” as the primary correctness mechanism.
+  - **Why:** TTLs turn correctness into luck. Revision keys make stale answers impossible by construction; invalidation becomes a cost optimization, not a correctness requirement.
+
+- **Decision 3: Default reads at a “stable” revision frontier**
+  - **Chose:** serve checks by default at the latest **stable revision** per region (a bounded-lag snapshot), with opt-in minimum revision for strictness.
+  - **Rejected:** “always read latest committed globally” (multi-region tail latency tax) and “eventual by default with no token” (debugging nightmare).
+  - **Why:** most product flows tolerate sub-second propagation, but some flows (post-share confirmation) need read-your-writes. One API supports both without punishing every request.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Clients] --> E[Edge gRPC]
+  E --> A[Authz API]
+  A --> Q[Check Engine]
+  Q --> R[Redis Cache]
+  Q --> T[CockroachDB]
+  T --> K[Kafka Log]
+  K --> W[Watch/Frontier]
+  W --> Q
+```
+
+### Components
+
+- **Edge gRPC**
+  - Terminates TLS, enforces authn, rate limits by tenant, and attaches caller identity and requested consistency mode.
+  - Keeps the authz API stateless and horizontally scalable.
+
+- **Authz API**
+  - Implements `WriteTuples`, `Check`, `BulkCheck`, `Lookup*`, `ReadSchema`, `WriteSchema`, `Watch`.
+  - Owns request shaping: max depth, max expansions, time budgets, and per-tenant quotas.
+
+- **Check Engine**
+  - Compiles schema to an executable plan and evaluates requests as a graph query.
+  - Uses aggressive memoization and batched storage reads; it never “walks edges one at a time” over the network.
+
+- **Redis Cache**
+  - Shared cache for common subproblems (e.g., group membership expansions) keyed by revision.
+  - Treated as a performance layer; correctness does not depend on it.
+
+- **CockroachDB (Tuple + Schema Store)**
+  - Source of truth for tuples and schema versions.
+  - MVCC timestamps act as authorization revisions; transactions mint new revisions on write.
+
+- **Kafka Log**
+  - Append-only stream of tuple mutations `(tenant, revision, changes...)`.
+  - Powers watch, cache invalidation hints, replication observability, and forensic debugging.
+
+- **Watch/Frontier**
+  - Maintains per-tenant regional “stable revision” (a frontier that is known to be present and queryable locally).
+  - Feeds the check engine the default revision to use for low-latency reads.
+
+## Deep Dive: Consistent, Low-Latency Checks (Revisions + Frontier)
+
+The hardest part is making checks fast *and* correct after writes across regions. The design hinges on three related mechanisms:
+
+1) **Revision tokens are the contract.**  
+Every tuple write transaction commits at a specific MVCC timestamp (the revision). The API returns that revision token to the caller. Reads accept `min_revision`; the service guarantees the snapshot it uses is `>= min_revision`. This makes “read-your-writes” explicit: the caller who just shared a document passes the token into the subsequent check/UI refresh.
+
+2) **Default reads use a stable frontier, not “latest”.**  
+If every check demanded the newest committed revision, multi-region reality shows up as tail latency: your local region might not have applied the newest writes or might need cross-region coordination. Instead, `Watch/Frontier` tracks a per-tenant stable revision that is safely queryable locally (bounded lag, e.g., hundreds of ms). Most reads use this frontier and get predictable low latency. Strict callers pass `min_revision` and accept the (rare) cost of waiting until the frontier advances or routing to the write region.
+
+3) **Caches are safe because they’re revision-scoped.**  
+The check engine decomposes evaluation into subproblems (e.g., “is user:7 in group:9?”) and memoizes results keyed by `(tenant, revision, node)`. If a tuple changes, the revision changes; old cached answers remain correct for old revisions and are never used for newer ones. The Kafka change stream is used to *evict* old revision keys to control memory, not to prevent incorrect decisions.
+
+On the execution side, the check engine evaluates permissions as a DAG of userset expressions with strict limits:
+- **Cycle safety**: track visited `(relation, object)` nodes per request; break cycles deterministically.
+- **Batching**: fetch adjacency lists in sets (one round-trip per layer), not per edge.
+- **Short-circuit**: unions return on first allow; intersections fail on first deny; exclusions evaluate deny-set early to avoid wasted work.
+- **Budgets**: enforce max depth, max nodes expanded, and a wall-clock deadline—then fail closed with a typed error so callers can degrade gracefully.
+
+This combination is what makes the system “Zanzibar-style” in practice: correctness comes from snapshot semantics, not heroic cache invalidation.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness you can reason about (snapshot checks) | “Always latest” reads everywhere |
+| Predictable p95 latency via stable frontier | Extra complexity in consistency modes |
+| Operational debuggability (revisions, watch) | Higher storage cost for MVCC/history |
+| Simple stateless scaling at API tier | Heavier tuple store requirements |
+
+## Failure Modes
+
+- **Frontier stalls (writes succeed but reads look stale)**
+  - **What happens:** default checks keep using an old stable revision; product appears “permissions didn’t apply”.
+  - **Detect:** frontier lag metrics per tenant/region; watch consumer offsets; alarms on lag > threshold.
+  - **Recover:** fail over watch consumers; throttle heavy tenants; if needed, route strict reads to the write region until frontier catches up.
+
+- **Cache stampede on hot objects**
+  - **What happens:** a popular resource triggers many identical subproblems after cache eviction; tuple store sees a spike.
+  - **Detect:** elevated Redis miss rates + tuple-store read amplification per check.
+  - **Recover:** singleflight/coalescing per `(tenant, revision, key)` in the check engine; serve stale-at-same-revision from in-process cache; add targeted prewarm for hot groups.
+
+- **Pathological graph expansion (accidental or malicious)**
+  - **What happens:** checks hit expansion limits, time out, or overload storage.
+  - **Detect:** per-tenant expansion counters, top-N objects by expanded nodes, elevated “limit exceeded” errors.
+  - **Recover:** enforce schema guardrails (cap nesting depth, cap group size for certain relations), quarantine tenants via quotas, provide tooling to explain/check “why denied/allowed” with bounded traces.
+
+## What I'd Do Differently At...
+
+- **10x scale:** add a dedicated “membership index” table/materialization for the hottest computed relationships (still revisioned), and introduce regional read pools tuned for the check engine’s access patterns.
+- **100x scale:** move from general-purpose SQL to a purpose-built, sharded KV tuple store with MVCC-like revisions and locality controls; keep the revision/token API unchanged so callers and higher layers don’t notice the replatform.
+
+## Operational Notes
+
+- **Consistency is a product decision:** document which flows must pass `min_revision` (post-write confirmation, admin tooling) and keep everything else on default frontier reads for latency.
+- **Always ship “explain” tooling:** a bounded “why allowed/denied” trace is the difference between an on-call fixing an incident in 10 minutes vs 2 hours.
+- **Quotas are non-negotiable:** enforce per-tenant limits on tuple count, write rate, and max expansion per check; authz is an attack surface.
+- **Schema rollout must be safe:** validate new schema versions offline against sampled tuples; gate activation per tenant; keep old versions queryable for rollback.
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Treat authz as a **versioned snapshot query** with an explicit **revision contract** (`write -> revision`, `read(min_revision)`) so correctness and caching fall out naturally.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| MVCC tuple store (CockroachDB) | Makes “check at revision” a real, debuggable guarantee instead of a cache-invalidation guessing game |
+| Check engine (memoized, batched) | ReBAC worst-cases are query-shape problems; you need controlled expansion, batching, and short-circuiting |
+| Revision tokens in API | Turns consistency into an explicit product/API choice; enables read-your-writes without punishing all reads |
+| Per-tenant quotas/limits | Authz is an attack surface; guardrails prevent one tenant/object from taking down the fleet |
+| Watch (some form) | Required for operability: debugging, replication verification, and “what changed?” workflows |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Kafka log + Watch/Frontier service | Use **CockroachDB changefeeds** (resolved timestamps) to drive watch + frontier directly | Less generic pipeline than Kafka; ties you more tightly to CRDB primitives |
+| Separate “Edge gRPC” + “Authz API” | Collapse into one service (or keep a standard Envoy edge and treat it as infrastructure) | Slightly less explicit separation; fewer moving parts for on-call |
+| Redis cache keyed by exact `(tenant, revision, key)` | Cache primarily at the **stable frontier revision** (or a coarse “revision window”), keep per-request memoization for strict reads | Strict reads may benefit less from shared cache; needs careful correctness story for coarsening |
+| Custom Zanzibar implementation | Consider **SpiceDB/OpenFGA** as a baseline (even if you still choose custom) | You inherit their constraints/opinions; but you buy years of edge-case hardening |
+| Frontier “known queryable locally” as a bespoke concept | Align terminology/behavior with CRDB **follower reads / closed timestamps** | Might constrain how you model “stable”; but reduces bespoke consistency machinery |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **CockroachDB unavailable for 5 minutes**
+   - Design’s answer: not addressed (implicitly “checks hit tuple store if cache misses”)
+   - Recommendation: **Strengthen** — define explicit behavior: return typed `UNAVAILABLE` (not “deny”), shed load early, and publish an on-call playbook (what degrades, what hard-fails, which clients retry).
+
+2. **Kafka (or watch pipeline) is down but DB is up**
+   - Design’s answer: cache correctness doesn’t depend on invalidation; frontier may stall and reads look stale
+   - Recommendation: **Strengthen** — make “default stable revision” derivable from the DB (e.g., changefeed resolved timestamps / closed timestamp) so the watch pipeline failure doesn’t silently turn into “permissions didn’t apply”.
+
+3. **Cross-region partition: writes succeed in Region A, reads happen in Region B**
+   - Design’s answer: strict callers either wait for frontier or route to write region
+   - Recommendation: **Strengthen** — specify the policy knobs: max-wait before error, when to route vs wait, and how clients learn the “home region” for a tenant to avoid surprise tail latency.
+
+4. **Bad schema rollout (semantic change breaks checks or explodes expansions)**
+   - Design’s answer: “validate offline, gate per tenant, keep old versions queryable”
+   - Recommendation: **Strengthen** — add a hard “schema safety” contract: max expansion constraints enforced at compile-time, canary checks against recorded real queries, and a fast rollback path that doesn’t require tuple rewrites.
+
+5. **10x read traffic + hot object stampede**
+   - Design’s answer: singleflight/coalescing + prewarm + quotas
+   - Recommendation: **Acceptable**, with one caveat: revision-keyed shared caching can thrash if revisions advance quickly; bias caching toward the stable frontier to keep keys reusable across requests.
+
+## Recommendations
+
+### Must Fix
+- Clarify error semantics: “fail closed” vs “typed error” is contradictory; prefer **return errors** and let callers decide whether to treat authz `UNAVAILABLE` as deny for their risk model.
+- Define strict-read behavior under lag: max wait, routing rules, and what token is returned on every response (`served_revision`) so clients can enforce monotonic reads safely.
+- Address revision-key explosion: with high write rates, exact-revision Redis keys can become unbounded churn; constrain caching to stable frontier (or introduce a bounded revision window strategy).
+
+### Should Consider
+- Remove Kafka if it’s only there for watch/frontier/invalidation: CRDB changefeeds can cover most of this with fewer operational surfaces.
+- Make tenancy/sharding concrete: how tenants map to CRDB ranges/partitions, and how noisy-neighbor isolation works beyond quotas (routing + physical locality).
+- Add an explicit “consistency product matrix”: which user flows must pass `min_revision`, which must never block, and what UX you expect when strict reads can’t be satisfied.
+
+### Nice to Have
+- “Break-glass” tooling: immutable audit log of tuple writes, fast revert mechanism for accidental mass grants, and operator-safe bulk operations.
+- Golden-query suite: a small set of representative checks/lookups that run continuously per region to catch frontier/caching regressions early.
+
+## What’s Working Well
+- The revision-token contract is the right center of gravity: it makes correctness explainable and testable.
+- You treat graph blowups as a first-class reliability problem (limits, budgets, cycle handling) rather than an afterthought.
+- Operational concerns are baked in (explain tooling, quotas, schema rollout), which is where most Zanzibar-like systems fail in practice.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+
+thinking
+**Considering document simplification**
+
+I need to rewrite the given document in a simplified form while keeping the title, difficulty, and tags intact. The challenge is not to add new components but rather to remove or merge existing ones while preserving current section headings. The instructions mention maintaining structure, even if my output format requires specific elements. I can edit and repurpose existing sections, keeping the essential ones, but how do I handle a "What We Removed" section without it being a new addition? It's a bit tricky!
+thinking
+**Evaluating section removal and renaming**
+
+I see that there are sections like "What I'd Do Differently..." and "Critique to Address," which I could delete or potentially repurpose. The instruction says not to modify the title, difficulty, and tags, but doesn't forbid renaming headings. So, I could rename "Critique to Address" to "What We Removed," condensing the information. However, I wonder if removing "Critique to Address" entirely while incorporating its content into the design might be better. I think keeping a section called "What We Removed" by renaming another section sounds like a sensible plan!
+thinking
+**Simplifying architecture components**
+
+I see that renaming a section counts as a modification, but it's fine as long as I'm not adding new ones. I need clear justification for each component that remains, which I can include in the Architecture section. I'm thinking of reducing components to just Clients, Authz Service, and CockroachDB. I'll eliminate others like Edge gRPC, Redis, and Kafka. Instead, I can use CockroachDB for changefeeds and resolved timestamps, removing Kafka altogether while simplifying the design. It’s a cleaner approach!
+thinking
+**Addressing failure scenarios**
+
+I need to tackle various failure scenarios in the system, like when the database is unavailable, the watch pipeline goes down, or partition issues arise. For DB unavailability, I think we should return an "UNAVAILABLE" typed error. If the changefeed is down but the DB is still operational, reads will default to using the DB's closed timestamp. We can also handle routing policies as configuration settings without adding new components. I need to specify these details and update the architecture diagram to reflect this simplification!
+thinking
+**Condensing a markdown document**
+
+I must condense the markdown document while keeping the essential frontmatter like tags and difficulty intact. I'll remove sections like "Stress Test" and "Recommendations" and instead focus on simplifying the design. Existing headings should be reused where possible. We need an explicit "What We Removed" section, and I can transform "What I'd Do Differently..." into this new section.
+
+It's important to clarify failure modes and revise architectural components while ensuring the final document is straightforward without unnecessary argumentative phrasing. The goal is to produce a concise markdown document that includes all vital sections—I'll streamline it effectively.
+thinking
+**Finalizing key design decisions**
+
+I need to focus on three key design decisions: using a single CockroachDB store with MVCC, implementing a single stateless service, and leveraging a DB-native changefeed for watching plus stable revisions, with caching limited to per-request. The architecture diagram will outline the flow from Clients to the Authz Service and CockroachDB. I also want to include failure modes such as DB downtime and bad schema while ensuring I don't add any new components. Finally, I’ll summarize "What We Removed" in a bullet list and maintain essential operational notes.
+codex
+```markdown
+---
+title: "Authorization Service (Zanzibar-style)"
+category: "Security & Access Control"
+difficulty: "Hard"
+tags: ["authorization", "rebac", "zanzibar", "global", "low-latency", "consistency"]
+---
+
+## Overview
+
+This is a global relationship-based access control (ReBAC) service in the Zanzibar family: you write relationship tuples (e.g., `doc:123#viewer@user:7`) and query whether a principal has a permission on an object.
+
+The system is built around one contract: **writes return a revision token; reads either use a stable snapshot by default or request a minimum revision**. Every response includes `served_revision`. This makes correctness debuggable, makes read-your-writes explicit, and keeps performance optimizations from leaking into product semantics.
+
+## What Makes This Hard
+
+ReBAC checks can explode into many edges through groups/roles/nesting. The hard part isn’t “fast traversal”; it’s **bounded evaluation** (limits, cycle handling, time budgets) and **consistent snapshots** so answers don’t flap after writes.
+
+## Requirements
+
+### Functional Requirements
+- **Tuple writes**: create/delete relationships with idempotency; return `revision`.
+- **Schema management**: versioned types/relations/permissions with safe rollout and rollback.
+- **Permission checks**: `Check(subject, permission, object)` returns allow/deny, plus `served_revision`.
+- **Bulk checks**: evaluate many `(subject, object)` pairs efficiently.
+- **Lookup**:
+  - `LookupResources(subject, permission, resourceType)`
+  - `LookupSubjects(object, permission, subjectType)`
+- **Watch**: stream tuple changes in revision order for debugging and verification.
+- **Consistency controls**:
+  - Default: read at a region-local **stable revision**.
+  - Optional: `min_revision` for read-your-writes / monotonic reads.
+- **Error semantics**: on dependency failure, return typed errors (e.g., `UNAVAILABLE`, `DEADLINE_EXCEEDED`), not “deny”.
+
+### Scale Targets
+- **Tuples**: 100M active tuples.
+- **Read QPS**: 50k checks/s globally, p95 ≤ 15ms region-local.
+- **Write QPS**: 2k tuple writes/s globally with p99 commit ≤ 100ms.
+- **Fanout**: typical check touches 10–200 tuples; worst-case bounded by hard limits.
+- **Tenancy**: 10k tenants with quotas/limits to isolate noisy neighbors.
+
+## Key Design Decisions
+
+- **Decision 1: MVCC tuple store + revision tokens**
+  - **Chose:** CockroachDB for tuples + schema with MVCC revisions.
+  - **Why:** “Check at revision” is a real snapshot guarantee, not a cache-invalidation guessing game.
+
+- **Decision 2: One stateless service**
+  - **Chose:** a single Authz service that owns API, schema compilation, evaluation, limits, and per-request memoization.
+  - **Why:** fewer moving parts for on-call; horizontal scaling stays simple.
+
+- **Decision 3: DB-native watch + stable revision**
+  - **Chose:** CockroachDB changefeeds (resolved timestamps) to implement `Watch` and to derive the region’s default stable revision.
+  - **Why:** the same source of truth drives both “what changed?” and “what’s safely readable here”.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Clients] --> A[Authz Service]
+  A --> T[CockroachDB]
+  T --> A
+```
+
+### Components
+
+- **Authz Service**
+  - Provides `WriteTuples`, `Check`, `BulkCheck`, `Lookup*`, `ReadSchema`, `WriteSchema`, `Watch`.
+  - Enforces per-tenant quotas and per-request budgets (max depth, max expansions, deadline).
+  - Returns `served_revision` on every read; returns `revision` on every write.
+
+- **CockroachDB (Tuple + Schema Store + Changefeed)**
+  - Source of truth for tuples and schema versions.
+  - MVCC timestamps are authorization revisions.
+  - Changefeeds provide ordered change streaming with resolved timestamps.
+
+## Deep Dive: Consistent, Low-Latency Checks (Revisions + Stable Reads)
+
+1) **Revision tokens are the contract.**  
+Tuple writes commit at a specific MVCC timestamp and return that as `revision`. Reads accept `min_revision` and return `served_revision`.
+
+2) **Default reads use a region-local stable revision.**  
+The service reads at a stable snapshot that is known to be available locally (derived from the database’s resolved/closed timestamp signal), which keeps p95 latency predictable. Most product flows use this mode.
+
+3) **Strict reads are explicit and bounded.**  
+If `min_revision` is requested and the local stable revision is behind, the service either:
+- waits up to a configured max wait, then proceeds when satisfied, or
+- returns a typed `DEADLINE_EXCEEDED`, or
+- routes the request to the tenant’s write region (policy-controlled).
+All outcomes are visible via `served_revision` and error codes.
+
+Checks are evaluated as userset-expression plans with strict limits:
+- **Cycle safety** via visited-node tracking.
+- **Batching** adjacency reads by layer.
+- **Short-circuiting** unions/intersections/exclusions.
+- **Budgets** for max expansions, max depth, and wall-clock deadline.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Snapshot correctness with explicit tokens | “Always latest everywhere” reads |
+| Simple ops surface (one service + one store) | Heavy reliance on the tuple store |
+| Predictable latency via stable reads | Occasional strict-read waits/routing |
+| Debuggability (`served_revision`, watch) | Higher MVCC/history storage cost |
+
+## Failure Modes
+
+- **CockroachDB unavailable**
+  - **What happens:** reads/writes fail with `UNAVAILABLE`; no synthetic deny.
+  - **Recover:** shed load early; clients retry with backoff; keep deadlines tight.
+
+- **Changefeed/watch unavailable but DB is up**
+  - **What happens:** `Watch` is unavailable; default checks continue at stable reads derived from the DB.
+  - **Recover:** restart changefeed; alert on watch downtime; keep checks independent of watch health.
+
+- **Cross-region partition (writes in Region A, reads in Region B)**
+  - **What happens:** default reads remain stable but may lag; strict reads wait/reroute/error based on policy.
+  - **Recover:** tune max-wait and routing; expose tenant write region and `served_revision` to make behavior predictable.
+
+- **Bad schema rollout (semantic break or expansion blowup)**
+  - **What happens:** compile-time rejection (limits/guards) or runtime budget errors with typed failures.
+  - **Recover:** per-tenant gating; instant rollback to prior schema version; keep old versions queryable.
+
+- **Hot object stampede**
+  - **What happens:** storage amplification and tail latency from repeated identical subproblems.
+  - **Recover:** request coalescing (singleflight) inside the service; strict per-tenant budgets and rate limits.
+
+## What We Removed
+
+- **Kafka log**: change streaming and “frontier” come from CockroachDB changefeeds/resolved timestamps.
+- **Redis cache**: correctness relies on revisions; performance relies on batching + per-request memoization + coalescing.
+- **Separate Edge gRPC tier**: TLS/authn/rate limiting live in the same stateless service.
+- **Standalone Watch/Frontier service**: watch and stable revision tracking are part of the Authz service.
+
+## Operational Notes
+
+- **Consistency is a product decision:** document which flows pass `min_revision`; everything else uses default stable reads.
+- **Quotas are non-negotiable:** enforce per-tenant tuple/write/read/expansion limits.
+- **Schema rollout must be safe:** validate and gate per tenant; keep rollback fast.
+- **Explain tooling stays bounded:** return “why allowed/denied” traces within the same budgets as checks.
+```
+tokens used
+8,356
+```markdown
+---
+title: "Authorization Service (Zanzibar-style)"
+category: "Security & Access Control"
+difficulty: "Hard"
+tags: ["authorization", "rebac", "zanzibar", "global", "low-latency", "consistency"]
+---
+
+## Overview
+
+This is a global relationship-based access control (ReBAC) service in the Zanzibar family: you write relationship tuples (e.g., `doc:123#viewer@user:7`) and query whether a principal has a permission on an object.
+
+The system is built around one contract: **writes return a revision token; reads either use a stable snapshot by default or request a minimum revision**. Every response includes `served_revision`. This makes correctness debuggable, makes read-your-writes explicit, and keeps performance optimizations from leaking into product semantics.
+
+## What Makes This Hard
+
+ReBAC checks can explode into many edges through groups/roles/nesting. The hard part isn’t “fast traversal”; it’s **bounded evaluation** (limits, cycle handling, time budgets) and **consistent snapshots** so answers don’t flap after writes.
+
+## Requirements
+
+### Functional Requirements
+- **Tuple writes**: create/delete relationships with idempotency; return `revision`.
+- **Schema management**: versioned types/relations/permissions with safe rollout and rollback.
+- **Permission checks**: `Check(subject, permission, object)` returns allow/deny, plus `served_revision`.
+- **Bulk checks**: evaluate many `(subject, object)` pairs efficiently.
+- **Lookup**:
+  - `LookupResources(subject, permission, resourceType)`
+  - `LookupSubjects(object, permission, subjectType)`
+- **Watch**: stream tuple changes in revision order for debugging and verification.
+- **Consistency controls**:
+  - Default: read at a region-local **stable revision**.
+  - Optional: `min_revision` for read-your-writes / monotonic reads.
+- **Error semantics**: on dependency failure, return typed errors (e.g., `UNAVAILABLE`, `DEADLINE_EXCEEDED`), not “deny”.
+
+### Scale Targets
+- **Tuples**: 100M active tuples.
+- **Read QPS**: 50k checks/s globally, p95 ≤ 15ms region-local.
+- **Write QPS**: 2k tuple writes/s globally with p99 commit ≤ 100ms.
+- **Fanout**: typical check touches 10–200 tuples; worst-case bounded by hard limits.
+- **Tenancy**: 10k tenants with quotas/limits to isolate noisy neighbors.
+
+## Key Design Decisions
+
+- **Decision 1: MVCC tuple store + revision tokens**
+  - **Chose:** CockroachDB for tuples + schema with MVCC revisions.
+  - **Why:** “Check at revision” is a real snapshot guarantee, not a cache-invalidation guessing game.
+
+- **Decision 2: One stateless service**
+  - **Chose:** a single Authz service that owns API, schema compilation, evaluation, limits, and per-request memoization.
+  - **Why:** fewer moving parts for on-call; horizontal scaling stays simple.
+
+- **Decision 3: DB-native watch + stable revision**
+  - **Chose:** CockroachDB changefeeds (resolved timestamps) to implement `Watch` and to derive the region’s default stable revision.
+  - **Why:** the same source of truth drives both “what changed?” and “what’s safely readable here”.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Clients] --> A[Authz Service]
+  A --> T[CockroachDB]
+  T --> A
+```
+
+### Components
+
+- **Authz Service**
+  - Provides `WriteTuples`, `Check`, `BulkCheck`, `Lookup*`, `ReadSchema`, `WriteSchema`, `Watch`.
+  - Enforces per-tenant quotas and per-request budgets (max depth, max expansions, deadline).
+  - Returns `served_revision` on every read; returns `revision` on every write.
+
+- **CockroachDB (Tuple + Schema Store + Changefeed)**
+  - Source of truth for tuples and schema versions.
+  - MVCC timestamps are authorization revisions.
+  - Changefeeds provide ordered change streaming with resolved timestamps.
+
+## Deep Dive: Consistent, Low-Latency Checks (Revisions + Stable Reads)
+
+1) **Revision tokens are the contract.**  
+Tuple writes commit at a specific MVCC timestamp and return that as `revision`. Reads accept `min_revision` and return `served_revision`.
+
+2) **Default reads use a region-local stable revision.**  
+The service reads at a stable snapshot that is known to be available locally (derived from the database’s resolved/closed timestamp signal), which keeps p95 latency predictable. Most product flows use this mode.
+
+3) **Strict reads are explicit and bounded.**  
+If `min_revision` is requested and the local stable revision is behind, the service either:
+- waits up to a configured max wait, then proceeds when satisfied, or
+- returns a typed `DEADLINE_EXCEEDED`, or
+- routes the request to the tenant’s write region (policy-controlled).
+All outcomes are visible via `served_revision` and error codes.
+
+Checks are evaluated as userset-expression plans with strict limits:
+- **Cycle safety** via visited-node tracking.
+- **Batching** adjacency reads by layer.
+- **Short-circuiting** unions/intersections/exclusions.
+- **Budgets** for max expansions, max depth, and wall-clock deadline.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Snapshot correctness with explicit tokens | “Always latest everywhere” reads |
+| Simple ops surface (one service + one store) | Heavy reliance on the tuple store |
+| Predictable latency via stable reads | Occasional strict-read waits/routing |
+| Debuggability (`served_revision`, watch) | Higher MVCC/history storage cost |
+
+## Failure Modes
+
+- **CockroachDB unavailable**
+  - **What happens:** reads/writes fail with `UNAVAILABLE`; no synthetic deny.
+  - **Recover:** shed load early; clients retry with backoff; keep deadlines tight.
+
+- **Changefeed/watch unavailable but DB is up**
+  - **What happens:** `Watch` is unavailable; default checks continue at stable reads derived from the DB.
+  - **Recover:** restart changefeed; alert on watch downtime; keep checks independent of watch health.
+
+- **Cross-region partition (writes in Region A, reads in Region B)**
+  - **What happens:** default reads remain stable but may lag; strict reads wait/reroute/error based on policy.
+  - **Recover:** tune max-wait and routing; expose tenant write region and `served_revision` to make behavior predictable.
+
+- **Bad schema rollout (semantic break or expansion blowup)**
+  - **What happens:** compile-time rejection (limits/guards) or runtime budget errors with typed failures.
+  - **Recover:** per-tenant gating; instant rollback to prior schema version; keep old versions queryable.
+
+- **Hot object stampede**
+  - **What happens:** storage amplification and tail latency from repeated identical subproblems.
+  - **Recover:** request coalescing (singleflight) inside the service; strict per-tenant budgets and rate limits.
+
+## What We Removed
+
+- **Kafka log**: change streaming and “frontier” come from CockroachDB changefeeds/resolved timestamps.
+- **Redis cache**: correctness relies on revisions; performance relies on batching + per-request memoization + coalescing.
+- **Separate Edge gRPC tier**: TLS/authn/rate limiting live in the same stateless service.
+- **Standalone Watch/Frontier service**: watch and stable revision tracking are part of the Authz service.
+
+## Operational Notes
+
+- **Consistency is a product decision:** document which flows pass `min_revision`; everything else uses default stable reads.
+- **Quotas are non-negotiable:** enforce per-tenant tuple/write/read/expansion limits.
+- **Schema rollout must be safe:** validate and gate per tenant; keep rollback fast.
+- **Explain tooling stays bounded:** return “why allowed/denied” traces within the same budgets as checks.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/08-security-access-control/authorization-service-zanzibar.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Authorization Service (Zanzibar-style)
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/authorization-service-zanzibar.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/authorization-service-zanzibar.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/08-security-access-control/authorization-service-zanzibar.md

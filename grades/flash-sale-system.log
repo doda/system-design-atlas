@@ -1,0 +1,367 @@
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2a95-8c09-7b11-810a-23ffc2f4ed46
+--------
+user
+You are a senior systems architect reviewing a system design document.
+
+Grade this solution on three dimensions (1-10 scale):
+
+1. **Strength** (1-10): How technically sound, complete, and production-ready is the design?
+   - Does it address scalability, reliability, and failure modes?
+   - Are the trade-offs well-reasoned?
+   - Would this actually work at scale?
+
+2. **Interestingness** (1-10): How engaging and educational is the content?
+   - Does it teach useful concepts?
+   - Are there insights that aren't obvious?
+   - Would an engineer learn something valuable?
+
+3. **Novelty** (1-10): How unique or creative is the approach?
+   - Does it go beyond textbook solutions?
+   - Are there clever simplifications or unconventional choices?
+   - Does it challenge common assumptions?
+
+Also note any major issues or particularly strong aspects.
+
+Output ONLY valid JSON in this exact format:
+{
+  "slug": "flash-sale-system",
+  "strength": <1-10>,
+  "interestingness": <1-10>,
+  "novelty": <1-10>,
+  "overall": <average of three scores, 1 decimal>,
+  "summary": "<2-3 sentence summary of the design>",
+  "strengths": ["<strength 1>", "<strength 2>"],
+  "weaknesses": ["<weakness 1>", "<weakness 2>"],
+  "verdict": "<one of: exceptional, strong, adequate, weak>"
+}
+
+---
+
+## Solution to Grade
+
+---
+title: "Flash Sale System"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["flash-sale", "waiting-room", "queueing", "admission-control", "inventory-reservation", "idempotency", "redis", "payments"]
+---
+
+## Overview
+
+Flash sales generate extreme, short-lived load spikes focused on a small hot set of SKUs. The system must:
+
+- Prevent overselling (inventory correctness).
+- Stay responsive under overload (no cascading timeouts/retry storms).
+- Provide a fair, predictable user experience (FIFO, no retry advantage).
+- Resist abuse (basic bot defense and per-identity limits).
+
+This design uses:
+- A **virtual waiting room** to sequence users and throttle entry to checkout via short-lived **purchase grants**.
+- A **Redis-backed inventory hold** with TTL to atomically reserve stock under contention.
+- A **Postgres order ledger** to durably and idempotently confirm reservations into orders and handle payment callbacks.
+
+---
+
+## Requirements
+
+### Functional Requirements
+
+- Users join a sale/SKU queue and receive status hints (position/ETA optional).
+- The system admits users at a controlled rate per sale/SKU via short-lived **grant tokens**.
+- Users with a valid grant can create a **reservation (hold)** with a fixed TTL (e.g., 2–5 minutes).
+- A reservation can be confirmed into an order **exactly once** (idempotent).
+- Expired/canceled holds return inventory automatically.
+- Fairness:
+  - FIFO within a sale/SKU for eligible users.
+  - No retry advantage (polling doesn’t improve odds).
+- Anti-abuse:
+  - Per-account/device/IP constraints.
+  - Bot challenges/rate limits at the edge.
+- Operators can start/stop/pause a sale, adjust inventory and admit rate safely.
+
+### Non-Functional Requirements (Targets)
+
+- Peak enqueue: ~500k QPS (short burst), ~1M concurrent waiting.
+- Grant issuance: up to ~50k grants/sec aggregate.
+- Reservation attempts: up to ~20k QPS; confirmations: up to ~10k QPS.
+- SLOs (API boundary):
+  - Enqueue/Poll: P99 ~150ms
+  - Reserve: P99 ~200ms
+  - Confirm (excluding provider): P99 ~300ms
+- Consistency (strong where needed):
+  - Grant consumed at most once.
+  - Inventory hold decrements atomically.
+  - Reservation confirmed exactly once.
+
+### Constraints
+
+- Single-SKU flash sale checkout flow.
+- Single write region for sale-critical state.
+- Payments handled by an external provider; only tokens/refs stored.
+
+---
+
+## Simplified Architecture
+
+```mermaid
+flowchart LR
+  Client[Client] --> Edge[CDN + WAF]
+  Edge --> App["Flash Sale API"]
+  App <--> Redis[(Redis)]
+  App <--> DB[(Postgres)]
+  App <--> Pay[Payment Provider]
+```
+
+**Flash Sale API** is a single deployable service (can scale horizontally) with internal modules:
+- Queue & status
+- Admission (grants)
+- Reservation (holds)
+- Orders & payments (webhook + confirm)
+- Admin endpoints
+- Background jobs (admission workers + reconciliation)
+
+---
+
+## Key Invariants
+
+1. **No oversell**: `confirmed_orders + active_holds <= total_inventory`.
+2. **No retry advantage**: admission order is derived from server-assigned sequence, not client polling rate.
+3. **Exactly-once confirmation**: a reservation creates at most one order; duplicate confirms/webhooks are safe.
+4. **Fail closed on uncertainty**: if grant/hold cannot be validated, reject (with safe retry paths via idempotency).
+
+---
+
+## Components
+
+### 1) Edge (CDN + WAF/Bot Defense)
+
+- Serves static content and absorbs bursts.
+- Rate limits enqueue/poll endpoints per IP/device.
+- Challenges suspicious clients (captcha/proof-of-work) before queue entry.
+
+### 2) Flash Sale API (Modular Service)
+
+#### Queue (Virtual Waiting Room)
+Responsibilities:
+- Accept enqueue at very high QPS with minimal work.
+- Assign a stable FIFO sequence per sale/SKU.
+- Provide status hints with graceful degradation.
+
+Redis structures:
+- `seq:{saleId}:{skuId}`: monotonic `INCR` for FIFO sequence.
+- `enq:{saleId}:{skuId}:{userId}`: `SETNX` marker (TTL = sale window) to prevent duplicates.
+- `q:{saleId}:{skuId}`: Redis Stream entry `{seq, userId, enqueueTs}` (append-only).
+
+Token:
+- `queueToken` is an HMAC-signed blob containing `{saleId, skuId, userId, seq}`.
+
+Status hints:
+- `lastIssuedSeq:{saleId}:{skuId}` maintained by admission worker.
+- Position/ETA are computed from `(userSeq - lastIssuedSeq)` and configured admit rate; can degrade to `WAITING` + `pollAfterMs`.
+
+#### Admission (Grants)
+Responsibilities:
+- Issue grants at a controlled rate per sale/SKU.
+- Ensure FIFO admission based on queued sequence.
+- Ensure grants are short-lived and single-use.
+
+Mechanism:
+- A per-(saleId, skuId) **admission worker** reads `q:{saleId}:{skuId}` in order and mints grants up to a Redis token-bucket.
+- Grant token is HMAC-signed (or JWT) with `{saleId, skuId, userId, seq, jti, exp}`.
+
+Redis keys:
+- `bucket:{saleId}:{skuId}`: token bucket state (Lua for atomic refill/consume).
+- `grant:{saleId}:{userId}:{skuId}`: current grant token (TTL to exp) for polling retrieval.
+- `grant_used:{saleId}:{jti}`: `SETNX` + TTL to exp (single-use enforcement).
+
+Policy hooks (optional, simple):
+- Per-user “one active grant per SKU”.
+- Per-user “one active reservation per SKU”.
+
+#### Reservation (Inventory Holds)
+Responsibilities:
+- Atomically hold inventory with TTL.
+- Consume grant exactly once.
+- Return a reservation ID and expiry for checkout.
+
+Redis keys:
+- `inv:{saleId}:{skuId}:available`: integer available.
+- `res:{reservationId}`: hash `{saleId, skuId, userId, qty, expiresAt}` with key TTL = hold TTL.
+- `user_res:{saleId}:{skuId}:{userId}`: optional guard key (TTL = hold TTL).
+
+Atomic reserve (single Lua script):
+1. Validate grant claims (sale/SKU/user/exp).
+2. `SETNX grant_used:{saleId}:{jti}`.
+3. Optional `SETNX user_res:{saleId}:{skuId}:{userId}`.
+4. Check `inv:available >= qty`, then decrement.
+5. Create `res:{reservationId}` with TTL.
+
+Durability:
+- After Redis reserve succeeds, write/update `reservations` in Postgres using `Idempotency-Key` (unique) so retries return the same reservation.
+
+Expiration:
+- Redis TTL releases holds automatically.
+- A periodic reconciler updates Postgres reservation state to `EXPIRED` when the Redis hold is gone.
+
+#### Orders & Payments
+Responsibilities:
+- Confirm a reservation into an order exactly once.
+- Handle payment provider webhooks idempotently.
+- Keep a durable state machine in Postgres.
+
+Approach:
+- `POST /orders/confirm` creates/updates an order and marks the reservation `CONFIRMED` in a single DB transaction (idempotent via `Idempotency-Key` and unique constraints).
+- Webhooks update payment status; events are deduped by provider event ID stored in Postgres.
+
+---
+
+## Data Model (Postgres)
+
+Tables (minimal):
+- `sales(sale_id PK, starts_at, ends_at, status, default_hold_ttl_seconds, created_at, updated_at)`
+- `sale_skus(sale_id, sku_id PK, total_inventory, unit_price, currency, admit_rate_per_sec, updated_at)`
+- `reservations(reservation_id PK, sale_id, sku_id, user_id, qty, state, expires_at, idempotency_key UNIQUE, created_at, updated_at)`
+- `orders(order_id PK, reservation_id UNIQUE, user_id, amount, currency, state, payment_provider_ref UNIQUE NULL, created_at, updated_at)`
+- `payment_events(provider_event_id PK, received_at, payload_json)` for webhook dedupe/audit (optional but practical)
+
+Indexes:
+- `reservations(sale_id, sku_id, user_id, state)`
+- `reservations(expires_at)`
+- unique `orders(reservation_id)`, unique `orders(payment_provider_ref)`
+
+---
+
+## API Design
+
+### Enqueue
+- `POST /v1/sales/{saleId}/skus/{skuId}/enqueue`
+- Response:
+  - `{ "queueToken": "qt_...", "pollAfterMs": 1000, "positionHint": 12450 }`
+- Errors:
+  - `403` abuse/bot
+  - `409` already enqueued (returns same token)
+  - `410` sale ended
+  - `429` rate limited
+
+### Grant Poll
+- `GET /v1/sales/{saleId}/grant?queueToken=...`
+- Response (waiting):
+  - `{ "status": "WAITING", "pollAfterMs": 1500, "positionHint": 8200, "etaHintSeconds": 120 }`
+- Response (admitted):
+  - `{ "status": "ADMITTED", "grantToken": "gt_...", "expiresAt": "..." }`
+
+### Reserve
+- `POST /v1/reservations`
+- Headers: `Idempotency-Key: <uuid>`
+- Body: `{ "grantToken": "...", "saleId": "...", "skuId": "...", "qty": 1 }`
+- Response:
+  - `{ "reservationId": "r_...", "expiresAt": "...", "state": "HELD" }`
+- Errors:
+  - `401` invalid/expired grant
+  - `409` out of stock / grant used / active reservation exists
+  - `429` overloaded (retry with same idempotency key)
+
+### Confirm Order
+- `POST /v1/orders/confirm`
+- Headers: `Idempotency-Key: <uuid>`
+- Body: `{ "reservationId": "r_...", "paymentProviderRef": "pp_..." }`
+- Response:
+  - `{ "orderId": "o_...", "state": "PAID" }` or `{ "orderId": "o_...", "state": "PENDING_PAYMENT" }`
+- Errors:
+  - `409` invalid reservation state / duplicate payment ref
+  - `422` invalid payload
+
+### Admin (examples)
+- `POST /v1/admin/sales/{saleId}/pause`
+- `POST /v1/admin/sales/{saleId}/skus/{skuId}/admit-rate`
+- `POST /v1/admin/sales/{saleId}/skus/{skuId}/inventory`
+
+---
+
+## End-to-End Flow
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant A as Flash Sale API
+  participant R as Redis
+  participant D as Postgres
+  participant P as Payment Provider
+
+  C->>A: Enqueue
+  A->>R: INCR seq + XADD queue entry
+  A-->>C: queueToken + pollAfterMs
+
+  loop Poll
+    C->>A: Grant poll (queueToken)
+    A->>R: Read minted grant (or WAITING)
+    A-->>C: WAITING or ADMITTED(grantToken)
+  end
+
+  C->>A: Reserve (Idempotency-Key)
+  A->>R: Lua reserve (consume grant + dec inv + create hold TTL)
+  A->>D: Upsert reservation (idempotent)
+  A-->>C: reservationId + expiresAt
+
+  C->>A: Confirm (Idempotency-Key)
+  A->>D: Tx: create/update order + confirm reservation
+  A-->>C: order state
+
+  P->>A: Webhook events
+  A->>D: Dedupe + apply state transition
+```
+
+---
+
+## Scaling & Performance
+
+- **Overload protection**: admission rate is the primary control knob; queue/poll endpoints are lightweight and can degrade to minimal responses.
+- **Hot SKU contention**: inventory hold uses a single Redis Lua script to keep reserve to one round-trip and avoid races.
+- **Database pressure**: reservations and orders are single-row upserts with indexed unique constraints; admission can be tuned down based on DB latency/error rate.
+- **Horizontal scaling**: the Flash Sale API is stateless for requests; admission workers partition by `(saleId, skuId)` and can be scaled separately within the same deployment.
+
+---
+
+## Failure Modes & Mitigations
+
+- **Redis unavailable**: pause admission for affected SKUs; reserve/confirm fail closed because holds/grants can’t be validated.
+- **Postgres latency spikes**: reduce admit rate; shed confirm traffic with `429` if necessary; keep transactions minimal.
+- **Redis reserve succeeds but DB write fails**: client retries with same idempotency key; reconciler backfills/repairs reservation state based on Redis holds.
+- **Duplicate/out-of-order webhooks**: dedupe by `provider_event_id` and guard with unique `payment_provider_ref` and `reservation_id`.
+
+---
+
+## Operations
+
+Monitoring essentials:
+- Queue: enqueue QPS, poll QPS, grant issuance rate, `lastIssuedSeq` lag.
+- Reservation: success rate, out-of-stock rate, Redis P99, Lua runtime.
+- DB: transaction P99, error rate, pool saturation.
+- Payments: webhook lag, dedupe rate, confirm success/failure.
+
+Runbook essentials:
+- Pause/resume admission per SKU.
+- Reduce admit rate globally.
+- Disable position/ETA hints (WAITING-only).
+- Trigger reconciliation and generate an inventory audit snapshot.
+
+---
+
+## Simplification Notes
+
+- Removed: Kafka/Pulsar stream; durable workflows use Postgres (orders/reservations/webhook events) and provider retry semantics, keeping the sale-critical path synchronous and small.
+- Removed: Separate Queue/Grant/Reservation/Order services and API gateway; replaced with a single horizontally scalable Flash Sale API with internal modules and background workers to reduce deployment and operational surface area.
+- Merged: Control plane into the same service as admin endpoints (RBAC-protected), so sale tuning and incident actions share the same configuration and runtime signals.
+- Complexity kept: Redis Lua-based holds and single-use grants remain necessary to enforce atomic inventory correctness and exactly-once consumption under extreme contention.
+mcp startup: no servers
+ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Dec 17th, 2025 1:06 AM.
+Warning: no last agent message; wrote empty content to /Users/dominikdabrowski/pr/system-design-atlas/grades/flash-sale-system.json

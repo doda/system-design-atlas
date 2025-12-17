@@ -1,0 +1,2646 @@
+==========================================
+Generating (v2): Distributed Key-Value Store
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-1f06-7f33-8b36-509fd9cfd571
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Distributed Key-Value Store
+**Category**: Storage & Data Platforms
+
+**Problem Statement**:
+Design a Dynamo-style store with tunable consistency, partitioning, and conflict resolution (vector clocks/LWW).
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+thinking
+**Planning node architecture**
+
+I need to focus on partitioning and choose a consistent hashing ring with virtual nodes for effective rebalancing. I previously rejected range sharding due to hotspots. I'm considering a setup with up to 8 nodes but might go with 7: Client, Router/Load Balancer, Coordinator, and three Replica nodes. The diagram needs to be simple, showing connections between Client, Load Balancer, and nodes. I also want to include on-call notes related to latency and maintenance. Alright, let’s produce this!
+codex
+```markdown
+---
+title: "Distributed Key-Value Store (Dynamo-Style)"
+category: "Storage & Data Platforms"
+difficulty: "Hard"
+tags: [dynamo, kv-store, quorum, eventual-consistency, consistent-hashing, vector-clocks, lww]
+---
+
+## Overview
+
+This system is a Dynamo-style distributed key-value store optimized for high availability and predictable latency under partial failure. It shards keys via consistent hashing, replicates each key to `N` nodes, and lets callers tune consistency per operation with quorum reads/writes (`R`, `W`) rather than baking in a single consistency model.
+
+The key insight is to treat *coordination as a per-request behavior, not a fixed leader*: any node can coordinate a read/write using membership data, and correctness comes from (1) quorum intersection when you want it and (2) disciplined conflict handling when you don’t. Everything else stays boring: local LSM storage (RocksDB), gossip membership (SWIM), background repair (Merkle trees), and bounded “make progress anyway” mechanisms (sloppy quorum + hinted handoff).
+
+## What Makes This Hard
+
+Naive implementations underestimate three things:
+
+1. **Metadata growth and conflict semantics**: vector clocks can explode if you attach identity to “writers” incorrectly, and LWW can silently lose updates if you lean on wall clocks.
+2. **Keeping the system “available” without letting entropy win**: sloppy quorum and hinted handoff keep writes flowing during failures, but without aggressive anti-entropy you end up with permanent divergence and strange read behavior.
+3. **Operational safety of deletes and repairs**: tombstones, compaction, and repair jobs interact; get this wrong and you oscillate between resurrected data and disk blowups.
+
+## Requirements
+
+### Functional Requirements
+- `GET(key)`, `PUT(key, value)`, `DELETE(key)` with per-request consistency: choose `R`/`W` (or presets like `ONE`, `QUORUM`, `ALL`).
+- Conflict resolution modes per-namespace:
+  - **Vector-clock**: detect concurrent versions and return siblings to the client (or a server-side merge function).
+  - **LWW**: pick a single winner deterministically using Hybrid Logical Clocks (HLC), not raw wall time.
+- Always-on writes during replica loss via **sloppy quorum**, with eventual convergence via **hinted handoff + anti-entropy**.
+- Bounded staleness mechanisms: **read repair** on quorum reads, plus scheduled background repair.
+- Multi-tenant safety: per-namespace quotas and limits (value size, sibling cap, hint cap).
+
+### Scale Targets
+- **Cluster size**: 50–200 nodes (failure is normal at this size; design must assume constant churn).
+- **Data**: 50 TB logical, ~150 TB physical at `N=3` (capacity planning revolves around replication overhead + compaction).
+- **Throughput**: 100k writes/s, 300k reads/s sustained (forces careful coordination path: no global leader, minimal cross-node chatter).
+- **Latency**: p99 `GET` < 20 ms, p99 `PUT` < 30 ms within a region (makes tail latency under partial failure the real constraint, not average throughput).
+
+## Key Design Decisions
+
+- **Tunable consistency via quorums (`R`,`W`) on `N` replicas**
+  - Chose: quorum reads/writes with coordinator-per-request.
+  - Rejected: single-leader replication (too fragile for tail latency and availability under partitions).
+  - Why: quorums give *a dial*, not a binary choice; `R+W>N` yields strong-ish read-your-writes, while `R=1/W=1` buys availability.
+
+- **Partitioning with consistent hashing + virtual nodes**
+  - Chose: ring with vnodes (e.g., 256 vnodes/node), replication to the next `N` distinct nodes.
+  - Rejected: range sharding (hotspot-prone, painful splits) and centralized partition map (becomes an availability dependency).
+  - Why: vnodes smooth skew and make rebalancing “move many small things” instead of “move a few terrifying things”.
+
+- **Conflict handling as a first-class API choice (Vector Clocks vs LWW/HLC)**
+  - Chose: per-namespace mode: vector clocks (sibling-aware) for correctness-sensitive data; LWW with HLC for simplicity-sensitive data.
+  - Rejected: pretending conflicts don’t exist (you end up with phantom data loss).
+  - Why: the store can’t guess whether overwriting is safe; forcing an explicit mode prevents accidental semantics.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client SDK] --> LB[Request Router]
+  LB --> N1[Any Node<br/>Coordinator]
+
+  subgraph R["Replica Set (N)"]
+    A[Replica Node A]
+    B[Replica Node B]
+    D[Replica Node C]
+  end
+
+  N1 --> A
+  N1 --> B
+  N1 --> D
+
+  N1 <--> G[Gossip (SWIM)]
+  A <--> AE[Anti-Entropy<br/>(Merkle Repair)]
+  B <--> AE
+  D <--> AE
+  N1 --> O[Observability]
+  A --> O
+  B --> O
+  D --> O
+```
+
+### Components
+
+- **Client SDK**
+  - Encodes consistency level (`R`,`W`) and namespace conflict mode expectations.
+  - Retries safely with idempotency tokens for `PUT/DELETE` (prevents “double write” amplification on timeouts).
+
+- **Request Router**
+  - Simple L7 routing to any healthy node; no “smart” partition routing needed because any node can coordinate.
+
+- **Coordinator (Any Node)**
+  - Computes the key’s vnode/token, picks the preference list (replicas), executes quorum logic, and returns either a single value (LWW) or siblings (vector-clock mode).
+  - Owns hedged requests and timeouts to control tail latency.
+
+- **Replica Nodes**
+  - Store data locally in **RocksDB** (LSM), keyed by `(partition, key)` with version metadata.
+  - Maintain per-partition Merkle trees / segment hashes to support efficient divergence detection.
+
+- **Gossip (SWIM)**
+  - Membership + failure suspicion used to build the ring and preference lists without a coordinator service.
+  - Drives “distinct node” selection for replicas (avoid putting multiple replicas on the same failed rack/host class).
+
+- **Anti-Entropy (Merkle Repair)**
+  - Periodically compares partition trees between replicas, pulls missing versions/tombstones, and converges the replica set.
+  - The system stays correct because *repair is guaranteed*, not because failure is rare.
+
+- **Observability**
+  - Critical signals: hint backlog, sibling rate, repair lag, read-repair rate, compaction debt, and coordinator timeout rates.
+
+## Deep Dive: Sloppy Quorums + Conflict Resolution (The Real Dynamo Trick)
+
+A write is a race between *availability* and *agreement*. Dynamo’s answer is: **never block the write on perfect placement**, but always preserve enough information to reconcile later.
+
+### Write Path (PUT/DELETE)
+
+1. **Coordinator selects replicas**: compute the vnode, take the next `N` distinct nodes as the preference list.
+2. **Send writes in parallel** to those `N`. Each replica stores:
+   - The value (or tombstone).
+   - Version metadata:
+     - **Vector-clock mode**: coordinator increments its `(node_id, counter)` entry and attaches the vector clock.
+     - **LWW mode**: coordinator stamps with **HLC** `(physical_time, logical_counter, coordinator_id)` to provide monotonicity without trusting wall clocks.
+3. **Wait for `W` acknowledgements**.
+4. If not enough replicas respond, **sloppy quorum** kicks in:
+   - Coordinator continues down the preference list to healthy nodes and writes “on behalf of” the intended replica set.
+   - These off-target writes are stored as **hints** with a strict cap (bytes + age). If the cap is hit, the write fails fast; unbounded hints are a slow-motion outage.
+
+This design is opinionated about one subtlety: **vector clocks are per-object and per-replica/coordinator identity, not per-client identity**. If you tie clock entries to “clients”, the clock becomes unbounded in any multi-writer scenario. Replica/coordinator IDs are bounded by cluster size, and you can prune dominated entries once repair converges.
+
+### Read Path (GET)
+
+1. Coordinator queries the preference list in parallel.
+2. **Wait for `R` responses**, then:
+   - **LWW mode**: pick the max HLC version; if older versions appear, issue **read repair** to lagging replicas (in the background, never on the critical path).
+   - **Vector-clock mode**: compute partial order:
+     - If one version’s clock dominates all others, return it.
+     - If there are concurrent versions, return **siblings** (bounded to a max; if exceeded, fail the read with a “too many siblings” error to force a domain decision).
+3. If `R=1`, staleness is expected; the system compensates with background repair, not wishful thinking.
+
+### Why Anti-Entropy Is Non-Negotiable
+
+Sloppy quorum and hints keep the system writable during failures, but they *manufacture divergence*. Merkle-tree repair is what turns “we wrote somewhere” into “we wrote correctly” after the network heals. Without it, you get the worst of both worlds: availability during incidents and data inconsistency forever.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| High availability under partitions | Immediate global consistency |
+| Predictable p99 latency (parallelism + hedging) | Higher write amplification (replication + repair) |
+| Operational simplicity (no leader service) | More background work (repair, compaction, tombstones) |
+| Explicit conflict semantics (vector clocks / LWW) | More complexity at API boundary |
+
+## Failure Modes
+
+- **Network partition splits the replica set**
+  - What happens: writes succeed via sloppy quorum; reads may return stale values or siblings.
+  - Detect: elevated coordinator timeouts, mismatch between membership views, rising hint backlog.
+  - Recover: membership stabilizes; hinted handoff drains; anti-entropy repairs partitions until divergence metrics return to baseline.
+
+- **Hint backlog grows without bound (slow-motion outage)**
+  - What happens: disk fills, compaction debt spikes, read latency degrades, then cascading failures.
+  - Detect: hint bytes/age crossing SLO, compaction pending bytes, replica write stalls.
+  - Recover: enforce hard caps + shedding (fail writes rather than hoarding); prioritize handoff and repair; temporarily raise `W` only if you can afford reduced availability.
+
+- **Deletes resurrect (tombstone mishandling)**
+  - What happens: a replica that missed a tombstone later “wins” during repair or LWW.
+  - Detect: resurrection counters, tombstone/put inversion alerts in repair logs.
+  - Recover: treat tombstones as first-class versions that replicate and repair; keep tombstones for `T_gc` > maximum repair interval; never drop tombstones before repair convergence.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Add rack/zone-aware replica placement and admission control tied to compaction debt.
+  - Split “coordinator” and “storage” roles on the same node with isolation (CPU and IO budgets) to protect tail latency.
+
+- **100x scale:**
+  - Move from per-partition Merkle trees to more incremental, streaming repair metadata (Merkle rebuild costs become painful).
+  - Introduce multi-region replication as a separate layer (async log shipping per partition); trying to stretch Dynamo semantics across WAN without a dedicated replication strategy becomes operationally brutal.
+
+## Operational Notes
+
+- `R/W` defaults matter more than features: pick sane presets (`QUORUM` for most reads, `ONE` for latency-sensitive caches, `ALL` only for maintenance).
+- Watch **sibling rate** like an error budget: rising siblings means either too-low `R/W` for the workload or a repair system falling behind.
+- Set `T_gc` (tombstone retention) based on worst-case repair + outage windows; a short `T_gc` is the fastest path to resurrection bugs.
+- Compaction debt is your hidden incident precursor; throttle writes before the LSM falls over.
+- Repair must be schedulable, observable, and bounded; “best effort” repair turns into permanent inconsistency at scale.
+```
+tokens used
+4,643
+```markdown
+---
+title: "Distributed Key-Value Store (Dynamo-Style)"
+category: "Storage & Data Platforms"
+difficulty: "Hard"
+tags: [dynamo, kv-store, quorum, eventual-consistency, consistent-hashing, vector-clocks, lww]
+---
+
+## Overview
+
+This system is a Dynamo-style distributed key-value store optimized for high availability and predictable latency under partial failure. It shards keys via consistent hashing, replicates each key to `N` nodes, and lets callers tune consistency per operation with quorum reads/writes (`R`, `W`) rather than baking in a single consistency model.
+
+The key insight is to treat *coordination as a per-request behavior, not a fixed leader*: any node can coordinate a read/write using membership data, and correctness comes from (1) quorum intersection when you want it and (2) disciplined conflict handling when you don’t. Everything else stays boring: local LSM storage (RocksDB), gossip membership (SWIM), background repair (Merkle trees), and bounded “make progress anyway” mechanisms (sloppy quorum + hinted handoff).
+
+## What Makes This Hard
+
+Naive implementations underestimate three things:
+
+1. **Metadata growth and conflict semantics**: vector clocks can explode if you attach identity to “writers” incorrectly, and LWW can silently lose updates if you lean on wall clocks.
+2. **Keeping the system “available” without letting entropy win**: sloppy quorum and hinted handoff keep writes flowing during failures, but without aggressive anti-entropy you end up with permanent divergence and strange read behavior.
+3. **Operational safety of deletes and repairs**: tombstones, compaction, and repair jobs interact; get this wrong and you oscillate between resurrected data and disk blowups.
+
+## Requirements
+
+### Functional Requirements
+- `GET(key)`, `PUT(key, value)`, `DELETE(key)` with per-request consistency: choose `R`/`W` (or presets like `ONE`, `QUORUM`, `ALL`).
+- Conflict resolution modes per-namespace:
+  - **Vector-clock**: detect concurrent versions and return siblings to the client (or a server-side merge function).
+  - **LWW**: pick a single winner deterministically using Hybrid Logical Clocks (HLC), not raw wall time.
+- Always-on writes during replica loss via **sloppy quorum**, with eventual convergence via **hinted handoff + anti-entropy**.
+- Bounded staleness mechanisms: **read repair** on quorum reads, plus scheduled background repair.
+- Multi-tenant safety: per-namespace quotas and limits (value size, sibling cap, hint cap).
+
+### Scale Targets
+- **Cluster size**: 50–200 nodes (failure is normal at this size; design must assume constant churn).
+- **Data**: 50 TB logical, ~150 TB physical at `N=3` (capacity planning revolves around replication overhead + compaction).
+- **Throughput**: 100k writes/s, 300k reads/s sustained (forces careful coordination path: no global leader, minimal cross-node chatter).
+- **Latency**: p99 `GET` < 20 ms, p99 `PUT` < 30 ms within a region (makes tail latency under partial failure the real constraint, not average throughput).
+
+## Key Design Decisions
+
+- **Tunable consistency via quorums (`R`,`W`) on `N` replicas**
+  - Chose: quorum reads/writes with coordinator-per-request.
+  - Rejected: single-leader replication (too fragile for tail latency and availability under partitions).
+  - Why: quorums give *a dial*, not a binary choice; `R+W>N` yields strong-ish read-your-writes, while `R=1/W=1` buys availability.
+
+- **Partitioning with consistent hashing + virtual nodes**
+  - Chose: ring with vnodes (e.g., 256 vnodes/node), replication to the next `N` distinct nodes.
+  - Rejected: range sharding (hotspot-prone, painful splits) and centralized partition map (becomes an availability dependency).
+  - Why: vnodes smooth skew and make rebalancing “move many small things” instead of “move a few terrifying things”.
+
+- **Conflict handling as a first-class API choice (Vector Clocks vs LWW/HLC)**
+  - Chose: per-namespace mode: vector clocks (sibling-aware) for correctness-sensitive data; LWW with HLC for simplicity-sensitive data.
+  - Rejected: pretending conflicts don’t exist (you end up with phantom data loss).
+  - Why: the store can’t guess whether overwriting is safe; forcing an explicit mode prevents accidental semantics.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client SDK] --> LB[Request Router]
+  LB --> N1[Any Node<br/>Coordinator]
+
+  subgraph R["Replica Set (N)"]
+    A[Replica Node A]
+    B[Replica Node B]
+    D[Replica Node C]
+  end
+
+  N1 --> A
+  N1 --> B
+  N1 --> D
+
+  N1 <--> G[Gossip (SWIM)]
+  A <--> AE[Anti-Entropy<br/>(Merkle Repair)]
+  B <--> AE
+  D <--> AE
+  N1 --> O[Observability]
+  A --> O
+  B --> O
+  D --> O
+```
+
+### Components
+
+- **Client SDK**
+  - Encodes consistency level (`R`,`W`) and namespace conflict mode expectations.
+  - Retries safely with idempotency tokens for `PUT/DELETE` (prevents “double write” amplification on timeouts).
+
+- **Request Router**
+  - Simple L7 routing to any healthy node; no “smart” partition routing needed because any node can coordinate.
+
+- **Coordinator (Any Node)**
+  - Computes the key’s vnode/token, picks the preference list (replicas), executes quorum logic, and returns either a single value (LWW) or siblings (vector-clock mode).
+  - Owns hedged requests and timeouts to control tail latency.
+
+- **Replica Nodes**
+  - Store data locally in **RocksDB** (LSM), keyed by `(partition, key)` with version metadata.
+  - Maintain per-partition Merkle trees / segment hashes to support efficient divergence detection.
+
+- **Gossip (SWIM)**
+  - Membership + failure suspicion used to build the ring and preference lists without a coordinator service.
+  - Drives “distinct node” selection for replicas (avoid putting multiple replicas on the same failed rack/host class).
+
+- **Anti-Entropy (Merkle Repair)**
+  - Periodically compares partition trees between replicas, pulls missing versions/tombstones, and converges the replica set.
+  - The system stays correct because *repair is guaranteed*, not because failure is rare.
+
+- **Observability**
+  - Critical signals: hint backlog, sibling rate, repair lag, read-repair rate, compaction debt, and coordinator timeout rates.
+
+## Deep Dive: Sloppy Quorums + Conflict Resolution (The Real Dynamo Trick)
+
+A write is a race between *availability* and *agreement*. Dynamo’s answer is: **never block the write on perfect placement**, but always preserve enough information to reconcile later.
+
+### Write Path (PUT/DELETE)
+
+1. **Coordinator selects replicas**: compute the vnode, take the next `N` distinct nodes as the preference list.
+2. **Send writes in parallel** to those `N`. Each replica stores:
+   - The value (or tombstone).
+   - Version metadata:
+     - **Vector-clock mode**: coordinator increments its `(node_id, counter)` entry and attaches the vector clock.
+     - **LWW mode**: coordinator stamps with **HLC** `(physical_time, logical_counter, coordinator_id)` to provide monotonicity without trusting wall clocks.
+3. **Wait for `W` acknowledgements**.
+4. If not enough replicas respond, **sloppy quorum** kicks in:
+   - Coordinator continues down the preference list to healthy nodes and writes “on behalf of” the intended replica set.
+   - These off-target writes are stored as **hints** with a strict cap (bytes + age). If the cap is hit, the write fails fast; unbounded hints are a slow-motion outage.
+
+This design is opinionated about one subtlety: **vector clocks are per-object and per-replica/coordinator identity, not per-client identity**. If you tie clock entries to “clients”, the clock becomes unbounded in any multi-writer scenario. Replica/coordinator IDs are bounded by cluster size, and you can prune dominated entries once repair converges.
+
+### Read Path (GET)
+
+1. Coordinator queries the preference list in parallel.
+2. **Wait for `R` responses**, then:
+   - **LWW mode**: pick the max HLC version; if older versions appear, issue **read repair** to lagging replicas (in the background, never on the critical path).
+   - **Vector-clock mode**: compute partial order:
+     - If one version’s clock dominates all others, return it.
+     - If there are concurrent versions, return **siblings** (bounded to a max; if exceeded, fail the read with a “too many siblings” error to force a domain decision).
+3. If `R=1`, staleness is expected; the system compensates with background repair, not wishful thinking.
+
+### Why Anti-Entropy Is Non-Negotiable
+
+Sloppy quorum and hints keep the system writable during failures, but they *manufacture divergence*. Merkle-tree repair is what turns “we wrote somewhere” into “we wrote correctly” after the network heals. Without it, you get the worst of both worlds: availability during incidents and data inconsistency forever.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| High availability under partitions | Immediate global consistency |
+| Predictable p99 latency (parallelism + hedging) | Higher write amplification (replication + repair) |
+| Operational simplicity (no leader service) | More background work (repair, compaction, tombstones) |
+| Explicit conflict semantics (vector clocks / LWW) | More complexity at API boundary |
+
+## Failure Modes
+
+- **Network partition splits the replica set**
+  - What happens: writes succeed via sloppy quorum; reads may return stale values or siblings.
+  - Detect: elevated coordinator timeouts, mismatch between membership views, rising hint backlog.
+  - Recover: membership stabilizes; hinted handoff drains; anti-entropy repairs partitions until divergence metrics return to baseline.
+
+- **Hint backlog grows without bound (slow-motion outage)**
+  - What happens: disk fills, compaction debt spikes, read latency degrades, then cascading failures.
+  - Detect: hint bytes/age crossing SLO, compaction pending bytes, replica write stalls.
+  - Recover: enforce hard caps + shedding (fail writes rather than hoarding); prioritize handoff and repair; temporarily raise `W` only if you can afford reduced availability.
+
+- **Deletes resurrect (tombstone mishandling)**
+  - What happens: a replica that missed a tombstone later “wins” during repair or LWW.
+  - Detect: resurrection counters, tombstone/put inversion alerts in repair logs.
+  - Recover: treat tombstones as first-class versions that replicate and repair; keep tombstones for `T_gc` > maximum repair interval; never drop tombstones before repair convergence.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Add rack/zone-aware replica placement and admission control tied to compaction debt.
+  - Split “coordinator” and “storage” roles on the same node with isolation (CPU and IO budgets) to protect tail latency.
+
+- **100x scale:**
+  - Move from per-partition Merkle trees to more incremental, streaming repair metadata (Merkle rebuild costs become painful).
+  - Introduce multi-region replication as a separate layer (async log shipping per partition); trying to stretch Dynamo semantics across WAN without a dedicated replication strategy becomes operationally brutal.
+
+## Operational Notes
+
+- `R/W` defaults matter more than features: pick sane presets (`QUORUM` for most reads, `ONE` for latency-sensitive caches, `ALL` only for maintenance).
+- Watch **sibling rate** like an error budget: rising siblings means either too-low `R/W` for the workload or a repair system falling behind.
+- Set `T_gc` (tombstone retention) based on worst-case repair + outage windows; a short `T_gc` is the fastest path to resurrection bugs.
+- Compaction debt is your hidden incident precursor; throttle writes before the LSM falls over.
+- Repair must be schedulable, observable, and bounded; “best effort” repair turns into permanent inconsistency at scale.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/distributed-key-value-store.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-9316-7f81-8875-eea50846b215
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Distributed Key-Value Store (Dynamo-Style)"
+category: "Storage & Data Platforms"
+difficulty: "Hard"
+tags: [dynamo, kv-store, quorum, eventual-consistency, consistent-hashing, vector-clocks, lww]
+---
+
+## Overview
+
+This system is a Dynamo-style distributed key-value store optimized for high availability and predictable latency under partial failure. It shards keys via consistent hashing, replicates each key to `N` nodes, and lets callers tune consistency per operation with quorum reads/writes (`R`, `W`) rather than baking in a single consistency model.
+
+The key insight is to treat *coordination as a per-request behavior, not a fixed leader*: any node can coordinate a read/write using membership data, and correctness comes from (1) quorum intersection when you want it and (2) disciplined conflict handling when you don’t. Everything else stays boring: local LSM storage (RocksDB), gossip membership (SWIM), background repair (Merkle trees), and bounded “make progress anyway” mechanisms (sloppy quorum + hinted handoff).
+
+## What Makes This Hard
+
+Naive implementations underestimate three things:
+
+1. **Metadata growth and conflict semantics**: vector clocks can explode if you attach identity to “writers” incorrectly, and LWW can silently lose updates if you lean on wall clocks.
+2. **Keeping the system “available” without letting entropy win**: sloppy quorum and hinted handoff keep writes flowing during failures, but without aggressive anti-entropy you end up with permanent divergence and strange read behavior.
+3. **Operational safety of deletes and repairs**: tombstones, compaction, and repair jobs interact; get this wrong and you oscillate between resurrected data and disk blowups.
+
+## Requirements
+
+### Functional Requirements
+- `GET(key)`, `PUT(key, value)`, `DELETE(key)` with per-request consistency: choose `R`/`W` (or presets like `ONE`, `QUORUM`, `ALL`).
+- Conflict resolution modes per-namespace:
+  - **Vector-clock**: detect concurrent versions and return siblings to the client (or a server-side merge function).
+  - **LWW**: pick a single winner deterministically using Hybrid Logical Clocks (HLC), not raw wall time.
+- Always-on writes during replica loss via **sloppy quorum**, with eventual convergence via **hinted handoff + anti-entropy**.
+- Bounded staleness mechanisms: **read repair** on quorum reads, plus scheduled background repair.
+- Multi-tenant safety: per-namespace quotas and limits (value size, sibling cap, hint cap).
+
+### Scale Targets
+- **Cluster size**: 50–200 nodes (failure is normal at this size; design must assume constant churn).
+- **Data**: 50 TB logical, ~150 TB physical at `N=3` (capacity planning revolves around replication overhead + compaction).
+- **Throughput**: 100k writes/s, 300k reads/s sustained (forces careful coordination path: no global leader, minimal cross-node chatter).
+- **Latency**: p99 `GET` < 20 ms, p99 `PUT` < 30 ms within a region (makes tail latency under partial failure the real constraint, not average throughput).
+
+## Key Design Decisions
+
+- **Tunable consistency via quorums (`R`,`W`) on `N` replicas**
+  - Chose: quorum reads/writes with coordinator-per-request.
+  - Rejected: single-leader replication (too fragile for tail latency and availability under partitions).
+  - Why: quorums give *a dial*, not a binary choice; `R+W>N` yields strong-ish read-your-writes, while `R=1/W=1` buys availability.
+
+- **Partitioning with consistent hashing + virtual nodes**
+  - Chose: ring with vnodes (e.g., 256 vnodes/node), replication to the next `N` distinct nodes.
+  - Rejected: range sharding (hotspot-prone, painful splits) and centralized partition map (becomes an availability dependency).
+  - Why: vnodes smooth skew and make rebalancing “move many small things” instead of “move a few terrifying things”.
+
+- **Conflict handling as a first-class API choice (Vector Clocks vs LWW/HLC)**
+  - Chose: per-namespace mode: vector clocks (sibling-aware) for correctness-sensitive data; LWW with HLC for simplicity-sensitive data.
+  - Rejected: pretending conflicts don’t exist (you end up with phantom data loss).
+  - Why: the store can’t guess whether overwriting is safe; forcing an explicit mode prevents accidental semantics.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client SDK] --> LB[Request Router]
+  LB --> N1[Any Node<br/>Coordinator]
+
+  subgraph R["Replica Set (N)"]
+    A[Replica Node A]
+    B[Replica Node B]
+    D[Replica Node C]
+  end
+
+  N1 --> A
+  N1 --> B
+  N1 --> D
+
+  N1 <--> G[Gossip (SWIM)]
+  A <--> AE[Anti-Entropy<br/>(Merkle Repair)]
+  B <--> AE
+  D <--> AE
+  N1 --> O[Observability]
+  A --> O
+  B --> O
+  D --> O
+```
+
+### Components
+
+- **Client SDK**
+  - Encodes consistency level (`R`,`W`) and namespace conflict mode expectations.
+  - Retries safely with idempotency tokens for `PUT/DELETE` (prevents “double write” amplification on timeouts).
+
+- **Request Router**
+  - Simple L7 routing to any healthy node; no “smart” partition routing needed because any node can coordinate.
+
+- **Coordinator (Any Node)**
+  - Computes the key’s vnode/token, picks the preference list (replicas), executes quorum logic, and returns either a single value (LWW) or siblings (vector-clock mode).
+  - Owns hedged requests and timeouts to control tail latency.
+
+- **Replica Nodes**
+  - Store data locally in **RocksDB** (LSM), keyed by `(partition, key)` with version metadata.
+  - Maintain per-partition Merkle trees / segment hashes to support efficient divergence detection.
+
+- **Gossip (SWIM)**
+  - Membership + failure suspicion used to build the ring and preference lists without a coordinator service.
+  - Drives “distinct node” selection for replicas (avoid putting multiple replicas on the same failed rack/host class).
+
+- **Anti-Entropy (Merkle Repair)**
+  - Periodically compares partition trees between replicas, pulls missing versions/tombstones, and converges the replica set.
+  - The system stays correct because *repair is guaranteed*, not because failure is rare.
+
+- **Observability**
+  - Critical signals: hint backlog, sibling rate, repair lag, read-repair rate, compaction debt, and coordinator timeout rates.
+
+## Deep Dive: Sloppy Quorums + Conflict Resolution (The Real Dynamo Trick)
+
+A write is a race between *availability* and *agreement*. Dynamo’s answer is: **never block the write on perfect placement**, but always preserve enough information to reconcile later.
+
+### Write Path (PUT/DELETE)
+
+1. **Coordinator selects replicas**: compute the vnode, take the next `N` distinct nodes as the preference list.
+2. **Send writes in parallel** to those `N`. Each replica stores:
+   - The value (or tombstone).
+   - Version metadata:
+     - **Vector-clock mode**: coordinator increments its `(node_id, counter)` entry and attaches the vector clock.
+     - **LWW mode**: coordinator stamps with **HLC** `(physical_time, logical_counter, coordinator_id)` to provide monotonicity without trusting wall clocks.
+3. **Wait for `W` acknowledgements**.
+4. If not enough replicas respond, **sloppy quorum** kicks in:
+   - Coordinator continues down the preference list to healthy nodes and writes “on behalf of” the intended replica set.
+   - These off-target writes are stored as **hints** with a strict cap (bytes + age). If the cap is hit, the write fails fast; unbounded hints are a slow-motion outage.
+
+This design is opinionated about one subtlety: **vector clocks are per-object and per-replica/coordinator identity, not per-client identity**. If you tie clock entries to “clients”, the clock becomes unbounded in any multi-writer scenario. Replica/coordinator IDs are bounded by cluster size, and you can prune dominated entries once repair converges.
+
+### Read Path (GET)
+
+1. Coordinator queries the preference list in parallel.
+2. **Wait for `R` responses**, then:
+   - **LWW mode**: pick the max HLC version; if older versions appear, issue **read repair** to lagging replicas (in the background, never on the critical path).
+   - **Vector-clock mode**: compute partial order:
+     - If one version’s clock dominates all others, return it.
+     - If there are concurrent versions, return **siblings** (bounded to a max; if exceeded, fail the read with a “too many siblings” error to force a domain decision).
+3. If `R=1`, staleness is expected; the system compensates with background repair, not wishful thinking.
+
+### Why Anti-Entropy Is Non-Negotiable
+
+Sloppy quorum and hints keep the system writable during failures, but they *manufacture divergence*. Merkle-tree repair is what turns “we wrote somewhere” into “we wrote correctly” after the network heals. Without it, you get the worst of both worlds: availability during incidents and data inconsistency forever.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| High availability under partitions | Immediate global consistency |
+| Predictable p99 latency (parallelism + hedging) | Higher write amplification (replication + repair) |
+| Operational simplicity (no leader service) | More background work (repair, compaction, tombstones) |
+| Explicit conflict semantics (vector clocks / LWW) | More complexity at API boundary |
+
+## Failure Modes
+
+- **Network partition splits the replica set**
+  - What happens: writes succeed via sloppy quorum; reads may return stale values or siblings.
+  - Detect: elevated coordinator timeouts, mismatch between membership views, rising hint backlog.
+  - Recover: membership stabilizes; hinted handoff drains; anti-entropy repairs partitions until divergence metrics return to baseline.
+
+- **Hint backlog grows without bound (slow-motion outage)**
+  - What happens: disk fills, compaction debt spikes, read latency degrades, then cascading failures.
+  - Detect: hint bytes/age crossing SLO, compaction pending bytes, replica write stalls.
+  - Recover: enforce hard caps + shedding (fail writes rather than hoarding); prioritize handoff and repair; temporarily raise `W` only if you can afford reduced availability.
+
+- **Deletes resurrect (tombstone mishandling)**
+  - What happens: a replica that missed a tombstone later “wins” during repair or LWW.
+  - Detect: resurrection counters, tombstone/put inversion alerts in repair logs.
+  - Recover: treat tombstones as first-class versions that replicate and repair; keep tombstones for `T_gc` > maximum repair interval; never drop tombstones before repair convergence.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Add rack/zone-aware replica placement and admission control tied to compaction debt.
+  - Split “coordinator” and “storage” roles on the same node with isolation (CPU and IO budgets) to protect tail latency.
+
+- **100x scale:**
+  - Move from per-partition Merkle trees to more incremental, streaming repair metadata (Merkle rebuild costs become painful).
+  - Introduce multi-region replication as a separate layer (async log shipping per partition); trying to stretch Dynamo semantics across WAN without a dedicated replication strategy becomes operationally brutal.
+
+## Operational Notes
+
+- `R/W` defaults matter more than features: pick sane presets (`QUORUM` for most reads, `ONE` for latency-sensitive caches, `ALL` only for maintenance).
+- Watch **sibling rate** like an error budget: rising siblings means either too-low `R/W` for the workload or a repair system falling behind.
+- Set `T_gc` (tombstone retention) based on worst-case repair + outage windows; a short `T_gc` is the fastest path to resurrection bugs.
+- Compaction debt is your hidden incident precursor; throttle writes before the LSM falls over.
+- Repair must be schedulable, observable, and bounded; “best effort” repair turns into permanent inconsistency at scale.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+thinking
+**Critiquing a design**
+
+The user is asking for a structured critique of a design without needing tools. I think it’s good to mention simpler alternatives, like using an existing database instead. While this design follows a Dynamo-style, it’s worth questioning the need for a custom store—suggesting options like Cassandra or Riak. I also want to highlight details around vector clock growth and HLC.
+
+I’ll include a components table and pinpoint simplification opportunities. Overall, I’m aiming to keep it concise yet informative.
+thinking
+**Exploring alternatives and failure scenarios**
+
+I need to mention proven alternatives like Cassandra or Scylla, or even DynamoDB. I’ll also suggest using etcd for metadata rather than for data. The design includes elements like SWIM, so it might be helpful to simplify with existing libraries such as memberlist or Hashicorp.
+
+For stress testing, I should consider scenarios where the database goes down, like local RocksDB issues, compaction stalls, and other failures, including membership divergence and coordinator failures. It's important to cover these failure scenarios thoroughly.
+thinking
+**Providing recommendations for improvements**
+
+I need to recommend fixing some key aspects, like defining the exact consistency semantics, ensuring replica write idempotency and managing deletes. It's also crucial to handle handoff interplay and membership epochs. I should consider defining invariants for HLC and conflict resolution.
+
+Using "dotted version vectors" could help reduce metadata. For efficiency, I might suggest adaptive timeouts and multi-tenant quotas. 
+
+Additionally, while it's nice to have tools for chaos tests and admin APIs, what's currently working well includes clear conflict semantics and an emphasis on repair. This will guide our structured output.
+codex
+## Elegance Check
+
+### The Core Insight
+Treat coordination as *per-request* (any node can coordinate) and make correctness come from a small set of disciplined mechanisms: quorum intersection when you want it, explicit conflict semantics when you don’t, and mandatory anti-entropy to clean up the mess that “stay available” features intentionally create.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Coordinator (any node) | Removes a leader dependency and lets you trade latency/availability per request via `R/W`, hedging, and timeouts. |
+| RocksDB (LSM) | Proven local durability + predictable single-node performance; lets you focus novelty on distributed behavior. |
+| Sloppy quorum + hinted handoff (capped) | Maintains write availability during partial failure while keeping the “damage” bounded and observable. |
+| Anti-entropy repair | The converger that makes the availability story honest; without it, divergence becomes permanent state. |
+| Conflict modes (vector clock vs LWW/HLC) | Forces explicit semantics instead of silent data loss; lets namespaces pick correctness vs simplicity. |
+| Observability (hint/repair/sibling/compaction signals) | The difference between “eventual consistency” and “eventual chaos” is whether operators can see and bound the backlog. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Building a full Dynamo-style store | Use Scylla/Cassandra/Riak (or DynamoDB) and document where you’d extend/operate it | Less bespoke control/learning; dramatically lower ops+correctness risk. |
+| SWIM gossip for membership + ring | Use a well-tested library (e.g., memberlist) and keep “ring math” separate/pure | Less flexibility in failure detector tuning; big reliability win. |
+| Merkle trees per partition | Start with “repair by log/segment checksum” (coarse-grained) or periodic full range-hash on small partitions | More bandwidth/CPU during repair; simpler implementation path and fewer edge cases early. |
+| Vector clocks as the primary sibling mechanism | Use dotted version vectors (DVV) / “dot + causal context” | More complex conceptually than VC; significantly better metadata growth behavior in practice. |
+| Any-node coordination always | Add token-aware routing (router/client picks a coordinator in the preference list) | Slightly more routing complexity; fewer cross-node hops and better p99 under load. |
+| LWW with HLC only | Offer “LWW + tie-breaker + read-your-writes token” as the default API; keep VC only for opt-in namespaces | Gives weaker semantics than causal tracking everywhere; simpler for most tenants and reduces sibling operational burden. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Membership split-brain (gossip partition yields different rings)**
+   - Design’s answer: partially addressed (mentions mismatch between membership views, timeouts, hints)
+   - Recommendation: Strengthen  
+   You need an explicit notion of *ring epoch/config version* and rules for when a node will coordinate/accept writes under uncertain membership (otherwise you can write “correctly” to the wrong replica set for minutes).
+
+2. **Coordinator crashes after `W` acks but before replying (client retries)**
+   - Design’s answer: addressed via idempotency tokens in SDK
+   - Recommendation: Strengthen  
+   Make idempotency real end-to-end: replicas must persist a `(token → result/version)` cache (bounded/TTL) or make `PUT` conditional on version/context; otherwise retries can create extra siblings or overwrite under LWW.
+
+3. **Disk/LSM distress (compaction debt spikes, write stalls, tail latency collapse)**
+   - Design’s answer: addressed at a monitoring level (“compaction debt… throttle writes”)
+   - Recommendation: Strengthen  
+   Define concrete admission control: per-node write-rate limiting tied to memtable flush/level0 files, and coordinator behavior when replicas are “slow-but-alive” (e.g., temporarily treat as non-ackable, adjust hedges, and surface a clear overload signal).
+
+4. **Tombstone GC races repair (delete resurrection)**
+   - Design’s answer: addressed (tombstones as versions, `T_gc` > max repair interval)
+   - Recommendation: Strengthen  
+   Specify *how* you prove “repair convergence” for a key-range before GC (watermarks/repair epochs). Time-based `T_gc` alone tends to fail during long incidents + operator pauses.
+
+5. **Traffic 10x + hotspot keys**
+   - Design’s answer: not addressed
+   - Recommendation: Strengthen  
+   Dynamo-style rings don’t fix per-key hotspots. You likely need: request coalescing for hot reads, per-key rate limits, optional client-side sharding (key salting) for specific namespaces, and a “hot partition” alert tied to vnode/key metrics.
+
+## Recommendations
+
+### Must Fix
+- Define membership/ring safety: ring epoching, coordination rules under disagreement, and how preference lists change during churn.
+- Make retries truly idempotent at replicas (token persistence/TTL) and define semantics for “timeout but maybe committed”.
+- Specify overload behavior (slow replicas, compaction stalls, disk-full): what the coordinator does and what errors clients see.
+
+### Should Consider
+- Prefer DVV (or similar) over raw vector clocks for sibling-heavy namespaces to bound metadata and reduce pathological growth.
+- Add token-aware routing to reduce coordination hops and improve p99 under load.
+- Clarify default semantics per mode (e.g., what clients must supply/retain for VC mode; what “read-your-writes” means under LWW).
+
+### Nice to Have
+- Operator “break glass” controls: pause repair, cap handoff bandwidth, force drain hints, per-namespace SLO dashboards.
+- A small chaos/regression suite focused on: membership churn, retry storms, tombstone GC, and repair lag.
+
+## What's Working Well
+- The design is honest that sloppy quorum manufactures divergence and that anti-entropy is mandatory to pay that debt down.
+- You explicitly cap the dangerous queues (hints/siblings) and tie them to observability, which is the right operational posture.
+- Calling out tombstones/compaction/repair interactions upfront is rare and exactly what prevents “works in the lab, corrupts in prod” outcomes.
+tokens used
+5,545
+## Elegance Check
+
+### The Core Insight
+Treat coordination as *per-request* (any node can coordinate) and make correctness come from a small set of disciplined mechanisms: quorum intersection when you want it, explicit conflict semantics when you don’t, and mandatory anti-entropy to clean up the mess that “stay available” features intentionally create.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Coordinator (any node) | Removes a leader dependency and lets you trade latency/availability per request via `R/W`, hedging, and timeouts. |
+| RocksDB (LSM) | Proven local durability + predictable single-node performance; lets you focus novelty on distributed behavior. |
+| Sloppy quorum + hinted handoff (capped) | Maintains write availability during partial failure while keeping the “damage” bounded and observable. |
+| Anti-entropy repair | The converger that makes the availability story honest; without it, divergence becomes permanent state. |
+| Conflict modes (vector clock vs LWW/HLC) | Forces explicit semantics instead of silent data loss; lets namespaces pick correctness vs simplicity. |
+| Observability (hint/repair/sibling/compaction signals) | The difference between “eventual consistency” and “eventual chaos” is whether operators can see and bound the backlog. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Building a full Dynamo-style store | Use Scylla/Cassandra/Riak (or DynamoDB) and document where you’d extend/operate it | Less bespoke control/learning; dramatically lower ops+correctness risk. |
+| SWIM gossip for membership + ring | Use a well-tested library (e.g., memberlist) and keep “ring math” separate/pure | Less flexibility in failure detector tuning; big reliability win. |
+| Merkle trees per partition | Start with “repair by log/segment checksum” (coarse-grained) or periodic full range-hash on small partitions | More bandwidth/CPU during repair; simpler implementation path and fewer edge cases early. |
+| Vector clocks as the primary sibling mechanism | Use dotted version vectors (DVV) / “dot + causal context” | More complex conceptually than VC; significantly better metadata growth behavior in practice. |
+| Any-node coordination always | Add token-aware routing (router/client picks a coordinator in the preference list) | Slightly more routing complexity; fewer cross-node hops and better p99 under load. |
+| LWW with HLC only | Offer “LWW + tie-breaker + read-your-writes token” as the default API; keep VC only for opt-in namespaces | Gives weaker semantics than causal tracking everywhere; simpler for most tenants and reduces sibling operational burden. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Membership split-brain (gossip partition yields different rings)**
+   - Design’s answer: partially addressed (mentions mismatch between membership views, timeouts, hints)
+   - Recommendation: Strengthen  
+   You need an explicit notion of *ring epoch/config version* and rules for when a node will coordinate/accept writes under uncertain membership (otherwise you can write “correctly” to the wrong replica set for minutes).
+
+2. **Coordinator crashes after `W` acks but before replying (client retries)**
+   - Design’s answer: addressed via idempotency tokens in SDK
+   - Recommendation: Strengthen  
+   Make idempotency real end-to-end: replicas must persist a `(token → result/version)` cache (bounded/TTL) or make `PUT` conditional on version/context; otherwise retries can create extra siblings or overwrite under LWW.
+
+3. **Disk/LSM distress (compaction debt spikes, write stalls, tail latency collapse)**
+   - Design’s answer: addressed at a monitoring level (“compaction debt… throttle writes”)
+   - Recommendation: Strengthen  
+   Define concrete admission control: per-node write-rate limiting tied to memtable flush/level0 files, and coordinator behavior when replicas are “slow-but-alive” (e.g., temporarily treat as non-ackable, adjust hedges, and surface a clear overload signal).
+
+4. **Tombstone GC races repair (delete resurrection)**
+   - Design’s answer: addressed (tombstones as versions, `T_gc` > max repair interval)
+   - Recommendation: Strengthen  
+   Specify *how* you prove “repair convergence” for a key-range before GC (watermarks/repair epochs). Time-based `T_gc` alone tends to fail during long incidents + operator pauses.
+
+5. **Traffic 10x + hotspot keys**
+   - Design’s answer: not addressed
+   - Recommendation: Strengthen  
+   Dynamo-style rings don’t fix per-key hotspots. You likely need: request coalescing for hot reads, per-key rate limits, optional client-side sharding (key salting) for specific namespaces, and a “hot partition” alert tied to vnode/key metrics.
+
+## Recommendations
+
+### Must Fix
+- Define membership/ring safety: ring epoching, coordination rules under disagreement, and how preference lists change during churn.
+- Make retries truly idempotent at replicas (token persistence/TTL) and define semantics for “timeout but maybe committed”.
+- Specify overload behavior (slow replicas, compaction stalls, disk-full): what the coordinator does and what errors clients see.
+
+### Should Consider
+- Prefer DVV (or similar) over raw vector clocks for sibling-heavy namespaces to bound metadata and reduce pathological growth.
+- Add token-aware routing to reduce coordination hops and improve p99 under load.
+- Clarify default semantics per mode (e.g., what clients must supply/retain for VC mode; what “read-your-writes” means under LWW).
+
+### Nice to Have
+- Operator “break glass” controls: pause repair, cap handoff bandwidth, force drain hints, per-namespace SLO dashboards.
+- A small chaos/regression suite focused on: membership churn, retry storms, tombstone GC, and repair lag.
+
+## What's Working Well
+- The design is honest that sloppy quorum manufactures divergence and that anti-entropy is mandatory to pay that debt down.
+- You explicitly cap the dangerous queues (hints/siblings) and tie them to observability, which is the right operational posture.
+- Calling out tombstones/compaction/repair interactions upfront is rare and exactly what prevents “works in the lab, corrupts in prod” outcomes.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/distributed-key-value-store.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afb-2c1a-7871-a320-dcbb7af3fc1d
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Distributed Key-Value Store (Dynamo-Style)"
+category: "Storage & Data Platforms"
+difficulty: "Hard"
+tags: [dynamo, kv-store, quorum, eventual-consistency, consistent-hashing, vector-clocks, lww]
+---
+
+## Overview
+
+This system is a Dynamo-style distributed key-value store optimized for high availability and predictable latency under partial failure. It shards keys via consistent hashing, replicates each key to `N` nodes, and lets callers tune consistency per operation with quorum reads/writes (`R`, `W`) rather than baking in a single consistency model.
+
+The key insight is to treat *coordination as a per-request behavior, not a fixed leader*: any node can coordinate a read/write using membership data, and correctness comes from (1) quorum intersection when you want it and (2) disciplined conflict handling when you don’t. Everything else stays boring: local LSM storage (RocksDB), gossip membership (SWIM), background repair (Merkle trees), and bounded “make progress anyway” mechanisms (sloppy quorum + hinted handoff).
+
+## What Makes This Hard
+
+Naive implementations underestimate three things:
+
+1. **Metadata growth and conflict semantics**: vector clocks can explode if you attach identity to “writers” incorrectly, and LWW can silently lose updates if you lean on wall clocks.
+2. **Keeping the system “available” without letting entropy win**: sloppy quorum and hinted handoff keep writes flowing during failures, but without aggressive anti-entropy you end up with permanent divergence and strange read behavior.
+3. **Operational safety of deletes and repairs**: tombstones, compaction, and repair jobs interact; get this wrong and you oscillate between resurrected data and disk blowups.
+
+## Requirements
+
+### Functional Requirements
+- `GET(key)`, `PUT(key, value)`, `DELETE(key)` with per-request consistency: choose `R`/`W` (or presets like `ONE`, `QUORUM`, `ALL`).
+- Conflict resolution modes per-namespace:
+  - **Vector-clock**: detect concurrent versions and return siblings to the client (or a server-side merge function).
+  - **LWW**: pick a single winner deterministically using Hybrid Logical Clocks (HLC), not raw wall time.
+- Always-on writes during replica loss via **sloppy quorum**, with eventual convergence via **hinted handoff + anti-entropy**.
+- Bounded staleness mechanisms: **read repair** on quorum reads, plus scheduled background repair.
+- Multi-tenant safety: per-namespace quotas and limits (value size, sibling cap, hint cap).
+
+### Scale Targets
+- **Cluster size**: 50–200 nodes (failure is normal at this size; design must assume constant churn).
+- **Data**: 50 TB logical, ~150 TB physical at `N=3` (capacity planning revolves around replication overhead + compaction).
+- **Throughput**: 100k writes/s, 300k reads/s sustained (forces careful coordination path: no global leader, minimal cross-node chatter).
+- **Latency**: p99 `GET` < 20 ms, p99 `PUT` < 30 ms within a region (makes tail latency under partial failure the real constraint, not average throughput).
+
+## Key Design Decisions
+
+- **Tunable consistency via quorums (`R`,`W`) on `N` replicas**
+  - Chose: quorum reads/writes with coordinator-per-request.
+  - Rejected: single-leader replication (too fragile for tail latency and availability under partitions).
+  - Why: quorums give *a dial*, not a binary choice; `R+W>N` yields strong-ish read-your-writes, while `R=1/W=1` buys availability.
+
+- **Partitioning with consistent hashing + virtual nodes**
+  - Chose: ring with vnodes (e.g., 256 vnodes/node), replication to the next `N` distinct nodes.
+  - Rejected: range sharding (hotspot-prone, painful splits) and centralized partition map (becomes an availability dependency).
+  - Why: vnodes smooth skew and make rebalancing “move many small things” instead of “move a few terrifying things”.
+
+- **Conflict handling as a first-class API choice (Vector Clocks vs LWW/HLC)**
+  - Chose: per-namespace mode: vector clocks (sibling-aware) for correctness-sensitive data; LWW with HLC for simplicity-sensitive data.
+  - Rejected: pretending conflicts don’t exist (you end up with phantom data loss).
+  - Why: the store can’t guess whether overwriting is safe; forcing an explicit mode prevents accidental semantics.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client SDK] --> LB[Request Router]
+  LB --> N1[Any Node<br/>Coordinator]
+
+  subgraph R["Replica Set (N)"]
+    A[Replica Node A]
+    B[Replica Node B]
+    D[Replica Node C]
+  end
+
+  N1 --> A
+  N1 --> B
+  N1 --> D
+
+  N1 <--> G[Gossip (SWIM)]
+  A <--> AE[Anti-Entropy<br/>(Merkle Repair)]
+  B <--> AE
+  D <--> AE
+  N1 --> O[Observability]
+  A --> O
+  B --> O
+  D --> O
+```
+
+### Components
+
+- **Client SDK**
+  - Encodes consistency level (`R`,`W`) and namespace conflict mode expectations.
+  - Retries safely with idempotency tokens for `PUT/DELETE` (prevents “double write” amplification on timeouts).
+
+- **Request Router**
+  - Simple L7 routing to any healthy node; no “smart” partition routing needed because any node can coordinate.
+
+- **Coordinator (Any Node)**
+  - Computes the key’s vnode/token, picks the preference list (replicas), executes quorum logic, and returns either a single value (LWW) or siblings (vector-clock mode).
+  - Owns hedged requests and timeouts to control tail latency.
+
+- **Replica Nodes**
+  - Store data locally in **RocksDB** (LSM), keyed by `(partition, key)` with version metadata.
+  - Maintain per-partition Merkle trees / segment hashes to support efficient divergence detection.
+
+- **Gossip (SWIM)**
+  - Membership + failure suspicion used to build the ring and preference lists without a coordinator service.
+  - Drives “distinct node” selection for replicas (avoid putting multiple replicas on the same failed rack/host class).
+
+- **Anti-Entropy (Merkle Repair)**
+  - Periodically compares partition trees between replicas, pulls missing versions/tombstones, and converges the replica set.
+  - The system stays correct because *repair is guaranteed*, not because failure is rare.
+
+- **Observability**
+  - Critical signals: hint backlog, sibling rate, repair lag, read-repair rate, compaction debt, and coordinator timeout rates.
+
+## Deep Dive: Sloppy Quorums + Conflict Resolution (The Real Dynamo Trick)
+
+A write is a race between *availability* and *agreement*. Dynamo’s answer is: **never block the write on perfect placement**, but always preserve enough information to reconcile later.
+
+### Write Path (PUT/DELETE)
+
+1. **Coordinator selects replicas**: compute the vnode, take the next `N` distinct nodes as the preference list.
+2. **Send writes in parallel** to those `N`. Each replica stores:
+   - The value (or tombstone).
+   - Version metadata:
+     - **Vector-clock mode**: coordinator increments its `(node_id, counter)` entry and attaches the vector clock.
+     - **LWW mode**: coordinator stamps with **HLC** `(physical_time, logical_counter, coordinator_id)` to provide monotonicity without trusting wall clocks.
+3. **Wait for `W` acknowledgements**.
+4. If not enough replicas respond, **sloppy quorum** kicks in:
+   - Coordinator continues down the preference list to healthy nodes and writes “on behalf of” the intended replica set.
+   - These off-target writes are stored as **hints** with a strict cap (bytes + age). If the cap is hit, the write fails fast; unbounded hints are a slow-motion outage.
+
+This design is opinionated about one subtlety: **vector clocks are per-object and per-replica/coordinator identity, not per-client identity**. If you tie clock entries to “clients”, the clock becomes unbounded in any multi-writer scenario. Replica/coordinator IDs are bounded by cluster size, and you can prune dominated entries once repair converges.
+
+### Read Path (GET)
+
+1. Coordinator queries the preference list in parallel.
+2. **Wait for `R` responses**, then:
+   - **LWW mode**: pick the max HLC version; if older versions appear, issue **read repair** to lagging replicas (in the background, never on the critical path).
+   - **Vector-clock mode**: compute partial order:
+     - If one version’s clock dominates all others, return it.
+     - If there are concurrent versions, return **siblings** (bounded to a max; if exceeded, fail the read with a “too many siblings” error to force a domain decision).
+3. If `R=1`, staleness is expected; the system compensates with background repair, not wishful thinking.
+
+### Why Anti-Entropy Is Non-Negotiable
+
+Sloppy quorum and hints keep the system writable during failures, but they *manufacture divergence*. Merkle-tree repair is what turns “we wrote somewhere” into “we wrote correctly” after the network heals. Without it, you get the worst of both worlds: availability during incidents and data inconsistency forever.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| High availability under partitions | Immediate global consistency |
+| Predictable p99 latency (parallelism + hedging) | Higher write amplification (replication + repair) |
+| Operational simplicity (no leader service) | More background work (repair, compaction, tombstones) |
+| Explicit conflict semantics (vector clocks / LWW) | More complexity at API boundary |
+
+## Failure Modes
+
+- **Network partition splits the replica set**
+  - What happens: writes succeed via sloppy quorum; reads may return stale values or siblings.
+  - Detect: elevated coordinator timeouts, mismatch between membership views, rising hint backlog.
+  - Recover: membership stabilizes; hinted handoff drains; anti-entropy repairs partitions until divergence metrics return to baseline.
+
+- **Hint backlog grows without bound (slow-motion outage)**
+  - What happens: disk fills, compaction debt spikes, read latency degrades, then cascading failures.
+  - Detect: hint bytes/age crossing SLO, compaction pending bytes, replica write stalls.
+  - Recover: enforce hard caps + shedding (fail writes rather than hoarding); prioritize handoff and repair; temporarily raise `W` only if you can afford reduced availability.
+
+- **Deletes resurrect (tombstone mishandling)**
+  - What happens: a replica that missed a tombstone later “wins” during repair or LWW.
+  - Detect: resurrection counters, tombstone/put inversion alerts in repair logs.
+  - Recover: treat tombstones as first-class versions that replicate and repair; keep tombstones for `T_gc` > maximum repair interval; never drop tombstones before repair convergence.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Add rack/zone-aware replica placement and admission control tied to compaction debt.
+  - Split “coordinator” and “storage” roles on the same node with isolation (CPU and IO budgets) to protect tail latency.
+
+- **100x scale:**
+  - Move from per-partition Merkle trees to more incremental, streaming repair metadata (Merkle rebuild costs become painful).
+  - Introduce multi-region replication as a separate layer (async log shipping per partition); trying to stretch Dynamo semantics across WAN without a dedicated replication strategy becomes operationally brutal.
+
+## Operational Notes
+
+- `R/W` defaults matter more than features: pick sane presets (`QUORUM` for most reads, `ONE` for latency-sensitive caches, `ALL` only for maintenance).
+- Watch **sibling rate** like an error budget: rising siblings means either too-low `R/W` for the workload or a repair system falling behind.
+- Set `T_gc` (tombstone retention) based on worst-case repair + outage windows; a short `T_gc` is the fastest path to resurrection bugs.
+- Compaction debt is your hidden incident precursor; throttle writes before the LSM falls over.
+- Repair must be schedulable, observable, and bounded; “best effort” repair turns into permanent inconsistency at scale.
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Treat coordination as *per-request* (any node can coordinate) and make correctness come from a small set of disciplined mechanisms: quorum intersection when you want it, explicit conflict semantics when you don’t, and mandatory anti-entropy to clean up the mess that “stay available” features intentionally create.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Coordinator (any node) | Removes a leader dependency and lets you trade latency/availability per request via `R/W`, hedging, and timeouts. |
+| RocksDB (LSM) | Proven local durability + predictable single-node performance; lets you focus novelty on distributed behavior. |
+| Sloppy quorum + hinted handoff (capped) | Maintains write availability during partial failure while keeping the “damage” bounded and observable. |
+| Anti-entropy repair | The converger that makes the availability story honest; without it, divergence becomes permanent state. |
+| Conflict modes (vector clock vs LWW/HLC) | Forces explicit semantics instead of silent data loss; lets namespaces pick correctness vs simplicity. |
+| Observability (hint/repair/sibling/compaction signals) | The difference between “eventual consistency” and “eventual chaos” is whether operators can see and bound the backlog. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Building a full Dynamo-style store | Use Scylla/Cassandra/Riak (or DynamoDB) and document where you’d extend/operate it | Less bespoke control/learning; dramatically lower ops+correctness risk. |
+| SWIM gossip for membership + ring | Use a well-tested library (e.g., memberlist) and keep “ring math” separate/pure | Less flexibility in failure detector tuning; big reliability win. |
+| Merkle trees per partition | Start with “repair by log/segment checksum” (coarse-grained) or periodic full range-hash on small partitions | More bandwidth/CPU during repair; simpler implementation path and fewer edge cases early. |
+| Vector clocks as the primary sibling mechanism | Use dotted version vectors (DVV) / “dot + causal context” | More complex conceptually than VC; significantly better metadata growth behavior in practice. |
+| Any-node coordination always | Add token-aware routing (router/client picks a coordinator in the preference list) | Slightly more routing complexity; fewer cross-node hops and better p99 under load. |
+| LWW with HLC only | Offer “LWW + tie-breaker + read-your-writes token” as the default API; keep VC only for opt-in namespaces | Gives weaker semantics than causal tracking everywhere; simpler for most tenants and reduces sibling operational burden. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Membership split-brain (gossip partition yields different rings)**
+   - Design’s answer: partially addressed (mentions mismatch between membership views, timeouts, hints)
+   - Recommendation: Strengthen  
+   You need an explicit notion of *ring epoch/config version* and rules for when a node will coordinate/accept writes under uncertain membership (otherwise you can write “correctly” to the wrong replica set for minutes).
+
+2. **Coordinator crashes after `W` acks but before replying (client retries)**
+   - Design’s answer: addressed via idempotency tokens in SDK
+   - Recommendation: Strengthen  
+   Make idempotency real end-to-end: replicas must persist a `(token → result/version)` cache (bounded/TTL) or make `PUT` conditional on version/context; otherwise retries can create extra siblings or overwrite under LWW.
+
+3. **Disk/LSM distress (compaction debt spikes, write stalls, tail latency collapse)**
+   - Design’s answer: addressed at a monitoring level (“compaction debt… throttle writes”)
+   - Recommendation: Strengthen  
+   Define concrete admission control: per-node write-rate limiting tied to memtable flush/level0 files, and coordinator behavior when replicas are “slow-but-alive” (e.g., temporarily treat as non-ackable, adjust hedges, and surface a clear overload signal).
+
+4. **Tombstone GC races repair (delete resurrection)**
+   - Design’s answer: addressed (tombstones as versions, `T_gc` > max repair interval)
+   - Recommendation: Strengthen  
+   Specify *how* you prove “repair convergence” for a key-range before GC (watermarks/repair epochs). Time-based `T_gc` alone tends to fail during long incidents + operator pauses.
+
+5. **Traffic 10x + hotspot keys**
+   - Design’s answer: not addressed
+   - Recommendation: Strengthen  
+   Dynamo-style rings don’t fix per-key hotspots. You likely need: request coalescing for hot reads, per-key rate limits, optional client-side sharding (key salting) for specific namespaces, and a “hot partition” alert tied to vnode/key metrics.
+
+## Recommendations
+
+### Must Fix
+- Define membership/ring safety: ring epoching, coordination rules under disagreement, and how preference lists change during churn.
+- Make retries truly idempotent at replicas (token persistence/TTL) and define semantics for “timeout but maybe committed”.
+- Specify overload behavior (slow replicas, compaction stalls, disk-full): what the coordinator does and what errors clients see.
+
+### Should Consider
+- Prefer DVV (or similar) over raw vector clocks for sibling-heavy namespaces to bound metadata and reduce pathological growth.
+- Add token-aware routing to reduce coordination hops and improve p99 under load.
+- Clarify default semantics per mode (e.g., what clients must supply/retain for VC mode; what “read-your-writes” means under LWW).
+
+### Nice to Have
+- Operator “break glass” controls: pause repair, cap handoff bandwidth, force drain hints, per-namespace SLO dashboards.
+- A small chaos/regression suite focused on: membership churn, retry storms, tombstone GC, and repair lag.
+
+## What's Working Well
+- The design is honest that sloppy quorum manufactures divergence and that anti-entropy is mandatory to pay that debt down.
+- You explicitly cap the dangerous queues (hints/siblings) and tie them to observability, which is the right operational posture.
+- Calling out tombstones/compaction/repair interactions upfront is rare and exactly what prevents “works in the lab, corrupts in prod” outcomes.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+
+thinking
+**Considering documentation adjustments**
+
+The requirement specifies a "What We Removed" section, but I wonder if I can include removed items in the existing "Failure Modes" section without adding a new subsection. Another option might be to repurpose the "What Makes This Hard" section by renaming it. 
+
+I can condense "Key Design Decisions" and potentially cut down "Deep Dive: Sloppy Quorums + Conflict Resolution." The critique suggests using a membership library instead of custom SWIM, which I can mention without adding components. Simplifying Merkle trees by using range hash could also help reduce complexity.
+thinking
+**Evaluating conflict modes**
+
+I’m thinking about simplifying the conflict modes. The current setup defaults to LWW, tie-breakers, and RYW tokens, but I could consider making vector clocks optional or even removing them. The requirements mention per-namespace conflict modes, so if I only support LWW with HLC and optional conditional writes, I’d lose the sibling API. The simplest solution might be to stick with only LWW and HLC, making the concurrency semantics clear. I wonder if removing vector clocks would break the requirements, but it might help simplify things. However, I need to ensure that it still aligns with the Dynamo-style core principles.
+thinking
+**Considering quorum and handoff options**
+
+I'm contemplating whether to remove sloppy quorum and hinted handoff. Eliminating sloppy quorum could reduce availability during failures, but failing if fewer than W nodes are available might be acceptable initially. However, I'd lose "always-on writes" during partial failures. Maybe keeping sloppy quorum as part of Dynamo is better, but hinted handoff could be replaced with background repair. 
+
+Relying on temporary replicas labeled as "temporary" might streamline things, yet it also adds complexity. So, I’m leaning towards using N=3 and W=2 for writes; this could work for a small team while maintaining functionality.
+thinking
+**Reevaluating write requirements**
+
+I’m considering the requirement for always-on writes during replica loss. Should we change that requirement? It seems I might be allowed to simplify things by dropping sloppy quorum and stating that write operations need W acknowledgments from a preference list, failing if not met. This would reduce complexity and avoid hints, but it could also impact high availability.
+
+Is this the simplest solution for various use cases? Maybe it still fits the Dynamo-style label. However, while we have “The Minimalist v2” approach, critiques mention aspects like ring epoching and idempotency — we should address these but avoid adding components like a ring epoch store. Instead, we could store configuration within each node, eliminating the need for a central service.
+thinking
+**Finalizing configuration and architecture**
+
+I’m exploring options for using a small "config in gossip" or possibly a file with manual deployments to address membership split-brain. The simplest approach might be to introduce a versioned "Ring Config (epoch)" file that nodes use to coordinate only if they share the same epoch. This metadata isn't a separate service.
+
+I’m considering retaining the current ring config version at each node and using gossips, requiring a majority for the coordinator. However, this begins to resemble consensus.
+
+If I simplify the membership library to be just advisory with manual ring changes, it could reduce churn but increase operational complexity. For 50-200 nodes, this might be manageable, especially for a small team. I could use a static node list and consistent hashing with no automatic membership, removing SWIM. Instead, I could rely on client health checks for failure detection and have replica selection utilize the static list. This makes it easier to avoid split-brain issues.
+
+I want to ensure that the final architecture emphasizes simplicity, using a statically configured ring setup with N=3, relying on LWW (HLC) for quorums. I would incorporate periodic background repairs through a "range-hash scan" instead of Merkle trees and keep the observability metrics standard. Although I need to condense sections, the user wants specific outputs that justify design decisions, what has been removed, and trade-offs. 
+
+Thus, I plan to reformat the sections by renaming "What Makes This Hard" to "What We Removed" to address the requirement directly and remove less relevant sections. It’s essential to maintain minimal complexity while also incorporating failure scenarios, such as ring epoching, idempotency tokens, and handling overload behavior. 
+
+I’ll implement idempotency using a client-supplied idempotency key. Each replica can store it alongside the last write ID for records. To manage overload, replicas can indicate when they are overloaded, and the coordinator can account for that to maintain quorum. Tombstone garbage collection can be handled through retention strategies associated with repair cycles. For hotspot keys, I’ll allow client-side salting and implement read coalescing at the coordinator.
+
+Overall, I should stick to these streamlined principles to ensure clarity and effectiveness.
+thinking
+**Finalizing design document structure**
+
+I'm thinking about the design that requires node coordination to identify active nodes, possibly using router health checks instead of membership. While I want to compute a preference list that includes all nodes, even if some are down, managing a static config for 50-200 nodes could lead to manual churn. 
+
+To simplify, I could adjust the target to a more realistic range of 20-100 nodes, but it’s crucial not to create new sections. I can keep mention of virtual nodes (vnodes) for consistent hashing since it aids in scalability but could consider switching to rendezvous hashing if it’s simpler. 
+
+My minimal architecture would include:
+
+- A stateless request router (LB).
+- Key-value (KV) nodes acting as both coordinator and replica.
+- Local storage with RocksDB.
+- Static cluster configuration with token assignment and versioning.
+- Replication setup with N=3, quorum R/W, without sloppy quorum.
+- LWW with HLC for conflict semantics.
+- Background periodic repair tasks.
+- Standard observability metrics.
+
+I’ll keep the existing document structure but rename "What Makes This Hard" to "What We Removed" for clarity. This keeps the section count consistent while integrating critique topics about config versions and idempotency tokens into key designs. Overall, I’ll aim for a simplified yet comprehensive markdown document that effectively conveys all necessary information.
+codex
+```markdown
+---
+title: "Distributed Key-Value Store (Dynamo-Style)"
+category: "Storage & Data Platforms"
+difficulty: "Hard"
+tags: [dynamo, kv-store, quorum, eventual-consistency, consistent-hashing, vector-clocks, lww]
+---
+
+## Overview
+
+A simple Dynamo-style key-value store inside one region: keys are sharded by consistent hashing, each key is stored on `N` replicas, and each request chooses `R`/`W` to trade latency vs consistency.
+
+Each node runs the same binary and can act as coordinator for a request. Correctness comes from quorum intersection when you choose it (`R+W>N`) plus always-running background repair to converge replicas after failures and timeouts. Conflict semantics are intentionally simple: **Last-Write-Wins using Hybrid Logical Clocks (HLC)**.
+
+## What We Removed
+
+- **Vector clocks + siblings**: only LWW/HLC remains.
+- **Sloppy quorum + hinted handoff**: writes go only to the preference list; if quorum can’t be met, the write fails.
+- **Gossip membership (SWIM)**: the ring is driven by a versioned static node list (config epoch), not emergent membership.
+- **Merkle trees per partition**: repair uses coarse range hashes + targeted sync instead of per-partition Merkle maintenance.
+- **“Smart” SDK behavior**: the API supports idempotency and conditional writes directly; SDKs are optional thin wrappers.
+
+## Requirements
+
+### Functional Requirements
+- `GET(key)`, `PUT(key, value)`, `DELETE(key)` with per-request consistency presets (`ONE`, `QUORUM`, `ALL`) mapping to `R/W`.
+- Versioning and conflict resolution:
+  - **LWW/HLC only**: each write carries an HLC timestamp and deterministic tie-breaker.
+  - Optional conditional writes: `PUT`/`DELETE` can include `if_version` (or `if_not_exists`) to avoid lost updates.
+- Read repair on quorum reads (best-effort, background).
+- Background repair that continuously converges replicas.
+- Multi-tenant safety: per-namespace limits (value size, request rate, max tombstone age).
+
+### Scale Targets
+- **Cluster size**: 50–200 nodes.
+- **Data**: 50 TB logical, ~150 TB physical at `N=3`.
+- **Throughput**: 100k writes/s, 300k reads/s sustained.
+- **Latency**: p99 `GET` < 20 ms, p99 `PUT` < 30 ms within a region.
+
+## Key Design Decisions
+
+- **Quorum replication (`N`, `R`, `W`) with any-node coordination**
+  - Any node can coordinate; the coordinator sends parallel RPCs to the preference list and waits for `R`/`W`.
+  - Defaults: `N=3`, `W=2`, `R=2` for most namespaces.
+
+- **Static ring with an explicit config epoch**
+  - Nodes load a shared ring config (node list + tokens) with an `epoch`.
+  - A node only coordinates if its local `epoch` matches the peers it is contacting; otherwise it fails fast with a clear “ring epoch mismatch” error.
+
+- **LWW with HLC (plus deterministic tie-break)**
+  - Each write is stamped with HLC and `coordinator_id` as tie-breaker.
+  - Clients that need safety from overwrites use conditional writes (`if_version`).
+
+- **Repair by coarse range hashes**
+  - Periodically compute hashes for fixed key ranges (or SSTable/segment ranges), compare between replicas, and sync mismatched ranges.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> LB[Request Router]
+  LB --> N1[KV Node (Coordinator)]
+
+  subgraph R["Preference List (N)"]
+    A[KV Node (Replica)]
+    B[KV Node (Replica)]
+    D[KV Node (Replica)]
+  end
+
+  N1 --> A
+  N1 --> B
+  N1 --> D
+
+  A <--> REPAIR[Background Repair<br/>(Range Hash + Sync)]
+  B <--> REPAIR
+  D <--> REPAIR
+
+  N1 --> O[Observability]
+  A --> O
+  B --> O
+  D --> O
+```
+
+### Components
+
+- **Request Router**
+  - Justification: routes to any healthy node; keeps clients simple and avoids “token-aware routing” complexity.
+
+- **KV Node (Coordinator + Replica in one process)**
+  - Justification: one deployable unit; any node can coordinate to avoid a leader dependency.
+  - Responsibilities:
+    - Compute preference list from ring config.
+    - Execute quorum logic with timeouts.
+    - Apply backpressure: treat overloaded replicas as non-ackable and return explicit overload errors when quorum can’t be met.
+
+- **Local Storage (RocksDB)**
+  - Justification: proven durability and performance; keeps novelty in the distributed layer.
+  - Stores: value, HLC version, optional `last_request_id` for idempotent retries per key, tombstone marker.
+
+- **Background Repair (Range Hash + Sync)**
+  - Justification: convergence mechanism that keeps eventual consistency honest.
+  - Behavior: compare coarse hashes across replicas; sync only mismatched ranges; rate-limited to protect tail latency.
+
+- **Observability**
+  - Justification: the system’s failure mode is backlog and overload; operators need visibility.
+  - Minimum signals: quorum failure rate, replica latency, overload rate, repair lag, tombstone count/age, compaction pressure.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Buildability and operability by a small team | Lower availability during multi-replica loss (no sloppy quorum) |
+| Clear semantics (LWW/HLC + optional conditional writes) | No sibling returns or causal tracking |
+| Predictable runtime behavior (static ring epoch) | Less “hands-off” membership; changes are operational events |
+| Simple repair implementation | More bandwidth/CPU than fine-grained Merkle repair |
+
+## Failure Modes
+
+- **Ring epoch mismatch (split config / partial rollout)**
+  - What happens: nodes disagree on token ownership.
+  - Detect: elevated “epoch mismatch” errors.
+  - Recover: complete rollout or roll back; writes fail fast rather than silently landing on the wrong replica set.
+
+- **Coordinator crashes after quorum but before responding (client retries)**
+  - What happens: client may retry a committed write.
+  - Detect: increased duplicate `request_id` rate (if used) and retry metrics.
+  - Recover: clients send `request_id`; replicas store per-key `last_request_id` + result metadata and return the same outcome for duplicates.
+
+- **Replica overload (compaction stalls / disk pressure)**
+  - What happens: tail latency spikes and quorum becomes hard to meet.
+  - Detect: compaction pressure + overload responses + rising quorum timeouts.
+  - Recover: coordinators stop counting overloaded replicas toward `R/W`; return `503 overloaded` when quorum isn’t achievable; operators reduce write load or add capacity.
+
+- **Delete resurrection (tombstone retention too short)**
+  - What happens: an old value reappears via repair or late replica.
+  - Detect: resurrection counter during repair.
+  - Recover: tombstones replicate like values; keep tombstones for `T_gc` comfortably above worst-case repair lag and outage windows.
+
+- **Hot keys**
+  - What happens: a single key saturates its replica set.
+  - Detect: per-key rate and latency outliers.
+  - Recover: per-key rate limits; optional client-side key salting for namespaces that need it; coordinator-side request coalescing for hot reads.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Add zone-aware placement in the ring config and tighten admission control tied to compaction pressure.
+
+- **100x scale:**
+  - Add token-aware routing (clients/routers pick a coordinator in the preference list) and move to more incremental repair metadata.
+
+## Operational Notes
+
+- Keep defaults boring: `N=3`, `R=2`, `W=2` for most data; use `ONE` only for explicitly stale-tolerant namespaces.
+- Treat overload as a first-class response: fast failure beats slow global meltdown.
+- Repair must be always-on and rate-limited; repair lag is the primary “eventual consistency health” metric.
+- Set `T_gc` from measured repair lag, not hope; lowering it is a correctness change, not an ops tweak.
+```
+tokens used
+9,677
+```markdown
+---
+title: "Distributed Key-Value Store (Dynamo-Style)"
+category: "Storage & Data Platforms"
+difficulty: "Hard"
+tags: [dynamo, kv-store, quorum, eventual-consistency, consistent-hashing, vector-clocks, lww]
+---
+
+## Overview
+
+A simple Dynamo-style key-value store inside one region: keys are sharded by consistent hashing, each key is stored on `N` replicas, and each request chooses `R`/`W` to trade latency vs consistency.
+
+Each node runs the same binary and can act as coordinator for a request. Correctness comes from quorum intersection when you choose it (`R+W>N`) plus always-running background repair to converge replicas after failures and timeouts. Conflict semantics are intentionally simple: **Last-Write-Wins using Hybrid Logical Clocks (HLC)**.
+
+## What We Removed
+
+- **Vector clocks + siblings**: only LWW/HLC remains.
+- **Sloppy quorum + hinted handoff**: writes go only to the preference list; if quorum can’t be met, the write fails.
+- **Gossip membership (SWIM)**: the ring is driven by a versioned static node list (config epoch), not emergent membership.
+- **Merkle trees per partition**: repair uses coarse range hashes + targeted sync instead of per-partition Merkle maintenance.
+- **“Smart” SDK behavior**: the API supports idempotency and conditional writes directly; SDKs are optional thin wrappers.
+
+## Requirements
+
+### Functional Requirements
+- `GET(key)`, `PUT(key, value)`, `DELETE(key)` with per-request consistency presets (`ONE`, `QUORUM`, `ALL`) mapping to `R/W`.
+- Versioning and conflict resolution:
+  - **LWW/HLC only**: each write carries an HLC timestamp and deterministic tie-breaker.
+  - Optional conditional writes: `PUT`/`DELETE` can include `if_version` (or `if_not_exists`) to avoid lost updates.
+- Read repair on quorum reads (best-effort, background).
+- Background repair that continuously converges replicas.
+- Multi-tenant safety: per-namespace limits (value size, request rate, max tombstone age).
+
+### Scale Targets
+- **Cluster size**: 50–200 nodes.
+- **Data**: 50 TB logical, ~150 TB physical at `N=3`.
+- **Throughput**: 100k writes/s, 300k reads/s sustained.
+- **Latency**: p99 `GET` < 20 ms, p99 `PUT` < 30 ms within a region.
+
+## Key Design Decisions
+
+- **Quorum replication (`N`, `R`, `W`) with any-node coordination**
+  - Any node can coordinate; the coordinator sends parallel RPCs to the preference list and waits for `R`/`W`.
+  - Defaults: `N=3`, `W=2`, `R=2` for most namespaces.
+
+- **Static ring with an explicit config epoch**
+  - Nodes load a shared ring config (node list + tokens) with an `epoch`.
+  - A node only coordinates if its local `epoch` matches the peers it is contacting; otherwise it fails fast with a clear “ring epoch mismatch” error.
+
+- **LWW with HLC (plus deterministic tie-break)**
+  - Each write is stamped with HLC and `coordinator_id` as tie-breaker.
+  - Clients that need safety from overwrites use conditional writes (`if_version`).
+
+- **Repair by coarse range hashes**
+  - Periodically compute hashes for fixed key ranges (or SSTable/segment ranges), compare between replicas, and sync mismatched ranges.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> LB[Request Router]
+  LB --> N1[KV Node (Coordinator)]
+
+  subgraph R["Preference List (N)"]
+    A[KV Node (Replica)]
+    B[KV Node (Replica)]
+    D[KV Node (Replica)]
+  end
+
+  N1 --> A
+  N1 --> B
+  N1 --> D
+
+  A <--> REPAIR[Background Repair<br/>(Range Hash + Sync)]
+  B <--> REPAIR
+  D <--> REPAIR
+
+  N1 --> O[Observability]
+  A --> O
+  B --> O
+  D --> O
+```
+
+### Components
+
+- **Request Router**
+  - Justification: routes to any healthy node; keeps clients simple and avoids “token-aware routing” complexity.
+
+- **KV Node (Coordinator + Replica in one process)**
+  - Justification: one deployable unit; any node can coordinate to avoid a leader dependency.
+  - Responsibilities:
+    - Compute preference list from ring config.
+    - Execute quorum logic with timeouts.
+    - Apply backpressure: treat overloaded replicas as non-ackable and return explicit overload errors when quorum can’t be met.
+
+- **Local Storage (RocksDB)**
+  - Justification: proven durability and performance; keeps novelty in the distributed layer.
+  - Stores: value, HLC version, optional `last_request_id` for idempotent retries per key, tombstone marker.
+
+- **Background Repair (Range Hash + Sync)**
+  - Justification: convergence mechanism that keeps eventual consistency honest.
+  - Behavior: compare coarse hashes across replicas; sync only mismatched ranges; rate-limited to protect tail latency.
+
+- **Observability**
+  - Justification: the system’s failure mode is backlog and overload; operators need visibility.
+  - Minimum signals: quorum failure rate, replica latency, overload rate, repair lag, tombstone count/age, compaction pressure.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Buildability and operability by a small team | Lower availability during multi-replica loss (no sloppy quorum) |
+| Clear semantics (LWW/HLC + optional conditional writes) | No sibling returns or causal tracking |
+| Predictable runtime behavior (static ring epoch) | Less “hands-off” membership; changes are operational events |
+| Simple repair implementation | More bandwidth/CPU than fine-grained Merkle repair |
+
+## Failure Modes
+
+- **Ring epoch mismatch (split config / partial rollout)**
+  - What happens: nodes disagree on token ownership.
+  - Detect: elevated “epoch mismatch” errors.
+  - Recover: complete rollout or roll back; writes fail fast rather than silently landing on the wrong replica set.
+
+- **Coordinator crashes after quorum but before responding (client retries)**
+  - What happens: client may retry a committed write.
+  - Detect: increased duplicate `request_id` rate (if used) and retry metrics.
+  - Recover: clients send `request_id`; replicas store per-key `last_request_id` + result metadata and return the same outcome for duplicates.
+
+- **Replica overload (compaction stalls / disk pressure)**
+  - What happens: tail latency spikes and quorum becomes hard to meet.
+  - Detect: compaction pressure + overload responses + rising quorum timeouts.
+  - Recover: coordinators stop counting overloaded replicas toward `R/W`; return `503 overloaded` when quorum isn’t achievable; operators reduce write load or add capacity.
+
+- **Delete resurrection (tombstone retention too short)**
+  - What happens: an old value reappears via repair or late replica.
+  - Detect: resurrection counter during repair.
+  - Recover: tombstones replicate like values; keep tombstones for `T_gc` comfortably above worst-case repair lag and outage windows.
+
+- **Hot keys**
+  - What happens: a single key saturates its replica set.
+  - Detect: per-key rate and latency outliers.
+  - Recover: per-key rate limits; optional client-side key salting for namespaces that need it; coordinator-side request coalescing for hot reads.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Add zone-aware placement in the ring config and tighten admission control tied to compaction pressure.
+
+- **100x scale:**
+  - Add token-aware routing (clients/routers pick a coordinator in the preference list) and move to more incremental repair metadata.
+
+## Operational Notes
+
+- Keep defaults boring: `N=3`, `R=2`, `W=2` for most data; use `ONE` only for explicitly stale-tolerant namespaces.
+- Treat overload as a first-class response: fast failure beats slow global meltdown.
+- Repair must be always-on and rate-limited; repair lag is the primary “eventual consistency health” metric.
+- Set `T_gc` from measured repair lag, not hope; lowering it is a correctness change, not an ops tweak.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/02-storage-data-platforms/distributed-key-value-store.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+Found invalid Mermaid diagrams, fixing...
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afc-e93d-7690-9ee4-fdd999f8d924
+--------
+user
+Fix these Mermaid syntax errors:
+
+
+--- Block 1 ---
+flowchart LR
+  C[Client] --> LB[Request Router]
+  LB --> N1[KV Node (Coordinator)]
+
+  subgraph R["Preference List (N)"]
+    A[KV Node (Replica)]
+    B[KV Node (Replica)]
+    D[KV Node (Replica)]
+  end
+
+  N1 --> A
+  N1 --> B
+  N1 --> D
+
+  A <--> REPAIR[Background Repair<br/>(Range Hash + Sync)]
+  B <--> REPAIR
+  D <--> REPAIR
+
+  N1 --> O[Observability]
+  A --> O
+  B --> O
+  D --> O
+--- Error ---
+Generating single mermaid chart
+
+Error: Parse error on line 3:
+
+
+Common fixes:
+- Quote labels with special characters: A["Label (with parens)"]
+- Use short labels (2-4 words max)
+- Remove HTML tags
+- Keep diagrams simple (max 8 nodes)
+
+Output the complete fixed document.
+
+---
+
+```markdown
+---
+title: "Distributed Key-Value Store (Dynamo-Style)"
+category: "Storage & Data Platforms"
+difficulty: "Hard"
+tags: [dynamo, kv-store, quorum, eventual-consistency, consistent-hashing, vector-clocks, lww]
+---
+
+## Overview
+
+A simple Dynamo-style key-value store inside one region: keys are sharded by consistent hashing, each key is stored on `N` replicas, and each request chooses `R`/`W` to trade latency vs consistency.
+
+Each node runs the same binary and can act as coordinator for a request. Correctness comes from quorum intersection when you choose it (`R+W>N`) plus always-running background repair to converge replicas after failures and timeouts. Conflict semantics are intentionally simple: **Last-Write-Wins using Hybrid Logical Clocks (HLC)**.
+
+## What We Removed
+
+- **Vector clocks + siblings**: only LWW/HLC remains.
+- **Sloppy quorum + hinted handoff**: writes go only to the preference list; if quorum can’t be met, the write fails.
+- **Gossip membership (SWIM)**: the ring is driven by a versioned static node list (config epoch), not emergent membership.
+- **Merkle trees per partition**: repair uses coarse range hashes + targeted sync instead of per-partition Merkle maintenance.
+- **“Smart” SDK behavior**: the API supports idempotency and conditional writes directly; SDKs are optional thin wrappers.
+
+## Requirements
+
+### Functional Requirements
+- `GET(key)`, `PUT(key, value)`, `DELETE(key)` with per-request consistency presets (`ONE`, `QUORUM`, `ALL`) mapping to `R/W`.
+- Versioning and conflict resolution:
+  - **LWW/HLC only**: each write carries an HLC timestamp and deterministic tie-breaker.
+  - Optional conditional writes: `PUT`/`DELETE` can include `if_version` (or `if_not_exists`) to avoid lost updates.
+- Read repair on quorum reads (best-effort, background).
+- Background repair that continuously converges replicas.
+- Multi-tenant safety: per-namespace limits (value size, request rate, max tombstone age).
+
+### Scale Targets
+- **Cluster size**: 50–200 nodes.
+- **Data**: 50 TB logical, ~150 TB physical at `N=3`.
+- **Throughput**: 100k writes/s, 300k reads/s sustained.
+- **Latency**: p99 `GET` < 20 ms, p99 `PUT` < 30 ms within a region.
+
+## Key Design Decisions
+
+- **Quorum replication (`N`, `R`, `W`) with any-node coordination**
+  - Any node can coordinate; the coordinator sends parallel RPCs to the preference list and waits for `R`/`W`.
+  - Defaults: `N=3`, `W=2`, `R=2` for most namespaces.
+
+- **Static ring with an explicit config epoch**
+  - Nodes load a shared ring config (node list + tokens) with an `epoch`.
+  - A node only coordinates if its local `epoch` matches the peers it is contacting; otherwise it fails fast with a clear “ring epoch mismatch” error.
+
+- **LWW with HLC (plus deterministic tie-break)**
+  - Each write is stamped with HLC and `coordinator_id` as tie-breaker.
+  - Clients that need safety from overwrites use conditional writes (`if_version`).
+
+- **Repair by coarse range hashes**
+  - Periodically compute hashes for fixed key ranges (or SSTable/segment ranges), compare between replicas, and sync mismatched ranges.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> LB[Request Router]
+  LB --> N1[KV Node (Coordinator)]
+
+  subgraph R["Preference List (N)"]
+    A[KV Node (Replica)]
+    B[KV Node (Replica)]
+    D[KV Node (Replica)]
+  end
+
+  N1 --> A
+  N1 --> B
+  N1 --> D
+
+  A <--> REPAIR[Background Repair<br/>(Range Hash + Sync)]
+  B <--> REPAIR
+  D <--> REPAIR
+
+  N1 --> O[Observability]
+  A --> O
+  B --> O
+  D --> O
+```
+
+### Components
+
+- **Request Router**
+  - Justification: routes to any healthy node; keeps clients simple and avoids “token-aware routing” complexity.
+
+- **KV Node (Coordinator + Replica in one process)**
+  - Justification: one deployable unit; any node can coordinate to avoid a leader dependency.
+  - Responsibilities:
+    - Compute preference list from ring config.
+    - Execute quorum logic with timeouts.
+    - Apply backpressure: treat overloaded replicas as non-ackable and return explicit overload errors when quorum can’t be met.
+
+- **Local Storage (RocksDB)**
+  - Justification: proven durability and performance; keeps novelty in the distributed layer.
+  - Stores: value, HLC version, optional `last_request_id` for idempotent retries per key, tombstone marker.
+
+- **Background Repair (Range Hash + Sync)**
+  - Justification: convergence mechanism that keeps eventual consistency honest.
+  - Behavior: compare coarse hashes across replicas; sync only mismatched ranges; rate-limited to protect tail latency.
+
+- **Observability**
+  - Justification: the system’s failure mode is backlog and overload; operators need visibility.
+  - Minimum signals: quorum failure rate, replica latency, overload rate, repair lag, tombstone count/age, compaction pressure.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Buildability and operability by a small team | Lower availability during multi-replica loss (no sloppy quorum) |
+| Clear semantics (LWW/HLC + optional conditional writes) | No sibling returns or causal tracking |
+| Predictable runtime behavior (static ring epoch) | Less “hands-off” membership; changes are operational events |
+| Simple repair implementation | More bandwidth/CPU than fine-grained Merkle repair |
+
+## Failure Modes
+
+- **Ring epoch mismatch (split config / partial rollout)**
+  - What happens: nodes disagree on token ownership.
+  - Detect: elevated “epoch mismatch” errors.
+  - Recover: complete rollout or roll back; writes fail fast rather than silently landing on the wrong replica set.
+
+- **Coordinator crashes after quorum but before responding (client retries)**
+  - What happens: client may retry a committed write.
+  - Detect: increased duplicate `request_id` rate (if used) and retry metrics.
+  - Recover: clients send `request_id`; replicas store per-key `last_request_id` + result metadata and return the same outcome for duplicates.
+
+- **Replica overload (compaction stalls / disk pressure)**
+  - What happens: tail latency spikes and quorum becomes hard to meet.
+  - Detect: compaction pressure + overload responses + rising quorum timeouts.
+  - Recover: coordinators stop counting overloaded replicas toward `R/W`; return `503 overloaded` when quorum isn’t achievable; operators reduce write load or add capacity.
+
+- **Delete resurrection (tombstone retention too short)**
+  - What happens: an old value reappears via repair or late replica.
+  - Detect: resurrection counter during repair.
+  - Recover: tombstones replicate like values; keep tombstones for `T_gc` comfortably above worst-case repair lag and outage windows.
+
+- **Hot keys**
+  - What happens: a single key saturates its replica set.
+  - Detect: per-key rate and latency outliers.
+  - Recover: per-key rate limits; optional client-side key salting for namespaces that need it; coordinator-side request coalescing for hot reads.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Add zone-aware placement in the ring config and tighten admission control tied to compaction pressure.
+
+- **100x scale:**
+  - Add token-aware routing (clients/routers pick a coordinator in the preference list) and move to more incremental repair metadata.
+
+## Operational Notes
+
+- Keep defaults boring: `N=3`, `R=2`, `W=2` for most data; use `ONE` only for explicitly stale-tolerant namespaces.
+- Treat overload as a first-class response: fast failure beats slow global meltdown.
+- Repair must be always-on and rate-limited; repair lag is the primary “eventual consistency health” metric.
+- Set `T_gc` from measured repair lag, not hope; lowering it is a correctness change, not an ops tweak.
+```
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+thinking
+**Fixing Mermaid syntax errors**
+
+I need to address some Mermaid syntax errors, especially a parse error on line 3 related to `LB --> N1[KV Node (Coordinator)]`. It seems like the parentheses might need quotes, as Mermaid suggests quoting labels with special characters. The label for "KV Node (Coordinator)" should be written as `N1["KV Node (Coordinator)"]`. I also need to ensure that similar node labels with parentheses, like "KV Node (Replica)," are quoted. This can help alleviate the parsing issues I'm facing.
+thinking
+**Troubleshooting node ID errors**
+
+I’m considering whether the error could be due to the node ID, which starts with a number. The parse issue does seem to relate to the line `LB --> N1[KV Node (Coordinator)]`. Mermaid might want the label in quotes, as in `N1["KV Node (Coordinator)"]`, especially if parentheses cause bugs. I should also address the `<br/>` tag, which might not be supported everywhere. Instead, I can replace it with a simpler label format, like `Background Repair (Range Hash + Sync)`, to avoid HTML complications.
+thinking
+**Checking arrow notations**
+
+I'm thinking about whether the arrow notation `<-->` is causing any parse issues. It seems like Mermaid actually supports bidirectional arrows, like `A <--> B`, but maybe it's not applicable in flowcharts. According to the Mermaid documentation, both `A <--> B` and `A --- B` are valid. I should also make sure that the node ID for REPAIR is properly defined and quoted while removing any `<br>` tags. 
+
+So, the update looks like this:
+
+C[Client] --> LB[Request Router]  
+LB --> N1["KV Node (Coordinator)"]  
+
+Then I’ll structure the subgraph and ensure everything is formatted correctly.
+thinking
+**Updating node labels and outputting document**
+
+I’m considering whether A, B, and D might need unique node labels, even though they can share the same labels. I’ll prepare to output the entire fixed document with the updated Mermaid block included. 
+
+Since the user wants the complete fixed document, I need to check the workspace to locate the relevant file, potentially using `rg` to search for the title string. After that, I’ll patch the file and output the entire fixed markdown content, rather than just the patch, to ensure the user has everything they need.
+thinking
+**Preparing to update and output document**
+
+The user didn't explicitly ask for the file update, but as a coding agent, updating the corresponding file is expected. I’ll handle both tasks: applying the fix and also printing the complete markdown content as requested. 
+
+I realize the final output will be lengthy, but since the user specifically asked for it, I need to comply and provide the full document. I’ll make sure the Mermaid block is corrected too. First, I’ll locate the file and patch it using the shell.
+exec
+/bin/zsh -lc "rg -n \"Distributed Key-Value Store \\(Dynamo-Style\\)\" -S ." in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 98ms:
+./solutions-v2/02-storage-data-platforms/distributed-key-value-store.md:3:title: "Distributed Key-Value Store (Dynamo-Style)"
+./logs/distributed-key-value-store.log:235:title: "Distributed Key-Value Store (Dynamo-Style)"
+./logs/distributed-key-value-store.log:569:title: "Distributed Key-Value Store (Dynamo-Style)"
+./logs/distributed-key-value-store.log:984:title: "Distributed Key-Value Store (Dynamo-Style)"
+./logs/distributed-key-value-store.log:1377:title: "Distributed Key-Value Store (Dynamo-Style)"
+./logs/distributed-key-value-store.log:1838:title: "Distributed Key-Value Store (Dynamo-Style)"
+./logs/distributed-key-value-store.log:2391:title: "Distributed Key-Value Store (Dynamo-Style)"
+./logs/distributed-key-value-store.log:2891:title: "Distributed Key-Value Store (Dynamo-Style)"
+./logs/distributed-key-value-store.log:3107:title: "Distributed Key-Value Store (Dynamo-Style)"
+./logs/distributed-key-value-store.log:3369:title: "Distributed Key-Value Store (Dynamo-Style)"
+./logs/distributed-key-value-store.log:3610:./solutions/02-storage-data-platforms/distributed-key-value-store.md:2:title: "Distributed Key-Value Store (Dynamo-Style)"
+./logs/distributed-key-value-store.log:3611:./logs/distributed-key-value-store.log:235:title: "Distributed Key-Value Store (Dynamo-Style)"
+./logs/distributed-key-value-store.log:3612:./logs/distributed-key-value-store.log:569:title: "Distributed Key-Value Store (Dynamo-Style)"
+./logs/distributed-key-value-store.log:3613:./logs/distributed-key-value-store.log:984:title: "Distributed Key-Value Store (Dynamo-Style)"
+./logs/distributed-key-value-store.log:3614:./logs/distributed-key-value-store.log:1377:title: "Distributed Key-Value Store (Dynamo-Style)"
+./logs/distributed-key-value-store.log:3615:./logs/distributed-key-value-store.log:1838:title: "Distributed Key-Value Store (Dynamo-Style)"
+./logs/distributed-key-value-store.log:3616:./logs/distributed-key-value-store.log:2391:title: "Distributed Key-Value Store (Dynamo-Style)"
+./logs/distributed-key-value-store.log:3617:./logs/distributed-key-value-store.log:2891:title: "Distributed Key-Value Store (Dynamo-Style)"
+./logs/distributed-key-value-store.log:3618:./logs/distributed-key-value-store.log:3107:title: "Distributed Key-Value Store (Dynamo-Style)"
+./logs/distributed-key-value-store.log:3619:./logs/distributed-key-value-store.log:3369:title: "Distributed Key-Value Store (Dynamo-Style)"
+
+thinking
+**Examining document versions**
+
+It seems there are multiple versions of documents, like solutions, drafts, and reviewed ones, perhaps a "solutions-v2" too. Now, I suspect one of these might fix the issue since the user's content could match one of the files. I'll inspect the relevant file to see how to patch things up properly. I'll focus on opening `solutions-v2/02-storage-data-platforms/distributed-key-value-store.md` and use tools like sed or rg to explore it further.
+exec
+/bin/zsh -lc "sed -n '1,220p' solutions-v2/02-storage-data-platforms/distributed-key-value-store.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 47ms:
+```markdown
+---
+title: "Distributed Key-Value Store (Dynamo-Style)"
+category: "Storage & Data Platforms"
+difficulty: "Hard"
+tags: [dynamo, kv-store, quorum, eventual-consistency, consistent-hashing, vector-clocks, lww]
+---
+
+## Overview
+
+A simple Dynamo-style key-value store inside one region: keys are sharded by consistent hashing, each key is stored on `N` replicas, and each request chooses `R`/`W` to trade latency vs consistency.
+
+Each node runs the same binary and can act as coordinator for a request. Correctness comes from quorum intersection when you choose it (`R+W>N`) plus always-running background repair to converge replicas after failures and timeouts. Conflict semantics are intentionally simple: **Last-Write-Wins using Hybrid Logical Clocks (HLC)**.
+
+## What We Removed
+
+- **Vector clocks + siblings**: only LWW/HLC remains.
+- **Sloppy quorum + hinted handoff**: writes go only to the preference list; if quorum can’t be met, the write fails.
+- **Gossip membership (SWIM)**: the ring is driven by a versioned static node list (config epoch), not emergent membership.
+- **Merkle trees per partition**: repair uses coarse range hashes + targeted sync instead of per-partition Merkle maintenance.
+exec
+/bin/zsh -lc 'rg -n "Background Repair<br/" -S .' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 58ms:
+./solutions-v2/02-storage-data-platforms/distributed-key-value-store.md:74:  A <--> REPAIR[Background Repair<br/>(Range Hash + Sync)]
+./logs/v2/distributed-key-value-store.log:1554:  A <--> REPAIR[Background Repair<br/>(Range Hash + Sync)]
+./logs/v2/distributed-key-value-store.log:1714:  A <--> REPAIR[Background Repair<br/>(Range Hash + Sync)]
+./logs/v2/distributed-key-value-store.log:1835:  A <--> REPAIR[Background Repair<br/>(Range Hash + Sync)]
+./logs/v2/distributed-key-value-store.log:1932:  A <--> REPAIR[Background Repair<br/>(Range Hash + Sync)]
+./logs/v2/distributed-key-value-store.log:2105:/bin/zsh -lc 'rg -n "Background Repair<br/" -S .' in /Users/dominikdabrowski/pr/system-design-atlas
+exec
+/bin/zsh -lc 'rg -n "flowchart LR" solutions solutions-v2 drafts drafts-v2 reviewed -S' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 138ms:
+solutions-v2/10-strategic-problems/attribution-measurement-system.md:47:flowchart LR
+solutions-v2/10-strategic-problems/self-healing-infrastructure.md:54:flowchart LR
+solutions/10-strategic-problems/multi-cluster-service-mesh.md:213:flowchart LR
+solutions-v2/10-strategic-problems/global-blacklisting-system.md:63:flowchart LR
+solutions/10-strategic-problems/global-blacklisting-system.md:71:flowchart LR
+solutions/05-social-discovery/recommendation-system-infrastructure.md:49:flowchart LR
+solutions-v2/05-social-discovery/comment-system.md:53:flowchart LR
+drafts-v2/email-delivery-platform.md:58:flowchart LR
+solutions-v2/05-social-discovery/search-autocomplete.md:43:flowchart LR
+reviewed/ride-hailing-dispatch.md:77:flowchart LR
+solutions/05-social-discovery/social-news-feed.md:63:flowchart LR
+drafts-v2/workflow-orchestration-engine.md:59:flowchart LR
+reviewed/recommendation-system-infrastructure.md:90:flowchart LR
+solutions/05-social-discovery/search-autocomplete.md:47:flowchart LR
+solutions-v2/09-iot-edge/calendar-scheduling-system.md:59:flowchart LR
+drafts-v2/ride-hailing-dispatch.md:60:flowchart LR
+solutions/09-iot-edge/api-gateway.md:52:flowchart LR
+drafts-v2/recommendation-system-infrastructure.md:60:flowchart LR
+solutions-v2/09-iot-edge/smart-home-hub.md:48:flowchart LR
+drafts-v2/collaborative-document-editing.md:58:flowchart LR
+exec
+/bin/zsh -lc 'find .. -name AGENTS.md -print' in /Users/dominikdabrowski/pr/system-design-atlas exited 124 in 10.00s:
+
+
+thinking
+I'm considering a few options to locate the file AGENTS.md. First, I think searching for it with a command like `rg --files AGENTS.md` could be effective. Another option is using `ls`, but I'm leaning toward checking directories with `find . -maxdepth 3 -name AGENTS.md -print` for a quicker result. I want to ensure I'm being efficient in my search and not getting sidetracked. Let's see what works best!
+exec
+/bin/zsh -lc 'find . -maxdepth 4 -name AGENTS.md -print' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 132ms:
+
+
+thinking
+**Inspecting documents for consistency**
+
+I need to patch the file `solutions-v2/02-storage-data-platforms/distributed-key-value-store.md`. Additionally, I should check `drafts-v2/distributed-key-value-store.md` and `reviewed/distributed-key-value-store.md` since they might also have the same Mermaid block. I've got to ensure consistency and cover any potential errors that could arise in multiple places. I’ll search for matching nodes using a command like `rg "KV Node \\(Coordinator\\)"` to find them all. It's essential to be thorough!
+exec
+/bin/zsh -lc "rg -n \"KV Node \\(Coordinator\\)\" -S solutions-v2/02-storage-data-platforms/distributed-key-value-store.md solutions/02-storage-data-platforms/distributed-key-value-store.md drafts-v2/distributed-key-value-store.md reviewed/distributed-key-value-store.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 56ms:
+solutions-v2/02-storage-data-platforms/distributed-key-value-store.md:62:  LB --> N1[KV Node (Coordinator)]
+file update
+M /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/02-storage-data-platforms/distributed-key-value-store.md
+@@ -61,8 +61,8 @@
+   C[Client] --> LB[Request Router]
+-  LB --> N1[KV Node (Coordinator)]
++  LB --> N1["KV Node (Coordinator)"]
+ 
+   subgraph R["Preference List (N)"]
+-    A[KV Node (Replica)]
+-    B[KV Node (Replica)]
+-    D[KV Node (Replica)]
++    A["KV Node (Replica)"]
++    B["KV Node (Replica)"]
++    D["KV Node (Replica)"]
+   end
+@@ -73,3 +73,3 @@
+ 
+-  A <--> REPAIR[Background Repair<br/>(Range Hash + Sync)]
++  A <--> REPAIR["Background Repair (Range Hash + Sync)"]
+   B <--> REPAIR
+@@ -157,2 +157,2 @@
+ - Set `T_gc` from measured repair lag, not hope; lowering it is a correctness change, not an ops tweak.
+-```
+\ No newline at end of file
++```
+apply_patch(auto_approved=true) exited 0 in 29ms:
+Success. Updated the following files:
+M solutions-v2/02-storage-data-platforms/distributed-key-value-store.md
+file update:
+diff --git a/solutions-v2/02-storage-data-platforms/distributed-key-value-store.md b/solutions-v2/02-storage-data-platforms/distributed-key-value-store.md
+index 9b2e8a4232838540791d4dbe39e31c96416c59ce..14cbac54bbe02634e800444a5a89e038051de340
+--- a/solutions-v2/02-storage-data-platforms/distributed-key-value-store.md
++++ b/solutions-v2/02-storage-data-platforms/distributed-key-value-store.md
+@@ -59,19 +59,19 @@
+ ```mermaid
+ flowchart LR
+   C[Client] --> LB[Request Router]
+-  LB --> N1[KV Node (Coordinator)]
++  LB --> N1["KV Node (Coordinator)"]
+ 
+   subgraph R["Preference List (N)"]
+-    A[KV Node (Replica)]
+-    B[KV Node (Replica)]
+-    D[KV Node (Replica)]
++    A["KV Node (Replica)"]
++    B["KV Node (Replica)"]
++    D["KV Node (Replica)"]
+   end
+ 
+   N1 --> A
+   N1 --> B
+   N1 --> D
+ 
+-  A <--> REPAIR[Background Repair<br/>(Range Hash + Sync)]
++  A <--> REPAIR["Background Repair (Range Hash + Sync)"]
+   B <--> REPAIR
+   D <--> REPAIR
+ 
+@@ -155,4 +155,4 @@
+ - Treat overload as a first-class response: fast failure beats slow global meltdown.
+ - Repair must be always-on and rate-limited; repair lag is the primary “eventual consistency health” metric.
+ - Set `T_gc` from measured repair lag, not hope; lowering it is a correctness change, not an ops tweak.
+-```
+\ No newline at end of file
++```
+
+
+thinking
+**Checking mermaid syntax**
+
+I'm ensuring that the mermaid syntax is valid. I can't run the mermaid CLI, as it’s likely not installed. I need to check the formatting too. The problem might persist if `<-->` isn't supported. I’ve fixed a parse error on line 3 by quoting. I'm planning to remove potential parse issues related to `<br/>`, and the user wants a complete fixed document output. I’ll ensure the output matches the file content exactly by retrieving it.
+file update:
+diff --git a/solutions-v2/02-storage-data-platforms/distributed-key-value-store.md b/solutions-v2/02-storage-data-platforms/distributed-key-value-store.md
+index 9b2e8a4232838540791d4dbe39e31c96416c59ce..14cbac54bbe02634e800444a5a89e038051de340
+--- a/solutions-v2/02-storage-data-platforms/distributed-key-value-store.md
++++ b/solutions-v2/02-storage-data-platforms/distributed-key-value-store.md
+@@ -59,19 +59,19 @@
+ ```mermaid
+ flowchart LR
+   C[Client] --> LB[Request Router]
+-  LB --> N1[KV Node (Coordinator)]
++  LB --> N1["KV Node (Coordinator)"]
+ 
+   subgraph R["Preference List (N)"]
+-    A[KV Node (Replica)]
+-    B[KV Node (Replica)]
+-    D[KV Node (Replica)]
++    A["KV Node (Replica)"]
++    B["KV Node (Replica)"]
++    D["KV Node (Replica)"]
+   end
+ 
+   N1 --> A
+   N1 --> B
+   N1 --> D
+ 
+-  A <--> REPAIR[Background Repair<br/>(Range Hash + Sync)]
++  A <--> REPAIR["Background Repair (Range Hash + Sync)"]
+   B <--> REPAIR
+   D <--> REPAIR
+ 
+@@ -155,4 +155,4 @@
+ - Treat overload as a first-class response: fast failure beats slow global meltdown.
+ - Repair must be always-on and rate-limited; repair lag is the primary “eventual consistency health” metric.
+ - Set `T_gc` from measured repair lag, not hope; lowering it is a correctness change, not an ops tweak.
+-```
+\ No newline at end of file
++```
+
+exec
+/bin/zsh -lc 'cat solutions-v2/02-storage-data-platforms/distributed-key-value-store.md' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 89ms:
+```markdown
+---
+title: "Distributed Key-Value Store (Dynamo-Style)"
+category: "Storage & Data Platforms"
+difficulty: "Hard"
+tags: [dynamo, kv-store, quorum, eventual-consistency, consistent-hashing, vector-clocks, lww]
+---
+
+## Overview
+
+A simple Dynamo-style key-value store inside one region: keys are sharded by consistent hashing, each key is stored on `N` replicas, and each request chooses `R`/`W` to trade latency vs consistency.
+
+Each node runs the same binary and can act as coordinator for a request. Correctness comes from quorum intersection when you choose it (`R+W>N`) plus always-running background repair to converge replicas after failures and timeouts. Conflict semantics are intentionally simple: **Last-Write-Wins using Hybrid Logical Clocks (HLC)**.
+
+## What We Removed
+
+- **Vector clocks + siblings**: only LWW/HLC remains.
+- **Sloppy quorum + hinted handoff**: writes go only to the preference list; if quorum can’t be met, the write fails.
+- **Gossip membership (SWIM)**: the ring is driven by a versioned static node list (config epoch), not emergent membership.
+- **Merkle trees per partition**: repair uses coarse range hashes + targeted sync instead of per-partition Merkle maintenance.
+codex
+```markdown
+---
+title: "Distributed Key-Value Store (Dynamo-Style)"
+category: "Storage & Data Platforms"
+difficulty: "Hard"
+tags: [dynamo, kv-store, quorum, eventual-consistency, consistent-hashing, vector-clocks, lww]
+---
+
+## Overview
+
+A simple Dynamo-style key-value store inside one region: keys are sharded by consistent hashing, each key is stored on `N` replicas, and each request chooses `R`/`W` to trade latency vs consistency.
+
+Each node runs the same binary and can act as coordinator for a request. Correctness comes from quorum intersection when you choose it (`R+W>N`) plus always-running background repair to converge replicas after failures and timeouts. Conflict semantics are intentionally simple: **Last-Write-Wins using Hybrid Logical Clocks (HLC)**.
+
+## What We Removed
+
+- **Vector clocks + siblings**: only LWW/HLC remains.
+- **Sloppy quorum + hinted handoff**: writes go only to the preference list; if quorum can’t be met, the write fails.
+- **Gossip membership (SWIM)**: the ring is driven by a versioned static node list (config epoch), not emergent membership.
+- **Merkle trees per partition**: repair uses coarse range hashes + targeted sync instead of per-partition Merkle maintenance.
+- **“Smart” SDK behavior**: the API supports idempotency and conditional writes directly; SDKs are optional thin wrappers.
+
+## Requirements
+
+### Functional Requirements
+- `GET(key)`, `PUT(key, value)`, `DELETE(key)` with per-request consistency presets (`ONE`, `QUORUM`, `ALL`) mapping to `R/W`.
+- Versioning and conflict resolution:
+  - **LWW/HLC only**: each write carries an HLC timestamp and deterministic tie-breaker.
+  - Optional conditional writes: `PUT`/`DELETE` can include `if_version` (or `if_not_exists`) to avoid lost updates.
+- Read repair on quorum reads (best-effort, background).
+- Background repair that continuously converges replicas.
+- Multi-tenant safety: per-namespace limits (value size, request rate, max tombstone age).
+
+### Scale Targets
+- **Cluster size**: 50–200 nodes.
+- **Data**: 50 TB logical, ~150 TB physical at `N=3`.
+- **Throughput**: 100k writes/s, 300k reads/s sustained.
+- **Latency**: p99 `GET` < 20 ms, p99 `PUT` < 30 ms within a region.
+
+## Key Design Decisions
+
+- **Quorum replication (`N`, `R`, `W`) with any-node coordination**
+  - Any node can coordinate; the coordinator sends parallel RPCs to the preference list and waits for `R`/`W`.
+  - Defaults: `N=3`, `W=2`, `R=2` for most namespaces.
+
+- **Static ring with an explicit config epoch**
+  - Nodes load a shared ring config (node list + tokens) with an `epoch`.
+  - A node only coordinates if its local `epoch` matches the peers it is contacting; otherwise it fails fast with a clear “ring epoch mismatch” error.
+
+- **LWW with HLC (plus deterministic tie-break)**
+  - Each write is stamped with HLC and `coordinator_id` as tie-breaker.
+  - Clients that need safety from overwrites use conditional writes (`if_version`).
+
+- **Repair by coarse range hashes**
+  - Periodically compute hashes for fixed key ranges (or SSTable/segment ranges), compare between replicas, and sync mismatched ranges.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> LB[Request Router]
+  LB --> N1["KV Node (Coordinator)"]
+
+  subgraph R["Preference List (N)"]
+    A["KV Node (Replica)"]
+    B["KV Node (Replica)"]
+    D["KV Node (Replica)"]
+  end
+
+  N1 --> A
+  N1 --> B
+  N1 --> D
+
+  A <--> REPAIR["Background Repair (Range Hash + Sync)"]
+  B <--> REPAIR
+  D <--> REPAIR
+
+  N1 --> O[Observability]
+  A --> O
+  B --> O
+  D --> O
+```
+
+### Components
+
+- **Request Router**
+  - Justification: routes to any healthy node; keeps clients simple and avoids “token-aware routing” complexity.
+
+- **KV Node (Coordinator + Replica in one process)**
+  - Justification: one deployable unit; any node can coordinate to avoid a leader dependency.
+  - Responsibilities:
+    - Compute preference list from ring config.
+    - Execute quorum logic with timeouts.
+    - Apply backpressure: treat overloaded replicas as non-ackable and return explicit overload errors when quorum can’t be met.
+
+- **Local Storage (RocksDB)**
+  - Justification: proven durability and performance; keeps novelty in the distributed layer.
+  - Stores: value, HLC version, optional `last_request_id` for idempotent retries per key, tombstone marker.
+
+- **Background Repair (Range Hash + Sync)**
+  - Justification: convergence mechanism that keeps eventual consistency honest.
+  - Behavior: compare coarse hashes across replicas; sync only mismatched ranges; rate-limited to protect tail latency.
+
+- **Observability**
+  - Justification: the system’s failure mode is backlog and overload; operators need visibility.
+  - Minimum signals: quorum failure rate, replica latency, overload rate, repair lag, tombstone count/age, compaction pressure.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Buildability and operability by a small team | Lower availability during multi-replica loss (no sloppy quorum) |
+| Clear semantics (LWW/HLC + optional conditional writes) | No sibling returns or causal tracking |
+| Predictable runtime behavior (static ring epoch) | Less “hands-off” membership; changes are operational events |
+| Simple repair implementation | More bandwidth/CPU than fine-grained Merkle repair |
+
+## Failure Modes
+
+- **Ring epoch mismatch (split config / partial rollout)**
+  - What happens: nodes disagree on token ownership.
+  - Detect: elevated “epoch mismatch” errors.
+  - Recover: complete rollout or roll back; writes fail fast rather than silently landing on the wrong replica set.
+
+- **Coordinator crashes after quorum but before responding (client retries)**
+  - What happens: client may retry a committed write.
+  - Detect: increased duplicate `request_id` rate (if used) and retry metrics.
+  - Recover: clients send `request_id`; replicas store per-key `last_request_id` + result metadata and return the same outcome for duplicates.
+
+- **Replica overload (compaction stalls / disk pressure)**
+  - What happens: tail latency spikes and quorum becomes hard to meet.
+  - Detect: compaction pressure + overload responses + rising quorum timeouts.
+  - Recover: coordinators stop counting overloaded replicas toward `R/W`; return `503 overloaded` when quorum isn’t achievable; operators reduce write load or add capacity.
+
+- **Delete resurrection (tombstone retention too short)**
+  - What happens: an old value reappears via repair or late replica.
+  - Detect: resurrection counter during repair.
+  - Recover: tombstones replicate like values; keep tombstones for `T_gc` comfortably above worst-case repair lag and outage windows.
+
+- **Hot keys**
+  - What happens: a single key saturates its replica set.
+  - Detect: per-key rate and latency outliers.
+  - Recover: per-key rate limits; optional client-side key salting for namespaces that need it; coordinator-side request coalescing for hot reads.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Add zone-aware placement in the ring config and tighten admission control tied to compaction pressure.
+
+- **100x scale:**
+  - Add token-aware routing (clients/routers pick a coordinator in the preference list) and move to more incremental repair metadata.
+
+## Operational Notes
+
+- Keep defaults boring: `N=3`, `R=2`, `W=2` for most data; use `ONE` only for explicitly stale-tolerant namespaces.
+- Treat overload as a first-class response: fast failure beats slow global meltdown.
+- Repair must be always-on and rate-limited; repair lag is the primary “eventual consistency health” metric.
+- Set `T_gc` from measured repair lag, not hope; lowering it is a correctness change, not an ops tweak.
+```
+file update:
+diff --git a/solutions-v2/02-storage-data-platforms/distributed-key-value-store.md b/solutions-v2/02-storage-data-platforms/distributed-key-value-store.md
+index 9b2e8a4232838540791d4dbe39e31c96416c59ce..14cbac54bbe02634e800444a5a89e038051de340
+--- a/solutions-v2/02-storage-data-platforms/distributed-key-value-store.md
++++ b/solutions-v2/02-storage-data-platforms/distributed-key-value-store.md
+@@ -59,19 +59,19 @@
+ ```mermaid
+ flowchart LR
+   C[Client] --> LB[Request Router]
+-  LB --> N1[KV Node (Coordinator)]
++  LB --> N1["KV Node (Coordinator)"]
+ 
+   subgraph R["Preference List (N)"]
+-    A[KV Node (Replica)]
+-    B[KV Node (Replica)]
+-    D[KV Node (Replica)]
++    A["KV Node (Replica)"]
++    B["KV Node (Replica)"]
++    D["KV Node (Replica)"]
+   end
+ 
+   N1 --> A
+   N1 --> B
+   N1 --> D
+ 
+-  A <--> REPAIR[Background Repair<br/>(Range Hash + Sync)]
++  A <--> REPAIR["Background Repair (Range Hash + Sync)"]
+   B <--> REPAIR
+   D <--> REPAIR
+ 
+@@ -155,4 +155,4 @@
+ - Treat overload as a first-class response: fast failure beats slow global meltdown.
+ - Repair must be always-on and rate-limited; repair lag is the primary “eventual consistency health” metric.
+ - Set `T_gc` from measured repair lag, not hope; lowering it is a correctness change, not an ops tweak.
+-```
+\ No newline at end of file
++```
+
+tokens used
+17,422
+```markdown
+---
+title: "Distributed Key-Value Store (Dynamo-Style)"
+category: "Storage & Data Platforms"
+difficulty: "Hard"
+tags: [dynamo, kv-store, quorum, eventual-consistency, consistent-hashing, vector-clocks, lww]
+---
+
+## Overview
+
+A simple Dynamo-style key-value store inside one region: keys are sharded by consistent hashing, each key is stored on `N` replicas, and each request chooses `R`/`W` to trade latency vs consistency.
+
+Each node runs the same binary and can act as coordinator for a request. Correctness comes from quorum intersection when you choose it (`R+W>N`) plus always-running background repair to converge replicas after failures and timeouts. Conflict semantics are intentionally simple: **Last-Write-Wins using Hybrid Logical Clocks (HLC)**.
+
+## What We Removed
+
+- **Vector clocks + siblings**: only LWW/HLC remains.
+- **Sloppy quorum + hinted handoff**: writes go only to the preference list; if quorum can’t be met, the write fails.
+- **Gossip membership (SWIM)**: the ring is driven by a versioned static node list (config epoch), not emergent membership.
+- **Merkle trees per partition**: repair uses coarse range hashes + targeted sync instead of per-partition Merkle maintenance.
+- **“Smart” SDK behavior**: the API supports idempotency and conditional writes directly; SDKs are optional thin wrappers.
+
+## Requirements
+
+### Functional Requirements
+- `GET(key)`, `PUT(key, value)`, `DELETE(key)` with per-request consistency presets (`ONE`, `QUORUM`, `ALL`) mapping to `R/W`.
+- Versioning and conflict resolution:
+  - **LWW/HLC only**: each write carries an HLC timestamp and deterministic tie-breaker.
+  - Optional conditional writes: `PUT`/`DELETE` can include `if_version` (or `if_not_exists`) to avoid lost updates.
+- Read repair on quorum reads (best-effort, background).
+- Background repair that continuously converges replicas.
+- Multi-tenant safety: per-namespace limits (value size, request rate, max tombstone age).
+
+### Scale Targets
+- **Cluster size**: 50–200 nodes.
+- **Data**: 50 TB logical, ~150 TB physical at `N=3`.
+- **Throughput**: 100k writes/s, 300k reads/s sustained.
+- **Latency**: p99 `GET` < 20 ms, p99 `PUT` < 30 ms within a region.
+
+## Key Design Decisions
+
+- **Quorum replication (`N`, `R`, `W`) with any-node coordination**
+  - Any node can coordinate; the coordinator sends parallel RPCs to the preference list and waits for `R`/`W`.
+  - Defaults: `N=3`, `W=2`, `R=2` for most namespaces.
+
+- **Static ring with an explicit config epoch**
+  - Nodes load a shared ring config (node list + tokens) with an `epoch`.
+  - A node only coordinates if its local `epoch` matches the peers it is contacting; otherwise it fails fast with a clear “ring epoch mismatch” error.
+
+- **LWW with HLC (plus deterministic tie-break)**
+  - Each write is stamped with HLC and `coordinator_id` as tie-breaker.
+  - Clients that need safety from overwrites use conditional writes (`if_version`).
+
+- **Repair by coarse range hashes**
+  - Periodically compute hashes for fixed key ranges (or SSTable/segment ranges), compare between replicas, and sync mismatched ranges.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> LB[Request Router]
+  LB --> N1["KV Node (Coordinator)"]
+
+  subgraph R["Preference List (N)"]
+    A["KV Node (Replica)"]
+    B["KV Node (Replica)"]
+    D["KV Node (Replica)"]
+  end
+
+  N1 --> A
+  N1 --> B
+  N1 --> D
+
+  A <--> REPAIR["Background Repair (Range Hash + Sync)"]
+  B <--> REPAIR
+  D <--> REPAIR
+
+  N1 --> O[Observability]
+  A --> O
+  B --> O
+  D --> O
+```
+
+### Components
+
+- **Request Router**
+  - Justification: routes to any healthy node; keeps clients simple and avoids “token-aware routing” complexity.
+
+- **KV Node (Coordinator + Replica in one process)**
+  - Justification: one deployable unit; any node can coordinate to avoid a leader dependency.
+  - Responsibilities:
+    - Compute preference list from ring config.
+    - Execute quorum logic with timeouts.
+    - Apply backpressure: treat overloaded replicas as non-ackable and return explicit overload errors when quorum can’t be met.
+
+- **Local Storage (RocksDB)**
+  - Justification: proven durability and performance; keeps novelty in the distributed layer.
+  - Stores: value, HLC version, optional `last_request_id` for idempotent retries per key, tombstone marker.
+
+- **Background Repair (Range Hash + Sync)**
+  - Justification: convergence mechanism that keeps eventual consistency honest.
+  - Behavior: compare coarse hashes across replicas; sync only mismatched ranges; rate-limited to protect tail latency.
+
+- **Observability**
+  - Justification: the system’s failure mode is backlog and overload; operators need visibility.
+  - Minimum signals: quorum failure rate, replica latency, overload rate, repair lag, tombstone count/age, compaction pressure.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Buildability and operability by a small team | Lower availability during multi-replica loss (no sloppy quorum) |
+| Clear semantics (LWW/HLC + optional conditional writes) | No sibling returns or causal tracking |
+| Predictable runtime behavior (static ring epoch) | Less “hands-off” membership; changes are operational events |
+| Simple repair implementation | More bandwidth/CPU than fine-grained Merkle repair |
+
+## Failure Modes
+
+- **Ring epoch mismatch (split config / partial rollout)**
+  - What happens: nodes disagree on token ownership.
+  - Detect: elevated “epoch mismatch” errors.
+  - Recover: complete rollout or roll back; writes fail fast rather than silently landing on the wrong replica set.
+
+- **Coordinator crashes after quorum but before responding (client retries)**
+  - What happens: client may retry a committed write.
+  - Detect: increased duplicate `request_id` rate (if used) and retry metrics.
+  - Recover: clients send `request_id`; replicas store per-key `last_request_id` + result metadata and return the same outcome for duplicates.
+
+- **Replica overload (compaction stalls / disk pressure)**
+  - What happens: tail latency spikes and quorum becomes hard to meet.
+  - Detect: compaction pressure + overload responses + rising quorum timeouts.
+  - Recover: coordinators stop counting overloaded replicas toward `R/W`; return `503 overloaded` when quorum isn’t achievable; operators reduce write load or add capacity.
+
+- **Delete resurrection (tombstone retention too short)**
+  - What happens: an old value reappears via repair or late replica.
+  - Detect: resurrection counter during repair.
+  - Recover: tombstones replicate like values; keep tombstones for `T_gc` comfortably above worst-case repair lag and outage windows.
+
+- **Hot keys**
+  - What happens: a single key saturates its replica set.
+  - Detect: per-key rate and latency outliers.
+  - Recover: per-key rate limits; optional client-side key salting for namespaces that need it; coordinator-side request coalescing for hot reads.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Add zone-aware placement in the ring config and tighten admission control tied to compaction pressure.
+
+- **100x scale:**
+  - Add token-aware routing (clients/routers pick a coordinator in the preference list) and move to more incremental repair metadata.
+
+## Operational Notes
+
+- Keep defaults boring: `N=3`, `R=2`, `W=2` for most data; use `ONE` only for explicitly stale-tolerant namespaces.
+- Treat overload as a first-class response: fast failure beats slow global meltdown.
+- Repair must be always-on and rate-limited; repair lag is the primary “eventual consistency health” metric.
+- Set `T_gc` from measured repair lag, not hope; lowering it is a correctness change, not an ops tweak.
+```
+[Pass 4/4] Mermaid diagrams fixed
+
+==========================================
+Completed (v2): Distributed Key-Value Store
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/distributed-key-value-store.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/distributed-key-value-store.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/02-storage-data-platforms/distributed-key-value-store.md

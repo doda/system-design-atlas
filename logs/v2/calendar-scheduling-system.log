@@ -1,0 +1,1737 @@
+==========================================
+Generating (v2): Calendar Scheduling System
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2cb0-7582-ac02-dba6ac4a5678
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Calendar Scheduling System
+**Category**: IoT & Edge
+
+**Problem Statement**:
+Design a system for recurring events, time zone complexity, and conflict detection across millions of agendas.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+thinking
+**Evaluating event management features**
+
+I’m focusing on functional requirements like creating and editing events with recurrence, exceptions, and timezones. I’ll also need to detect conflicts, manage free/busy queries, enable sharing, handle offline sync, and set reminders. Scaling targets will involve listing these needs. I should dive deeper into conflict detection for recurring edits by computing deltas of occurrences. It seems I need to balance correctness and simplicity, while sacrificing some global real-time features. No tools are needed for this!
+codex
+```markdown
+---
+title: "Calendar Scheduling System"
+category: "IoT & Edge"
+difficulty: "Hard"
+tags: ["calendar", "recurrence", "rrule", "timezones", "conflict-detection", "postgres", "offline-sync"]
+---
+
+## Overview
+
+This system stores calendar events (including recurring rules) and serves fast “what’s on my schedule?” queries while reliably detecting conflicts—even when users travel across time zones and daylight saving time (DST) shifts occur. The key insight is to **separate event intent from event instances**: store the canonical event definition (RRULE + timezone + exceptions) and **materialize occurrences only within a rolling window** where conflicts and UI views matter.
+
+Naive designs either (a) expand every recurrence forever (explodes storage and backfills) or (b) compute everything on the fly (conflict checks become expensive and inconsistent across clients). This design keeps recurrence logic authoritative on the server, but bounds it: a background expander maintains a per-calendar occurrence index for, say, the next 18 months, making reads and conflict checks boring and fast.
+
+Because this is “IoT & Edge”, the system treats clients as intermittently connected: offline edits are accepted as *proposals* and reconciled server-side using stable sync tokens. Clients can do optimistic local checks, but the server makes the final call.
+
+## What Makes This Hard
+
+Most teams underestimate two traps:
+
+1. **“Same local time” is not “same instant.”** Recurring meetings defined as “9:00 AM America/Los_Angeles” must stay at 9:00 AM local time across DST transitions, which means the UTC timestamp changes. Storing only UTC loses the user’s intent; storing only local time loses ordering and conflict correctness.
+
+2. **Conflicts + recurrence is a cross-product.** A “simple” conflict check becomes “does this rule generate any occurrences that overlap any other rule’s occurrences,” especially when exceptions, edits to a single instance, and shared calendars enter the picture.
+
+## Requirements
+
+### Functional Requirements
+- Create/update/delete single and recurring events using iCalendar-style rules (RRULE), including exceptions (EXDATE) and modified instances (“this one occurrence moved”).
+- Support per-event timezone (IANA tzid) and preserve “wall-clock intent” for recurring events.
+- Conflict detection on create/update for a calendar (and optionally across selected calendars), with clear “why it conflicts” feedback.
+- Efficient agenda view (day/week/month) and free/busy queries.
+- Multi-device sync with offline capability: sync tokens, idempotent writes, and deterministic reconciliation.
+- Shared calendars: read access at scale; writes serialized per calendar.
+
+### Scale Targets
+- 20M daily active users; average 3 calendars/user; average 500 events/calendar.
+- 30% of events recurring; typical RRULE creates 1–52 occurrences/year.
+- Peak reads: 200k agenda/free-busy QPS (driven by UI refresh + widgets).
+- Peak writes: 10k QPS (creates/edits + sync replays).
+- Latency: p95 agenda view < 150ms, p95 create/update with conflict check < 250ms.
+- Materialization window: 18 months forward + 3 months back (covers UI, reminders, late edits; bounds storage).
+
+## Key Design Decisions
+
+- **Choose: “Definition + bounded materialization.”**
+  - Rejected: infinite pre-expansion; pure on-demand expansion.
+  - Why: bounded occurrences make conflict checks and queries fast without unbounded storage or unpredictable CPU.
+
+- **Choose: Server-authoritative timezone semantics using IANA tzdb.**
+  - Rejected: “store UTC only” or “client decides timezone math.”
+  - Why: correctness depends on consistent tz rules; server authority prevents devices with stale tzdb from silently diverging.
+
+- **Choose: Postgres range indexing + exclusion for conflicts (per calendar shard).**
+  - Rejected: custom interval trees in a service; distributed locking.
+  - Why: Postgres can enforce “no overlaps” with transactional guarantees; it’s simpler than inventing a new concurrency/control plane.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Edge Clients] --> G[API Gateway]
+  G --> A[Auth]
+  G --> S[Calendar API]
+  S --> R[(Redis Cache)]
+  S --> P[(Postgres)]
+  S --> N[Push/Email]
+  W[Expander Worker] --> P
+  S --> Q[Job Queue]
+  Q --> W
+```
+
+### Components
+
+- **Edge Clients**
+  - Maintain a local cache and sync token; can render agendas offline.
+  - Submit edits with idempotency keys; show “tentative conflict” only as UX, not truth.
+
+- **API Gateway**
+  - Rate limits per user/device; collapses retries; enforces idempotency key presence on writes.
+
+- **Auth**
+  - Issues short-lived tokens; carries device-id for sync and dedupe.
+
+- **Calendar API**
+  - Owns event definitions, permissions, and the read model for agenda/free-busy.
+  - For writes: validates RRULE, records definition changes, schedules (re)materialization jobs, and performs conflict checks.
+
+- **Postgres**
+  - Source of truth for: calendars, event definitions, exceptions, and materialized occurrences.
+  - Partitioned/sharded by `calendar_id` to keep conflict checks local and hot data bounded.
+
+- **Redis Cache**
+  - Caches common agenda windows and free/busy responses keyed by `(calendar_id, window, tzid, version)`.
+
+- **Job Queue + Expander Worker**
+  - Materializes occurrences for the rolling window and maintains the conflict index.
+  - Idempotent jobs keyed by `(calendar_id, event_id, definition_version)`.
+
+- **Push/Email**
+  - Notifies devices about calendar version bumps and sends reminders from materialized occurrences.
+
+## Deep Dive: Conflict Detection for Recurring Events (Without Exploding)
+
+**Hard part:** given a proposed change (new recurring event, edit to RRULE, or edit to a single instance), decide if it overlaps existing events—quickly, correctly, and transactionally.
+
+### Data Model (core tables)
+- `event_definition`
+  - `event_id`, `calendar_id`
+  - `dtstart_local` (wall-clock), `tzid` (IANA)
+  - `rrule` (normalized), `duration_seconds`
+  - `definition_version` (monotonic)
+- `event_exception`
+  - `event_id`, `original_occurrence_key`, `override_dtstart_local/tzid/duration` or `is_cancelled`
+- `occurrence`
+  - One row per expanded instance within the materialization window
+  - `calendar_id`, `event_id`, `occurrence_start_utc`, `occurrence_end_utc`, `occurrence_key`
+  - Postgres `tstzrange` generated from start/end
+  - Indexed by `(calendar_id, occurrence_start_utc)` and GiST on the range
+
+### The elegant trick: let the database enforce “no overlaps”
+For calendars that require “no conflicts,” define an exclusion constraint on the materialized occurrences:
+
+- Conceptually: `EXCLUDE USING gist (calendar_id WITH =, time_range WITH &&) WHERE (status = 'active')`
+
+Now a write that inserts conflicting occurrences *cannot commit*. That gives you:
+- Correctness under concurrency (two devices editing simultaneously).
+- No separate locking system.
+- A deterministic “which occurrence overlapped” error you can surface.
+
+### Write path (new or edited recurring event)
+1. **Persist definition change** in `event_definition` with a new `definition_version` (fast, always succeeds unless invalid).
+2. **Materialize in a transaction** for the bounded window:
+   - Expand RRULE for the window using tz-aware arithmetic: generate local occurrences, convert each to UTC using tzdb rules at that date.
+   - Apply exceptions/overrides deterministically by `occurrence_key` (see below).
+   - Upsert rows into `occurrence` for `(event_id, occurrence_key)`; delete stale rows for this event that no longer exist in-window.
+3. **Conflict check is implicit:** if any inserted/updated `occurrence` overlaps existing ones for the same `calendar_id`, Postgres raises an exclusion violation; the API returns a 409 with the colliding occurrence ids/times.
+
+### Stable occurrence identity (the part that prevents “exception drift”)
+A recurring series needs a stable key for “the third Tuesday occurrence” even when tz offsets change. Use:
+- `occurrence_key = (event_id, local_date, local_time, tzid)` derived from the recurrence rule’s *local* generation step, not from UTC.
+- Exceptions store `original_occurrence_key` so “move just this one” stays attached even as tz offsets shift.
+
+This is the non-obvious piece: **exceptions must bind to the recurrence in the same coordinate system the user thinks in (local time),** otherwise DST will make exceptions slide to the wrong instance.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correct timezone + DST semantics | Some extra write amplification (materialization) |
+| Simple, transactional conflict guarantees | Conflicts limited to the materialized window |
+| Fast agenda/free-busy reads | Background worker complexity and lag management |
+| Edge-friendly sync | Server does more validation/merge work |
+
+## Failure Modes
+
+- **Materialization lag (worker backlog)**
+  - What happens: agenda/free-busy misses newly edited future instances; reminders drift.
+  - Detect: per-calendar “window covered until” metric; queue depth + job age SLOs.
+  - Recover: prioritize calendars with upcoming occurrences; temporarily fall back to on-demand expansion for reads beyond covered horizon (read-only, no conflict promises).
+
+- **Timezone database mismatch (clients vs server)**
+  - What happens: clients render different times; offline edits generate surprising results.
+  - Detect: include `tzdb_version` in sync metadata; log server/client mismatches.
+  - Recover: server remains authoritative; force a “re-sync and re-render” on mismatch; ship tzdb updates aggressively.
+
+- **Hot calendar shard (shared calendar, celebrity schedule)**
+  - What happens: high contention on the same `calendar_id`, conflict checks slow.
+  - Detect: per-calendar write latency + lock wait time; top-N hottest calendars.
+  - Recover: isolate hot calendars onto dedicated Postgres shards; add per-calendar write queueing to serialize at the API layer for those specific ids.
+
+## What I'd Do Differently At...
+
+- **10x scale:** shard Postgres by `calendar_id`, add read replicas for agenda views, and push more agenda queries into cache with versioned keys.
+- **100x scale:** move the occurrence store to a distributed SQL system (Spanner/Cockroach) or a purpose-built per-calendar storage service with the same “bounded materialization + exclusion-like guarantee” semantics; keep the rule expansion workers close to storage to reduce write amplification and contention.
+
+## Operational Notes
+
+- Treat RRULE parsing/normalization as an API contract: reject ambiguous rules and cap expansions (e.g., max occurrences per window) to prevent “infinite meeting” abuse.
+- Backfills are routine: tzdb updates and rule-bug fixes require re-materializing affected calendars; build a throttled reindex pipeline from day one.
+- Monitor “coverage horizon” per calendar, not just worker CPU—being *correct but late* is still a production incident for reminders.
+- Idempotency is non-negotiable: mobile retries and offline sync replays must not duplicate definitions or occurrences.
+```
+tokens used
+3,394
+```markdown
+---
+title: "Calendar Scheduling System"
+category: "IoT & Edge"
+difficulty: "Hard"
+tags: ["calendar", "recurrence", "rrule", "timezones", "conflict-detection", "postgres", "offline-sync"]
+---
+
+## Overview
+
+This system stores calendar events (including recurring rules) and serves fast “what’s on my schedule?” queries while reliably detecting conflicts—even when users travel across time zones and daylight saving time (DST) shifts occur. The key insight is to **separate event intent from event instances**: store the canonical event definition (RRULE + timezone + exceptions) and **materialize occurrences only within a rolling window** where conflicts and UI views matter.
+
+Naive designs either (a) expand every recurrence forever (explodes storage and backfills) or (b) compute everything on the fly (conflict checks become expensive and inconsistent across clients). This design keeps recurrence logic authoritative on the server, but bounds it: a background expander maintains a per-calendar occurrence index for, say, the next 18 months, making reads and conflict checks boring and fast.
+
+Because this is “IoT & Edge”, the system treats clients as intermittently connected: offline edits are accepted as *proposals* and reconciled server-side using stable sync tokens. Clients can do optimistic local checks, but the server makes the final call.
+
+## What Makes This Hard
+
+Most teams underestimate two traps:
+
+1. **“Same local time” is not “same instant.”** Recurring meetings defined as “9:00 AM America/Los_Angeles” must stay at 9:00 AM local time across DST transitions, which means the UTC timestamp changes. Storing only UTC loses the user’s intent; storing only local time loses ordering and conflict correctness.
+
+2. **Conflicts + recurrence is a cross-product.** A “simple” conflict check becomes “does this rule generate any occurrences that overlap any other rule’s occurrences,” especially when exceptions, edits to a single instance, and shared calendars enter the picture.
+
+## Requirements
+
+### Functional Requirements
+- Create/update/delete single and recurring events using iCalendar-style rules (RRULE), including exceptions (EXDATE) and modified instances (“this one occurrence moved”).
+- Support per-event timezone (IANA tzid) and preserve “wall-clock intent” for recurring events.
+- Conflict detection on create/update for a calendar (and optionally across selected calendars), with clear “why it conflicts” feedback.
+- Efficient agenda view (day/week/month) and free/busy queries.
+- Multi-device sync with offline capability: sync tokens, idempotent writes, and deterministic reconciliation.
+- Shared calendars: read access at scale; writes serialized per calendar.
+
+### Scale Targets
+- 20M daily active users; average 3 calendars/user; average 500 events/calendar.
+- 30% of events recurring; typical RRULE creates 1–52 occurrences/year.
+- Peak reads: 200k agenda/free-busy QPS (driven by UI refresh + widgets).
+- Peak writes: 10k QPS (creates/edits + sync replays).
+- Latency: p95 agenda view < 150ms, p95 create/update with conflict check < 250ms.
+- Materialization window: 18 months forward + 3 months back (covers UI, reminders, late edits; bounds storage).
+
+## Key Design Decisions
+
+- **Choose: “Definition + bounded materialization.”**
+  - Rejected: infinite pre-expansion; pure on-demand expansion.
+  - Why: bounded occurrences make conflict checks and queries fast without unbounded storage or unpredictable CPU.
+
+- **Choose: Server-authoritative timezone semantics using IANA tzdb.**
+  - Rejected: “store UTC only” or “client decides timezone math.”
+  - Why: correctness depends on consistent tz rules; server authority prevents devices with stale tzdb from silently diverging.
+
+- **Choose: Postgres range indexing + exclusion for conflicts (per calendar shard).**
+  - Rejected: custom interval trees in a service; distributed locking.
+  - Why: Postgres can enforce “no overlaps” with transactional guarantees; it’s simpler than inventing a new concurrency/control plane.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Edge Clients] --> G[API Gateway]
+  G --> A[Auth]
+  G --> S[Calendar API]
+  S --> R[(Redis Cache)]
+  S --> P[(Postgres)]
+  S --> N[Push/Email]
+  W[Expander Worker] --> P
+  S --> Q[Job Queue]
+  Q --> W
+```
+
+### Components
+
+- **Edge Clients**
+  - Maintain a local cache and sync token; can render agendas offline.
+  - Submit edits with idempotency keys; show “tentative conflict” only as UX, not truth.
+
+- **API Gateway**
+  - Rate limits per user/device; collapses retries; enforces idempotency key presence on writes.
+
+- **Auth**
+  - Issues short-lived tokens; carries device-id for sync and dedupe.
+
+- **Calendar API**
+  - Owns event definitions, permissions, and the read model for agenda/free-busy.
+  - For writes: validates RRULE, records definition changes, schedules (re)materialization jobs, and performs conflict checks.
+
+- **Postgres**
+  - Source of truth for: calendars, event definitions, exceptions, and materialized occurrences.
+  - Partitioned/sharded by `calendar_id` to keep conflict checks local and hot data bounded.
+
+- **Redis Cache**
+  - Caches common agenda windows and free/busy responses keyed by `(calendar_id, window, tzid, version)`.
+
+- **Job Queue + Expander Worker**
+  - Materializes occurrences for the rolling window and maintains the conflict index.
+  - Idempotent jobs keyed by `(calendar_id, event_id, definition_version)`.
+
+- **Push/Email**
+  - Notifies devices about calendar version bumps and sends reminders from materialized occurrences.
+
+## Deep Dive: Conflict Detection for Recurring Events (Without Exploding)
+
+**Hard part:** given a proposed change (new recurring event, edit to RRULE, or edit to a single instance), decide if it overlaps existing events—quickly, correctly, and transactionally.
+
+### Data Model (core tables)
+- `event_definition`
+  - `event_id`, `calendar_id`
+  - `dtstart_local` (wall-clock), `tzid` (IANA)
+  - `rrule` (normalized), `duration_seconds`
+  - `definition_version` (monotonic)
+- `event_exception`
+  - `event_id`, `original_occurrence_key`, `override_dtstart_local/tzid/duration` or `is_cancelled`
+- `occurrence`
+  - One row per expanded instance within the materialization window
+  - `calendar_id`, `event_id`, `occurrence_start_utc`, `occurrence_end_utc`, `occurrence_key`
+  - Postgres `tstzrange` generated from start/end
+  - Indexed by `(calendar_id, occurrence_start_utc)` and GiST on the range
+
+### The elegant trick: let the database enforce “no overlaps”
+For calendars that require “no conflicts,” define an exclusion constraint on the materialized occurrences:
+
+- Conceptually: `EXCLUDE USING gist (calendar_id WITH =, time_range WITH &&) WHERE (status = 'active')`
+
+Now a write that inserts conflicting occurrences *cannot commit*. That gives you:
+- Correctness under concurrency (two devices editing simultaneously).
+- No separate locking system.
+- A deterministic “which occurrence overlapped” error you can surface.
+
+### Write path (new or edited recurring event)
+1. **Persist definition change** in `event_definition` with a new `definition_version` (fast, always succeeds unless invalid).
+2. **Materialize in a transaction** for the bounded window:
+   - Expand RRULE for the window using tz-aware arithmetic: generate local occurrences, convert each to UTC using tzdb rules at that date.
+   - Apply exceptions/overrides deterministically by `occurrence_key` (see below).
+   - Upsert rows into `occurrence` for `(event_id, occurrence_key)`; delete stale rows for this event that no longer exist in-window.
+3. **Conflict check is implicit:** if any inserted/updated `occurrence` overlaps existing ones for the same `calendar_id`, Postgres raises an exclusion violation; the API returns a 409 with the colliding occurrence ids/times.
+
+### Stable occurrence identity (the part that prevents “exception drift”)
+A recurring series needs a stable key for “the third Tuesday occurrence” even when tz offsets change. Use:
+- `occurrence_key = (event_id, local_date, local_time, tzid)` derived from the recurrence rule’s *local* generation step, not from UTC.
+- Exceptions store `original_occurrence_key` so “move just this one” stays attached even as tz offsets shift.
+
+This is the non-obvious piece: **exceptions must bind to the recurrence in the same coordinate system the user thinks in (local time),** otherwise DST will make exceptions slide to the wrong instance.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correct timezone + DST semantics | Some extra write amplification (materialization) |
+| Simple, transactional conflict guarantees | Conflicts limited to the materialized window |
+| Fast agenda/free-busy reads | Background worker complexity and lag management |
+| Edge-friendly sync | Server does more validation/merge work |
+
+## Failure Modes
+
+- **Materialization lag (worker backlog)**
+  - What happens: agenda/free-busy misses newly edited future instances; reminders drift.
+  - Detect: per-calendar “window covered until” metric; queue depth + job age SLOs.
+  - Recover: prioritize calendars with upcoming occurrences; temporarily fall back to on-demand expansion for reads beyond covered horizon (read-only, no conflict promises).
+
+- **Timezone database mismatch (clients vs server)**
+  - What happens: clients render different times; offline edits generate surprising results.
+  - Detect: include `tzdb_version` in sync metadata; log server/client mismatches.
+  - Recover: server remains authoritative; force a “re-sync and re-render” on mismatch; ship tzdb updates aggressively.
+
+- **Hot calendar shard (shared calendar, celebrity schedule)**
+  - What happens: high contention on the same `calendar_id`, conflict checks slow.
+  - Detect: per-calendar write latency + lock wait time; top-N hottest calendars.
+  - Recover: isolate hot calendars onto dedicated Postgres shards; add per-calendar write queueing to serialize at the API layer for those specific ids.
+
+## What I'd Do Differently At...
+
+- **10x scale:** shard Postgres by `calendar_id`, add read replicas for agenda views, and push more agenda queries into cache with versioned keys.
+- **100x scale:** move the occurrence store to a distributed SQL system (Spanner/Cockroach) or a purpose-built per-calendar storage service with the same “bounded materialization + exclusion-like guarantee” semantics; keep the rule expansion workers close to storage to reduce write amplification and contention.
+
+## Operational Notes
+
+- Treat RRULE parsing/normalization as an API contract: reject ambiguous rules and cap expansions (e.g., max occurrences per window) to prevent “infinite meeting” abuse.
+- Backfills are routine: tzdb updates and rule-bug fixes require re-materializing affected calendars; build a throttled reindex pipeline from day one.
+- Monitor “coverage horizon” per calendar, not just worker CPU—being *correct but late* is still a production incident for reminders.
+- Idempotency is non-negotiable: mobile retries and offline sync replays must not duplicate definitions or occurrences.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/calendar-scheduling-system.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-b8d3-7113-8656-0bdbb1a6463a
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Calendar Scheduling System"
+category: "IoT & Edge"
+difficulty: "Hard"
+tags: ["calendar", "recurrence", "rrule", "timezones", "conflict-detection", "postgres", "offline-sync"]
+---
+
+## Overview
+
+This system stores calendar events (including recurring rules) and serves fast “what’s on my schedule?” queries while reliably detecting conflicts—even when users travel across time zones and daylight saving time (DST) shifts occur. The key insight is to **separate event intent from event instances**: store the canonical event definition (RRULE + timezone + exceptions) and **materialize occurrences only within a rolling window** where conflicts and UI views matter.
+
+Naive designs either (a) expand every recurrence forever (explodes storage and backfills) or (b) compute everything on the fly (conflict checks become expensive and inconsistent across clients). This design keeps recurrence logic authoritative on the server, but bounds it: a background expander maintains a per-calendar occurrence index for, say, the next 18 months, making reads and conflict checks boring and fast.
+
+Because this is “IoT & Edge”, the system treats clients as intermittently connected: offline edits are accepted as *proposals* and reconciled server-side using stable sync tokens. Clients can do optimistic local checks, but the server makes the final call.
+
+## What Makes This Hard
+
+Most teams underestimate two traps:
+
+1. **“Same local time” is not “same instant.”** Recurring meetings defined as “9:00 AM America/Los_Angeles” must stay at 9:00 AM local time across DST transitions, which means the UTC timestamp changes. Storing only UTC loses the user’s intent; storing only local time loses ordering and conflict correctness.
+
+2. **Conflicts + recurrence is a cross-product.** A “simple” conflict check becomes “does this rule generate any occurrences that overlap any other rule’s occurrences,” especially when exceptions, edits to a single instance, and shared calendars enter the picture.
+
+## Requirements
+
+### Functional Requirements
+- Create/update/delete single and recurring events using iCalendar-style rules (RRULE), including exceptions (EXDATE) and modified instances (“this one occurrence moved”).
+- Support per-event timezone (IANA tzid) and preserve “wall-clock intent” for recurring events.
+- Conflict detection on create/update for a calendar (and optionally across selected calendars), with clear “why it conflicts” feedback.
+- Efficient agenda view (day/week/month) and free/busy queries.
+- Multi-device sync with offline capability: sync tokens, idempotent writes, and deterministic reconciliation.
+- Shared calendars: read access at scale; writes serialized per calendar.
+
+### Scale Targets
+- 20M daily active users; average 3 calendars/user; average 500 events/calendar.
+- 30% of events recurring; typical RRULE creates 1–52 occurrences/year.
+- Peak reads: 200k agenda/free-busy QPS (driven by UI refresh + widgets).
+- Peak writes: 10k QPS (creates/edits + sync replays).
+- Latency: p95 agenda view < 150ms, p95 create/update with conflict check < 250ms.
+- Materialization window: 18 months forward + 3 months back (covers UI, reminders, late edits; bounds storage).
+
+## Key Design Decisions
+
+- **Choose: “Definition + bounded materialization.”**
+  - Rejected: infinite pre-expansion; pure on-demand expansion.
+  - Why: bounded occurrences make conflict checks and queries fast without unbounded storage or unpredictable CPU.
+
+- **Choose: Server-authoritative timezone semantics using IANA tzdb.**
+  - Rejected: “store UTC only” or “client decides timezone math.”
+  - Why: correctness depends on consistent tz rules; server authority prevents devices with stale tzdb from silently diverging.
+
+- **Choose: Postgres range indexing + exclusion for conflicts (per calendar shard).**
+  - Rejected: custom interval trees in a service; distributed locking.
+  - Why: Postgres can enforce “no overlaps” with transactional guarantees; it’s simpler than inventing a new concurrency/control plane.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Edge Clients] --> G[API Gateway]
+  G --> A[Auth]
+  G --> S[Calendar API]
+  S --> R[(Redis Cache)]
+  S --> P[(Postgres)]
+  S --> N[Push/Email]
+  W[Expander Worker] --> P
+  S --> Q[Job Queue]
+  Q --> W
+```
+
+### Components
+
+- **Edge Clients**
+  - Maintain a local cache and sync token; can render agendas offline.
+  - Submit edits with idempotency keys; show “tentative conflict” only as UX, not truth.
+
+- **API Gateway**
+  - Rate limits per user/device; collapses retries; enforces idempotency key presence on writes.
+
+- **Auth**
+  - Issues short-lived tokens; carries device-id for sync and dedupe.
+
+- **Calendar API**
+  - Owns event definitions, permissions, and the read model for agenda/free-busy.
+  - For writes: validates RRULE, records definition changes, schedules (re)materialization jobs, and performs conflict checks.
+
+- **Postgres**
+  - Source of truth for: calendars, event definitions, exceptions, and materialized occurrences.
+  - Partitioned/sharded by `calendar_id` to keep conflict checks local and hot data bounded.
+
+- **Redis Cache**
+  - Caches common agenda windows and free/busy responses keyed by `(calendar_id, window, tzid, version)`.
+
+- **Job Queue + Expander Worker**
+  - Materializes occurrences for the rolling window and maintains the conflict index.
+  - Idempotent jobs keyed by `(calendar_id, event_id, definition_version)`.
+
+- **Push/Email**
+  - Notifies devices about calendar version bumps and sends reminders from materialized occurrences.
+
+## Deep Dive: Conflict Detection for Recurring Events (Without Exploding)
+
+**Hard part:** given a proposed change (new recurring event, edit to RRULE, or edit to a single instance), decide if it overlaps existing events—quickly, correctly, and transactionally.
+
+### Data Model (core tables)
+- `event_definition`
+  - `event_id`, `calendar_id`
+  - `dtstart_local` (wall-clock), `tzid` (IANA)
+  - `rrule` (normalized), `duration_seconds`
+  - `definition_version` (monotonic)
+- `event_exception`
+  - `event_id`, `original_occurrence_key`, `override_dtstart_local/tzid/duration` or `is_cancelled`
+- `occurrence`
+  - One row per expanded instance within the materialization window
+  - `calendar_id`, `event_id`, `occurrence_start_utc`, `occurrence_end_utc`, `occurrence_key`
+  - Postgres `tstzrange` generated from start/end
+  - Indexed by `(calendar_id, occurrence_start_utc)` and GiST on the range
+
+### The elegant trick: let the database enforce “no overlaps”
+For calendars that require “no conflicts,” define an exclusion constraint on the materialized occurrences:
+
+- Conceptually: `EXCLUDE USING gist (calendar_id WITH =, time_range WITH &&) WHERE (status = 'active')`
+
+Now a write that inserts conflicting occurrences *cannot commit*. That gives you:
+- Correctness under concurrency (two devices editing simultaneously).
+- No separate locking system.
+- A deterministic “which occurrence overlapped” error you can surface.
+
+### Write path (new or edited recurring event)
+1. **Persist definition change** in `event_definition` with a new `definition_version` (fast, always succeeds unless invalid).
+2. **Materialize in a transaction** for the bounded window:
+   - Expand RRULE for the window using tz-aware arithmetic: generate local occurrences, convert each to UTC using tzdb rules at that date.
+   - Apply exceptions/overrides deterministically by `occurrence_key` (see below).
+   - Upsert rows into `occurrence` for `(event_id, occurrence_key)`; delete stale rows for this event that no longer exist in-window.
+3. **Conflict check is implicit:** if any inserted/updated `occurrence` overlaps existing ones for the same `calendar_id`, Postgres raises an exclusion violation; the API returns a 409 with the colliding occurrence ids/times.
+
+### Stable occurrence identity (the part that prevents “exception drift”)
+A recurring series needs a stable key for “the third Tuesday occurrence” even when tz offsets change. Use:
+- `occurrence_key = (event_id, local_date, local_time, tzid)` derived from the recurrence rule’s *local* generation step, not from UTC.
+- Exceptions store `original_occurrence_key` so “move just this one” stays attached even as tz offsets shift.
+
+This is the non-obvious piece: **exceptions must bind to the recurrence in the same coordinate system the user thinks in (local time),** otherwise DST will make exceptions slide to the wrong instance.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correct timezone + DST semantics | Some extra write amplification (materialization) |
+| Simple, transactional conflict guarantees | Conflicts limited to the materialized window |
+| Fast agenda/free-busy reads | Background worker complexity and lag management |
+| Edge-friendly sync | Server does more validation/merge work |
+
+## Failure Modes
+
+- **Materialization lag (worker backlog)**
+  - What happens: agenda/free-busy misses newly edited future instances; reminders drift.
+  - Detect: per-calendar “window covered until” metric; queue depth + job age SLOs.
+  - Recover: prioritize calendars with upcoming occurrences; temporarily fall back to on-demand expansion for reads beyond covered horizon (read-only, no conflict promises).
+
+- **Timezone database mismatch (clients vs server)**
+  - What happens: clients render different times; offline edits generate surprising results.
+  - Detect: include `tzdb_version` in sync metadata; log server/client mismatches.
+  - Recover: server remains authoritative; force a “re-sync and re-render” on mismatch; ship tzdb updates aggressively.
+
+- **Hot calendar shard (shared calendar, celebrity schedule)**
+  - What happens: high contention on the same `calendar_id`, conflict checks slow.
+  - Detect: per-calendar write latency + lock wait time; top-N hottest calendars.
+  - Recover: isolate hot calendars onto dedicated Postgres shards; add per-calendar write queueing to serialize at the API layer for those specific ids.
+
+## What I'd Do Differently At...
+
+- **10x scale:** shard Postgres by `calendar_id`, add read replicas for agenda views, and push more agenda queries into cache with versioned keys.
+- **100x scale:** move the occurrence store to a distributed SQL system (Spanner/Cockroach) or a purpose-built per-calendar storage service with the same “bounded materialization + exclusion-like guarantee” semantics; keep the rule expansion workers close to storage to reduce write amplification and contention.
+
+## Operational Notes
+
+- Treat RRULE parsing/normalization as an API contract: reject ambiguous rules and cap expansions (e.g., max occurrences per window) to prevent “infinite meeting” abuse.
+- Backfills are routine: tzdb updates and rule-bug fixes require re-materializing affected calendars; build a throttled reindex pipeline from day one.
+- Monitor “coverage horizon” per calendar, not just worker CPU—being *correct but late* is still a production incident for reminders.
+- Idempotency is non-negotiable: mobile retries and offline sync replays must not duplicate definitions or occurrences.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+thinking
+**Structuring the response**
+
+I need to be concise while following the required structure. Using tables sounds like a good idea. I’m considering keeping it within 10 lines, but the template has multiple sections which might need more room. I think we can be minimal yet complete, aiming for around 50 to 80 lines. I should also remember to avoid oververbosity, use sections, and skip emojis and citations while providing a clear "Design's answer."
+codex
+## Elegance Check
+
+### The Core Insight
+Separating **event intent (RRULE + tz + exceptions)** from **bounded materialized occurrences** is the right “make it boring” move: it keeps timezone semantics authoritative while making agenda + conflict checks fast and transactional.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Postgres (`occurrence` + GiST + exclusion constraint) | Concurrency-safe “no overlaps” without inventing a lock/coordinator system. |
+| Canonical `event_definition` + `event_exception` | Preserves wall-clock intent and supports per-instance overrides correctly. |
+| Expander worker | Moves expensive recurrence math off the read path and bounds it to a window. |
+| Sync tokens + idempotency | Makes offline/retry behavior deterministic and debuggable. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Dedicated Job Queue | Postgres-backed queue (`FOR UPDATE SKIP LOCKED`) or outbox table + worker | Less infra; careful with noisy neighbors and vacuum/load. |
+| Redis for agenda/free-busy cache | Start with Postgres read replicas + app cache keyed by `calendar_version` | Less operational overhead; weaker cross-node cache hit rate. |
+| “Persist definition, then materialize” (two-step) | One transaction that updates definition + occurrences + bumps `calendar_version` | Slightly longer transactions; avoids “definition says X, occurrences show Y” windows. |
+| Full re-materialize for every edit | Incremental expansion: only recompute affected range, and “extend horizon” jobs | More logic; big win on write amplification. |
+| API-layer serialization for hot calendars | Postgres advisory lock per `calendar_id` for write path | Simpler than custom queues; still bottlenecked for celebrity calendars. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Postgres down for 5 minutes**
+   - Design's answer: not addressed (mostly focuses on worker lag)
+   - Recommendation: Strengthen — define read behavior (stale cache vs fail), write behavior (reject with retry-after), and how sync tokens recover after missed pushes.
+
+2. **Ambiguous local times at DST fall-back (e.g., 01:30 occurs twice)**
+   - Design's answer: not addressed
+   - Recommendation: Must fix — define a deterministic mapping for “fold” times (pick first/second instance) and encode it in `occurrence_key`/exception identity; otherwise “exceptions drift” can still happen for the repeated hour case.
+
+3. **Bad config / tzdb update changes future offsets**
+   - Design's answer: re-materialize pipeline + tzdb_version mismatch detection
+   - Recommendation: Strengthen — store `expanded_tzdb_version` per occurrence batch and make reads detect/avoid mixing versions within a window; plan a throttled, resumable reindex keyed by tzid + date ranges.
+
+4. **Worker backlog causes horizon gaps**
+   - Design's answer: coverage metrics + prioritized calendars + on-demand expansion beyond horizon (read-only)
+   - Recommendation: Acceptable, but clarify “correctness tiers” — what endpoints are allowed to fall back, and how reminders are prevented from firing late/incorrectly (e.g., reminders only from covered horizon).
+
+5. **Traffic 10x + hot shared calendar**
+   - Design's answer: isolate onto dedicated shard + serialize writes
+   - Recommendation: Strengthen — define a degradation mode (queue writes for that calendar with clear client feedback) and a read strategy (aggressive caching + read replicas) so one calendar can’t cause cascading DB contention.
+
+## Recommendations
+
+### Must Fix
+- Fix the **scale math**: with “500 events/calendar” and 60M calendars, the implied definition/occurrence row counts are not Postgres-realistic; either revise assumptions (typical calendars far smaller, only active calendars materialized) or introduce explicit **tiering** (hot window in Postgres, cold history in cheaper storage).
+- Specify **transactional consistency** between `event_definition`, `event_exception`, `occurrence`, and the cache key (`calendar_version`) to avoid clients seeing mismatched reads during concurrent edits.
+- Define **DST ambiguity** handling and include it in occurrence/exception identity.
+
+### Should Consider
+- Make conflict detection explicitly **window-scoped** in the API contract (including what happens when editing something that would create a conflict beyond the horizon).
+- Add a `calendar_change_log` (or equivalent) to back sync tokens with a clear retention/compaction story; idempotency keys alone won’t resolve write-write conflicts cleanly.
+- Clarify cross-calendar conflict checks: exclusion constraints only protect *within one calendar*; cross-calendar checks need a query-time overlap scan or an aggregated “busy index”.
+
+### Nice to Have
+- Separate models for **all-day/floating-time** events vs tz-aware timed events; they behave differently and simplify correctness.
+- Make cache invalidation purely version-based (`calendar_version`) and remove ad-hoc keys like `(window,tzid,version)` where possible (compute tz-specific projections from a shared busy set when feasible).
+
+## What's Working Well
+- The design is honest about the two real hard parts: **timezone intent** and **recurrence × conflict cross-product**.
+- Using **Postgres exclusion constraints** is an elegant “let the DB do concurrency” choice that keeps the system small-team operable.
+- The “stable occurrence identity binds to user coordinates” idea is strong; it just needs the DST-ambiguity edge case nailed down.
+- Operational notes (caps on expansion, reindex pipeline, horizon monitoring) show good production instincts.
+tokens used
+6,338
+## Elegance Check
+
+### The Core Insight
+Separating **event intent (RRULE + tz + exceptions)** from **bounded materialized occurrences** is the right “make it boring” move: it keeps timezone semantics authoritative while making agenda + conflict checks fast and transactional.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Postgres (`occurrence` + GiST + exclusion constraint) | Concurrency-safe “no overlaps” without inventing a lock/coordinator system. |
+| Canonical `event_definition` + `event_exception` | Preserves wall-clock intent and supports per-instance overrides correctly. |
+| Expander worker | Moves expensive recurrence math off the read path and bounds it to a window. |
+| Sync tokens + idempotency | Makes offline/retry behavior deterministic and debuggable. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Dedicated Job Queue | Postgres-backed queue (`FOR UPDATE SKIP LOCKED`) or outbox table + worker | Less infra; careful with noisy neighbors and vacuum/load. |
+| Redis for agenda/free-busy cache | Start with Postgres read replicas + app cache keyed by `calendar_version` | Less operational overhead; weaker cross-node cache hit rate. |
+| “Persist definition, then materialize” (two-step) | One transaction that updates definition + occurrences + bumps `calendar_version` | Slightly longer transactions; avoids “definition says X, occurrences show Y” windows. |
+| Full re-materialize for every edit | Incremental expansion: only recompute affected range, and “extend horizon” jobs | More logic; big win on write amplification. |
+| API-layer serialization for hot calendars | Postgres advisory lock per `calendar_id` for write path | Simpler than custom queues; still bottlenecked for celebrity calendars. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Postgres down for 5 minutes**
+   - Design's answer: not addressed (mostly focuses on worker lag)
+   - Recommendation: Strengthen — define read behavior (stale cache vs fail), write behavior (reject with retry-after), and how sync tokens recover after missed pushes.
+
+2. **Ambiguous local times at DST fall-back (e.g., 01:30 occurs twice)**
+   - Design's answer: not addressed
+   - Recommendation: Must fix — define a deterministic mapping for “fold” times (pick first/second instance) and encode it in `occurrence_key`/exception identity; otherwise “exceptions drift” can still happen for the repeated hour case.
+
+3. **Bad config / tzdb update changes future offsets**
+   - Design's answer: re-materialize pipeline + tzdb_version mismatch detection
+   - Recommendation: Strengthen — store `expanded_tzdb_version` per occurrence batch and make reads detect/avoid mixing versions within a window; plan a throttled, resumable reindex keyed by tzid + date ranges.
+
+4. **Worker backlog causes horizon gaps**
+   - Design's answer: coverage metrics + prioritized calendars + on-demand expansion beyond horizon (read-only)
+   - Recommendation: Acceptable, but clarify “correctness tiers” — what endpoints are allowed to fall back, and how reminders are prevented from firing late/incorrectly (e.g., reminders only from covered horizon).
+
+5. **Traffic 10x + hot shared calendar**
+   - Design's answer: isolate onto dedicated shard + serialize writes
+   - Recommendation: Strengthen — define a degradation mode (queue writes for that calendar with clear client feedback) and a read strategy (aggressive caching + read replicas) so one calendar can’t cause cascading DB contention.
+
+## Recommendations
+
+### Must Fix
+- Fix the **scale math**: with “500 events/calendar” and 60M calendars, the implied definition/occurrence row counts are not Postgres-realistic; either revise assumptions (typical calendars far smaller, only active calendars materialized) or introduce explicit **tiering** (hot window in Postgres, cold history in cheaper storage).
+- Specify **transactional consistency** between `event_definition`, `event_exception`, `occurrence`, and the cache key (`calendar_version`) to avoid clients seeing mismatched reads during concurrent edits.
+- Define **DST ambiguity** handling and include it in occurrence/exception identity.
+
+### Should Consider
+- Make conflict detection explicitly **window-scoped** in the API contract (including what happens when editing something that would create a conflict beyond the horizon).
+- Add a `calendar_change_log` (or equivalent) to back sync tokens with a clear retention/compaction story; idempotency keys alone won’t resolve write-write conflicts cleanly.
+- Clarify cross-calendar conflict checks: exclusion constraints only protect *within one calendar*; cross-calendar checks need a query-time overlap scan or an aggregated “busy index”.
+
+### Nice to Have
+- Separate models for **all-day/floating-time** events vs tz-aware timed events; they behave differently and simplify correctness.
+- Make cache invalidation purely version-based (`calendar_version`) and remove ad-hoc keys like `(window,tzid,version)` where possible (compute tz-specific projections from a shared busy set when feasible).
+
+## What's Working Well
+- The design is honest about the two real hard parts: **timezone intent** and **recurrence × conflict cross-product**.
+- Using **Postgres exclusion constraints** is an elegant “let the DB do concurrency” choice that keeps the system small-team operable.
+- The “stable occurrence identity binds to user coordinates” idea is strong; it just needs the DST-ambiguity edge case nailed down.
+- Operational notes (caps on expansion, reindex pipeline, horizon monitoring) show good production instincts.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/calendar-scheduling-system.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afa-22fa-7bd0-81b4-baa547670efe
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Calendar Scheduling System"
+category: "IoT & Edge"
+difficulty: "Hard"
+tags: ["calendar", "recurrence", "rrule", "timezones", "conflict-detection", "postgres", "offline-sync"]
+---
+
+## Overview
+
+This system stores calendar events (including recurring rules) and serves fast “what’s on my schedule?” queries while reliably detecting conflicts—even when users travel across time zones and daylight saving time (DST) shifts occur. The key insight is to **separate event intent from event instances**: store the canonical event definition (RRULE + timezone + exceptions) and **materialize occurrences only within a rolling window** where conflicts and UI views matter.
+
+Naive designs either (a) expand every recurrence forever (explodes storage and backfills) or (b) compute everything on the fly (conflict checks become expensive and inconsistent across clients). This design keeps recurrence logic authoritative on the server, but bounds it: a background expander maintains a per-calendar occurrence index for, say, the next 18 months, making reads and conflict checks boring and fast.
+
+Because this is “IoT & Edge”, the system treats clients as intermittently connected: offline edits are accepted as *proposals* and reconciled server-side using stable sync tokens. Clients can do optimistic local checks, but the server makes the final call.
+
+## What Makes This Hard
+
+Most teams underestimate two traps:
+
+1. **“Same local time” is not “same instant.”** Recurring meetings defined as “9:00 AM America/Los_Angeles” must stay at 9:00 AM local time across DST transitions, which means the UTC timestamp changes. Storing only UTC loses the user’s intent; storing only local time loses ordering and conflict correctness.
+
+2. **Conflicts + recurrence is a cross-product.** A “simple” conflict check becomes “does this rule generate any occurrences that overlap any other rule’s occurrences,” especially when exceptions, edits to a single instance, and shared calendars enter the picture.
+
+## Requirements
+
+### Functional Requirements
+- Create/update/delete single and recurring events using iCalendar-style rules (RRULE), including exceptions (EXDATE) and modified instances (“this one occurrence moved”).
+- Support per-event timezone (IANA tzid) and preserve “wall-clock intent” for recurring events.
+- Conflict detection on create/update for a calendar (and optionally across selected calendars), with clear “why it conflicts” feedback.
+- Efficient agenda view (day/week/month) and free/busy queries.
+- Multi-device sync with offline capability: sync tokens, idempotent writes, and deterministic reconciliation.
+- Shared calendars: read access at scale; writes serialized per calendar.
+
+### Scale Targets
+- 20M daily active users; average 3 calendars/user; average 500 events/calendar.
+- 30% of events recurring; typical RRULE creates 1–52 occurrences/year.
+- Peak reads: 200k agenda/free-busy QPS (driven by UI refresh + widgets).
+- Peak writes: 10k QPS (creates/edits + sync replays).
+- Latency: p95 agenda view < 150ms, p95 create/update with conflict check < 250ms.
+- Materialization window: 18 months forward + 3 months back (covers UI, reminders, late edits; bounds storage).
+
+## Key Design Decisions
+
+- **Choose: “Definition + bounded materialization.”**
+  - Rejected: infinite pre-expansion; pure on-demand expansion.
+  - Why: bounded occurrences make conflict checks and queries fast without unbounded storage or unpredictable CPU.
+
+- **Choose: Server-authoritative timezone semantics using IANA tzdb.**
+  - Rejected: “store UTC only” or “client decides timezone math.”
+  - Why: correctness depends on consistent tz rules; server authority prevents devices with stale tzdb from silently diverging.
+
+- **Choose: Postgres range indexing + exclusion for conflicts (per calendar shard).**
+  - Rejected: custom interval trees in a service; distributed locking.
+  - Why: Postgres can enforce “no overlaps” with transactional guarantees; it’s simpler than inventing a new concurrency/control plane.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Edge Clients] --> G[API Gateway]
+  G --> A[Auth]
+  G --> S[Calendar API]
+  S --> R[(Redis Cache)]
+  S --> P[(Postgres)]
+  S --> N[Push/Email]
+  W[Expander Worker] --> P
+  S --> Q[Job Queue]
+  Q --> W
+```
+
+### Components
+
+- **Edge Clients**
+  - Maintain a local cache and sync token; can render agendas offline.
+  - Submit edits with idempotency keys; show “tentative conflict” only as UX, not truth.
+
+- **API Gateway**
+  - Rate limits per user/device; collapses retries; enforces idempotency key presence on writes.
+
+- **Auth**
+  - Issues short-lived tokens; carries device-id for sync and dedupe.
+
+- **Calendar API**
+  - Owns event definitions, permissions, and the read model for agenda/free-busy.
+  - For writes: validates RRULE, records definition changes, schedules (re)materialization jobs, and performs conflict checks.
+
+- **Postgres**
+  - Source of truth for: calendars, event definitions, exceptions, and materialized occurrences.
+  - Partitioned/sharded by `calendar_id` to keep conflict checks local and hot data bounded.
+
+- **Redis Cache**
+  - Caches common agenda windows and free/busy responses keyed by `(calendar_id, window, tzid, version)`.
+
+- **Job Queue + Expander Worker**
+  - Materializes occurrences for the rolling window and maintains the conflict index.
+  - Idempotent jobs keyed by `(calendar_id, event_id, definition_version)`.
+
+- **Push/Email**
+  - Notifies devices about calendar version bumps and sends reminders from materialized occurrences.
+
+## Deep Dive: Conflict Detection for Recurring Events (Without Exploding)
+
+**Hard part:** given a proposed change (new recurring event, edit to RRULE, or edit to a single instance), decide if it overlaps existing events—quickly, correctly, and transactionally.
+
+### Data Model (core tables)
+- `event_definition`
+  - `event_id`, `calendar_id`
+  - `dtstart_local` (wall-clock), `tzid` (IANA)
+  - `rrule` (normalized), `duration_seconds`
+  - `definition_version` (monotonic)
+- `event_exception`
+  - `event_id`, `original_occurrence_key`, `override_dtstart_local/tzid/duration` or `is_cancelled`
+- `occurrence`
+  - One row per expanded instance within the materialization window
+  - `calendar_id`, `event_id`, `occurrence_start_utc`, `occurrence_end_utc`, `occurrence_key`
+  - Postgres `tstzrange` generated from start/end
+  - Indexed by `(calendar_id, occurrence_start_utc)` and GiST on the range
+
+### The elegant trick: let the database enforce “no overlaps”
+For calendars that require “no conflicts,” define an exclusion constraint on the materialized occurrences:
+
+- Conceptually: `EXCLUDE USING gist (calendar_id WITH =, time_range WITH &&) WHERE (status = 'active')`
+
+Now a write that inserts conflicting occurrences *cannot commit*. That gives you:
+- Correctness under concurrency (two devices editing simultaneously).
+- No separate locking system.
+- A deterministic “which occurrence overlapped” error you can surface.
+
+### Write path (new or edited recurring event)
+1. **Persist definition change** in `event_definition` with a new `definition_version` (fast, always succeeds unless invalid).
+2. **Materialize in a transaction** for the bounded window:
+   - Expand RRULE for the window using tz-aware arithmetic: generate local occurrences, convert each to UTC using tzdb rules at that date.
+   - Apply exceptions/overrides deterministically by `occurrence_key` (see below).
+   - Upsert rows into `occurrence` for `(event_id, occurrence_key)`; delete stale rows for this event that no longer exist in-window.
+3. **Conflict check is implicit:** if any inserted/updated `occurrence` overlaps existing ones for the same `calendar_id`, Postgres raises an exclusion violation; the API returns a 409 with the colliding occurrence ids/times.
+
+### Stable occurrence identity (the part that prevents “exception drift”)
+A recurring series needs a stable key for “the third Tuesday occurrence” even when tz offsets change. Use:
+- `occurrence_key = (event_id, local_date, local_time, tzid)` derived from the recurrence rule’s *local* generation step, not from UTC.
+- Exceptions store `original_occurrence_key` so “move just this one” stays attached even as tz offsets shift.
+
+This is the non-obvious piece: **exceptions must bind to the recurrence in the same coordinate system the user thinks in (local time),** otherwise DST will make exceptions slide to the wrong instance.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correct timezone + DST semantics | Some extra write amplification (materialization) |
+| Simple, transactional conflict guarantees | Conflicts limited to the materialized window |
+| Fast agenda/free-busy reads | Background worker complexity and lag management |
+| Edge-friendly sync | Server does more validation/merge work |
+
+## Failure Modes
+
+- **Materialization lag (worker backlog)**
+  - What happens: agenda/free-busy misses newly edited future instances; reminders drift.
+  - Detect: per-calendar “window covered until” metric; queue depth + job age SLOs.
+  - Recover: prioritize calendars with upcoming occurrences; temporarily fall back to on-demand expansion for reads beyond covered horizon (read-only, no conflict promises).
+
+- **Timezone database mismatch (clients vs server)**
+  - What happens: clients render different times; offline edits generate surprising results.
+  - Detect: include `tzdb_version` in sync metadata; log server/client mismatches.
+  - Recover: server remains authoritative; force a “re-sync and re-render” on mismatch; ship tzdb updates aggressively.
+
+- **Hot calendar shard (shared calendar, celebrity schedule)**
+  - What happens: high contention on the same `calendar_id`, conflict checks slow.
+  - Detect: per-calendar write latency + lock wait time; top-N hottest calendars.
+  - Recover: isolate hot calendars onto dedicated Postgres shards; add per-calendar write queueing to serialize at the API layer for those specific ids.
+
+## What I'd Do Differently At...
+
+- **10x scale:** shard Postgres by `calendar_id`, add read replicas for agenda views, and push more agenda queries into cache with versioned keys.
+- **100x scale:** move the occurrence store to a distributed SQL system (Spanner/Cockroach) or a purpose-built per-calendar storage service with the same “bounded materialization + exclusion-like guarantee” semantics; keep the rule expansion workers close to storage to reduce write amplification and contention.
+
+## Operational Notes
+
+- Treat RRULE parsing/normalization as an API contract: reject ambiguous rules and cap expansions (e.g., max occurrences per window) to prevent “infinite meeting” abuse.
+- Backfills are routine: tzdb updates and rule-bug fixes require re-materializing affected calendars; build a throttled reindex pipeline from day one.
+- Monitor “coverage horizon” per calendar, not just worker CPU—being *correct but late* is still a production incident for reminders.
+- Idempotency is non-negotiable: mobile retries and offline sync replays must not duplicate definitions or occurrences.
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Separating **event intent (RRULE + tz + exceptions)** from **bounded materialized occurrences** is the right “make it boring” move: it keeps timezone semantics authoritative while making agenda + conflict checks fast and transactional.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Postgres (`occurrence` + GiST + exclusion constraint) | Concurrency-safe “no overlaps” without inventing a lock/coordinator system. |
+| Canonical `event_definition` + `event_exception` | Preserves wall-clock intent and supports per-instance overrides correctly. |
+| Expander worker | Moves expensive recurrence math off the read path and bounds it to a window. |
+| Sync tokens + idempotency | Makes offline/retry behavior deterministic and debuggable. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Dedicated Job Queue | Postgres-backed queue (`FOR UPDATE SKIP LOCKED`) or outbox table + worker | Less infra; careful with noisy neighbors and vacuum/load. |
+| Redis for agenda/free-busy cache | Start with Postgres read replicas + app cache keyed by `calendar_version` | Less operational overhead; weaker cross-node cache hit rate. |
+| “Persist definition, then materialize” (two-step) | One transaction that updates definition + occurrences + bumps `calendar_version` | Slightly longer transactions; avoids “definition says X, occurrences show Y” windows. |
+| Full re-materialize for every edit | Incremental expansion: only recompute affected range, and “extend horizon” jobs | More logic; big win on write amplification. |
+| API-layer serialization for hot calendars | Postgres advisory lock per `calendar_id` for write path | Simpler than custom queues; still bottlenecked for celebrity calendars. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Postgres down for 5 minutes**
+   - Design's answer: not addressed (mostly focuses on worker lag)
+   - Recommendation: Strengthen — define read behavior (stale cache vs fail), write behavior (reject with retry-after), and how sync tokens recover after missed pushes.
+
+2. **Ambiguous local times at DST fall-back (e.g., 01:30 occurs twice)**
+   - Design's answer: not addressed
+   - Recommendation: Must fix — define a deterministic mapping for “fold” times (pick first/second instance) and encode it in `occurrence_key`/exception identity; otherwise “exceptions drift” can still happen for the repeated hour case.
+
+3. **Bad config / tzdb update changes future offsets**
+   - Design's answer: re-materialize pipeline + tzdb_version mismatch detection
+   - Recommendation: Strengthen — store `expanded_tzdb_version` per occurrence batch and make reads detect/avoid mixing versions within a window; plan a throttled, resumable reindex keyed by tzid + date ranges.
+
+4. **Worker backlog causes horizon gaps**
+   - Design's answer: coverage metrics + prioritized calendars + on-demand expansion beyond horizon (read-only)
+   - Recommendation: Acceptable, but clarify “correctness tiers” — what endpoints are allowed to fall back, and how reminders are prevented from firing late/incorrectly (e.g., reminders only from covered horizon).
+
+5. **Traffic 10x + hot shared calendar**
+   - Design's answer: isolate onto dedicated shard + serialize writes
+   - Recommendation: Strengthen — define a degradation mode (queue writes for that calendar with clear client feedback) and a read strategy (aggressive caching + read replicas) so one calendar can’t cause cascading DB contention.
+
+## Recommendations
+
+### Must Fix
+- Fix the **scale math**: with “500 events/calendar” and 60M calendars, the implied definition/occurrence row counts are not Postgres-realistic; either revise assumptions (typical calendars far smaller, only active calendars materialized) or introduce explicit **tiering** (hot window in Postgres, cold history in cheaper storage).
+- Specify **transactional consistency** between `event_definition`, `event_exception`, `occurrence`, and the cache key (`calendar_version`) to avoid clients seeing mismatched reads during concurrent edits.
+- Define **DST ambiguity** handling and include it in occurrence/exception identity.
+
+### Should Consider
+- Make conflict detection explicitly **window-scoped** in the API contract (including what happens when editing something that would create a conflict beyond the horizon).
+- Add a `calendar_change_log` (or equivalent) to back sync tokens with a clear retention/compaction story; idempotency keys alone won’t resolve write-write conflicts cleanly.
+- Clarify cross-calendar conflict checks: exclusion constraints only protect *within one calendar*; cross-calendar checks need a query-time overlap scan or an aggregated “busy index”.
+
+### Nice to Have
+- Separate models for **all-day/floating-time** events vs tz-aware timed events; they behave differently and simplify correctness.
+- Make cache invalidation purely version-based (`calendar_version`) and remove ad-hoc keys like `(window,tzid,version)` where possible (compute tz-specific projections from a shared busy set when feasible).
+
+## What's Working Well
+- The design is honest about the two real hard parts: **timezone intent** and **recurrence × conflict cross-product**.
+- Using **Postgres exclusion constraints** is an elegant “let the DB do concurrency” choice that keeps the system small-team operable.
+- The “stable occurrence identity binds to user coordinates” idea is strong; it just needs the DST-ambiguity edge case nailed down.
+- Operational notes (caps on expansion, reindex pipeline, horizon monitoring) show good production instincts.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+
+thinking
+**Simplifying architecture**
+
+I need to create a complete markdown document with frontmatter while simplifying the components involved: Edge Clients, Calendar API, Postgres, Worker, and possibly Push/Email as optional. I can remove separate API Gateway and Auth by integrating them into the Calendar API using managed authentication like OIDC. I wonder if calling it a managed service counts as adding components? It might be better to simplify and state "Calendar API (includes auth + rate limit)." For job queues, I’ll replace it with a Postgres table while caching in-process.
+thinking
+**Refining push/email handling**
+
+I'm considering whether to remove the Push/Email component for simplicity since reminders aren't explicitly mentioned in the requirements. Instead, we could keep push notifications optional, but it might be simpler to remove them entirely, allowing clients to poll for sync instead. This could impact battery life and data freshness, but it seems manageable. If Postgres goes down, we’ll define behavior for reads/writes, enabling client caching. I'm thinking about handling DST ambiguity with a `fold` flag in `occurrence_key`, which shouldn’t add components but does require an additional field.
+thinking
+**Handling ambiguous local times**
+
+Ambiguous local times can occur, but we can resolve them by choosing the earliest or latest offset, which must be deterministic. I’m planning to store the `local_datetime` along with the offset or `utc_offset_minutes`, plus an `is_fold` flag during expansion. The `occurrence_key` will be derived from local generation and the fold. 
+
+For transactional consistency, we should conduct one transaction for definitions, exceptions, and occurrences while bumping the `calendar_version`. Even if adding a `calendar_change_log` seems appealing, we can’t add a section, but creating a separate table is doable. Ultimately, I think using the `calendar_version` coupled with `updated_at` is the simplest approach for syncing!
+thinking
+**Managing offline write conflicts**
+
+We don't need a change log, but I need to think about write-write conflicts when offline. I can handle this with optimistic concurrency by including `if_match_calendar_version`. If a client's version is stale, the server will return a 409 error, prompting the client to fetch the latest version and retry a manual merge. This approach is deterministic and uses idempotency keys to prevent duplicates, simplifying things. 
+
+For shared calendars, I can serialize writes per calendar and utilize Postgres advisory locks without introducing new components. Conflict detection can occur within selected calendars, but cross-calendar checks can happen on the client side.
+thinking
+**Restructuring the document**
+
+I’m focusing on handling heavy expansions while implementing advisory locks for hot calendars and keeping transactions shorter. Since there's only one calendar, I could return a 429 status if the lock can't be acquired quickly. Now, I need to restructure the document without creating new sections. 
+
+I'll map current sections to new headings: "Minimal Architecture" for architecture, and I'll rename "What I'd Do Differently At..." to "What We Removed." This aligns with the instructions while maintaining clarity. Existing sections need adjustments, and I’ll condense them while ensuring that all essential information and justifications are included. It looks like I’ll also address scaling and operational notes compactly. 
+
+By doing this, I can ensure that removed components are clearly stated and justify why each component remains. I think I’ll simplify the design while keeping the title and format intact. Overall, my goal is to keep it factual and straightforward, avoiding any argumentative language. Let's craft this full markdown document with minimal revisions!
+thinking
+**Finalizing the calendar design**
+
+I need to address horizon coverage for rarely updated calendars, checking tzdb versions in the calendar row. If there's a mismatch, the first read will trigger an expansion, which is manageable. I’ll ensure not to add new components but can include necessary fields for notes about limitations in the Requirements or Key Design Decisions sections. 
+
+The user wants a complete markdown document, focusing on the design while maintaining clear instructions. I’ll keep titles and formats intact, renaming "Operational Notes" to "What We Removed" without adding sections. 
+
+I plan to summarize the architecture, DB schema, and conflict resolution strategies, ensuring clarity while addressing read/write scales with Postgres and its read replicas. I'll maintain a concise "What Makes This Hard" section and cut out unnecessary ones. Overall, I want to keep the design minimal and ensure it's buildable, addressing the user's needs effectively. Let's draft this now!
+codex
+```markdown
+---
+title: "Calendar Scheduling System"
+category: "IoT & Edge"
+difficulty: "Hard"
+tags: ["calendar", "recurrence", "rrule", "timezones", "conflict-detection", "postgres", "offline-sync"]
+---
+
+## Overview
+
+This system stores calendar events (including RRULE recurrence) and serves fast agenda/free-busy queries with conflict detection that stays correct across time zones and DST. It does this by storing **event intent** (RRULE + timezone + exceptions) and keeping a **bounded, rolling occurrence index** in Postgres for the only time range that matters for UI and edits.
+
+Clients are intermittently connected: they keep a local cache and sync using a single monotonic `calendar_version` plus idempotency keys. The server is authoritative for timezone math and conflicts.
+
+## What Makes This Hard
+
+1. **Wall-clock intent vs UTC reality.** “9:00 AM America/Los_Angeles” must remain 9:00 AM local across DST, which changes UTC instants.
+2. **Conflicts × recurrence.** “Does this overlap anything?” becomes “do any generated instances overlap,” including exceptions and edited single instances.
+3. **DST ambiguity.** Some local times are nonexistent (spring forward) or duplicated (fall back) and must be resolved deterministically.
+
+## Requirements
+
+### Functional Requirements
+- Create/update/delete single and recurring events using RRULE, including EXDATE and per-instance overrides/cancellations.
+- Support per-event IANA `tzid` and preserve wall-clock intent for recurring events.
+- Conflict detection on create/update **within a defined materialization window**, with “why it conflicts” feedback.
+- Efficient agenda (day/week/month) and free/busy queries.
+- Multi-device sync with offline capability: idempotent writes and deterministic reconciliation.
+- Shared calendars: reads at scale; writes serialized per calendar.
+
+### Scale Targets
+- 20M daily active users; average 1–2 actively used calendars/user.
+- Median calendars are small; the system only materializes windows for calendars that are read/written.
+- Peak reads: 200k agenda/free-busy QPS.
+- Peak writes: 10k QPS.
+- Latency: p95 agenda < 150ms; p95 create/update (with conflict check) < 250ms.
+- Materialization window: 6 months forward + 1 month back, sliding relative to “now”.
+
+## Key Design Decisions
+
+- **Definition + bounded materialization (rolling window).**
+  - `event_definition` and `event_exception` are authoritative; `occurrence` is a rolling index for fast reads and conflict checks.
+
+- **Postgres enforces conflicts transactionally.**
+  - Materialized occurrences store a `tstzrange`; a GiST exclusion constraint prevents overlaps per calendar without a separate lock service.
+
+- **Single write transaction for consistency.**
+  - A write updates definition/exceptions, (re)materializes occurrences for the window, and bumps `calendar_version` in one commit.
+
+- **Deterministic DST resolution is part of the data model.**
+  - Every generated local occurrence is resolved to UTC with a deterministic rule and recorded so exceptions never “drift.”
+
+- **Sync is version-based.**
+  - Clients sync by `(calendar_id, calendar_version)` and use idempotency keys; stale writes are rejected with a conflict response that forces a resync.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Edge Clients] --> S[Calendar API]
+  S --> P[(Postgres)]
+```
+
+### Components
+
+- **Edge Clients**
+  - Why it exists: offline agenda rendering and offline edits.
+  - Contract: sends idempotency keys and last-seen `calendar_version`; treats conflicts as server-authoritative.
+
+- **Calendar API**
+  - Why it exists: the only place that applies RRULE + timezone rules consistently and owns transactional writes.
+  - Responsibilities: validate rules, serialize writes per calendar, materialize the rolling window, serve agenda/free-busy, and run sync.
+
+- **Postgres**
+  - Why it exists: single durable source of truth + transactional conflict enforcement.
+  - Stores: calendars, definitions, exceptions, occurrences, and versions; partition/shard by `calendar_id` as needed.
+
+## Deep Dive: Conflict Detection for Recurring Events (Without Exploding)
+
+### Data Model (core tables)
+- `calendar`
+  - `calendar_id`, `calendar_version` (monotonic)
+  - `expanded_tzdb_version` (server tzdb version last used for this calendar’s occurrences)
+  - `window_start_utc`, `window_end_utc` (the currently materialized rolling window)
+- `event_definition`
+  - `event_id`, `calendar_id`
+  - `dtstart_local`, `tzid`, `rrule`, `duration_seconds`
+  - `definition_version` (monotonic)
+- `event_exception`
+  - `event_id`, `original_occurrence_key`
+  - overrides (`override_dtstart_local`, `override_tzid`, `override_duration`) or `is_cancelled`
+- `occurrence`
+  - `calendar_id`, `event_id`, `occurrence_key`
+  - `occurrence_start_utc`, `occurrence_end_utc`
+  - `time_range` as `tstzrange(start,end)`
+  - `resolved_offset_minutes`, `is_fold`, `expanded_tzdb_version`
+
+### Let the database enforce “no overlaps”
+For calendars that require “no conflicts,” enforce:
+
+- `EXCLUDE USING gist (calendar_id WITH =, time_range WITH &&) WHERE (status = 'active')`
+
+Any write that would overlap cannot commit. The API returns a 409 including the conflicting occurrences.
+
+### Stable occurrence identity (including DST ambiguity)
+`occurrence_key` is derived from **local generation**, not UTC, and includes the DST disambiguation:
+
+- `occurrence_key = (event_id, local_datetime, tzid, is_fold)`
+
+Deterministic resolution when converting `(local_datetime, tzid)` to UTC:
+- If local time is **ambiguous** (fall-back duplicate hour): choose the **earlier** offset (`is_fold = false`) unless an exception explicitly targets the later fold (`is_fold = true`).
+- If local time is **nonexistent** (spring-forward gap): shift forward to the **first valid local time** after the gap (keeping duration), and record the resolved offset used.
+
+Exceptions bind to `original_occurrence_key`, so “move just this one” remains attached to the intended local instance.
+
+### Write path (create/update)
+One transaction:
+1. Acquire a Postgres advisory lock for `calendar_id` (serializes writes per calendar).
+2. Validate RRULE and cap expansion (max occurrences in window).
+3. Update `event_definition` / `event_exception`.
+4. Ensure the calendar’s rolling window covers `[now-1mo, now+6mo]`; materialize occurrences for that window:
+   - Generate local instances, resolve to UTC deterministically, apply exceptions, upsert `occurrence`, delete stale in-window rows for the event.
+5. Bump `calendar_version` and commit.
+
+Reads are simple: query `occurrence` by `(calendar_id, time_range && window)` and return rows.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correct timezone + DST semantics | Write amplification within the window |
+| Transactional conflict guarantees | Conflicts are guaranteed only within the rolling window |
+| Simple operations (API + Postgres) | Some read requests may pay a one-time re-materialize cost when the window slides or tzdb changes |
+| Offline-friendly clients | Stale clients must resync before writes succeed |
+
+## Failure Modes
+
+- **Postgres down for 5 minutes**
+  - Reads/writes fail with 503 + retry-after.
+  - Clients continue offline using local cache; sync resumes by comparing `calendar_version` and refetching the rolling window.
+
+- **Ambiguous local times at DST fall-back**
+  - Occurrence generation records `is_fold` and the resolved offset.
+  - Exceptions target `(local_datetime, tzid, is_fold)` so overrides never attach to the wrong instance.
+
+- **tzdb update changes future offsets**
+  - Server bumps its `current_tzdb_version`.
+  - On the next read/write for a calendar, if `calendar.expanded_tzdb_version != current_tzdb_version`, the API re-materializes the rolling window in a transaction and updates `expanded_tzdb_version`.
+
+- **Hot shared calendar**
+  - Writes are serialized by advisory lock; if lock wait exceeds a small threshold, return 429 with retry-after to prevent pileups.
+  - Reads stay scalable via indexed range queries (and Postgres replicas if needed).
+
+## What We Removed
+
+- API Gateway and separate Auth service (folded into the Calendar API deployment boundary).
+- Redis cache (agenda/free-busy are served from the occurrence index; scaling uses Postgres replicas, not a second cache tier).
+- Dedicated job queue and expander worker (materialization happens inside the write transaction and opportunistically when the rolling window advances).
+- Push-based “version bumps” and reminder delivery (clients poll via sync; reminders come from clients’ local schedules).
+- Multi-step “persist then materialize” write flow (single transaction eliminates definition/occurrence mismatch windows).
+```
+
+tokens used
+11,376
+```markdown
+---
+title: "Calendar Scheduling System"
+category: "IoT & Edge"
+difficulty: "Hard"
+tags: ["calendar", "recurrence", "rrule", "timezones", "conflict-detection", "postgres", "offline-sync"]
+---
+
+## Overview
+
+This system stores calendar events (including RRULE recurrence) and serves fast agenda/free-busy queries with conflict detection that stays correct across time zones and DST. It does this by storing **event intent** (RRULE + timezone + exceptions) and keeping a **bounded, rolling occurrence index** in Postgres for the only time range that matters for UI and edits.
+
+Clients are intermittently connected: they keep a local cache and sync using a single monotonic `calendar_version` plus idempotency keys. The server is authoritative for timezone math and conflicts.
+
+## What Makes This Hard
+
+1. **Wall-clock intent vs UTC reality.** “9:00 AM America/Los_Angeles” must remain 9:00 AM local across DST, which changes UTC instants.
+2. **Conflicts × recurrence.** “Does this overlap anything?” becomes “do any generated instances overlap,” including exceptions and edited single instances.
+3. **DST ambiguity.** Some local times are nonexistent (spring forward) or duplicated (fall back) and must be resolved deterministically.
+
+## Requirements
+
+### Functional Requirements
+- Create/update/delete single and recurring events using RRULE, including EXDATE and per-instance overrides/cancellations.
+- Support per-event IANA `tzid` and preserve wall-clock intent for recurring events.
+- Conflict detection on create/update **within a defined materialization window**, with “why it conflicts” feedback.
+- Efficient agenda (day/week/month) and free/busy queries.
+- Multi-device sync with offline capability: idempotent writes and deterministic reconciliation.
+- Shared calendars: reads at scale; writes serialized per calendar.
+
+### Scale Targets
+- 20M daily active users; average 1–2 actively used calendars/user.
+- Median calendars are small; the system only materializes windows for calendars that are read/written.
+- Peak reads: 200k agenda/free-busy QPS.
+- Peak writes: 10k QPS.
+- Latency: p95 agenda < 150ms; p95 create/update (with conflict check) < 250ms.
+- Materialization window: 6 months forward + 1 month back, sliding relative to “now”.
+
+## Key Design Decisions
+
+- **Definition + bounded materialization (rolling window).**
+  - `event_definition` and `event_exception` are authoritative; `occurrence` is a rolling index for fast reads and conflict checks.
+
+- **Postgres enforces conflicts transactionally.**
+  - Materialized occurrences store a `tstzrange`; a GiST exclusion constraint prevents overlaps per calendar without a separate lock service.
+
+- **Single write transaction for consistency.**
+  - A write updates definition/exceptions, (re)materializes occurrences for the window, and bumps `calendar_version` in one commit.
+
+- **Deterministic DST resolution is part of the data model.**
+  - Every generated local occurrence is resolved to UTC with a deterministic rule and recorded so exceptions never “drift.”
+
+- **Sync is version-based.**
+  - Clients sync by `(calendar_id, calendar_version)` and use idempotency keys; stale writes are rejected with a conflict response that forces a resync.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Edge Clients] --> S[Calendar API]
+  S --> P[(Postgres)]
+```
+
+### Components
+
+- **Edge Clients**
+  - Why it exists: offline agenda rendering and offline edits.
+  - Contract: sends idempotency keys and last-seen `calendar_version`; treats conflicts as server-authoritative.
+
+- **Calendar API**
+  - Why it exists: the only place that applies RRULE + timezone rules consistently and owns transactional writes.
+  - Responsibilities: validate rules, serialize writes per calendar, materialize the rolling window, serve agenda/free-busy, and run sync.
+
+- **Postgres**
+  - Why it exists: single durable source of truth + transactional conflict enforcement.
+  - Stores: calendars, definitions, exceptions, occurrences, and versions; partition/shard by `calendar_id` as needed.
+
+## Deep Dive: Conflict Detection for Recurring Events (Without Exploding)
+
+### Data Model (core tables)
+- `calendar`
+  - `calendar_id`, `calendar_version` (monotonic)
+  - `expanded_tzdb_version` (server tzdb version last used for this calendar’s occurrences)
+  - `window_start_utc`, `window_end_utc` (the currently materialized rolling window)
+- `event_definition`
+  - `event_id`, `calendar_id`
+  - `dtstart_local`, `tzid`, `rrule`, `duration_seconds`
+  - `definition_version` (monotonic)
+- `event_exception`
+  - `event_id`, `original_occurrence_key`
+  - overrides (`override_dtstart_local`, `override_tzid`, `override_duration`) or `is_cancelled`
+- `occurrence`
+  - `calendar_id`, `event_id`, `occurrence_key`
+  - `occurrence_start_utc`, `occurrence_end_utc`
+  - `time_range` as `tstzrange(start,end)`
+  - `resolved_offset_minutes`, `is_fold`, `expanded_tzdb_version`
+
+### Let the database enforce “no overlaps”
+For calendars that require “no conflicts,” enforce:
+
+- `EXCLUDE USING gist (calendar_id WITH =, time_range WITH &&) WHERE (status = 'active')`
+
+Any write that would overlap cannot commit. The API returns a 409 including the conflicting occurrences.
+
+### Stable occurrence identity (including DST ambiguity)
+`occurrence_key` is derived from **local generation**, not UTC, and includes the DST disambiguation:
+
+- `occurrence_key = (event_id, local_datetime, tzid, is_fold)`
+
+Deterministic resolution when converting `(local_datetime, tzid)` to UTC:
+- If local time is **ambiguous** (fall-back duplicate hour): choose the **earlier** offset (`is_fold = false`) unless an exception explicitly targets the later fold (`is_fold = true`).
+- If local time is **nonexistent** (spring-forward gap): shift forward to the **first valid local time** after the gap (keeping duration), and record the resolved offset used.
+
+Exceptions bind to `original_occurrence_key`, so “move just this one” remains attached to the intended local instance.
+
+### Write path (create/update)
+One transaction:
+1. Acquire a Postgres advisory lock for `calendar_id` (serializes writes per calendar).
+2. Validate RRULE and cap expansion (max occurrences in window).
+3. Update `event_definition` / `event_exception`.
+4. Ensure the calendar’s rolling window covers `[now-1mo, now+6mo]`; materialize occurrences for that window:
+   - Generate local instances, resolve to UTC deterministically, apply exceptions, upsert `occurrence`, delete stale in-window rows for the event.
+5. Bump `calendar_version` and commit.
+
+Reads are simple: query `occurrence` by `(calendar_id, time_range && window)` and return rows.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correct timezone + DST semantics | Write amplification within the window |
+| Transactional conflict guarantees | Conflicts are guaranteed only within the rolling window |
+| Simple operations (API + Postgres) | Some read requests may pay a one-time re-materialize cost when the window slides or tzdb changes |
+| Offline-friendly clients | Stale clients must resync before writes succeed |
+
+## Failure Modes
+
+- **Postgres down for 5 minutes**
+  - Reads/writes fail with 503 + retry-after.
+  - Clients continue offline using local cache; sync resumes by comparing `calendar_version` and refetching the rolling window.
+
+- **Ambiguous local times at DST fall-back**
+  - Occurrence generation records `is_fold` and the resolved offset.
+  - Exceptions target `(local_datetime, tzid, is_fold)` so overrides never attach to the wrong instance.
+
+- **tzdb update changes future offsets**
+  - Server bumps its `current_tzdb_version`.
+  - On the next read/write for a calendar, if `calendar.expanded_tzdb_version != current_tzdb_version`, the API re-materializes the rolling window in a transaction and updates `expanded_tzdb_version`.
+
+- **Hot shared calendar**
+  - Writes are serialized by advisory lock; if lock wait exceeds a small threshold, return 429 with retry-after to prevent pileups.
+  - Reads stay scalable via indexed range queries (and Postgres replicas if needed).
+
+## What We Removed
+
+- API Gateway and separate Auth service (folded into the Calendar API deployment boundary).
+- Redis cache (agenda/free-busy are served from the occurrence index; scaling uses Postgres replicas, not a second cache tier).
+- Dedicated job queue and expander worker (materialization happens inside the write transaction and opportunistically when the rolling window advances).
+- Push-based “version bumps” and reminder delivery (clients poll via sync; reminders come from clients’ local schedules).
+- Multi-step “persist then materialize” write flow (single transaction eliminates definition/occurrence mismatch windows).
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/09-iot-edge/calendar-scheduling-system.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Calendar Scheduling System
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/calendar-scheduling-system.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/calendar-scheduling-system.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/09-iot-edge/calendar-scheduling-system.md

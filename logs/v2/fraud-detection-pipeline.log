@@ -1,0 +1,1542 @@
+==========================================
+Generating (v2): Fraud Detection Pipeline
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2bb4-7c02-bd1a-7092da05ae9c
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Fraud Detection Pipeline
+**Category**: Commerce & Fintech
+
+**Problem Statement**:
+Design a real-time risk scoring engine using streaming features, rules engines, and ML inference on transaction paths.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+Reconnecting... 1/5
+Reconnecting... 2/5
+
+
+thinking
+**Generating markdown architecture document**
+
+I'm focusing on creating a markdown document based on an architectural template for a data processing system. This will cover transaction ingress, an online feature store, stream processing with tools like Kafka and Flink, and decision services. I need to address challenges like feature freshness, low latency, and late events. I'll mention operational notes like monitoring and recovery strategies, and highlight the scale targets. Key decisions and rejections will also be detailed for clarity.
+thinking
+**Crafting concise paragraphs**
+
+I'm aiming to create concise yet thorough content, ideally with 2-3 paragraphs each. I want to keep it engaging and informative while ensuring clarity. I’ll also utilize Mermaid diagrams, but I need to limit them to a maximum of 8 nodes to maintain simplicity. This approach will help structure the information effectively and enhance comprehension. Alright, let’s put this plan into action and start drafting!
+codex
+```markdown
+---
+title: "Fraud Detection Pipeline"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: [fraud, streaming, ml, rules, kafka, flink, feature-store, risk]
+---
+
+## Overview
+
+This system scores transactions in real time (authorize/deny/challenge) by combining three signals: streaming behavioral features (velocity, patterns, device graph), deterministic rules (known bad, policy constraints), and ML inference (generalization + subtle correlations). The elegant insight is to treat “risk scoring” as a *pure function over an immutable event plus a versioned feature snapshot*, not as a tangle of microservices doing ad-hoc reads and writes.
+
+Most fraud platforms fail because they blur online decisioning with offline analytics: they compute features one way for training and another way for serving, then spend months chasing “model drift” that’s actually feature skew. This design makes one streaming pipeline the source of truth for features, then serves them with a low-latency online store and strict versioning.
+
+## What Makes This Hard
+
+Naive implementations look up “a few things from the DB” at auth time and bolt on a model call. That works until:
+- traffic spikes cause cache misses and DB thundering herds, blowing latency budgets
+- out-of-order events (retries, delayed device signals, chargebacks) corrupt “velocity” features
+- training data uses different time windows / joins than production, so the model learns on signals it won’t have at decision time
+- rule changes and model changes are deployed independently, making incidents impossible to attribute
+
+The trap: fraud is adversarial and non-stationary. The hardest part isn’t picking Kafka vs Kinesis; it’s building *replayable, versioned, auditable decisioning* without turning the system into component soup.
+
+## Requirements
+
+### Functional Requirements
+- Real-time decisioning on the transaction path with deterministic, explainable outputs (“why was this blocked?”).
+- Streaming feature computation with event-time semantics (late/out-of-order tolerated) and low-latency online serving.
+- Hybrid scoring: rules first (fast, safety rails), ML second (rank risk), with a consistent final policy layer.
+- Feedback ingestion (chargebacks, manual reviews, customer disputes) and linkage back to the original decision for training and evaluation.
+- Safe experimentation: shadow models, canary rules, and ability to replay historical traffic through a new model/ruleset.
+
+### Scale Targets
+- **Peak auth throughput:** 5k tx/s (regional bursty traffic); **sustained:** 1k tx/s.
+- **Latency budget:** p99 **< 80ms** end-to-end decisioning; p99.9 **< 150ms** (fraud is useless if it slows checkout).
+- **Feature freshness:** streaming features visible online within **< 1s** of event ingestion.
+- **History horizon:** 180 days of feature/backfill capability (fraud investigations and model iteration demand replay).
+- **Availability:** 99.95% on decision path; degrade safely (prefer “step-up/challenge” over “approve”).
+
+## Key Design Decisions
+
+- **We chose:** One streaming pipeline to compute *both* online features and offline training snapshots (same definitions, same windows).
+  - **Rejected:** Separate “online features in Redis” and “offline features in Spark” owned by different teams.
+  - **Why:** Feature skew is the silent killer; a single definition pipeline makes the model’s inputs real and replayable.
+
+- **We chose:** At-least-once streaming with idempotent writes keyed by `transaction_id` + `feature_set_version`.
+  - **Rejected:** Chasing end-to-end exactly-once across every sink.
+  - **Why:** Exactly-once complexity rarely pays off here; idempotency + audit logs handle duplicates while keeping ops sane.
+
+- **We chose:** A single low-latency **Decision Service** that composes (1) feature fetch, (2) rules eval, (3) model inference, (4) policy output.
+  - **Rejected:** Separate “rules service”, “model service”, “policy service” on the hot path.
+  - **Why:** Fraud latency is dominated by network hops; fewer hops also makes incident attribution and rollbacks clean.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Checkout / Payments"] --> B["Decision API"]
+  B --> C["Online Feature Store"]
+  B --> D["Rules + ML Scorer"]
+  D --> B
+  B --> E["Auth Decision"]
+  A --> F["Event Bus"]
+  F --> G["Stream Features"]
+  G --> C
+  F --> H["Offline Lake"]
+```
+
+### Components
+
+- **Decision API**
+  - Synchronous entry point on the payment path. Enforces strict timeouts, idempotency keys, and returns `approve/deny/challenge` + explanation payload.
+
+- **Online Feature Store (Redis Cluster)**
+  - Serves sub-10ms reads of hot features (velocity counters, device/user aggregates). Redis earns its place because it’s predictable under load and easy to shard by entity key.
+
+- **Rules + ML Scorer**
+  - Runs in one service/process boundary to avoid extra hops. Rules are compiled/validated configs with strict versioning; ML inference runs via an embedded runtime (e.g., ONNX Runtime) to keep p99 stable.
+
+- **Event Bus (Kafka)**
+  - Immutable log of transactions + signals (device telemetry, login events, shipping changes, 3DS outcomes). Kafka earns its place because replay is a first-class requirement, not a debugging trick.
+
+- **Stream Features (Flink)**
+  - Computes event-time windowed features with watermarking and late-event handling. Outputs to Redis (online) and to the lake (offline) using the same transformations.
+
+- **Offline Lake (S3 + Parquet + Metastore)**
+  - Stores raw events, feature snapshots, and labeled outcomes for training/evaluation. It exists to make replay, audits, and model iteration cheap.
+
+## Deep Dive: Feature Freshness Without Feature Skew
+
+The core contract is: **a decision is made using a feature snapshot that can be reconstructed.** We do that by versioning *feature definitions* and making the streaming job the only writer of those features.
+
+1) **Event-time semantics, not processing-time hacks**  
+Velocity and “recent behavior” are fraud-critical and fragile. The Flink job computes features using event timestamps with watermarks (e.g., 2 minutes). Late events update aggregates, but the decision path does not retroactively change decisions; instead, late updates flow into subsequent decisions and into evaluation.
+
+2) **Online/offline parity through “feature sets”**  
+Every feature belongs to a `feature_set_version` (e.g., `v37`). The same Flink code writes:
+- **Online:** entity-keyed Redis hashes like `user:{id}:v37`, `device:{id}:v37`
+- **Offline:** per-transaction feature rows keyed by `transaction_id`, including the exact `v37` values used/available at decision time  
+Training reads only those offline rows, not a separate ad-hoc join. This prevents the classic “training saw future data” leakage (e.g., using a chargeback that happened days later).
+
+3) **Decision-time consistency and fallbacks**  
+Decision API fetches a bounded set of keys (user/device/card/merchant). If a key is missing (cold start or Redis partial outage), the scorer explicitly substitutes defaults and emits a “feature_missing” signal that the model is trained to handle. When the feature store is unhealthy, the system degrades to conservative rules + step-up rather than timing out checkout.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Low, predictable p99 latency | Some model complexity (no multi-hop ensembles) |
+| Replayability + auditability | Higher storage and stricter version discipline |
+| Feature parity (less skew) | Less flexibility for ad-hoc offline joins |
+| Operational simplicity | Not chasing end-to-end exactly-once |
+
+## Failure Modes
+
+- **Kafka lag / consumer slowdown**
+  - **What happens:** online features get stale; model still runs but loses recent velocity signals.
+  - **Detect:** watermark delay, consumer lag, Redis write rate drop, sudden approval-rate shifts.
+  - **Recover:** autoscale Flink, shed non-critical input topics, temporarily bias policy toward “challenge” for high-risk segments.
+
+- **Online feature store partial outage**
+  - **What happens:** feature fetch timeouts threaten checkout latency.
+  - **Detect:** Redis p99, error rates, connection churn.
+  - **Recover:** strict client timeouts + circuit breaker; fall back to cached “last-known-good” small feature subset in-process; shift to rule-heavy conservative decisions.
+
+- **Bad model/rules release**
+  - **What happens:** sudden spike in false positives (revenue loss) or false negatives (fraud loss).
+  - **Detect:** canary metrics by version, approval/deny deltas by segment, post-auth chargeback leading indicators.
+  - **Recover:** instant rollback by version pin; keep “shadow” scoring running to validate the fix before re-rollout.
+
+## What I'd Do Differently At...
+
+- **10x scale:** split Redis by entity domain (user/device/card) with independent autoscaling; move heavy features to approximate sketches (e.g., HLL) where exactness doesn’t matter; introduce regional Kafka + regional decisioning to keep latency local.
+- **100x scale:** re-architect around multi-region active-active with strict data locality; replace single Redis with a tiered feature store (in-memory hot tier + durable KV like DynamoDB/Bigtable); formalize a feature registry with automated lineage + backfill pipelines to keep iteration speed.
+
+## Operational Notes
+
+- Treat every decision as an append-only record: `transaction_id`, `decision`, `rule_version`, `model_version`, `feature_set_version`, and a compact explanation payload.
+- Make replay a product feature: “re-score last week with model v42” should be a standard job, not a heroic incident script.
+- Monitor *decision distribution* (approve/deny/challenge) by merchant, BIN, country, device family—fraud and bugs both show up as distribution shifts.
+- Keep strict timeouts (e.g., 20ms feature fetch, 25ms inference, 10ms rules) and fail closed to “challenge” rather than timing out checkout.
+```
+tokens used
+2,668
+```markdown
+---
+title: "Fraud Detection Pipeline"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: [fraud, streaming, ml, rules, kafka, flink, feature-store, risk]
+---
+
+## Overview
+
+This system scores transactions in real time (authorize/deny/challenge) by combining three signals: streaming behavioral features (velocity, patterns, device graph), deterministic rules (known bad, policy constraints), and ML inference (generalization + subtle correlations). The elegant insight is to treat “risk scoring” as a *pure function over an immutable event plus a versioned feature snapshot*, not as a tangle of microservices doing ad-hoc reads and writes.
+
+Most fraud platforms fail because they blur online decisioning with offline analytics: they compute features one way for training and another way for serving, then spend months chasing “model drift” that’s actually feature skew. This design makes one streaming pipeline the source of truth for features, then serves them with a low-latency online store and strict versioning.
+
+## What Makes This Hard
+
+Naive implementations look up “a few things from the DB” at auth time and bolt on a model call. That works until:
+- traffic spikes cause cache misses and DB thundering herds, blowing latency budgets
+- out-of-order events (retries, delayed device signals, chargebacks) corrupt “velocity” features
+- training data uses different time windows / joins than production, so the model learns on signals it won’t have at decision time
+- rule changes and model changes are deployed independently, making incidents impossible to attribute
+
+The trap: fraud is adversarial and non-stationary. The hardest part isn’t picking Kafka vs Kinesis; it’s building *replayable, versioned, auditable decisioning* without turning the system into component soup.
+
+## Requirements
+
+### Functional Requirements
+- Real-time decisioning on the transaction path with deterministic, explainable outputs (“why was this blocked?”).
+- Streaming feature computation with event-time semantics (late/out-of-order tolerated) and low-latency online serving.
+- Hybrid scoring: rules first (fast, safety rails), ML second (rank risk), with a consistent final policy layer.
+- Feedback ingestion (chargebacks, manual reviews, customer disputes) and linkage back to the original decision for training and evaluation.
+- Safe experimentation: shadow models, canary rules, and ability to replay historical traffic through a new model/ruleset.
+
+### Scale Targets
+- **Peak auth throughput:** 5k tx/s (regional bursty traffic); **sustained:** 1k tx/s.
+- **Latency budget:** p99 **< 80ms** end-to-end decisioning; p99.9 **< 150ms** (fraud is useless if it slows checkout).
+- **Feature freshness:** streaming features visible online within **< 1s** of event ingestion.
+- **History horizon:** 180 days of feature/backfill capability (fraud investigations and model iteration demand replay).
+- **Availability:** 99.95% on decision path; degrade safely (prefer “step-up/challenge” over “approve”).
+
+## Key Design Decisions
+
+- **We chose:** One streaming pipeline to compute *both* online features and offline training snapshots (same definitions, same windows).
+  - **Rejected:** Separate “online features in Redis” and “offline features in Spark” owned by different teams.
+  - **Why:** Feature skew is the silent killer; a single definition pipeline makes the model’s inputs real and replayable.
+
+- **We chose:** At-least-once streaming with idempotent writes keyed by `transaction_id` + `feature_set_version`.
+  - **Rejected:** Chasing end-to-end exactly-once across every sink.
+  - **Why:** Exactly-once complexity rarely pays off here; idempotency + audit logs handle duplicates while keeping ops sane.
+
+- **We chose:** A single low-latency **Decision Service** that composes (1) feature fetch, (2) rules eval, (3) model inference, (4) policy output.
+  - **Rejected:** Separate “rules service”, “model service”, “policy service” on the hot path.
+  - **Why:** Fraud latency is dominated by network hops; fewer hops also makes incident attribution and rollbacks clean.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Checkout / Payments"] --> B["Decision API"]
+  B --> C["Online Feature Store"]
+  B --> D["Rules + ML Scorer"]
+  D --> B
+  B --> E["Auth Decision"]
+  A --> F["Event Bus"]
+  F --> G["Stream Features"]
+  G --> C
+  F --> H["Offline Lake"]
+```
+
+### Components
+
+- **Decision API**
+  - Synchronous entry point on the payment path. Enforces strict timeouts, idempotency keys, and returns `approve/deny/challenge` + explanation payload.
+
+- **Online Feature Store (Redis Cluster)**
+  - Serves sub-10ms reads of hot features (velocity counters, device/user aggregates). Redis earns its place because it’s predictable under load and easy to shard by entity key.
+
+- **Rules + ML Scorer**
+  - Runs in one service/process boundary to avoid extra hops. Rules are compiled/validated configs with strict versioning; ML inference runs via an embedded runtime (e.g., ONNX Runtime) to keep p99 stable.
+
+- **Event Bus (Kafka)**
+  - Immutable log of transactions + signals (device telemetry, login events, shipping changes, 3DS outcomes). Kafka earns its place because replay is a first-class requirement, not a debugging trick.
+
+- **Stream Features (Flink)**
+  - Computes event-time windowed features with watermarking and late-event handling. Outputs to Redis (online) and to the lake (offline) using the same transformations.
+
+- **Offline Lake (S3 + Parquet + Metastore)**
+  - Stores raw events, feature snapshots, and labeled outcomes for training/evaluation. It exists to make replay, audits, and model iteration cheap.
+
+## Deep Dive: Feature Freshness Without Feature Skew
+
+The core contract is: **a decision is made using a feature snapshot that can be reconstructed.** We do that by versioning *feature definitions* and making the streaming job the only writer of those features.
+
+1) **Event-time semantics, not processing-time hacks**  
+Velocity and “recent behavior” are fraud-critical and fragile. The Flink job computes features using event timestamps with watermarks (e.g., 2 minutes). Late events update aggregates, but the decision path does not retroactively change decisions; instead, late updates flow into subsequent decisions and into evaluation.
+
+2) **Online/offline parity through “feature sets”**  
+Every feature belongs to a `feature_set_version` (e.g., `v37`). The same Flink code writes:
+- **Online:** entity-keyed Redis hashes like `user:{id}:v37`, `device:{id}:v37`
+- **Offline:** per-transaction feature rows keyed by `transaction_id`, including the exact `v37` values used/available at decision time  
+Training reads only those offline rows, not a separate ad-hoc join. This prevents the classic “training saw future data” leakage (e.g., using a chargeback that happened days later).
+
+3) **Decision-time consistency and fallbacks**  
+Decision API fetches a bounded set of keys (user/device/card/merchant). If a key is missing (cold start or Redis partial outage), the scorer explicitly substitutes defaults and emits a “feature_missing” signal that the model is trained to handle. When the feature store is unhealthy, the system degrades to conservative rules + step-up rather than timing out checkout.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Low, predictable p99 latency | Some model complexity (no multi-hop ensembles) |
+| Replayability + auditability | Higher storage and stricter version discipline |
+| Feature parity (less skew) | Less flexibility for ad-hoc offline joins |
+| Operational simplicity | Not chasing end-to-end exactly-once |
+
+## Failure Modes
+
+- **Kafka lag / consumer slowdown**
+  - **What happens:** online features get stale; model still runs but loses recent velocity signals.
+  - **Detect:** watermark delay, consumer lag, Redis write rate drop, sudden approval-rate shifts.
+  - **Recover:** autoscale Flink, shed non-critical input topics, temporarily bias policy toward “challenge” for high-risk segments.
+
+- **Online feature store partial outage**
+  - **What happens:** feature fetch timeouts threaten checkout latency.
+  - **Detect:** Redis p99, error rates, connection churn.
+  - **Recover:** strict client timeouts + circuit breaker; fall back to cached “last-known-good” small feature subset in-process; shift to rule-heavy conservative decisions.
+
+- **Bad model/rules release**
+  - **What happens:** sudden spike in false positives (revenue loss) or false negatives (fraud loss).
+  - **Detect:** canary metrics by version, approval/deny deltas by segment, post-auth chargeback leading indicators.
+  - **Recover:** instant rollback by version pin; keep “shadow” scoring running to validate the fix before re-rollout.
+
+## What I'd Do Differently At...
+
+- **10x scale:** split Redis by entity domain (user/device/card) with independent autoscaling; move heavy features to approximate sketches (e.g., HLL) where exactness doesn’t matter; introduce regional Kafka + regional decisioning to keep latency local.
+- **100x scale:** re-architect around multi-region active-active with strict data locality; replace single Redis with a tiered feature store (in-memory hot tier + durable KV like DynamoDB/Bigtable); formalize a feature registry with automated lineage + backfill pipelines to keep iteration speed.
+
+## Operational Notes
+
+- Treat every decision as an append-only record: `transaction_id`, `decision`, `rule_version`, `model_version`, `feature_set_version`, and a compact explanation payload.
+- Make replay a product feature: “re-score last week with model v42” should be a standard job, not a heroic incident script.
+- Monitor *decision distribution* (approve/deny/challenge) by merchant, BIN, country, device family—fraud and bugs both show up as distribution shifts.
+- Keep strict timeouts (e.g., 20ms feature fetch, 25ms inference, 10ms rules) and fail closed to “challenge” rather than timing out checkout.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/fraud-detection-pipeline.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afd-73d1-70d0-8273-ba5ec3fafa1a
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Fraud Detection Pipeline"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: [fraud, streaming, ml, rules, kafka, flink, feature-store, risk]
+---
+
+## Overview
+
+This system scores transactions in real time (authorize/deny/challenge) by combining three signals: streaming behavioral features (velocity, patterns, device graph), deterministic rules (known bad, policy constraints), and ML inference (generalization + subtle correlations). The elegant insight is to treat “risk scoring” as a *pure function over an immutable event plus a versioned feature snapshot*, not as a tangle of microservices doing ad-hoc reads and writes.
+
+Most fraud platforms fail because they blur online decisioning with offline analytics: they compute features one way for training and another way for serving, then spend months chasing “model drift” that’s actually feature skew. This design makes one streaming pipeline the source of truth for features, then serves them with a low-latency online store and strict versioning.
+
+## What Makes This Hard
+
+Naive implementations look up “a few things from the DB” at auth time and bolt on a model call. That works until:
+- traffic spikes cause cache misses and DB thundering herds, blowing latency budgets
+- out-of-order events (retries, delayed device signals, chargebacks) corrupt “velocity” features
+- training data uses different time windows / joins than production, so the model learns on signals it won’t have at decision time
+- rule changes and model changes are deployed independently, making incidents impossible to attribute
+
+The trap: fraud is adversarial and non-stationary. The hardest part isn’t picking Kafka vs Kinesis; it’s building *replayable, versioned, auditable decisioning* without turning the system into component soup.
+
+## Requirements
+
+### Functional Requirements
+- Real-time decisioning on the transaction path with deterministic, explainable outputs (“why was this blocked?”).
+- Streaming feature computation with event-time semantics (late/out-of-order tolerated) and low-latency online serving.
+- Hybrid scoring: rules first (fast, safety rails), ML second (rank risk), with a consistent final policy layer.
+- Feedback ingestion (chargebacks, manual reviews, customer disputes) and linkage back to the original decision for training and evaluation.
+- Safe experimentation: shadow models, canary rules, and ability to replay historical traffic through a new model/ruleset.
+
+### Scale Targets
+- **Peak auth throughput:** 5k tx/s (regional bursty traffic); **sustained:** 1k tx/s.
+- **Latency budget:** p99 **< 80ms** end-to-end decisioning; p99.9 **< 150ms** (fraud is useless if it slows checkout).
+- **Feature freshness:** streaming features visible online within **< 1s** of event ingestion.
+- **History horizon:** 180 days of feature/backfill capability (fraud investigations and model iteration demand replay).
+- **Availability:** 99.95% on decision path; degrade safely (prefer “step-up/challenge” over “approve”).
+
+## Key Design Decisions
+
+- **We chose:** One streaming pipeline to compute *both* online features and offline training snapshots (same definitions, same windows).
+  - **Rejected:** Separate “online features in Redis” and “offline features in Spark” owned by different teams.
+  - **Why:** Feature skew is the silent killer; a single definition pipeline makes the model’s inputs real and replayable.
+
+- **We chose:** At-least-once streaming with idempotent writes keyed by `transaction_id` + `feature_set_version`.
+  - **Rejected:** Chasing end-to-end exactly-once across every sink.
+  - **Why:** Exactly-once complexity rarely pays off here; idempotency + audit logs handle duplicates while keeping ops sane.
+
+- **We chose:** A single low-latency **Decision Service** that composes (1) feature fetch, (2) rules eval, (3) model inference, (4) policy output.
+  - **Rejected:** Separate “rules service”, “model service”, “policy service” on the hot path.
+  - **Why:** Fraud latency is dominated by network hops; fewer hops also makes incident attribution and rollbacks clean.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Checkout / Payments"] --> B["Decision API"]
+  B --> C["Online Feature Store"]
+  B --> D["Rules + ML Scorer"]
+  D --> B
+  B --> E["Auth Decision"]
+  A --> F["Event Bus"]
+  F --> G["Stream Features"]
+  G --> C
+  F --> H["Offline Lake"]
+```
+
+### Components
+
+- **Decision API**
+  - Synchronous entry point on the payment path. Enforces strict timeouts, idempotency keys, and returns `approve/deny/challenge` + explanation payload.
+
+- **Online Feature Store (Redis Cluster)**
+  - Serves sub-10ms reads of hot features (velocity counters, device/user aggregates). Redis earns its place because it’s predictable under load and easy to shard by entity key.
+
+- **Rules + ML Scorer**
+  - Runs in one service/process boundary to avoid extra hops. Rules are compiled/validated configs with strict versioning; ML inference runs via an embedded runtime (e.g., ONNX Runtime) to keep p99 stable.
+
+- **Event Bus (Kafka)**
+  - Immutable log of transactions + signals (device telemetry, login events, shipping changes, 3DS outcomes). Kafka earns its place because replay is a first-class requirement, not a debugging trick.
+
+- **Stream Features (Flink)**
+  - Computes event-time windowed features with watermarking and late-event handling. Outputs to Redis (online) and to the lake (offline) using the same transformations.
+
+- **Offline Lake (S3 + Parquet + Metastore)**
+  - Stores raw events, feature snapshots, and labeled outcomes for training/evaluation. It exists to make replay, audits, and model iteration cheap.
+
+## Deep Dive: Feature Freshness Without Feature Skew
+
+The core contract is: **a decision is made using a feature snapshot that can be reconstructed.** We do that by versioning *feature definitions* and making the streaming job the only writer of those features.
+
+1) **Event-time semantics, not processing-time hacks**  
+Velocity and “recent behavior” are fraud-critical and fragile. The Flink job computes features using event timestamps with watermarks (e.g., 2 minutes). Late events update aggregates, but the decision path does not retroactively change decisions; instead, late updates flow into subsequent decisions and into evaluation.
+
+2) **Online/offline parity through “feature sets”**  
+Every feature belongs to a `feature_set_version` (e.g., `v37`). The same Flink code writes:
+- **Online:** entity-keyed Redis hashes like `user:{id}:v37`, `device:{id}:v37`
+- **Offline:** per-transaction feature rows keyed by `transaction_id`, including the exact `v37` values used/available at decision time  
+Training reads only those offline rows, not a separate ad-hoc join. This prevents the classic “training saw future data” leakage (e.g., using a chargeback that happened days later).
+
+3) **Decision-time consistency and fallbacks**  
+Decision API fetches a bounded set of keys (user/device/card/merchant). If a key is missing (cold start or Redis partial outage), the scorer explicitly substitutes defaults and emits a “feature_missing” signal that the model is trained to handle. When the feature store is unhealthy, the system degrades to conservative rules + step-up rather than timing out checkout.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Low, predictable p99 latency | Some model complexity (no multi-hop ensembles) |
+| Replayability + auditability | Higher storage and stricter version discipline |
+| Feature parity (less skew) | Less flexibility for ad-hoc offline joins |
+| Operational simplicity | Not chasing end-to-end exactly-once |
+
+## Failure Modes
+
+- **Kafka lag / consumer slowdown**
+  - **What happens:** online features get stale; model still runs but loses recent velocity signals.
+  - **Detect:** watermark delay, consumer lag, Redis write rate drop, sudden approval-rate shifts.
+  - **Recover:** autoscale Flink, shed non-critical input topics, temporarily bias policy toward “challenge” for high-risk segments.
+
+- **Online feature store partial outage**
+  - **What happens:** feature fetch timeouts threaten checkout latency.
+  - **Detect:** Redis p99, error rates, connection churn.
+  - **Recover:** strict client timeouts + circuit breaker; fall back to cached “last-known-good” small feature subset in-process; shift to rule-heavy conservative decisions.
+
+- **Bad model/rules release**
+  - **What happens:** sudden spike in false positives (revenue loss) or false negatives (fraud loss).
+  - **Detect:** canary metrics by version, approval/deny deltas by segment, post-auth chargeback leading indicators.
+  - **Recover:** instant rollback by version pin; keep “shadow” scoring running to validate the fix before re-rollout.
+
+## What I'd Do Differently At...
+
+- **10x scale:** split Redis by entity domain (user/device/card) with independent autoscaling; move heavy features to approximate sketches (e.g., HLL) where exactness doesn’t matter; introduce regional Kafka + regional decisioning to keep latency local.
+- **100x scale:** re-architect around multi-region active-active with strict data locality; replace single Redis with a tiered feature store (in-memory hot tier + durable KV like DynamoDB/Bigtable); formalize a feature registry with automated lineage + backfill pipelines to keep iteration speed.
+
+## Operational Notes
+
+- Treat every decision as an append-only record: `transaction_id`, `decision`, `rule_version`, `model_version`, `feature_set_version`, and a compact explanation payload.
+- Make replay a product feature: “re-score last week with model v42” should be a standard job, not a heroic incident script.
+- Monitor *decision distribution* (approve/deny/challenge) by merchant, BIN, country, device family—fraud and bugs both show up as distribution shifts.
+- Keep strict timeouts (e.g., 20ms feature fetch, 25ms inference, 10ms rules) and fail closed to “challenge” rather than timing out checkout.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+thinking
+**Considering data handling design**
+
+I’m thinking about how to ensure parity: the easiest option might be to use the same snapshot offline. At decision time, I could write the fetched features and the decision record to a Kafka topic and then sink them into the lake. This way, training uses that data without recomputing. However, keeping the streaming features could allow for backfilling. I’ll need to provide 3-5 scenarios, like DB downtime or slow components, and offer a design recommendation.
+codex
+## Elegance Check
+
+### The Core Insight
+Treating fraud decisioning as a pure function over an immutable event plus a *versioned, reconstructable* feature snapshot (to kill feature skew and make replay/audit first-class).
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Decision API (single hop) | Owns the latency budget, timeouts, idempotency, and returns an explainable decision deterministically. |
+| Kafka (immutable log) | Replay/backfill is a product requirement; the log is the source of truth for “what was known when”. |
+| Stream processor (Flink) | Event-time windowing + late/out-of-order handling is hard to re-create safely with ad-hoc services. |
+| Online KV (Redis) | Predictable low-latency reads for hot aggregates at auth time; easy sharding by entity key. |
+| Offline lake (S3/Parquet) | Cheap 180-day retention, training/eval, investigations, and reproducible replays. |
+| Versioned rules + embedded inference | Keeps p99 stable and rollbacks attributable (rule/model/feature-set pins). |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Flink for all streaming features | Kafka Streams (if windows are simpler) or managed Flink | Streams is easier to own but weaker for complex event-time + state; managed reduces ops but adds vendor coupling/cost. |
+| Redis as the only online feature source | Add a “decision snapshot log” (features actually read) as the training source | More data written per tx, but massively simplifies point-in-time correctness and eliminates “late event rewrote history” ambiguity. |
+| Custom rules runtime + validation pipeline | Use an existing rules engine/DSL (e.g., CEL, Open Policy Agent) compiled ahead-of-time | Less bespoke code, but you must constrain expressiveness to keep determinism and latency. |
+| Offline “lake + metastore” described generically | Iceberg/Delta + a single catalog standard | Slight upfront choice, but simplifies schema evolution, backfills, and reproducible training reads. |
+| Redis cluster sharding/ops | Managed Redis (or DynamoDB/Bigtable for colder features) | Managed reduces on-call load; durable KV increases latency/cost and complicates freshness guarantees. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Kafka is down / unreachable for 5 minutes**
+   - Design’s answer: partially addressed (talks about lag, not producer unavailability)
+   - Recommendation: Strengthen  
+   Add an explicit contract: decisioning must not depend on Kafka availability. Use an outbox (payments DB → Kafka) or local durable buffer so events are eventually published; clearly define what’s lost/queued under outage.
+
+2. **Redis partial outage or tail latency spike (slow, not failing)**
+   - Design’s answer: addressed (timeouts, circuit breaker, in-process last-known-good subset, conservative “challenge”)
+   - Recommendation: Strengthen  
+   Specify the “last-known-good” semantics (staleness bound, per-entity TTL, memory cap) and how you avoid stampedes (request coalescing, hedged reads, connection pool limits).
+
+3. **Network partition: Decision API can reach Redis but not Kafka/Flink (or vice versa)**
+   - Design’s answer: not addressed explicitly
+   - Recommendation: Strengthen  
+   Define which side is authoritative for feature freshness, and how you detect “feature pipeline split brain” (e.g., Redis write rate vs tx rate invariant). Decide whether to bias to challenge when freshness SLO is violated.
+
+4. **Bad config / version skew between scorer and feature pipeline**
+   - Design’s answer: partially addressed (version pin + rollback)
+   - Recommendation: Must fix  
+   Make version compatibility explicit: scorer should declare required `feature_set_version` and fail safe if Redis contains mixed/unknown schemas. Add automated canary replay (“N minutes of live traffic”) gating promotion.
+
+5. **Traffic 10x burst (5k/s → 50k/s)**
+   - Design’s answer: partially addressed (10x notes, sharding)
+   - Recommendation: Strengthen  
+   Call out the real bottleneck: Redis read QPS and Decision API CPU for inference. Add an explicit admission-control policy (sampled shadowing, feature fetch budget per segment, and graceful degradation tiers).
+
+## Recommendations
+
+### Must Fix
+- Define the *source of truth for training rows*: strongly consider logging the exact decision-time feature vector (and “feature_missing” flags) per `transaction_id` so offline training is point-in-time correct by construction.
+- Specify ingestion correctness from the auth path (outbox/buffer/idempotency): how you guarantee the transaction event is published even if Kafka is impaired.
+- Tighten versioning semantics: compatibility checks, schema evolution rules, and “feature-set rollout” procedure to prevent scorer/pipeline mismatch incidents.
+
+### Should Consider
+- Reduce “component soup” for a small team by preferring managed Kafka/Flink/Redis where possible, or by swapping Flink → Kafka Streams if feature logic permits.
+- Formalize freshness and staleness signals as first-class features (e.g., watermark delay, per-entity last_update_age) so the model/policy can react gracefully instead of implicit degradation.
+- Clarify replay mechanics: what replays (raw events vs decision snapshots), what is recomputed, and how you prevent label leakage (time-aware joins and explicit label availability windows).
+
+### Nice to Have
+- Explicit operator runbooks for 3am mistakes: “flip to challenge-only”, “pin to last-good versions”, “disable non-critical topics”, “safe rollback checklist”.
+- Privacy/security posture: PII in Redis/lake, retention, encryption, access controls, and audit trails (fraud systems are sensitive by default).
+
+## What’s Working Well
+- Clear separation of concerns: single hot-path service, strict time budgets, and deterministic explainability payloads.
+- Strong stance on feature parity and replayability; the “versioned feature set” framing is the right mental model.
+- Pragmatic exactly-once trade-off (at-least-once + idempotency) that matches fraud reality and keeps ops sane.
+tokens used
+5,000
+## Elegance Check
+
+### The Core Insight
+Treating fraud decisioning as a pure function over an immutable event plus a *versioned, reconstructable* feature snapshot (to kill feature skew and make replay/audit first-class).
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Decision API (single hop) | Owns the latency budget, timeouts, idempotency, and returns an explainable decision deterministically. |
+| Kafka (immutable log) | Replay/backfill is a product requirement; the log is the source of truth for “what was known when”. |
+| Stream processor (Flink) | Event-time windowing + late/out-of-order handling is hard to re-create safely with ad-hoc services. |
+| Online KV (Redis) | Predictable low-latency reads for hot aggregates at auth time; easy sharding by entity key. |
+| Offline lake (S3/Parquet) | Cheap 180-day retention, training/eval, investigations, and reproducible replays. |
+| Versioned rules + embedded inference | Keeps p99 stable and rollbacks attributable (rule/model/feature-set pins). |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Flink for all streaming features | Kafka Streams (if windows are simpler) or managed Flink | Streams is easier to own but weaker for complex event-time + state; managed reduces ops but adds vendor coupling/cost. |
+| Redis as the only online feature source | Add a “decision snapshot log” (features actually read) as the training source | More data written per tx, but massively simplifies point-in-time correctness and eliminates “late event rewrote history” ambiguity. |
+| Custom rules runtime + validation pipeline | Use an existing rules engine/DSL (e.g., CEL, Open Policy Agent) compiled ahead-of-time | Less bespoke code, but you must constrain expressiveness to keep determinism and latency. |
+| Offline “lake + metastore” described generically | Iceberg/Delta + a single catalog standard | Slight upfront choice, but simplifies schema evolution, backfills, and reproducible training reads. |
+| Redis cluster sharding/ops | Managed Redis (or DynamoDB/Bigtable for colder features) | Managed reduces on-call load; durable KV increases latency/cost and complicates freshness guarantees. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Kafka is down / unreachable for 5 minutes**
+   - Design’s answer: partially addressed (talks about lag, not producer unavailability)
+   - Recommendation: Strengthen  
+   Add an explicit contract: decisioning must not depend on Kafka availability. Use an outbox (payments DB → Kafka) or local durable buffer so events are eventually published; clearly define what’s lost/queued under outage.
+
+2. **Redis partial outage or tail latency spike (slow, not failing)**
+   - Design’s answer: addressed (timeouts, circuit breaker, in-process last-known-good subset, conservative “challenge”)
+   - Recommendation: Strengthen  
+   Specify the “last-known-good” semantics (staleness bound, per-entity TTL, memory cap) and how you avoid stampedes (request coalescing, hedged reads, connection pool limits).
+
+3. **Network partition: Decision API can reach Redis but not Kafka/Flink (or vice versa)**
+   - Design’s answer: not addressed explicitly
+   - Recommendation: Strengthen  
+   Define which side is authoritative for feature freshness, and how you detect “feature pipeline split brain” (e.g., Redis write rate vs tx rate invariant). Decide whether to bias to challenge when freshness SLO is violated.
+
+4. **Bad config / version skew between scorer and feature pipeline**
+   - Design’s answer: partially addressed (version pin + rollback)
+   - Recommendation: Must fix  
+   Make version compatibility explicit: scorer should declare required `feature_set_version` and fail safe if Redis contains mixed/unknown schemas. Add automated canary replay (“N minutes of live traffic”) gating promotion.
+
+5. **Traffic 10x burst (5k/s → 50k/s)**
+   - Design’s answer: partially addressed (10x notes, sharding)
+   - Recommendation: Strengthen  
+   Call out the real bottleneck: Redis read QPS and Decision API CPU for inference. Add an explicit admission-control policy (sampled shadowing, feature fetch budget per segment, and graceful degradation tiers).
+
+## Recommendations
+
+### Must Fix
+- Define the *source of truth for training rows*: strongly consider logging the exact decision-time feature vector (and “feature_missing” flags) per `transaction_id` so offline training is point-in-time correct by construction.
+- Specify ingestion correctness from the auth path (outbox/buffer/idempotency): how you guarantee the transaction event is published even if Kafka is impaired.
+- Tighten versioning semantics: compatibility checks, schema evolution rules, and “feature-set rollout” procedure to prevent scorer/pipeline mismatch incidents.
+
+### Should Consider
+- Reduce “component soup” for a small team by preferring managed Kafka/Flink/Redis where possible, or by swapping Flink → Kafka Streams if feature logic permits.
+- Formalize freshness and staleness signals as first-class features (e.g., watermark delay, per-entity last_update_age) so the model/policy can react gracefully instead of implicit degradation.
+- Clarify replay mechanics: what replays (raw events vs decision snapshots), what is recomputed, and how you prevent label leakage (time-aware joins and explicit label availability windows).
+
+### Nice to Have
+- Explicit operator runbooks for 3am mistakes: “flip to challenge-only”, “pin to last-good versions”, “disable non-critical topics”, “safe rollback checklist”.
+- Privacy/security posture: PII in Redis/lake, retention, encryption, access controls, and audit trails (fraud systems are sensitive by default).
+
+## What’s Working Well
+- Clear separation of concerns: single hot-path service, strict time budgets, and deterministic explainability payloads.
+- Strong stance on feature parity and replayability; the “versioned feature set” framing is the right mental model.
+- Pragmatic exactly-once trade-off (at-least-once + idempotency) that matches fraud reality and keeps ops sane.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/fraud-detection-pipeline.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afe-2a52-78e3-887f-0c124c3f9ed9
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Fraud Detection Pipeline"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: [fraud, streaming, ml, rules, kafka, flink, feature-store, risk]
+---
+
+## Overview
+
+This system scores transactions in real time (authorize/deny/challenge) by combining three signals: streaming behavioral features (velocity, patterns, device graph), deterministic rules (known bad, policy constraints), and ML inference (generalization + subtle correlations). The elegant insight is to treat “risk scoring” as a *pure function over an immutable event plus a versioned feature snapshot*, not as a tangle of microservices doing ad-hoc reads and writes.
+
+Most fraud platforms fail because they blur online decisioning with offline analytics: they compute features one way for training and another way for serving, then spend months chasing “model drift” that’s actually feature skew. This design makes one streaming pipeline the source of truth for features, then serves them with a low-latency online store and strict versioning.
+
+## What Makes This Hard
+
+Naive implementations look up “a few things from the DB” at auth time and bolt on a model call. That works until:
+- traffic spikes cause cache misses and DB thundering herds, blowing latency budgets
+- out-of-order events (retries, delayed device signals, chargebacks) corrupt “velocity” features
+- training data uses different time windows / joins than production, so the model learns on signals it won’t have at decision time
+- rule changes and model changes are deployed independently, making incidents impossible to attribute
+
+The trap: fraud is adversarial and non-stationary. The hardest part isn’t picking Kafka vs Kinesis; it’s building *replayable, versioned, auditable decisioning* without turning the system into component soup.
+
+## Requirements
+
+### Functional Requirements
+- Real-time decisioning on the transaction path with deterministic, explainable outputs (“why was this blocked?”).
+- Streaming feature computation with event-time semantics (late/out-of-order tolerated) and low-latency online serving.
+- Hybrid scoring: rules first (fast, safety rails), ML second (rank risk), with a consistent final policy layer.
+- Feedback ingestion (chargebacks, manual reviews, customer disputes) and linkage back to the original decision for training and evaluation.
+- Safe experimentation: shadow models, canary rules, and ability to replay historical traffic through a new model/ruleset.
+
+### Scale Targets
+- **Peak auth throughput:** 5k tx/s (regional bursty traffic); **sustained:** 1k tx/s.
+- **Latency budget:** p99 **< 80ms** end-to-end decisioning; p99.9 **< 150ms** (fraud is useless if it slows checkout).
+- **Feature freshness:** streaming features visible online within **< 1s** of event ingestion.
+- **History horizon:** 180 days of feature/backfill capability (fraud investigations and model iteration demand replay).
+- **Availability:** 99.95% on decision path; degrade safely (prefer “step-up/challenge” over “approve”).
+
+## Key Design Decisions
+
+- **We chose:** One streaming pipeline to compute *both* online features and offline training snapshots (same definitions, same windows).
+  - **Rejected:** Separate “online features in Redis” and “offline features in Spark” owned by different teams.
+  - **Why:** Feature skew is the silent killer; a single definition pipeline makes the model’s inputs real and replayable.
+
+- **We chose:** At-least-once streaming with idempotent writes keyed by `transaction_id` + `feature_set_version`.
+  - **Rejected:** Chasing end-to-end exactly-once across every sink.
+  - **Why:** Exactly-once complexity rarely pays off here; idempotency + audit logs handle duplicates while keeping ops sane.
+
+- **We chose:** A single low-latency **Decision Service** that composes (1) feature fetch, (2) rules eval, (3) model inference, (4) policy output.
+  - **Rejected:** Separate “rules service”, “model service”, “policy service” on the hot path.
+  - **Why:** Fraud latency is dominated by network hops; fewer hops also makes incident attribution and rollbacks clean.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Checkout / Payments"] --> B["Decision API"]
+  B --> C["Online Feature Store"]
+  B --> D["Rules + ML Scorer"]
+  D --> B
+  B --> E["Auth Decision"]
+  A --> F["Event Bus"]
+  F --> G["Stream Features"]
+  G --> C
+  F --> H["Offline Lake"]
+```
+
+### Components
+
+- **Decision API**
+  - Synchronous entry point on the payment path. Enforces strict timeouts, idempotency keys, and returns `approve/deny/challenge` + explanation payload.
+
+- **Online Feature Store (Redis Cluster)**
+  - Serves sub-10ms reads of hot features (velocity counters, device/user aggregates). Redis earns its place because it’s predictable under load and easy to shard by entity key.
+
+- **Rules + ML Scorer**
+  - Runs in one service/process boundary to avoid extra hops. Rules are compiled/validated configs with strict versioning; ML inference runs via an embedded runtime (e.g., ONNX Runtime) to keep p99 stable.
+
+- **Event Bus (Kafka)**
+  - Immutable log of transactions + signals (device telemetry, login events, shipping changes, 3DS outcomes). Kafka earns its place because replay is a first-class requirement, not a debugging trick.
+
+- **Stream Features (Flink)**
+  - Computes event-time windowed features with watermarking and late-event handling. Outputs to Redis (online) and to the lake (offline) using the same transformations.
+
+- **Offline Lake (S3 + Parquet + Metastore)**
+  - Stores raw events, feature snapshots, and labeled outcomes for training/evaluation. It exists to make replay, audits, and model iteration cheap.
+
+## Deep Dive: Feature Freshness Without Feature Skew
+
+The core contract is: **a decision is made using a feature snapshot that can be reconstructed.** We do that by versioning *feature definitions* and making the streaming job the only writer of those features.
+
+1) **Event-time semantics, not processing-time hacks**  
+Velocity and “recent behavior” are fraud-critical and fragile. The Flink job computes features using event timestamps with watermarks (e.g., 2 minutes). Late events update aggregates, but the decision path does not retroactively change decisions; instead, late updates flow into subsequent decisions and into evaluation.
+
+2) **Online/offline parity through “feature sets”**  
+Every feature belongs to a `feature_set_version` (e.g., `v37`). The same Flink code writes:
+- **Online:** entity-keyed Redis hashes like `user:{id}:v37`, `device:{id}:v37`
+- **Offline:** per-transaction feature rows keyed by `transaction_id`, including the exact `v37` values used/available at decision time  
+Training reads only those offline rows, not a separate ad-hoc join. This prevents the classic “training saw future data” leakage (e.g., using a chargeback that happened days later).
+
+3) **Decision-time consistency and fallbacks**  
+Decision API fetches a bounded set of keys (user/device/card/merchant). If a key is missing (cold start or Redis partial outage), the scorer explicitly substitutes defaults and emits a “feature_missing” signal that the model is trained to handle. When the feature store is unhealthy, the system degrades to conservative rules + step-up rather than timing out checkout.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Low, predictable p99 latency | Some model complexity (no multi-hop ensembles) |
+| Replayability + auditability | Higher storage and stricter version discipline |
+| Feature parity (less skew) | Less flexibility for ad-hoc offline joins |
+| Operational simplicity | Not chasing end-to-end exactly-once |
+
+## Failure Modes
+
+- **Kafka lag / consumer slowdown**
+  - **What happens:** online features get stale; model still runs but loses recent velocity signals.
+  - **Detect:** watermark delay, consumer lag, Redis write rate drop, sudden approval-rate shifts.
+  - **Recover:** autoscale Flink, shed non-critical input topics, temporarily bias policy toward “challenge” for high-risk segments.
+
+- **Online feature store partial outage**
+  - **What happens:** feature fetch timeouts threaten checkout latency.
+  - **Detect:** Redis p99, error rates, connection churn.
+  - **Recover:** strict client timeouts + circuit breaker; fall back to cached “last-known-good” small feature subset in-process; shift to rule-heavy conservative decisions.
+
+- **Bad model/rules release**
+  - **What happens:** sudden spike in false positives (revenue loss) or false negatives (fraud loss).
+  - **Detect:** canary metrics by version, approval/deny deltas by segment, post-auth chargeback leading indicators.
+  - **Recover:** instant rollback by version pin; keep “shadow” scoring running to validate the fix before re-rollout.
+
+## What I'd Do Differently At...
+
+- **10x scale:** split Redis by entity domain (user/device/card) with independent autoscaling; move heavy features to approximate sketches (e.g., HLL) where exactness doesn’t matter; introduce regional Kafka + regional decisioning to keep latency local.
+- **100x scale:** re-architect around multi-region active-active with strict data locality; replace single Redis with a tiered feature store (in-memory hot tier + durable KV like DynamoDB/Bigtable); formalize a feature registry with automated lineage + backfill pipelines to keep iteration speed.
+
+## Operational Notes
+
+- Treat every decision as an append-only record: `transaction_id`, `decision`, `rule_version`, `model_version`, `feature_set_version`, and a compact explanation payload.
+- Make replay a product feature: “re-score last week with model v42” should be a standard job, not a heroic incident script.
+- Monitor *decision distribution* (approve/deny/challenge) by merchant, BIN, country, device family—fraud and bugs both show up as distribution shifts.
+- Keep strict timeouts (e.g., 20ms feature fetch, 25ms inference, 10ms rules) and fail closed to “challenge” rather than timing out checkout.
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Treating fraud decisioning as a pure function over an immutable event plus a *versioned, reconstructable* feature snapshot (to kill feature skew and make replay/audit first-class).
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Decision API (single hop) | Owns the latency budget, timeouts, idempotency, and returns an explainable decision deterministically. |
+| Kafka (immutable log) | Replay/backfill is a product requirement; the log is the source of truth for “what was known when”. |
+| Stream processor (Flink) | Event-time windowing + late/out-of-order handling is hard to re-create safely with ad-hoc services. |
+| Online KV (Redis) | Predictable low-latency reads for hot aggregates at auth time; easy sharding by entity key. |
+| Offline lake (S3/Parquet) | Cheap 180-day retention, training/eval, investigations, and reproducible replays. |
+| Versioned rules + embedded inference | Keeps p99 stable and rollbacks attributable (rule/model/feature-set pins). |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Flink for all streaming features | Kafka Streams (if windows are simpler) or managed Flink | Streams is easier to own but weaker for complex event-time + state; managed reduces ops but adds vendor coupling/cost. |
+| Redis as the only online feature source | Add a “decision snapshot log” (features actually read) as the training source | More data written per tx, but massively simplifies point-in-time correctness and eliminates “late event rewrote history” ambiguity. |
+| Custom rules runtime + validation pipeline | Use an existing rules engine/DSL (e.g., CEL, Open Policy Agent) compiled ahead-of-time | Less bespoke code, but you must constrain expressiveness to keep determinism and latency. |
+| Offline “lake + metastore” described generically | Iceberg/Delta + a single catalog standard | Slight upfront choice, but simplifies schema evolution, backfills, and reproducible training reads. |
+| Redis cluster sharding/ops | Managed Redis (or DynamoDB/Bigtable for colder features) | Managed reduces on-call load; durable KV increases latency/cost and complicates freshness guarantees. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Kafka is down / unreachable for 5 minutes**
+   - Design’s answer: partially addressed (talks about lag, not producer unavailability)
+   - Recommendation: Strengthen  
+   Add an explicit contract: decisioning must not depend on Kafka availability. Use an outbox (payments DB → Kafka) or local durable buffer so events are eventually published; clearly define what’s lost/queued under outage.
+
+2. **Redis partial outage or tail latency spike (slow, not failing)**
+   - Design’s answer: addressed (timeouts, circuit breaker, in-process last-known-good subset, conservative “challenge”)
+   - Recommendation: Strengthen  
+   Specify the “last-known-good” semantics (staleness bound, per-entity TTL, memory cap) and how you avoid stampedes (request coalescing, hedged reads, connection pool limits).
+
+3. **Network partition: Decision API can reach Redis but not Kafka/Flink (or vice versa)**
+   - Design’s answer: not addressed explicitly
+   - Recommendation: Strengthen  
+   Define which side is authoritative for feature freshness, and how you detect “feature pipeline split brain” (e.g., Redis write rate vs tx rate invariant). Decide whether to bias to challenge when freshness SLO is violated.
+
+4. **Bad config / version skew between scorer and feature pipeline**
+   - Design’s answer: partially addressed (version pin + rollback)
+   - Recommendation: Must fix  
+   Make version compatibility explicit: scorer should declare required `feature_set_version` and fail safe if Redis contains mixed/unknown schemas. Add automated canary replay (“N minutes of live traffic”) gating promotion.
+
+5. **Traffic 10x burst (5k/s → 50k/s)**
+   - Design’s answer: partially addressed (10x notes, sharding)
+   - Recommendation: Strengthen  
+   Call out the real bottleneck: Redis read QPS and Decision API CPU for inference. Add an explicit admission-control policy (sampled shadowing, feature fetch budget per segment, and graceful degradation tiers).
+
+## Recommendations
+
+### Must Fix
+- Define the *source of truth for training rows*: strongly consider logging the exact decision-time feature vector (and “feature_missing” flags) per `transaction_id` so offline training is point-in-time correct by construction.
+- Specify ingestion correctness from the auth path (outbox/buffer/idempotency): how you guarantee the transaction event is published even if Kafka is impaired.
+- Tighten versioning semantics: compatibility checks, schema evolution rules, and “feature-set rollout” procedure to prevent scorer/pipeline mismatch incidents.
+
+### Should Consider
+- Reduce “component soup” for a small team by preferring managed Kafka/Flink/Redis where possible, or by swapping Flink → Kafka Streams if feature logic permits.
+- Formalize freshness and staleness signals as first-class features (e.g., watermark delay, per-entity last_update_age) so the model/policy can react gracefully instead of implicit degradation.
+- Clarify replay mechanics: what replays (raw events vs decision snapshots), what is recomputed, and how you prevent label leakage (time-aware joins and explicit label availability windows).
+
+### Nice to Have
+- Explicit operator runbooks for 3am mistakes: “flip to challenge-only”, “pin to last-good versions”, “disable non-critical topics”, “safe rollback checklist”.
+- Privacy/security posture: PII in Redis/lake, retention, encryption, access controls, and audit trails (fraud systems are sensitive by default).
+
+## What’s Working Well
+- Clear separation of concerns: single hot-path service, strict time budgets, and deterministic explainability payloads.
+- Strong stance on feature parity and replayability; the “versioned feature set” framing is the right mental model.
+- Pragmatic exactly-once trade-off (at-least-once + idempotency) that matches fraud reality and keeps ops sane.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+Reconnecting... 1/5
+
+
+
+
+
+
+thinking
+**Reconciling output format requirements**
+
+I need to figure out how to create a "What We Removed" section while still using existing sections like "Simplification Opportunities" or "Recommendations." I think I can adapt the current "Trade-offs" section to include removed content as a bullet list. However, since the requirement states it explicitly needs to be a section, I could include "What We Removed" under "Trade-offs" without creating a new heading. This way, I’m meeting the requirements while keeping the design simplified.
+thinking
+**Simplifying design documentation**
+
+I need to focus on maintaining crucial overall headings like Overview, Requirements, and Architecture while removing others like "Deep Dive" and "Critique," as they're unnecessary for the final design. Since the user wants simplifications, I can address failure scenarios in Failure Modes and Operational Notes, alongside Key Design Decisions. It's essential to simplify components too, possibly keeping the Decision API, Kafka, and others, but I’m unsure about Redis—maybe I could consider Postgres instead. However, I can’t add new sections, just refine existing ones.
+thinking
+**Considering component changes**
+
+I'm wondering if we could remove Flink in favor of Kafka Streams. This would still align with our goal of not adding more components since it's also a stream processor. I can refer to it as "Stream Features (Kafka Streams)" or "Stream Features (managed stream processor)." I also want to mention that the Decision API should write an append-only decision record to the Offline Lake or Kafka. The Outbox needs to ensure that decision-making doesn’t rely solely on Kafka, allowing for asynchronous event publishing with retries. But wait, that might introduce a new buffer component.
+thinking
+**Evaluating decision API structure**
+
+I’m considering treating Kafka as non-blocking while keeping the Decision API synchronous. However, if Kafka is down, events could be lost, which goes against the requirement for replay/backfill. I think we could write the decision record and transaction event to the Offline Lake synchronously, but writing to S3 might be slow and unsuitable for the hot path. Instead, I could propose that the Decision API writes to Kafka first, and if that's unavailable, it logs to a local append-only log for later shipping. This might add complexity, but it seems necessary for reliability.
+thinking
+**Crafting a simplified design document**
+
+I’m thinking about treating "Event Bus (Kafka)" as including a producer client with local persistence to simplify our design. The Decision API could persist an outbox in durable storage and still return a decision without blocking. I want to include failure scenarios like split brain and staleness checks using existing features stored in Redis. 
+
+I should also condense our sections and keep the essential parts in the design document without adding any new components. Following the instructions, I aim to create a simplified overview, requirements, architecture with fewer nodes, and clear decision points, including a "What We Removed" subsection in the Trade-offs. I'll structure this document carefully to adhere to all guidelines while emphasizing clarity and functionality.
+thinking
+**Preparing final markdown document**
+
+The user requested a complete final markdown document, so I need to focus strictly on producing that without any code changes. I’ll ensure to keep the title, difficulty, tags, and front matter intact as specified. 
+
+The document will include the same sections: an overview, concise bullet points for what makes the task difficult, condensed requirements, and key design decisions. I’ll summarize the architecture in a clear mermaid diagram, list components with justifications, and include trade-offs along with a section on failure modes and operational notes. Lastly, I'll make sure to simplify everything to ensure it can be built by a small team. Alright, let’s get started on this markdown!
+codex
+```markdown
+---
+title: "Fraud Detection Pipeline"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: [fraud, streaming, ml, rules, kafka, flink, feature-store, risk]
+---
+
+## Overview
+
+This system makes an `approve/deny/challenge` decision in real time by running deterministic rules and then ML inference over a **versioned feature snapshot**. A decision is treated as a pure function of an immutable transaction event plus the exact feature values (and missing/staleness flags) available at that moment.
+
+One streaming pipeline is the only producer of features and training data, so serving and training use the same definitions and the same point-in-time semantics.
+
+## What Makes This Hard
+
+- Fraud features are time-windowed and sensitive to out-of-order events.
+- Training must match serving exactly, or “model drift” becomes feature skew.
+- The decision path must stay under tight p99 latency even during partial outages and bursts.
+- Every decision must be replayable and explainable by version.
+
+## Requirements
+
+### Functional Requirements
+- Real-time decisioning on the transaction path with deterministic, explainable outputs.
+- Streaming feature computation with event-time semantics (late/out-of-order tolerated) and low-latency online serving.
+- Hybrid scoring: rules first, ML second, with a consistent final policy layer.
+- Feedback ingestion (chargebacks, manual reviews, disputes) linked back to the original decision for training/evaluation.
+- Safe experimentation: shadow models, canary rules, and replay of historical traffic through a new version.
+
+### Scale Targets
+- **Peak auth throughput:** 5k tx/s; **sustained:** 1k tx/s.
+- **Latency budget:** p99 **< 80ms** end-to-end; p99.9 **< 150ms**.
+- **Feature freshness:** visible online within **< 1s** of ingestion.
+- **History horizon:** 180 days of replay/backfill.
+- **Availability:** 99.95% on decision path; degrade safely to “challenge”.
+
+## Key Design Decisions
+
+- **One Decision Service** does feature fetch + rules + inference + policy in-process to minimize hops and keep rollbacks attributable by version.
+- **The training source of truth is the decision-time snapshot**: every transaction produces an append-only record containing the exact features read (including `feature_missing` and `feature_stale` flags), plus `rule_version`, `model_version`, and `feature_set_version`.
+- **At-least-once everywhere, idempotent by key** using `transaction_id` + `feature_set_version` for feature writes and decision snapshot writes.
+- **Decisioning does not depend on the event bus being available**: publishing is asynchronous with a local durable spool inside the Decision Service and background retry.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Checkout / Payments"] --> B["Decision Service"]
+  B --> C["Online Feature Store"]
+  B --> E["Auth Decision"]
+
+  A --> F["Event Bus"]
+  B --> F
+
+  F --> G["Stream Features"]
+  G --> C
+  G --> H["Offline Lake"]
+```
+
+### Components
+
+- **Decision Service**
+  - Justification: the only hot-path component; owns latency budgets, idempotency, explainability, and version pinning.
+  - Does: bounded feature fetch; rules; model inference; final policy; emits a decision snapshot event (features used + versions + outcome).
+  - Protects p99: strict per-step timeouts and tiered degradation (rules-only → conservative challenge).
+
+- **Online Feature Store (Redis Cluster)**
+  - Justification: predictable low-latency reads for hot aggregates (velocity/counters) under burst.
+  - Stores: entity-keyed feature hashes by `feature_set_version`, plus freshness metadata (`last_update_ts`, `pipeline_watermark_delay`).
+
+- **Event Bus (Kafka)**
+  - Justification: immutable log for replay/backfill and the bridge between online decisions and offline truth.
+  - Carries: transaction events, auxiliary signals, decision snapshot events, and feedback labels.
+
+- **Stream Features (Flink)**
+  - Justification: correct event-time windowing with late/out-of-order handling in one place.
+  - Produces: versioned online features to Redis and append-only offline rows (including decision snapshots and labels) to the lake.
+
+- **Offline Lake (S3 + Parquet)**
+  - Justification: cheap 180-day retention for audits, replay, and training/evaluation.
+  - Stores: raw events, decision snapshots (features actually used), and labeled outcomes with explicit label-availability timing.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Low, predictable p99 latency | Less multi-hop modeling complexity |
+| Replayability + auditability | More append-only storage (decision snapshots) |
+| Feature parity (less skew) | Less ad-hoc offline joining |
+| Simple ops for a small team | Some conservative “challenge” under uncertainty |
+
+**What We Removed**
+- Separate hot-path services (rules/model/policy split) in favor of a single Decision Service.
+- Any requirement for end-to-end exactly-once in favor of idempotency + append-only snapshots.
+- Training based on reconstructing features from raw joins; training reads decision snapshots directly.
+
+## Failure Modes
+
+- **Kafka down / unreachable**
+  - What happens: decisions continue; events are spooled locally for later publish.
+  - Detect: publish failures + growing local spool size.
+  - Recover: restore Kafka; drain spool with idempotent publish; if spool hits a hard cap, switch policy to more “challenge” for higher-risk segments while preserving checkout latency.
+
+- **Redis slow (tail latency spike) or partial outage**
+  - What happens: feature fetch threatens p99.
+  - Detect: Redis p99 + timeout rate + connection churn.
+  - Recover: strict client timeouts + circuit breaker; substitute defaults and set `feature_missing`; bias policy to challenge when feature coverage drops.
+
+- **Network partition (Decision Service ↔ Kafka/Flink)**
+  - What happens: feature freshness degrades even if Redis is reachable.
+  - Detect: invariant checks (tx rate vs Redis feature update rate) and freshness signals (`last_update_age`, watermark delay) stored in Redis.
+  - Recover: treat freshness SLO violation as an input: set `feature_stale` and shift policy toward challenge until freshness recovers.
+
+- **Version mismatch (scorer vs feature pipeline)**
+  - What happens: mixed schemas or unknown feature sets cause silent scoring errors if unchecked.
+  - Detect: Decision Service requires an explicit `feature_set_version` and rejects/flags unknown schemas; canary metrics by version.
+  - Recover: fail safe (defaults + `feature_schema_mismatch`), pin to last-known-good versions, and roll forward only after a canary replay on recent traffic.
+
+- **10x burst**
+  - What happens: bottlenecks are Redis read QPS and Decision Service CPU for inference.
+  - Detect: queueing time and per-step timeout rates.
+  - Recover: admission control tiers: reduce feature fetch set, disable shadow scoring, and fall back to rules-only for low-risk segments while biasing uncertain cases to challenge.
+
+## Operational Notes
+
+- Every decision emits one append-only snapshot keyed by `transaction_id` containing: `decision`, `rule_version`, `model_version`, `feature_set_version`, the exact feature vector read (including missing/stale flags), and a compact explanation payload.
+- Rollouts are versioned and gated: new `feature_set_version` ships first, then rules/model versions are canaried with shadow scoring on sampled traffic before becoming default.
+- Monitoring is distribution-first: approve/deny/challenge rates by merchant/BIN/country/device family, plus feature coverage and freshness signals (watermark delay, `last_update_age`) as first-class indicators.
+- Timeouts are enforced as a budget: feature fetch, rules, and inference each have a hard cap; on budget exhaustion, the system returns a conservative challenge instead of timing out checkout.
+```
+tokens used
+4,493
+```markdown
+---
+title: "Fraud Detection Pipeline"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: [fraud, streaming, ml, rules, kafka, flink, feature-store, risk]
+---
+
+## Overview
+
+This system makes an `approve/deny/challenge` decision in real time by running deterministic rules and then ML inference over a **versioned feature snapshot**. A decision is treated as a pure function of an immutable transaction event plus the exact feature values (and missing/staleness flags) available at that moment.
+
+One streaming pipeline is the only producer of features and training data, so serving and training use the same definitions and the same point-in-time semantics.
+
+## What Makes This Hard
+
+- Fraud features are time-windowed and sensitive to out-of-order events.
+- Training must match serving exactly, or “model drift” becomes feature skew.
+- The decision path must stay under tight p99 latency even during partial outages and bursts.
+- Every decision must be replayable and explainable by version.
+
+## Requirements
+
+### Functional Requirements
+- Real-time decisioning on the transaction path with deterministic, explainable outputs.
+- Streaming feature computation with event-time semantics (late/out-of-order tolerated) and low-latency online serving.
+- Hybrid scoring: rules first, ML second, with a consistent final policy layer.
+- Feedback ingestion (chargebacks, manual reviews, disputes) linked back to the original decision for training/evaluation.
+- Safe experimentation: shadow models, canary rules, and replay of historical traffic through a new version.
+
+### Scale Targets
+- **Peak auth throughput:** 5k tx/s; **sustained:** 1k tx/s.
+- **Latency budget:** p99 **< 80ms** end-to-end; p99.9 **< 150ms**.
+- **Feature freshness:** visible online within **< 1s** of ingestion.
+- **History horizon:** 180 days of replay/backfill.
+- **Availability:** 99.95% on decision path; degrade safely to “challenge”.
+
+## Key Design Decisions
+
+- **One Decision Service** does feature fetch + rules + inference + policy in-process to minimize hops and keep rollbacks attributable by version.
+- **The training source of truth is the decision-time snapshot**: every transaction produces an append-only record containing the exact features read (including `feature_missing` and `feature_stale` flags), plus `rule_version`, `model_version`, and `feature_set_version`.
+- **At-least-once everywhere, idempotent by key** using `transaction_id` + `feature_set_version` for feature writes and decision snapshot writes.
+- **Decisioning does not depend on the event bus being available**: publishing is asynchronous with a local durable spool inside the Decision Service and background retry.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Checkout / Payments"] --> B["Decision Service"]
+  B --> C["Online Feature Store"]
+  B --> E["Auth Decision"]
+
+  A --> F["Event Bus"]
+  B --> F
+
+  F --> G["Stream Features"]
+  G --> C
+  G --> H["Offline Lake"]
+```
+
+### Components
+
+- **Decision Service**
+  - Justification: the only hot-path component; owns latency budgets, idempotency, explainability, and version pinning.
+  - Does: bounded feature fetch; rules; model inference; final policy; emits a decision snapshot event (features used + versions + outcome).
+  - Protects p99: strict per-step timeouts and tiered degradation (rules-only → conservative challenge).
+
+- **Online Feature Store (Redis Cluster)**
+  - Justification: predictable low-latency reads for hot aggregates (velocity/counters) under burst.
+  - Stores: entity-keyed feature hashes by `feature_set_version`, plus freshness metadata (`last_update_ts`, `pipeline_watermark_delay`).
+
+- **Event Bus (Kafka)**
+  - Justification: immutable log for replay/backfill and the bridge between online decisions and offline truth.
+  - Carries: transaction events, auxiliary signals, decision snapshot events, and feedback labels.
+
+- **Stream Features (Flink)**
+  - Justification: correct event-time windowing with late/out-of-order handling in one place.
+  - Produces: versioned online features to Redis and append-only offline rows (including decision snapshots and labels) to the lake.
+
+- **Offline Lake (S3 + Parquet)**
+  - Justification: cheap 180-day retention for audits, replay, and training/evaluation.
+  - Stores: raw events, decision snapshots (features actually used), and labeled outcomes with explicit label-availability timing.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Low, predictable p99 latency | Less multi-hop modeling complexity |
+| Replayability + auditability | More append-only storage (decision snapshots) |
+| Feature parity (less skew) | Less ad-hoc offline joining |
+| Simple ops for a small team | Some conservative “challenge” under uncertainty |
+
+**What We Removed**
+- Separate hot-path services (rules/model/policy split) in favor of a single Decision Service.
+- Any requirement for end-to-end exactly-once in favor of idempotency + append-only snapshots.
+- Training based on reconstructing features from raw joins; training reads decision snapshots directly.
+
+## Failure Modes
+
+- **Kafka down / unreachable**
+  - What happens: decisions continue; events are spooled locally for later publish.
+  - Detect: publish failures + growing local spool size.
+  - Recover: restore Kafka; drain spool with idempotent publish; if spool hits a hard cap, switch policy to more “challenge” for higher-risk segments while preserving checkout latency.
+
+- **Redis slow (tail latency spike) or partial outage**
+  - What happens: feature fetch threatens p99.
+  - Detect: Redis p99 + timeout rate + connection churn.
+  - Recover: strict client timeouts + circuit breaker; substitute defaults and set `feature_missing`; bias policy to challenge when feature coverage drops.
+
+- **Network partition (Decision Service ↔ Kafka/Flink)**
+  - What happens: feature freshness degrades even if Redis is reachable.
+  - Detect: invariant checks (tx rate vs Redis feature update rate) and freshness signals (`last_update_age`, watermark delay) stored in Redis.
+  - Recover: treat freshness SLO violation as an input: set `feature_stale` and shift policy toward challenge until freshness recovers.
+
+- **Version mismatch (scorer vs feature pipeline)**
+  - What happens: mixed schemas or unknown feature sets cause silent scoring errors if unchecked.
+  - Detect: Decision Service requires an explicit `feature_set_version` and rejects/flags unknown schemas; canary metrics by version.
+  - Recover: fail safe (defaults + `feature_schema_mismatch`), pin to last-known-good versions, and roll forward only after a canary replay on recent traffic.
+
+- **10x burst**
+  - What happens: bottlenecks are Redis read QPS and Decision Service CPU for inference.
+  - Detect: queueing time and per-step timeout rates.
+  - Recover: admission control tiers: reduce feature fetch set, disable shadow scoring, and fall back to rules-only for low-risk segments while biasing uncertain cases to challenge.
+
+## Operational Notes
+
+- Every decision emits one append-only snapshot keyed by `transaction_id` containing: `decision`, `rule_version`, `model_version`, `feature_set_version`, the exact feature vector read (including missing/stale flags), and a compact explanation payload.
+- Rollouts are versioned and gated: new `feature_set_version` ships first, then rules/model versions are canaried with shadow scoring on sampled traffic before becoming default.
+- Monitoring is distribution-first: approve/deny/challenge rates by merchant/BIN/country/device family, plus feature coverage and freshness signals (watermark delay, `last_update_age`) as first-class indicators.
+- Timeouts are enforced as a budget: feature fetch, rules, and inference each have a hard cap; on budget exhaustion, the system returns a conservative challenge instead of timing out checkout.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/06-commerce-fintech/fraud-detection-pipeline.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Fraud Detection Pipeline
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/fraud-detection-pipeline.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/fraud-detection-pipeline.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/06-commerce-fintech/fraud-detection-pipeline.md

@@ -1,0 +1,321 @@
+---
+title: "DDoS Protection System"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["ddos", "waf", "rate-limiting", "anycast", "bot-management", "xdp"]
+---
+
+## Overview
+
+A DDoS protection system keeps customer origins reachable by absorbing hostile traffic and enforcing selective filtering at Internet scale—without blocking legitimate users. Attacks range from L3/L4 floods (SYN/UDP/amplification) to L7 request floods and protocol abuse (including HTTP/2 Rapid Reset), often changing faster than humans can respond.
+
+This design uses an Anycast edge that performs packet filtering, TLS/QUIC termination, HTTP proxying, and enforcement (WAF, rate limiting, bot signals, and challenges) locally in each PoP. A small control service manages policy, aggregates telemetry, detects anomalies, and publishes short-lived mitigations back to the edge with safe rollout and fast rollback.
+
+**Key idea**: keep the request path fully edge-local; keep the feedback loop fast, bounded, and safe.
+
+### Goals
+- Keep origin services stable under large L3/L4 and L7 attacks.
+- Preserve user experience with progressive challenges (token → PoW → CAPTCHA).
+- Propagate mitigations globally in seconds with TTLs and rollback controls.
+- Provide operator visibility (dashboards, APIs, audit logs) during incidents.
+
+### Non-goals
+- Replacing customer application security (authz logic, business abuse prevention).
+- Perfect attribution of attackers (IP and fingerprints are probabilistic).
+- Storing raw full-fidelity traffic at all times (telemetry is sampled and bounded).
+
+---
+
+## Requirements
+
+### Functional Requirements
+- Onboard protected properties (domains/IPs), configure origin routing, and define protection policies per property.
+- Mitigate:
+  - **L3/L4**: SYN floods, UDP floods/amplification, fragmented packets, malformed traffic.
+  - **L7**: request floods, cache-bypass floods, slow requests, HTTP/2 abuse (streams/resets), bot scraping, credential stuffing (at the edge level).
+- Enforce at the edge:
+  - WAF rules (signature + behavioral)
+  - Rate limiting (per-IP, per-session, per-fingerprint, per-path)
+  - Bot signals and risk scoring
+  - Challenge/allow/block decisions
+- Adaptive challenges:
+  - Token-based proof (cookie/header)
+  - Proof-of-Work (PoW)
+  - CAPTCHA (third-party optional; internal fallback required)
+- Continuously analyze traffic:
+  - Build baselines and detect anomalies
+  - Produce attack fingerprints (IP/ASN prefix, country, JA4/JA3, UA, path templates, header patterns)
+- Push mitigations to edge globally within seconds with staged rollout, TTLs, and rollback.
+- Provide real-time dashboards and APIs for attack status, mitigation history, and audit logs.
+
+### Non-Functional Requirements
+
+#### Scale (target design point)
+- **Global edge capacity**: 10 Tbps sustained, **50 Tbps burst**, with **>200 PoPs**.
+- **Packets/sec**: up to **200 Mpps** aggregate.
+- **HTTP**: up to **20M RPS** sustained, **100M RPS burst** during large L7 events.
+- **Tenancy**: 10K–100K protected properties; top tenant can see **1M+ RPS** during an attack.
+- **Telemetry ingestion**: edge-reduced aggregates; sampled logs are bounded and adaptive.
+
+#### Latency
+- **Edge enforcement overhead**: +1–3 ms P50, +10–20 ms P99 under normal load.
+- **Challenge issuance**: <50 ms P99 at edge (excluding user interaction / third-party CAPTCHA latency).
+- **Mitigation propagation**: <10 s P99 from detection to global edge enforcement.
+
+#### Availability & Reliability
+- **Edge proxy + enforcement**: 99.99% monthly (multi-PoP, multi-provider).
+- **Control service**: 99.9% monthly.
+- **Dashboards/analytics**: 99.9% monthly (degraded acceptable during extreme attacks).
+
+#### Consistency & Durability
+- **Policy updates**: strongly consistent within a property (monotonic versioning; single-writer per property).
+- **Mitigations**: monotonic, versioned, eventually consistent across PoPs (seconds).
+- **Policy + audit logs**: RPO ≈ 0 (multi-AZ), RTO < 15 minutes.
+- **Telemetry**: tolerates sampling loss under extreme attacks.
+
+---
+
+## Simplified Architecture
+
+```mermaid
+graph TB
+  C[Client] --> AE[Anycast Edge]
+  AE --> ORI[Customer Origin]
+
+  AE -->|"Config stream"| CTRL[Control Service]
+  AE -->|"Agg metrics"| CTRL
+  AE -->|"Sample logs"| OBJ[Object Storage]
+
+  CTRL --> PG[(Postgres)]
+```
+
+### Data Plane (Edge)
+A single “Edge Gateway” per PoP handles:
+- Anycast ingress, TCP/TLS/QUIC termination, HTTP proxying (HTTP/1.1 + HTTP/2 + QUIC).
+- L3/L4 fast filtering (XDP/eBPF where available) and connection protection (SYN cookies/proxy, strict caps).
+- L7 enforcement (WAF, rate limiting, bot signals, challenges).
+- Local-only operation: enforcement never depends on a central call per request.
+- Last-known-good config cache with monotonic version application.
+
+### Control Plane (Central)
+A single “Control Service” provides:
+- Customer APIs (property onboarding, policy updates) and operator tooling (dashboards, incident actions).
+- Policy compilation and signed config distribution to edges (streamed deltas).
+- Telemetry aggregation (minute-level counters + top-K summaries) and basic anomaly detection.
+- Mitigation generation with guardrails (TTLs, caps, staged rollout, rollback triggers).
+- Audit logging for all configuration and operator actions.
+
+---
+
+## Request Path (Fast Path)
+1. **Anycast routing** sends traffic to the nearest/healthy PoP.
+2. **L3/L4 filtering** drops obvious garbage cheaply (packet/flow level) and protects connection tables.
+3. **L7 proxy** terminates TLS/QUIC, normalizes HTTP, enforces timeouts and resource limits.
+4. **Enforcement** evaluates policy and dynamic mitigations:
+   - `ALLOW | BLOCK | CHALLENGE | RATE_LIMIT | LOG_ONLY`
+5. Clean traffic is proxied to the **origin** (optionally with origin shielding / mTLS).
+
+---
+
+## Control Loop (Seconds)
+- Each PoP periodically emits **aggregated metrics** (per property + key dimensions) and **top-K offenders** (bounded).
+- The control service detects anomalies and produces **short-lived mitigations** (fingerprints + action + confidence).
+- Mitigations are rolled out with:
+  - monotonic versions
+  - TTLs (renewal required)
+  - canary rollout and rollback triggers
+- Edges apply deltas and continue operating on cached config during control-plane degradation.
+
+---
+
+## Components
+
+### 1) Edge Gateway (Anycast PoP)
+**Responsibilities**
+- Volumetric protection (L3/L4), protocol normalization (L7), and tenant-aware enforcement.
+- Resource protection via explicit budgets: PPS/CPS/handshakes/RPS, header/body limits, concurrency caps.
+- Safe degradation modes under attack (disable expensive features first).
+
+**L3/L4 defenses**
+- XDP/eBPF early drops, conservative ACLs, protocol validation, fragment handling.
+- SYN cookies/SYN proxy with strict connection tracking caps.
+- Coarse QUIC/UDP flood controls (token-based retries, rate caps).
+
+**L7 hardening**
+- HTTP/2 stream concurrency caps and reset-rate limits (Rapid Reset mitigation).
+- Tight timeouts, header size limits, decompression limits, and per-connection concurrency caps.
+
+**State**
+- Rate limiting and bot signals are maintained locally (in-memory and/or kernel maps) with TTLs and bounded cardinality.
+
+---
+
+### 2) Enforcement (WAF, Rate Limits, Bot Signals, Challenges)
+**Policy inputs**
+- Customer policy (static rules and allow/deny lists).
+- Dynamic mitigations (short-lived fingerprints from the control service).
+- Risk signals (TLS/JA4/JA3, UA patterns, IP/ASN/country, behavioral counters).
+
+**Challenges (progressive)**
+1. **Signed token** (cookie/header) for low-risk verification
+2. **PoW** for medium-risk automation
+3. **CAPTCHA** for high-confidence bot traffic (third-party optional; internal fallback required)
+
+**Stateless verification**
+- Signed tokens (JWT/PASETO-style) with short TTL (e.g., 5–30 minutes).
+- Token binds to: `property_id`, token version, issuance time, and coarse client binding (e.g., ASN + UA hash or /24) to reduce replay without punishing NAT users.
+- Optional small, TTL-based revoke list for incident response.
+
+**Rate limiting**
+- Token bucket/leaky bucket with bounded keys:
+  - IP prefix, session token, fingerprint, path template, method, risk tier
+- Strict caps for high-cardinality dimensions; reject rules that would explode cardinality.
+
+---
+
+### 3) Control Service (Policy, Detection, Distribution, Dashboards)
+**Policy & distribution**
+- Single-writer per property; produces compiled rules and signed config bundles.
+- Edges subscribe via a streaming endpoint; apply deltas only in order.
+
+**Detection**
+- Focus on deterministic, explainable methods:
+  - baseline deviation detection (per property, per endpoint template)
+  - threshold/rate rules for known attack shapes (SYN/UDP spikes, HTTP/2 reset storms, sudden 4xx/429 patterns)
+  - bounded heavy-hitter analysis based on edge top-K summaries
+
+**Guardrails**
+- TTLs on dynamic mitigations (e.g., 10–60 minutes).
+- Per-property limits (e.g., max dynamic rules active, max delta size).
+- Canary rollout + rollback triggers (synthetic probes, error spikes, cohort comparisons).
+
+---
+
+## Data Model (Postgres)
+
+### Core configuration
+- `tenants(id, name, plan, created_at)`
+- `properties(id, tenant_id, domain, origin_config, tls_mode, created_at)`
+- `policies(id, property_id, default_action, version, created_at)`
+- `rules(id, policy_id, priority, match_expr, action, challenge_type, rate_limit, enabled, created_at)`
+
+### Dynamic mitigations & rollouts
+- `mitigations(id, property_id, fingerprint_type, fingerprint_value, action, confidence, rollout_state, expires_at, created_at)`
+- `rollout_events(id, mitigation_id, stage, decision, reason, created_at)`
+
+### Audit
+- `audit_log(id, tenant_id, actor, action, object_ref, diff, created_at)` (append-only)
+
+### Telemetry (aggregated)
+- `edge_agg_minute(ts, property_id, pop, rps, blocked_rps, challenged_rps, rl_rps, status_2xx, status_4xx, status_5xx, origin_err_rate, p95_edge_ms, p95_origin_ms)`
+- `edge_topk_minute(ts, property_id, pop, dimension, key_hash, rps, action)` (bounded rows per minute)
+
+### Sampled logs (optional)
+- Sampled logs are written as compressed files to object storage partitioned by day/tenant/region.
+- Postgres stores lightweight manifests/indices for retrieval:
+  - `log_objects(id, property_id, day, region, object_path, sample_rate, created_at)`
+
+**PII handling**
+- Hash IP/UA with a rotating keyed salt; store raw values only by explicit tenant opt-in and strict retention.
+- Default retention: aggregates 30–90 days; sampled logs 7–30 days (tiered storage).
+
+---
+
+## API Design (REST)
+
+### Authentication & tenancy
+- Customer API: scoped API tokens or OAuth2 client credentials; per-tenant rate limits.
+- Edge ↔ control: mTLS identities plus signed bundles.
+
+### Endpoints
+**Create property**
+- `POST /v1/properties`
+- Request: `{ "domain": "api.example.com", "origin": { "host": "origin.internal", "port": 443 }, "tlsMode": "full" }`
+
+**Update policy**
+- `PUT /v1/properties/{propertyId}/policy`
+- Response: `{ "version": 42 }`
+- Validation rejects overly broad/high-cardinality rules.
+
+**Get attack status**
+- `GET /v1/properties/{propertyId}/status?window=5m`
+- Returns aggregates, top fingerprints (bounded), and active mitigations.
+
+**Get audit log**
+- `GET /v1/tenants/{tenantId}/audit?since=...`
+
+### Edge endpoints
+- `GET /v1/edge/config/stream` (streaming deltas)
+- `POST /v1/edge/telemetry` (minute aggregates + top-K)
+
+---
+
+## Scaling & Performance
+
+### Edge-first scaling
+- Volumetric floods are absorbed by Anycast distribution and early packet drops.
+- L7 cost is controlled by strict budgets and feature gating under attack mode.
+- Rate limiting and bot signals stay local to avoid cross-PoP coordination on the hot path.
+
+### Telemetry scaling
+- Edges send bounded, periodic aggregates and top-K summaries rather than raw event streams.
+- Sampled logs go directly to object storage with adaptive sampling.
+
+### Capacity knobs that matter
+- PPS/CPS/handshake caps before L7
+- HTTP concurrency caps, header/body limits, per-tenant fairness
+- Config delta size limits and per-property dynamic rule caps
+
+---
+
+## Failure Modes & Mitigations
+
+### Control service outage
+- Edges continue on last-known-good policy and active TTL-based mitigations.
+- Dynamic mitigations expire automatically unless renewed.
+
+### False positives
+- Canary rollout with rollback triggers (synthetics, error spikes, cohort checks).
+- Short TTLs + per-property caps + allowlist escape hatch.
+
+### Telemetry overload
+- Aggregates prioritized; sampled logs throttle harder under load.
+- Detection falls back to edge-provided top-K summaries and conservative rules.
+
+### PoP uplink saturation
+- Anycast rebalancing, upstream filtering/RTBH/FlowSpec, temporary regional steering.
+
+### Key compromise (token/config signing)
+- Short token TTLs, key rotation by version, audit on key usage.
+- Emergency invalidation by key version; dual control for sensitive actions.
+
+---
+
+## Operations
+
+### SLOs (example)
+- Edge availability: 99.99%
+- Edge enforcement latency: P99 < 20 ms (excluding Internet RTT)
+- Config propagation: P99 < 10 s
+- Customer API availability: 99.9%
+
+### Monitoring
+- Edge: PPS/RPS/CPS, handshake rate, drops, 4xx/5xx, origin latency, budget saturations.
+- Enforcement: rule eval latency, blocks/challenges/429s, token verify failures.
+- Control: config staleness, rollout health, audit volume, telemetry ingest lag.
+
+### Deployment & rollback
+- Edge: canary PoPs → regional → global with automatic rollback on latency/error regressions.
+- Control: feature flags for detectors; tenant-based canaries.
+- Rollback: revert to prior config version; edges apply monotonic versions and keep last-known-good.
+
+---
+
+## Simplification Notes
+
+- Removed: dedicated stream bus and raw-event pipeline; acceptable because detection is driven by bounded edge aggregates and top-K summaries, with sampled logs written directly to object storage.
+- Removed: separate analytics OLAP cluster; acceptable because operational dashboards and incident response use minute aggregates stored in Postgres, and forensics use sampled logs in object storage.
+- Removed: per-PoP Redis/KeyDB counters; acceptable because rate limiting and bot counters are maintained locally within the Edge Gateway using bounded in-memory/kernels maps with TTLs.
+- Merged: L3/L4 filtering, L7 proxy, WAF/rate limiting/bot/challenges into a single Edge Gateway per PoP to keep the hot path local and reduce operational surface area.
+- Merged: policy store, audit log, detection, mitigation control, config distribution, and dashboards into one Control Service backed by Postgres to minimize moving parts while preserving versioning and rollout safety.
+- Complexity that remains: Anycast operations, edge packet filtering (XDP/eBPF), protocol-aware L7 enforcement (HTTP/2/QUIC), and signed/monotonic config distribution with canary rollback—these are required for correctness and survivability under real DDoS conditions.

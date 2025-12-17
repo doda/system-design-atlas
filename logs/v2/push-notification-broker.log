@@ -1,0 +1,1668 @@
+==========================================
+Generating (v2): Push Notification Broker
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-29d0-75b3-b394-651867762065
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Push Notification Broker
+**Category**: Real-Time & Media
+
+**Problem Statement**:
+Design a delivery service handling millions of notifications per second, with prioritization, rate limiting, and delivery receipts.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+thinking
+**Planning document generation**
+
+The user wants me to generate a document without coding but treating it as writing. I'll use markdown and include front matter while being opinionated and avoiding hedging. An architecture diagram will have a maximum of eight nodes, and I'll focus on the most challenging aspects, likely prioritizing rate limiting at a massive scale and receipt tracking. 
+
+Proven technologies like Kafka will be used to handle millions of transactions per second. Managing priorities is complex, but I can design separate topics for each priority and employ weighted fair scheduling. I'll also detail rate limiting strategies and delivery receipts using asynchronous callbacks.
+thinking
+**Drafting architectural document**
+
+I’m outlining an architecture for handling notification delivery. I'll use durable logs like Kafka for ingress, with dispatchers communicating with providers. For receipts, an event stream will write to a state store, and I'll expose queries via API. 
+
+I'll set scale targets, such as 2 million notifications per second for ingress and 10 million for bursts. Important details include latency objectives and handling priorities. I also need to consider potential failure modes and operational notes. The document will be straightforward and focused on functionality without unnecessary tools.
+codex
+```markdown
+---
+title: "Push Notification Broker"
+category: "Real-Time & Media"
+difficulty: "Hard"
+tags: ["push", "real-time", "rate-limiting", "prioritization", "kafka", "apns", "fcm"]
+---
+
+## Overview
+
+This system is a high-throughput push notification broker: it accepts notification intents from many producers, enforces prioritization and rate limits, fans out to push providers (APNS/FCM/web-push), and emits delivery receipts.
+
+The key insight is to treat “send a push” as a **scheduled, quota-governed dispatch problem**, not a simple HTTP relay. The elegant design separates (1) durable intake, (2) deterministic scheduling under multiple constraints, and (3) provider dispatch—so spikes, hot tenants, and provider slowdowns become queueing and scheduling problems with explicit policies instead of cascading failures.
+
+The hardest part is not “Kafka + workers”; it’s making prioritization and rate limiting **predictable under load** without global locks, while keeping receipts accurate enough to be trusted.
+
+## What Makes This Hard
+
+Naive implementations trap teams in two places:
+
+1. **Priority inversion under backpressure.** When providers slow down, a single FIFO queue makes “critical” notifications wait behind “bulk” traffic. Teams add ad-hoc bypasses that silently break quotas and fairness.
+
+2. **Rate limiting that lies.** Centralized counters melt at millions/sec; decentralized counters drift and allow quota bypass during failover. If limits aren’t enforceable at the point of dispatch, they’re just dashboards.
+
+3. **Receipts are not a single truth.** “Accepted by broker”, “accepted by provider”, and “delivered to device” are different events with different reliability. If you don’t model that explicitly, you either over-promise or drown in edge cases.
+
+## Requirements
+
+### Functional Requirements
+- Accept notifications with `tenant`, `audience` (device token(s) or topic), `priority` (e.g., `critical|high|normal|bulk`), `ttl`, and `idempotency_key`.
+- Enforce rate limits:
+  - per-tenant (contractual quota)
+  - per-campaign/job (blast control)
+  - per-destination/provider constraints (APNS/FCM limits, connection caps)
+- Prioritize traffic so `critical` is protected under overload while preserving tenant fairness.
+- Provide delivery receipts with clear semantics: `ENQUEUED`, `DISPATCHED`, `PROVIDER_ACCEPTED`, `DELIVERED` (when available), `FAILED` (reasoned).
+- Survive provider outages without dropping critical traffic; degrade bulk first.
+
+### Scale Targets
+- Ingest: **2M notifications/sec sustained**, **10M/sec burst for 60s** (marketing spikes + retries).
+- Payload: avg **700B**, p99 **2KB** (headers + small bodies; large payloads are rejected).
+- Fanout: assume **1.2 destinations/notification** average (single token dominant; some multi-token).
+- Latency SLO (broker → provider dispatch):
+  - `critical`: p99 **200ms**
+  - `normal`: p99 **2s**
+  - `bulk`: “best effort”, bounded by TTL
+- Receipts: **99.9% emitted** for broker and provider-acceptance states within **30s**.
+
+These numbers force a design where the hot path is append-only + partition-local scheduling; anything that needs cross-partition coordination will fail first.
+
+## Key Design Decisions
+
+- **We chose:** Kafka as the durable intake + state transition log (partitioned by routing key).
+  - **We rejected:** direct in-memory queues as the source of truth.
+  - **Why:** durable ordering + replay gives us controlled recovery and consistent receipts; partitions are the unit of scale and isolation.
+
+- **We chose:** Deterministic routing to a “Scheduler/Dispatcher” shard that owns quota enforcement for a keyspace.
+  - **We rejected:** centralized rate-limit service for every dispatch.
+  - **Why:** quota checks must be on the dispatch path; making them local avoids a global bottleneck and makes behavior stable under overload.
+
+- **We chose:** Priority as separate queues with **weighted fair scheduling** (WFS) per shard, with strict protection for `critical`.
+  - **We rejected:** single queue with “priority field” and hope.
+  - **Why:** separate queues make starvation and protection explicit; WFS prevents one tenant’s bulk from consuming the shard.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  P["Producers"] --> I["Ingress API"]
+  I --> K["Kafka (intents)"]
+  K --> S["Schedulers"]
+  S --> D["Dispatchers"]
+  D --> A["APNS/FCM"]
+  A --> R["Receipt Ingest"]
+  S --> E["Receipt Log"]
+  R --> E
+```
+
+### Components
+
+- **Ingress API**
+  - Validates payload, enforces auth, normalizes priority/TTL, assigns `notification_id`, and writes a single intent record.
+  - Earns its place by keeping the hot path “append-only”; no synchronous provider calls here.
+
+- **Kafka (intents)**
+  - Stores notification intents partitioned by a routing key (e.g., `hash(tenant_id, destination_hash)`).
+  - Enables replay-based recovery and deterministic sharding for quota ownership.
+
+- **Schedulers**
+  - Consume intents, place them into per-priority local queues, apply TTL, and decide *when* a notification may be dispatched under quotas.
+  - Own the hard policy logic; everything else stays boring.
+
+- **Dispatchers**
+  - Maintain provider connections, translate payload formats, batch where providers support it, and execute sends.
+  - Report outcomes (accepted/rejected/transient errors) as events.
+
+- **APNS/FCM**
+  - External systems with their own throttles, error codes, and semantics; treated as unreliable dependencies.
+
+- **Receipt Ingest**
+  - Handles provider callbacks/feedback (where available) and normalizes them into receipt events.
+
+- **Receipt Log**
+  - Append-only stream of receipt events; downstream consumers build queryable state (e.g., “latest status per notification_id”) without coupling the hot path.
+
+## Deep Dive: Scheduling Under Priority + Quotas (The Hardest Part)
+
+The scheduler shard is the unit of correctness. Each shard owns a slice of traffic by routing key, which means it can enforce limits without a global lock. The routing choice matters: partition by `(tenant_id, destination_hash)` so a single tenant’s traffic spreads across shards (parallelism), while quota accounting remains attributable to tenant and stable per shard.
+
+**Priority handling** is implemented as four independent queues per shard (`critical/high/normal/bulk`). Dispatch uses a two-layer policy:
+1. **Protection:** reserve capacity for `critical` (e.g., always attempt to dispatch `critical` first up to a configured ceiling tied to provider health). This prevents priority inversion during provider slowdowns.
+2. **Weighted Fair Scheduling:** for non-critical, schedule with weights across priorities *and* tenants. Practically, the shard maintains per-tenant subqueues per priority and uses deficit round robin (DRR) with weights. This avoids a single “bulk” tenant consuming the shard even if they are within quota, preserving latency for smaller tenants.
+
+**Rate limiting** is enforced at dispatch time using token buckets:
+- **Per-tenant bucket:** contractual QPS + burst.
+- **Per-provider bucket:** connection/throughput caps derived from live health.
+- **Per-campaign bucket (optional but common):** blast control keyed by `campaign_id`.
+
+To keep this scalable, buckets are **owned by the shard** and stored in memory for speed, with periodic checkpointing to a fast KV store for warm restart. Accuracy comes from ownership: only one shard decrements a given bucket key. If you need strict per-tenant global limits, you don’t centralize checks; you **allocate tenant quota across shards** (static or dynamic) so enforcement remains local and sum-bounded.
+
+Backpressure is explicit: when provider health drops, the per-provider bucket shrinks, which slows dispatch and grows queues. Because queues are priority-separated and TTL-aware, the system drops or expires `bulk` first, instead of randomly failing everything.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Predictable priority under overload | Some idle capacity when reserving for `critical` |
+| Enforceable quotas at high QPS | More complex sharding and routing design |
+| Replayable recovery + auditable receipts | Higher end-to-end complexity vs a simple relay |
+| Tenant fairness | Maximum throughput for a single tenant |
+
+## Failure Modes
+
+1. **Provider throttling/outage (APNS/FCM slows or rejects)**
+   - **What happens:** dispatcher errors rise; per-provider bucket contracts; queues grow.
+   - **Detect:** provider error codes + increased RTT + queue age per priority.
+   - **Recover:** automatically shed `bulk` (expire by TTL), keep `critical` protected, and retry transient failures with capped exponential backoff; page when `critical` queue age breaches SLO.
+
+2. **Hot tenant / blast storm**
+   - **What happens:** a tenant floods ingress and would starve others if not controlled.
+   - **Detect:** per-tenant queue depth + token-bucket depletion rate.
+   - **Recover:** per-tenant bucket clamps dispatch; ingress can optionally return 429 for non-critical once backlog crosses a tenant threshold (fail fast, predictable).
+
+3. **Shard loss / consumer restart**
+   - **What happens:** in-memory queues/buckets are lost; risk of duplicates or quota drift.
+   - **Detect:** consumer group rebalance + shard heartbeat missing.
+   - **Recover:** replay intents from Kafka; rely on idempotency at dispatch (provider-side dedupe where supported + broker-side `notification_id` de-dup window) and checkpointed buckets to avoid quota spikes after restart.
+
+## What I'd Do Differently At...
+
+- **10x scale:** split Kafka topics by priority (or at least by `critical` vs rest) to isolate tail latency, and run physically separate dispatcher pools per provider to isolate noisy neighbors.
+- **100x scale:** move from single-region active to multi-region active/active with regional schedulers and regional provider dispatch; receipts become eventually consistent with region-local status and a global “best known” view built from streams.
+
+## Operational Notes
+
+- The on-call’s primary dashboard is **queue age by priority**, not just throughput; age predicts SLO misses.
+- Provider health should directly drive capacity (token bucket size), otherwise you oscillate between overload and recovery.
+- Rebalances are dangerous: keep partitions stable, scale by adding shards gradually, and treat consumer lag as a first-class alert.
+- Receipts must be documented as a state machine; “DELIVERED” is provider-dependent and often unavailable—don’t conflate it with “PROVIDER_ACCEPTED”.
+```
+tokens used
+3,784
+```markdown
+---
+title: "Push Notification Broker"
+category: "Real-Time & Media"
+difficulty: "Hard"
+tags: ["push", "real-time", "rate-limiting", "prioritization", "kafka", "apns", "fcm"]
+---
+
+## Overview
+
+This system is a high-throughput push notification broker: it accepts notification intents from many producers, enforces prioritization and rate limits, fans out to push providers (APNS/FCM/web-push), and emits delivery receipts.
+
+The key insight is to treat “send a push” as a **scheduled, quota-governed dispatch problem**, not a simple HTTP relay. The elegant design separates (1) durable intake, (2) deterministic scheduling under multiple constraints, and (3) provider dispatch—so spikes, hot tenants, and provider slowdowns become queueing and scheduling problems with explicit policies instead of cascading failures.
+
+The hardest part is not “Kafka + workers”; it’s making prioritization and rate limiting **predictable under load** without global locks, while keeping receipts accurate enough to be trusted.
+
+## What Makes This Hard
+
+Naive implementations trap teams in two places:
+
+1. **Priority inversion under backpressure.** When providers slow down, a single FIFO queue makes “critical” notifications wait behind “bulk” traffic. Teams add ad-hoc bypasses that silently break quotas and fairness.
+
+2. **Rate limiting that lies.** Centralized counters melt at millions/sec; decentralized counters drift and allow quota bypass during failover. If limits aren’t enforceable at the point of dispatch, they’re just dashboards.
+
+3. **Receipts are not a single truth.** “Accepted by broker”, “accepted by provider”, and “delivered to device” are different events with different reliability. If you don’t model that explicitly, you either over-promise or drown in edge cases.
+
+## Requirements
+
+### Functional Requirements
+- Accept notifications with `tenant`, `audience` (device token(s) or topic), `priority` (e.g., `critical|high|normal|bulk`), `ttl`, and `idempotency_key`.
+- Enforce rate limits:
+  - per-tenant (contractual quota)
+  - per-campaign/job (blast control)
+  - per-destination/provider constraints (APNS/FCM limits, connection caps)
+- Prioritize traffic so `critical` is protected under overload while preserving tenant fairness.
+- Provide delivery receipts with clear semantics: `ENQUEUED`, `DISPATCHED`, `PROVIDER_ACCEPTED`, `DELIVERED` (when available), `FAILED` (reasoned).
+- Survive provider outages without dropping critical traffic; degrade bulk first.
+
+### Scale Targets
+- Ingest: **2M notifications/sec sustained**, **10M/sec burst for 60s** (marketing spikes + retries).
+- Payload: avg **700B**, p99 **2KB** (headers + small bodies; large payloads are rejected).
+- Fanout: assume **1.2 destinations/notification** average (single token dominant; some multi-token).
+- Latency SLO (broker → provider dispatch):
+  - `critical`: p99 **200ms**
+  - `normal`: p99 **2s**
+  - `bulk`: “best effort”, bounded by TTL
+- Receipts: **99.9% emitted** for broker and provider-acceptance states within **30s**.
+
+These numbers force a design where the hot path is append-only + partition-local scheduling; anything that needs cross-partition coordination will fail first.
+
+## Key Design Decisions
+
+- **We chose:** Kafka as the durable intake + state transition log (partitioned by routing key).
+  - **We rejected:** direct in-memory queues as the source of truth.
+  - **Why:** durable ordering + replay gives us controlled recovery and consistent receipts; partitions are the unit of scale and isolation.
+
+- **We chose:** Deterministic routing to a “Scheduler/Dispatcher” shard that owns quota enforcement for a keyspace.
+  - **We rejected:** centralized rate-limit service for every dispatch.
+  - **Why:** quota checks must be on the dispatch path; making them local avoids a global bottleneck and makes behavior stable under overload.
+
+- **We chose:** Priority as separate queues with **weighted fair scheduling** (WFS) per shard, with strict protection for `critical`.
+  - **We rejected:** single queue with “priority field” and hope.
+  - **Why:** separate queues make starvation and protection explicit; WFS prevents one tenant’s bulk from consuming the shard.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  P["Producers"] --> I["Ingress API"]
+  I --> K["Kafka (intents)"]
+  K --> S["Schedulers"]
+  S --> D["Dispatchers"]
+  D --> A["APNS/FCM"]
+  A --> R["Receipt Ingest"]
+  S --> E["Receipt Log"]
+  R --> E
+```
+
+### Components
+
+- **Ingress API**
+  - Validates payload, enforces auth, normalizes priority/TTL, assigns `notification_id`, and writes a single intent record.
+  - Earns its place by keeping the hot path “append-only”; no synchronous provider calls here.
+
+- **Kafka (intents)**
+  - Stores notification intents partitioned by a routing key (e.g., `hash(tenant_id, destination_hash)`).
+  - Enables replay-based recovery and deterministic sharding for quota ownership.
+
+- **Schedulers**
+  - Consume intents, place them into per-priority local queues, apply TTL, and decide *when* a notification may be dispatched under quotas.
+  - Own the hard policy logic; everything else stays boring.
+
+- **Dispatchers**
+  - Maintain provider connections, translate payload formats, batch where providers support it, and execute sends.
+  - Report outcomes (accepted/rejected/transient errors) as events.
+
+- **APNS/FCM**
+  - External systems with their own throttles, error codes, and semantics; treated as unreliable dependencies.
+
+- **Receipt Ingest**
+  - Handles provider callbacks/feedback (where available) and normalizes them into receipt events.
+
+- **Receipt Log**
+  - Append-only stream of receipt events; downstream consumers build queryable state (e.g., “latest status per notification_id”) without coupling the hot path.
+
+## Deep Dive: Scheduling Under Priority + Quotas (The Hardest Part)
+
+The scheduler shard is the unit of correctness. Each shard owns a slice of traffic by routing key, which means it can enforce limits without a global lock. The routing choice matters: partition by `(tenant_id, destination_hash)` so a single tenant’s traffic spreads across shards (parallelism), while quota accounting remains attributable to tenant and stable per shard.
+
+**Priority handling** is implemented as four independent queues per shard (`critical/high/normal/bulk`). Dispatch uses a two-layer policy:
+1. **Protection:** reserve capacity for `critical` (e.g., always attempt to dispatch `critical` first up to a configured ceiling tied to provider health). This prevents priority inversion during provider slowdowns.
+2. **Weighted Fair Scheduling:** for non-critical, schedule with weights across priorities *and* tenants. Practically, the shard maintains per-tenant subqueues per priority and uses deficit round robin (DRR) with weights. This avoids a single “bulk” tenant consuming the shard even if they are within quota, preserving latency for smaller tenants.
+
+**Rate limiting** is enforced at dispatch time using token buckets:
+- **Per-tenant bucket:** contractual QPS + burst.
+- **Per-provider bucket:** connection/throughput caps derived from live health.
+- **Per-campaign bucket (optional but common):** blast control keyed by `campaign_id`.
+
+To keep this scalable, buckets are **owned by the shard** and stored in memory for speed, with periodic checkpointing to a fast KV store for warm restart. Accuracy comes from ownership: only one shard decrements a given bucket key. If you need strict per-tenant global limits, you don’t centralize checks; you **allocate tenant quota across shards** (static or dynamic) so enforcement remains local and sum-bounded.
+
+Backpressure is explicit: when provider health drops, the per-provider bucket shrinks, which slows dispatch and grows queues. Because queues are priority-separated and TTL-aware, the system drops or expires `bulk` first, instead of randomly failing everything.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Predictable priority under overload | Some idle capacity when reserving for `critical` |
+| Enforceable quotas at high QPS | More complex sharding and routing design |
+| Replayable recovery + auditable receipts | Higher end-to-end complexity vs a simple relay |
+| Tenant fairness | Maximum throughput for a single tenant |
+
+## Failure Modes
+
+1. **Provider throttling/outage (APNS/FCM slows or rejects)**
+   - **What happens:** dispatcher errors rise; per-provider bucket contracts; queues grow.
+   - **Detect:** provider error codes + increased RTT + queue age per priority.
+   - **Recover:** automatically shed `bulk` (expire by TTL), keep `critical` protected, and retry transient failures with capped exponential backoff; page when `critical` queue age breaches SLO.
+
+2. **Hot tenant / blast storm**
+   - **What happens:** a tenant floods ingress and would starve others if not controlled.
+   - **Detect:** per-tenant queue depth + token-bucket depletion rate.
+   - **Recover:** per-tenant bucket clamps dispatch; ingress can optionally return 429 for non-critical once backlog crosses a tenant threshold (fail fast, predictable).
+
+3. **Shard loss / consumer restart**
+   - **What happens:** in-memory queues/buckets are lost; risk of duplicates or quota drift.
+   - **Detect:** consumer group rebalance + shard heartbeat missing.
+   - **Recover:** replay intents from Kafka; rely on idempotency at dispatch (provider-side dedupe where supported + broker-side `notification_id` de-dup window) and checkpointed buckets to avoid quota spikes after restart.
+
+## What I'd Do Differently At...
+
+- **10x scale:** split Kafka topics by priority (or at least by `critical` vs rest) to isolate tail latency, and run physically separate dispatcher pools per provider to isolate noisy neighbors.
+- **100x scale:** move from single-region active to multi-region active/active with regional schedulers and regional provider dispatch; receipts become eventually consistent with region-local status and a global “best known” view built from streams.
+
+## Operational Notes
+
+- The on-call’s primary dashboard is **queue age by priority**, not just throughput; age predicts SLO misses.
+- Provider health should directly drive capacity (token bucket size), otherwise you oscillate between overload and recovery.
+- Rebalances are dangerous: keep partitions stable, scale by adding shards gradually, and treat consumer lag as a first-class alert.
+- Receipts must be documented as a state machine; “DELIVERED” is provider-dependent and often unavailable—don’t conflate it with “PROVIDER_ACCEPTED”.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/push-notification-broker.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-6fcc-7e51-87f6-96d04886061c
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Push Notification Broker"
+category: "Real-Time & Media"
+difficulty: "Hard"
+tags: ["push", "real-time", "rate-limiting", "prioritization", "kafka", "apns", "fcm"]
+---
+
+## Overview
+
+This system is a high-throughput push notification broker: it accepts notification intents from many producers, enforces prioritization and rate limits, fans out to push providers (APNS/FCM/web-push), and emits delivery receipts.
+
+The key insight is to treat “send a push” as a **scheduled, quota-governed dispatch problem**, not a simple HTTP relay. The elegant design separates (1) durable intake, (2) deterministic scheduling under multiple constraints, and (3) provider dispatch—so spikes, hot tenants, and provider slowdowns become queueing and scheduling problems with explicit policies instead of cascading failures.
+
+The hardest part is not “Kafka + workers”; it’s making prioritization and rate limiting **predictable under load** without global locks, while keeping receipts accurate enough to be trusted.
+
+## What Makes This Hard
+
+Naive implementations trap teams in two places:
+
+1. **Priority inversion under backpressure.** When providers slow down, a single FIFO queue makes “critical” notifications wait behind “bulk” traffic. Teams add ad-hoc bypasses that silently break quotas and fairness.
+
+2. **Rate limiting that lies.** Centralized counters melt at millions/sec; decentralized counters drift and allow quota bypass during failover. If limits aren’t enforceable at the point of dispatch, they’re just dashboards.
+
+3. **Receipts are not a single truth.** “Accepted by broker”, “accepted by provider”, and “delivered to device” are different events with different reliability. If you don’t model that explicitly, you either over-promise or drown in edge cases.
+
+## Requirements
+
+### Functional Requirements
+- Accept notifications with `tenant`, `audience` (device token(s) or topic), `priority` (e.g., `critical|high|normal|bulk`), `ttl`, and `idempotency_key`.
+- Enforce rate limits:
+  - per-tenant (contractual quota)
+  - per-campaign/job (blast control)
+  - per-destination/provider constraints (APNS/FCM limits, connection caps)
+- Prioritize traffic so `critical` is protected under overload while preserving tenant fairness.
+- Provide delivery receipts with clear semantics: `ENQUEUED`, `DISPATCHED`, `PROVIDER_ACCEPTED`, `DELIVERED` (when available), `FAILED` (reasoned).
+- Survive provider outages without dropping critical traffic; degrade bulk first.
+
+### Scale Targets
+- Ingest: **2M notifications/sec sustained**, **10M/sec burst for 60s** (marketing spikes + retries).
+- Payload: avg **700B**, p99 **2KB** (headers + small bodies; large payloads are rejected).
+- Fanout: assume **1.2 destinations/notification** average (single token dominant; some multi-token).
+- Latency SLO (broker → provider dispatch):
+  - `critical`: p99 **200ms**
+  - `normal`: p99 **2s**
+  - `bulk`: “best effort”, bounded by TTL
+- Receipts: **99.9% emitted** for broker and provider-acceptance states within **30s**.
+
+These numbers force a design where the hot path is append-only + partition-local scheduling; anything that needs cross-partition coordination will fail first.
+
+## Key Design Decisions
+
+- **We chose:** Kafka as the durable intake + state transition log (partitioned by routing key).
+  - **We rejected:** direct in-memory queues as the source of truth.
+  - **Why:** durable ordering + replay gives us controlled recovery and consistent receipts; partitions are the unit of scale and isolation.
+
+- **We chose:** Deterministic routing to a “Scheduler/Dispatcher” shard that owns quota enforcement for a keyspace.
+  - **We rejected:** centralized rate-limit service for every dispatch.
+  - **Why:** quota checks must be on the dispatch path; making them local avoids a global bottleneck and makes behavior stable under overload.
+
+- **We chose:** Priority as separate queues with **weighted fair scheduling** (WFS) per shard, with strict protection for `critical`.
+  - **We rejected:** single queue with “priority field” and hope.
+  - **Why:** separate queues make starvation and protection explicit; WFS prevents one tenant’s bulk from consuming the shard.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  P["Producers"] --> I["Ingress API"]
+  I --> K["Kafka (intents)"]
+  K --> S["Schedulers"]
+  S --> D["Dispatchers"]
+  D --> A["APNS/FCM"]
+  A --> R["Receipt Ingest"]
+  S --> E["Receipt Log"]
+  R --> E
+```
+
+### Components
+
+- **Ingress API**
+  - Validates payload, enforces auth, normalizes priority/TTL, assigns `notification_id`, and writes a single intent record.
+  - Earns its place by keeping the hot path “append-only”; no synchronous provider calls here.
+
+- **Kafka (intents)**
+  - Stores notification intents partitioned by a routing key (e.g., `hash(tenant_id, destination_hash)`).
+  - Enables replay-based recovery and deterministic sharding for quota ownership.
+
+- **Schedulers**
+  - Consume intents, place them into per-priority local queues, apply TTL, and decide *when* a notification may be dispatched under quotas.
+  - Own the hard policy logic; everything else stays boring.
+
+- **Dispatchers**
+  - Maintain provider connections, translate payload formats, batch where providers support it, and execute sends.
+  - Report outcomes (accepted/rejected/transient errors) as events.
+
+- **APNS/FCM**
+  - External systems with their own throttles, error codes, and semantics; treated as unreliable dependencies.
+
+- **Receipt Ingest**
+  - Handles provider callbacks/feedback (where available) and normalizes them into receipt events.
+
+- **Receipt Log**
+  - Append-only stream of receipt events; downstream consumers build queryable state (e.g., “latest status per notification_id”) without coupling the hot path.
+
+## Deep Dive: Scheduling Under Priority + Quotas (The Hardest Part)
+
+The scheduler shard is the unit of correctness. Each shard owns a slice of traffic by routing key, which means it can enforce limits without a global lock. The routing choice matters: partition by `(tenant_id, destination_hash)` so a single tenant’s traffic spreads across shards (parallelism), while quota accounting remains attributable to tenant and stable per shard.
+
+**Priority handling** is implemented as four independent queues per shard (`critical/high/normal/bulk`). Dispatch uses a two-layer policy:
+1. **Protection:** reserve capacity for `critical` (e.g., always attempt to dispatch `critical` first up to a configured ceiling tied to provider health). This prevents priority inversion during provider slowdowns.
+2. **Weighted Fair Scheduling:** for non-critical, schedule with weights across priorities *and* tenants. Practically, the shard maintains per-tenant subqueues per priority and uses deficit round robin (DRR) with weights. This avoids a single “bulk” tenant consuming the shard even if they are within quota, preserving latency for smaller tenants.
+
+**Rate limiting** is enforced at dispatch time using token buckets:
+- **Per-tenant bucket:** contractual QPS + burst.
+- **Per-provider bucket:** connection/throughput caps derived from live health.
+- **Per-campaign bucket (optional but common):** blast control keyed by `campaign_id`.
+
+To keep this scalable, buckets are **owned by the shard** and stored in memory for speed, with periodic checkpointing to a fast KV store for warm restart. Accuracy comes from ownership: only one shard decrements a given bucket key. If you need strict per-tenant global limits, you don’t centralize checks; you **allocate tenant quota across shards** (static or dynamic) so enforcement remains local and sum-bounded.
+
+Backpressure is explicit: when provider health drops, the per-provider bucket shrinks, which slows dispatch and grows queues. Because queues are priority-separated and TTL-aware, the system drops or expires `bulk` first, instead of randomly failing everything.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Predictable priority under overload | Some idle capacity when reserving for `critical` |
+| Enforceable quotas at high QPS | More complex sharding and routing design |
+| Replayable recovery + auditable receipts | Higher end-to-end complexity vs a simple relay |
+| Tenant fairness | Maximum throughput for a single tenant |
+
+## Failure Modes
+
+1. **Provider throttling/outage (APNS/FCM slows or rejects)**
+   - **What happens:** dispatcher errors rise; per-provider bucket contracts; queues grow.
+   - **Detect:** provider error codes + increased RTT + queue age per priority.
+   - **Recover:** automatically shed `bulk` (expire by TTL), keep `critical` protected, and retry transient failures with capped exponential backoff; page when `critical` queue age breaches SLO.
+
+2. **Hot tenant / blast storm**
+   - **What happens:** a tenant floods ingress and would starve others if not controlled.
+   - **Detect:** per-tenant queue depth + token-bucket depletion rate.
+   - **Recover:** per-tenant bucket clamps dispatch; ingress can optionally return 429 for non-critical once backlog crosses a tenant threshold (fail fast, predictable).
+
+3. **Shard loss / consumer restart**
+   - **What happens:** in-memory queues/buckets are lost; risk of duplicates or quota drift.
+   - **Detect:** consumer group rebalance + shard heartbeat missing.
+   - **Recover:** replay intents from Kafka; rely on idempotency at dispatch (provider-side dedupe where supported + broker-side `notification_id` de-dup window) and checkpointed buckets to avoid quota spikes after restart.
+
+## What I'd Do Differently At...
+
+- **10x scale:** split Kafka topics by priority (or at least by `critical` vs rest) to isolate tail latency, and run physically separate dispatcher pools per provider to isolate noisy neighbors.
+- **100x scale:** move from single-region active to multi-region active/active with regional schedulers and regional provider dispatch; receipts become eventually consistent with region-local status and a global “best known” view built from streams.
+
+## Operational Notes
+
+- The on-call’s primary dashboard is **queue age by priority**, not just throughput; age predicts SLO misses.
+- Provider health should directly drive capacity (token bucket size), otherwise you oscillate between overload and recovery.
+- Rebalances are dangerous: keep partitions stable, scale by adding shards gradually, and treat consumer lag as a first-class alert.
+- Receipts must be documented as a state machine; “DELIVERED” is provider-dependent and often unavailable—don’t conflate it with “PROVIDER_ACCEPTED”.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+codex
+## Elegance Check
+
+### The Core Insight
+Treating push sends as a **quota-governed scheduling problem** (not an HTTP relay) is the right abstraction; it turns provider slowness and tenant spikes into explicit, testable policy.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Kafka intents log | Durable intake + replay; clean separation of “accepted” vs “sent” semantics. |
+| Scheduler policy (per shard) | The only truly custom logic: deterministic prioritization + fairness + quota enforcement under load. |
+| Dispatcher (per provider) | Encapsulates provider-specific protocols, batching, and retry/error mapping. |
+| Receipt stream | Makes status an append-only fact log (auditable, rebuildable) instead of a fragile in-place DB update. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Separate `Schedulers` and `Dispatchers` services | One “Broker Worker” binary: consume → schedule → dispatch (provider adapters as modules), still horizontally scaled by Kafka partitions | Less independent scaling, but fewer moving parts and simpler on-call. |
+| Custom checkpointed in-memory token buckets to “fast KV” | Use Redis for rate limits (Lua token bucket / sliding window) or Redis Cluster with key hashing per tenant/campaign | Adds Redis dependency + network hop; buys simpler correctness and restart behavior. |
+| Receipt Log as a distinct component | Make receipts a Kafka topic (append-only) + a **compacted** “latest-status” topic (or Kafka Streams materialized store) | Ties you closer to Kafka tooling; reduces bespoke state stores. |
+| Quota allocation “across shards” for strict per-tenant global limits | Accept “soft global” limits (bounded drift) with Redis-backed global counters, while keeping shard-local fairness | Slightly less pure locality; dramatically simpler than dynamic shard quota allocation. |
+| Partition key = `(tenant_id, destination_hash)` for parallelism + per-tenant accounting | Consider `(tenant_id)` for strict per-tenant quotas + a second-stage fanout/dispatch pool, or isolate only hot tenants into dedicated partitions | Reduces parallelism for hot tenants unless you add a split mechanism; improves quota correctness and explainability. |
+| Weighted fair scheduling across tenants *and* priorities (DRR) per shard | Start with priority queues + per-tenant token buckets + simple round-robin among active tenants | Slightly weaker fairness under edge cases; easier to reason about and implement correctly. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Kafka is unavailable for 5 minutes**
+   - Design’s answer: not addressed (implicitly Kafka is core truth)
+   - Recommendation: Strengthen (define ingress behavior: 503 vs local buffer with bounded disk; define “receipt gap” semantics; ensure producers have idempotent retry guidance)
+
+2. **KV store for bucket checkpointing is down / slow**
+   - Design’s answer: not addressed (checkpointing assumed available)
+   - Recommendation: Strengthen (treat checkpointing as best-effort; on restart, rebuild buckets from Kafka events or fall back to conservative limits to avoid post-restart quota spikes)
+
+3. **Network partition: Scheduler can read Kafka but can’t reach APNS/FCM**
+   - Design’s answer: partially addressed (provider health shrinks bucket; retries)
+   - Recommendation: Strengthen (explicit circuit breaker states per provider; ensure retries don’t explode Kafka/receipt volume; ensure `critical` has a bounded queue growth + clear “degraded” receipt)
+
+4. **One component becomes slow, not failing (e.g., dispatch RTT p99 jumps, CPU throttling)**
+   - Design’s answer: partially addressed (queue age as SLO signal)
+   - Recommendation: Strengthen (define backpressure contracts: max in-flight per provider, per-tenant queue caps, and what gets dropped/429’d first; avoid hidden threadpool queueing)
+
+5. **Bad config / policy deploy (wrong weights, bucket sizes, or “critical reserve” too high)**
+   - Design’s answer: not addressed
+   - Recommendation: Strengthen (config versioning + canarying; “safe mode” defaults; runtime guardrails like min/max bucket bounds and automatic rollback on SLO regression)
+
+## Recommendations
+
+### Must Fix
+- **Make quota correctness explicit:** “allocate tenant quota across shards” is the hardest operationally—spell out the exact algorithm, how it adapts to partition count changes/rebalances, and the worst-case drift during failures.
+- **Define idempotency precisely:** broker-level dedupe storage/retention, memory sizing at 2M/sec, and provider-specific idempotency (APNS collapse-id, FCM keys) so “replay + retries” doesn’t silently multiply sends.
+- **Clarify receipt semantics and gaps:** what’s guaranteed when Kafka lags, providers time out, or callbacks never arrive; document the state machine and when states are terminal.
+
+### Should Consider
+- **Reduce component count:** merge scheduler+dispatcher into one worker process (still logically separated) unless you truly need independent scaling and blast radius separation.
+- **Use Kafka-native materialization for receipts:** append-only receipts + compacted latest-status topic (or Kafka Streams) to avoid a bespoke “queryable state” path.
+- **Isolate `critical` at the transport layer:** a separate Kafka topic (or at least partitions/consumer group) for `critical` so “protection” isn’t purely an in-process scheduling promise under extreme lag.
+
+### Nice to Have
+- **Operator-focused controls:** per-tenant kill switch, per-campaign pause, and “degrade mode” that automatically converts `normal`→`bulk` for certain tenants during incidents.
+- **Replay safety tooling:** a “replay with limits” tool that reprocesses Kafka safely (caps per-tenant/provider, emits audit receipts).
+
+## What’s Working Well
+- The design is honest that **prioritization + enforceable quotas** (not Kafka itself) is the real problem, and it puts the custom complexity in the scheduler where it belongs.
+- Priority separation + queue-age-first observability is operationally mature and aligns with SLOs.
+- Receipts modeled as facts (ENQUEUED/DISPATCHED/PROVIDER_ACCEPTED/DELIVERED/FAILED) avoids the most common push-system lie: conflating “accepted” with “delivered”.
+- Treating provider capacity as a dynamic control signal (bucket contraction) is a clean, elegant way to avoid cascading failures.
+tokens used
+4,787
+## Elegance Check
+
+### The Core Insight
+Treating push sends as a **quota-governed scheduling problem** (not an HTTP relay) is the right abstraction; it turns provider slowness and tenant spikes into explicit, testable policy.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Kafka intents log | Durable intake + replay; clean separation of “accepted” vs “sent” semantics. |
+| Scheduler policy (per shard) | The only truly custom logic: deterministic prioritization + fairness + quota enforcement under load. |
+| Dispatcher (per provider) | Encapsulates provider-specific protocols, batching, and retry/error mapping. |
+| Receipt stream | Makes status an append-only fact log (auditable, rebuildable) instead of a fragile in-place DB update. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Separate `Schedulers` and `Dispatchers` services | One “Broker Worker” binary: consume → schedule → dispatch (provider adapters as modules), still horizontally scaled by Kafka partitions | Less independent scaling, but fewer moving parts and simpler on-call. |
+| Custom checkpointed in-memory token buckets to “fast KV” | Use Redis for rate limits (Lua token bucket / sliding window) or Redis Cluster with key hashing per tenant/campaign | Adds Redis dependency + network hop; buys simpler correctness and restart behavior. |
+| Receipt Log as a distinct component | Make receipts a Kafka topic (append-only) + a **compacted** “latest-status” topic (or Kafka Streams materialized store) | Ties you closer to Kafka tooling; reduces bespoke state stores. |
+| Quota allocation “across shards” for strict per-tenant global limits | Accept “soft global” limits (bounded drift) with Redis-backed global counters, while keeping shard-local fairness | Slightly less pure locality; dramatically simpler than dynamic shard quota allocation. |
+| Partition key = `(tenant_id, destination_hash)` for parallelism + per-tenant accounting | Consider `(tenant_id)` for strict per-tenant quotas + a second-stage fanout/dispatch pool, or isolate only hot tenants into dedicated partitions | Reduces parallelism for hot tenants unless you add a split mechanism; improves quota correctness and explainability. |
+| Weighted fair scheduling across tenants *and* priorities (DRR) per shard | Start with priority queues + per-tenant token buckets + simple round-robin among active tenants | Slightly weaker fairness under edge cases; easier to reason about and implement correctly. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Kafka is unavailable for 5 minutes**
+   - Design’s answer: not addressed (implicitly Kafka is core truth)
+   - Recommendation: Strengthen (define ingress behavior: 503 vs local buffer with bounded disk; define “receipt gap” semantics; ensure producers have idempotent retry guidance)
+
+2. **KV store for bucket checkpointing is down / slow**
+   - Design’s answer: not addressed (checkpointing assumed available)
+   - Recommendation: Strengthen (treat checkpointing as best-effort; on restart, rebuild buckets from Kafka events or fall back to conservative limits to avoid post-restart quota spikes)
+
+3. **Network partition: Scheduler can read Kafka but can’t reach APNS/FCM**
+   - Design’s answer: partially addressed (provider health shrinks bucket; retries)
+   - Recommendation: Strengthen (explicit circuit breaker states per provider; ensure retries don’t explode Kafka/receipt volume; ensure `critical` has a bounded queue growth + clear “degraded” receipt)
+
+4. **One component becomes slow, not failing (e.g., dispatch RTT p99 jumps, CPU throttling)**
+   - Design’s answer: partially addressed (queue age as SLO signal)
+   - Recommendation: Strengthen (define backpressure contracts: max in-flight per provider, per-tenant queue caps, and what gets dropped/429’d first; avoid hidden threadpool queueing)
+
+5. **Bad config / policy deploy (wrong weights, bucket sizes, or “critical reserve” too high)**
+   - Design’s answer: not addressed
+   - Recommendation: Strengthen (config versioning + canarying; “safe mode” defaults; runtime guardrails like min/max bucket bounds and automatic rollback on SLO regression)
+
+## Recommendations
+
+### Must Fix
+- **Make quota correctness explicit:** “allocate tenant quota across shards” is the hardest operationally—spell out the exact algorithm, how it adapts to partition count changes/rebalances, and the worst-case drift during failures.
+- **Define idempotency precisely:** broker-level dedupe storage/retention, memory sizing at 2M/sec, and provider-specific idempotency (APNS collapse-id, FCM keys) so “replay + retries” doesn’t silently multiply sends.
+- **Clarify receipt semantics and gaps:** what’s guaranteed when Kafka lags, providers time out, or callbacks never arrive; document the state machine and when states are terminal.
+
+### Should Consider
+- **Reduce component count:** merge scheduler+dispatcher into one worker process (still logically separated) unless you truly need independent scaling and blast radius separation.
+- **Use Kafka-native materialization for receipts:** append-only receipts + compacted latest-status topic (or Kafka Streams) to avoid a bespoke “queryable state” path.
+- **Isolate `critical` at the transport layer:** a separate Kafka topic (or at least partitions/consumer group) for `critical` so “protection” isn’t purely an in-process scheduling promise under extreme lag.
+
+### Nice to Have
+- **Operator-focused controls:** per-tenant kill switch, per-campaign pause, and “degrade mode” that automatically converts `normal`→`bulk` for certain tenants during incidents.
+- **Replay safety tooling:** a “replay with limits” tool that reprocesses Kafka safely (caps per-tenant/provider, emits audit receipts).
+
+## What’s Working Well
+- The design is honest that **prioritization + enforceable quotas** (not Kafka itself) is the real problem, and it puts the custom complexity in the scheduler where it belongs.
+- Priority separation + queue-age-first observability is operationally mature and aligns with SLOs.
+- Receipts modeled as facts (ENQUEUED/DISPATCHED/PROVIDER_ACCEPTED/DELIVERED/FAILED) avoids the most common push-system lie: conflating “accepted” with “delivered”.
+- Treating provider capacity as a dynamic control signal (bucket contraction) is a clean, elegant way to avoid cascading failures.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/push-notification-broker.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afb-2fe0-76c1-b474-4f7edc519508
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Push Notification Broker"
+category: "Real-Time & Media"
+difficulty: "Hard"
+tags: ["push", "real-time", "rate-limiting", "prioritization", "kafka", "apns", "fcm"]
+---
+
+## Overview
+
+This system is a high-throughput push notification broker: it accepts notification intents from many producers, enforces prioritization and rate limits, fans out to push providers (APNS/FCM/web-push), and emits delivery receipts.
+
+The key insight is to treat “send a push” as a **scheduled, quota-governed dispatch problem**, not a simple HTTP relay. The elegant design separates (1) durable intake, (2) deterministic scheduling under multiple constraints, and (3) provider dispatch—so spikes, hot tenants, and provider slowdowns become queueing and scheduling problems with explicit policies instead of cascading failures.
+
+The hardest part is not “Kafka + workers”; it’s making prioritization and rate limiting **predictable under load** without global locks, while keeping receipts accurate enough to be trusted.
+
+## What Makes This Hard
+
+Naive implementations trap teams in two places:
+
+1. **Priority inversion under backpressure.** When providers slow down, a single FIFO queue makes “critical” notifications wait behind “bulk” traffic. Teams add ad-hoc bypasses that silently break quotas and fairness.
+
+2. **Rate limiting that lies.** Centralized counters melt at millions/sec; decentralized counters drift and allow quota bypass during failover. If limits aren’t enforceable at the point of dispatch, they’re just dashboards.
+
+3. **Receipts are not a single truth.** “Accepted by broker”, “accepted by provider”, and “delivered to device” are different events with different reliability. If you don’t model that explicitly, you either over-promise or drown in edge cases.
+
+## Requirements
+
+### Functional Requirements
+- Accept notifications with `tenant`, `audience` (device token(s) or topic), `priority` (e.g., `critical|high|normal|bulk`), `ttl`, and `idempotency_key`.
+- Enforce rate limits:
+  - per-tenant (contractual quota)
+  - per-campaign/job (blast control)
+  - per-destination/provider constraints (APNS/FCM limits, connection caps)
+- Prioritize traffic so `critical` is protected under overload while preserving tenant fairness.
+- Provide delivery receipts with clear semantics: `ENQUEUED`, `DISPATCHED`, `PROVIDER_ACCEPTED`, `DELIVERED` (when available), `FAILED` (reasoned).
+- Survive provider outages without dropping critical traffic; degrade bulk first.
+
+### Scale Targets
+- Ingest: **2M notifications/sec sustained**, **10M/sec burst for 60s** (marketing spikes + retries).
+- Payload: avg **700B**, p99 **2KB** (headers + small bodies; large payloads are rejected).
+- Fanout: assume **1.2 destinations/notification** average (single token dominant; some multi-token).
+- Latency SLO (broker → provider dispatch):
+  - `critical`: p99 **200ms**
+  - `normal`: p99 **2s**
+  - `bulk`: “best effort”, bounded by TTL
+- Receipts: **99.9% emitted** for broker and provider-acceptance states within **30s**.
+
+These numbers force a design where the hot path is append-only + partition-local scheduling; anything that needs cross-partition coordination will fail first.
+
+## Key Design Decisions
+
+- **We chose:** Kafka as the durable intake + state transition log (partitioned by routing key).
+  - **We rejected:** direct in-memory queues as the source of truth.
+  - **Why:** durable ordering + replay gives us controlled recovery and consistent receipts; partitions are the unit of scale and isolation.
+
+- **We chose:** Deterministic routing to a “Scheduler/Dispatcher” shard that owns quota enforcement for a keyspace.
+  - **We rejected:** centralized rate-limit service for every dispatch.
+  - **Why:** quota checks must be on the dispatch path; making them local avoids a global bottleneck and makes behavior stable under overload.
+
+- **We chose:** Priority as separate queues with **weighted fair scheduling** (WFS) per shard, with strict protection for `critical`.
+  - **We rejected:** single queue with “priority field” and hope.
+  - **Why:** separate queues make starvation and protection explicit; WFS prevents one tenant’s bulk from consuming the shard.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  P["Producers"] --> I["Ingress API"]
+  I --> K["Kafka (intents)"]
+  K --> S["Schedulers"]
+  S --> D["Dispatchers"]
+  D --> A["APNS/FCM"]
+  A --> R["Receipt Ingest"]
+  S --> E["Receipt Log"]
+  R --> E
+```
+
+### Components
+
+- **Ingress API**
+  - Validates payload, enforces auth, normalizes priority/TTL, assigns `notification_id`, and writes a single intent record.
+  - Earns its place by keeping the hot path “append-only”; no synchronous provider calls here.
+
+- **Kafka (intents)**
+  - Stores notification intents partitioned by a routing key (e.g., `hash(tenant_id, destination_hash)`).
+  - Enables replay-based recovery and deterministic sharding for quota ownership.
+
+- **Schedulers**
+  - Consume intents, place them into per-priority local queues, apply TTL, and decide *when* a notification may be dispatched under quotas.
+  - Own the hard policy logic; everything else stays boring.
+
+- **Dispatchers**
+  - Maintain provider connections, translate payload formats, batch where providers support it, and execute sends.
+  - Report outcomes (accepted/rejected/transient errors) as events.
+
+- **APNS/FCM**
+  - External systems with their own throttles, error codes, and semantics; treated as unreliable dependencies.
+
+- **Receipt Ingest**
+  - Handles provider callbacks/feedback (where available) and normalizes them into receipt events.
+
+- **Receipt Log**
+  - Append-only stream of receipt events; downstream consumers build queryable state (e.g., “latest status per notification_id”) without coupling the hot path.
+
+## Deep Dive: Scheduling Under Priority + Quotas (The Hardest Part)
+
+The scheduler shard is the unit of correctness. Each shard owns a slice of traffic by routing key, which means it can enforce limits without a global lock. The routing choice matters: partition by `(tenant_id, destination_hash)` so a single tenant’s traffic spreads across shards (parallelism), while quota accounting remains attributable to tenant and stable per shard.
+
+**Priority handling** is implemented as four independent queues per shard (`critical/high/normal/bulk`). Dispatch uses a two-layer policy:
+1. **Protection:** reserve capacity for `critical` (e.g., always attempt to dispatch `critical` first up to a configured ceiling tied to provider health). This prevents priority inversion during provider slowdowns.
+2. **Weighted Fair Scheduling:** for non-critical, schedule with weights across priorities *and* tenants. Practically, the shard maintains per-tenant subqueues per priority and uses deficit round robin (DRR) with weights. This avoids a single “bulk” tenant consuming the shard even if they are within quota, preserving latency for smaller tenants.
+
+**Rate limiting** is enforced at dispatch time using token buckets:
+- **Per-tenant bucket:** contractual QPS + burst.
+- **Per-provider bucket:** connection/throughput caps derived from live health.
+- **Per-campaign bucket (optional but common):** blast control keyed by `campaign_id`.
+
+To keep this scalable, buckets are **owned by the shard** and stored in memory for speed, with periodic checkpointing to a fast KV store for warm restart. Accuracy comes from ownership: only one shard decrements a given bucket key. If you need strict per-tenant global limits, you don’t centralize checks; you **allocate tenant quota across shards** (static or dynamic) so enforcement remains local and sum-bounded.
+
+Backpressure is explicit: when provider health drops, the per-provider bucket shrinks, which slows dispatch and grows queues. Because queues are priority-separated and TTL-aware, the system drops or expires `bulk` first, instead of randomly failing everything.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Predictable priority under overload | Some idle capacity when reserving for `critical` |
+| Enforceable quotas at high QPS | More complex sharding and routing design |
+| Replayable recovery + auditable receipts | Higher end-to-end complexity vs a simple relay |
+| Tenant fairness | Maximum throughput for a single tenant |
+
+## Failure Modes
+
+1. **Provider throttling/outage (APNS/FCM slows or rejects)**
+   - **What happens:** dispatcher errors rise; per-provider bucket contracts; queues grow.
+   - **Detect:** provider error codes + increased RTT + queue age per priority.
+   - **Recover:** automatically shed `bulk` (expire by TTL), keep `critical` protected, and retry transient failures with capped exponential backoff; page when `critical` queue age breaches SLO.
+
+2. **Hot tenant / blast storm**
+   - **What happens:** a tenant floods ingress and would starve others if not controlled.
+   - **Detect:** per-tenant queue depth + token-bucket depletion rate.
+   - **Recover:** per-tenant bucket clamps dispatch; ingress can optionally return 429 for non-critical once backlog crosses a tenant threshold (fail fast, predictable).
+
+3. **Shard loss / consumer restart**
+   - **What happens:** in-memory queues/buckets are lost; risk of duplicates or quota drift.
+   - **Detect:** consumer group rebalance + shard heartbeat missing.
+   - **Recover:** replay intents from Kafka; rely on idempotency at dispatch (provider-side dedupe where supported + broker-side `notification_id` de-dup window) and checkpointed buckets to avoid quota spikes after restart.
+
+## What I'd Do Differently At...
+
+- **10x scale:** split Kafka topics by priority (or at least by `critical` vs rest) to isolate tail latency, and run physically separate dispatcher pools per provider to isolate noisy neighbors.
+- **100x scale:** move from single-region active to multi-region active/active with regional schedulers and regional provider dispatch; receipts become eventually consistent with region-local status and a global “best known” view built from streams.
+
+## Operational Notes
+
+- The on-call’s primary dashboard is **queue age by priority**, not just throughput; age predicts SLO misses.
+- Provider health should directly drive capacity (token bucket size), otherwise you oscillate between overload and recovery.
+- Rebalances are dangerous: keep partitions stable, scale by adding shards gradually, and treat consumer lag as a first-class alert.
+- Receipts must be documented as a state machine; “DELIVERED” is provider-dependent and often unavailable—don’t conflate it with “PROVIDER_ACCEPTED”.
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Treating push sends as a **quota-governed scheduling problem** (not an HTTP relay) is the right abstraction; it turns provider slowness and tenant spikes into explicit, testable policy.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Kafka intents log | Durable intake + replay; clean separation of “accepted” vs “sent” semantics. |
+| Scheduler policy (per shard) | The only truly custom logic: deterministic prioritization + fairness + quota enforcement under load. |
+| Dispatcher (per provider) | Encapsulates provider-specific protocols, batching, and retry/error mapping. |
+| Receipt stream | Makes status an append-only fact log (auditable, rebuildable) instead of a fragile in-place DB update. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Separate `Schedulers` and `Dispatchers` services | One “Broker Worker” binary: consume → schedule → dispatch (provider adapters as modules), still horizontally scaled by Kafka partitions | Less independent scaling, but fewer moving parts and simpler on-call. |
+| Custom checkpointed in-memory token buckets to “fast KV” | Use Redis for rate limits (Lua token bucket / sliding window) or Redis Cluster with key hashing per tenant/campaign | Adds Redis dependency + network hop; buys simpler correctness and restart behavior. |
+| Receipt Log as a distinct component | Make receipts a Kafka topic (append-only) + a **compacted** “latest-status” topic (or Kafka Streams materialized store) | Ties you closer to Kafka tooling; reduces bespoke state stores. |
+| Quota allocation “across shards” for strict per-tenant global limits | Accept “soft global” limits (bounded drift) with Redis-backed global counters, while keeping shard-local fairness | Slightly less pure locality; dramatically simpler than dynamic shard quota allocation. |
+| Partition key = `(tenant_id, destination_hash)` for parallelism + per-tenant accounting | Consider `(tenant_id)` for strict per-tenant quotas + a second-stage fanout/dispatch pool, or isolate only hot tenants into dedicated partitions | Reduces parallelism for hot tenants unless you add a split mechanism; improves quota correctness and explainability. |
+| Weighted fair scheduling across tenants *and* priorities (DRR) per shard | Start with priority queues + per-tenant token buckets + simple round-robin among active tenants | Slightly weaker fairness under edge cases; easier to reason about and implement correctly. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Kafka is unavailable for 5 minutes**
+   - Design’s answer: not addressed (implicitly Kafka is core truth)
+   - Recommendation: Strengthen (define ingress behavior: 503 vs local buffer with bounded disk; define “receipt gap” semantics; ensure producers have idempotent retry guidance)
+
+2. **KV store for bucket checkpointing is down / slow**
+   - Design’s answer: not addressed (checkpointing assumed available)
+   - Recommendation: Strengthen (treat checkpointing as best-effort; on restart, rebuild buckets from Kafka events or fall back to conservative limits to avoid post-restart quota spikes)
+
+3. **Network partition: Scheduler can read Kafka but can’t reach APNS/FCM**
+   - Design’s answer: partially addressed (provider health shrinks bucket; retries)
+   - Recommendation: Strengthen (explicit circuit breaker states per provider; ensure retries don’t explode Kafka/receipt volume; ensure `critical` has a bounded queue growth + clear “degraded” receipt)
+
+4. **One component becomes slow, not failing (e.g., dispatch RTT p99 jumps, CPU throttling)**
+   - Design’s answer: partially addressed (queue age as SLO signal)
+   - Recommendation: Strengthen (define backpressure contracts: max in-flight per provider, per-tenant queue caps, and what gets dropped/429’d first; avoid hidden threadpool queueing)
+
+5. **Bad config / policy deploy (wrong weights, bucket sizes, or “critical reserve” too high)**
+   - Design’s answer: not addressed
+   - Recommendation: Strengthen (config versioning + canarying; “safe mode” defaults; runtime guardrails like min/max bucket bounds and automatic rollback on SLO regression)
+
+## Recommendations
+
+### Must Fix
+- **Make quota correctness explicit:** “allocate tenant quota across shards” is the hardest operationally—spell out the exact algorithm, how it adapts to partition count changes/rebalances, and the worst-case drift during failures.
+- **Define idempotency precisely:** broker-level dedupe storage/retention, memory sizing at 2M/sec, and provider-specific idempotency (APNS collapse-id, FCM keys) so “replay + retries” doesn’t silently multiply sends.
+- **Clarify receipt semantics and gaps:** what’s guaranteed when Kafka lags, providers time out, or callbacks never arrive; document the state machine and when states are terminal.
+
+### Should Consider
+- **Reduce component count:** merge scheduler+dispatcher into one worker process (still logically separated) unless you truly need independent scaling and blast radius separation.
+- **Use Kafka-native materialization for receipts:** append-only receipts + compacted latest-status topic (or Kafka Streams) to avoid a bespoke “queryable state” path.
+- **Isolate `critical` at the transport layer:** a separate Kafka topic (or at least partitions/consumer group) for `critical` so “protection” isn’t purely an in-process scheduling promise under extreme lag.
+
+### Nice to Have
+- **Operator-focused controls:** per-tenant kill switch, per-campaign pause, and “degrade mode” that automatically converts `normal`→`bulk` for certain tenants during incidents.
+- **Replay safety tooling:** a “replay with limits” tool that reprocesses Kafka safely (caps per-tenant/provider, emits audit receipts).
+
+## What’s Working Well
+- The design is honest that **prioritization + enforceable quotas** (not Kafka itself) is the real problem, and it puts the custom complexity in the scheduler where it belongs.
+- Priority separation + queue-age-first observability is operationally mature and aligns with SLOs.
+- Receipts modeled as facts (ENQUEUED/DISPATCHED/PROVIDER_ACCEPTED/DELIVERED/FAILED) avoids the most common push-system lie: conflating “accepted” with “delivered”.
+- Treating provider capacity as a dynamic control signal (bucket contraction) is a clean, elegant way to avoid cascading failures.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+
+thinking
+**Evaluating tenant quotas**
+
+I'm considering soft global quotas based on tenant_id and destination_hash, but managing them across shards complicates things. A simpler approach might be partitioning by tenant_id, which allows strict quotas and straightforward scheduling. However, if a tenant saturates its partition, that’s an acceptable tradeoff for fairness and throughput. I'll suggest that hot tenants could have more partitions using a "tenant sharding key" for better management. It does add some complexity, but we can keep the default partition key as tenant_id while allowing for optional configurations.
+thinking
+**Streamlining tenant management**
+
+To simplify things, I think starting with tenant_id is a good plan. If a tenant becomes too "hot," we could split them by adding a `routing_salt`, but it will need collaboration from producers. However, it might be easier to just accept that a single tenant has throughput limits. Following a "startup test" with three engineers leads me to keep partitioning by tenant_id without overcomplicating. If one tenant needs more throughput, we can increase partitions while acknowledging that this could mean temporary throttling. Let's ensure producers provide an idempotency_key to maintain idempotency in dispatch.
+thinking
+**Simplifying idempotency management**
+
+I want to keep things minimal by using a Kafka compacted topic keyed by idempotency_key to map to notification_id for 24 hours. However, implementing Kafka's transactional producer might complicate matters. One alternative is storing idempotency data in Postgres, but that adds an extra component which goes against our rules. Using Kafka only is better, but reading from the compacted topic for every request is slow. Maybe a local RocksDB via Kafka Streams would work, but that feels like adding too. For simplicity, I could keep Ingress stateless and allow workers to dedupe attempts with an in-memory window, recognizing this might lead to duplicates on restarts.
+thinking
+**Defining idempotency states**
+
+The requirements don't specify strictness, so for notifications, we can accept them with the idempotency_key and aim for "best-effort deduplication within TTL." While we need to define idempotency precisely, we should keep it minimal. For receipt semantics, I want to ensure clear definitions: ENQUEUED for Kafka writes, DISPATCHED for send attempts, PROVIDER_ACCEPTED for successful receipts, DELIVERED upon callback, and FAILED with reasons. For degraded states, I could use FAILED with "provider_unreachable" after TTL expiry, as long as we remain explicit about potential gaps in receipts. For Kafka unavailability, Ingress can return a 503 immediately without a local buffer.
+thinking
+**Documenting design changes**
+
+I need to refine our configuration process, focusing on keeping config versioned in files or environment variables. To ensure stability, we should implement runtime bounds and a "safe mode" fallback if queue age worsens. I'll draft a complete final markdown document with the original titles, avoiding critiques. We can remove the "What Makes This Hard" section and instead rename "What I’d Do Differently At..." to "What We Removed". 
+
+For architecture, I'll provide a minimal diagram, avoiding additional components while ensuring clarity. The design will include a focus on idempotency, structured per dispatch unit, and aim for simplicity in receipt management without complex additions. I’ll highlight operational notes and ensure all sections retain their relevance while keeping the document polished.
+thinking
+**Drafting the final design document**
+
+In the "What We Removed" section, I'll list any removed or merged components since that's allowed. I need to integrate failure scenarios into the Failure Modes and Operational Notes, clarifying how Ingress behaves when Kafka is unavailable—specifically, that there’s no local buffer. While I have a complexity budget for 1-3 custom components, I’ll only mention "Broker Worker policy" and "Ingress API" since Kafka and providers are managed externally. 
+
+I'll keep it crisp and minimal, ensuring I mention critical aspects while avoiding unnecessary complexity, such as Kafka transactions. For receipts, I’ll retain them as Kafka topics without delving into Kafka Streams. I’ll also consider simplifying the querying of receipts, thinking it might be out of scope. Let's focus on delivering a straightforward document that aligns with our design goals.
+codex
+```markdown
+---
+title: "Push Notification Broker"
+category: "Real-Time & Media"
+difficulty: "Hard"
+tags: ["push", "real-time", "rate-limiting", "prioritization", "kafka", "apns", "fcm"]
+---
+
+## Overview
+
+This system accepts push notification intents, applies priority + rate limits, dispatches to APNS/FCM/web-push, and emits receipts.
+
+The system’s core is a single worker tier that treats “send a push” as a **quota-governed scheduling problem**. Everything else is durable intake (Kafka) and boring I/O to providers.
+
+## Requirements
+
+### Functional Requirements
+- Accept notifications with `tenant`, `audience` (device token or provider topic), `priority` (`critical|high|normal|bulk`), `ttl`, and `idempotency_key`.
+- Enforce rate limits:
+  - per-tenant
+  - per-campaign/job
+  - per-provider constraints (APNS/FCM throttles, connection caps)
+- Prioritize so `critical` is protected under overload while preserving tenant fairness.
+- Provide receipts with clear semantics: `ENQUEUED`, `DISPATCHED`, `PROVIDER_ACCEPTED`, `DELIVERED` (when available), `FAILED` (reasoned).
+- Survive provider outages without dropping critical traffic; degrade bulk first.
+
+### Scale Targets
+- Ingest: **2M notifications/sec sustained**, **10M/sec burst for 60s**.
+- Payload: avg **700B**, p99 **2KB**.
+- Fanout: **1.2 destinations/notification** average.
+- Latency SLO (broker → provider dispatch):
+  - `critical`: p99 **200ms**
+  - `normal`: p99 **2s**
+  - `bulk`: best effort within TTL
+- Receipts: **99.9% emitted** for broker + provider-acceptance states within **30s**.
+
+## Key Design Decisions
+
+- **Kafka is the only durable system of record.**
+  - Intents are append-only; receipts are append-only.
+  - If Kafka is unavailable, the broker does not accept traffic.
+
+- **Partition ownership is the unit of correctness.**
+  - Route by `hash(tenant_id)` so all traffic for a tenant is owned by exactly one Kafka partition at a time.
+  - Rate limits and fairness are enforced only by the worker consuming that partition.
+
+- **Scheduling is simple and explicit.**
+  - Four in-memory queues per partition (`critical/high/normal/bulk`) with TTL enforcement.
+  - `critical` is always attempted first (subject to provider circuit breaker + caps).
+  - Non-critical uses round-robin across active tenants within each priority with per-tenant token buckets (no DRR/weights).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  P["Producers"] --> I["Ingress API"]
+  I --> K["Kafka (intents + receipts topics)"]
+  K --> W["Broker Workers (schedule + dispatch)"]
+  W --> A["APNS / FCM / Web-Push"]
+  A --> I
+```
+
+## Components
+
+- **Ingress API**
+  - Justification: the only public entrypoint for auth/validation and a single, durable write to Kafka.
+  - Behavior:
+    - Validates payload, normalizes priority/TTL, rejects oversized payloads.
+    - Enforces a hard max fanout per request; large audiences must use provider topics.
+    - Emits `ENQUEUED` by writing the intent to Kafka (no synchronous provider calls).
+    - Receives provider callbacks/feedback (when available) and writes receipt events to Kafka.
+
+- **Kafka**
+  - Justification: durable intake + replay, and the receipt fact log.
+  - Topics:
+    - `intents` (append-only): notification intents to be dispatched.
+    - `receipts` (append-only): state transitions and outcomes.
+    - Optional `latest_status` (compacted): best-known status per `notification_id` for cheap queries.
+
+- **Broker Workers**
+  - Justification: the only custom logic—priority + quotas + provider-specific dispatch—in one horizontally scaled tier.
+  - Responsibilities:
+    - Consume `intents`, enqueue by priority, enforce TTL (expire → `FAILED` with `ttl_expired`).
+    - Rate limit at dispatch time:
+      - per-tenant token bucket (QPS + burst)
+      - per-campaign token bucket (within tenant)
+      - per-provider caps (max in-flight + dynamic QPS based on health)
+    - Provider dispatch with bounded retries and strict in-flight limits.
+    - Emit receipts (`DISPATCHED`, `PROVIDER_ACCEPTED`, `FAILED`) to Kafka.
+
+- **APNS / FCM / Web-Push**
+  - Justification: required external dependencies; treated as unreliable and rate-limited.
+
+## Deep Dive: Scheduling Under Priority + Quotas (The Hardest Part)
+
+Each Kafka partition is owned by exactly one worker at a time, so per-tenant state is local and lock-free.
+
+- **Priority**
+  - `critical` is always attempted first, but never bypasses provider safety limits (circuit breaker and in-flight caps).
+  - `bulk` is strictly best-effort: it is the first to be delayed and the first to expire.
+
+- **Fairness**
+  - Within a priority level, the worker cycles through active tenants (round-robin).
+  - Each tenant has its own token bucket; a tenant with no tokens is skipped until refilled.
+
+- **Rate limiting**
+  - Enforced only at the moment of dispatch.
+  - Provider protection is explicit:
+    - max concurrent in-flight per provider per worker
+    - a provider token bucket whose refill rate is reduced when RTT/errors rise
+
+- **Idempotency**
+  - Contract: at-least-once dispatch.
+  - Broker behavior: best-effort de-duplication within a bounded time window per partition keyed by `(tenant_id, idempotency_key)`; duplicates outside the window may be re-sent and are visible via receipts.
+
+- **Receipts semantics**
+  - `ENQUEUED`: intent durably written to Kafka.
+  - `DISPATCHED`: worker attempted a provider send.
+  - `PROVIDER_ACCEPTED`: provider accepted the request (not device delivery).
+  - `DELIVERED`: only when the provider supplies a delivery signal.
+  - `FAILED`: terminal broker decision (e.g., `ttl_expired`, `invalid_token`, `provider_rejected`, `retries_exhausted`).
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Few moving parts (3-engineer operable) | Less independent scaling between “scheduling” and “dispatch” |
+| Strict per-tenant quotas (single-partition ownership) | Hot tenants can be throughput-limited by their partition |
+| Clear receipts as a fact log | At-least-once dispatch unless providers support strong de-dupe |
+| Predictable overload behavior (critical protected, bulk expires) | Some bulk traffic may never send under sustained provider issues |
+
+## Failure Modes
+
+1. **Kafka unavailable**
+   - **What happens:** ingress rejects requests.
+   - **Detect:** produce failures / Kafka client error rate.
+   - **Recover:** return 503; producers retry with `idempotency_key`; once Kafka returns, normal flow resumes.
+
+2. **Provider throttling/outage**
+   - **What happens:** provider circuit breaker opens; dispatch slows; queues grow; bulk expires first.
+   - **Detect:** provider error codes, RTT, open-breaker state, queue age by priority.
+   - **Recover:** shrink provider send rate, cap retries, keep `critical` flowing when possible, emit `FAILED` on TTL expiry.
+
+3. **Network partition: worker can read Kafka but can’t reach providers**
+   - **What happens:** breaker opens quickly; retries stay bounded; intent backlog grows.
+   - **Detect:** simultaneous provider connection failures + rising queue age.
+   - **Recover:** stop sending until connectivity returns; do not amplify with uncontrolled retries; expire by TTL.
+
+4. **Slow component (CPU throttling / RTT p99 jumps)**
+   - **What happens:** in-flight caps are hit; queues age upward before errors appear.
+   - **Detect:** queue age by priority + worker event loop lag + provider RTT.
+   - **Recover:** reduce per-worker concurrency, scale workers, and allow bulk to expire rather than destabilizing critical.
+
+5. **Bad policy/config deploy**
+   - **What happens:** incorrect bucket sizes or caps can starve priorities or overload providers.
+   - **Detect:** abrupt SLO regression in queue age and provider errors after a config change.
+   - **Recover:** bounded config values, fast rollback, and a safe default profile (conservative provider caps, strict bulk shedding).
+
+## What We Removed
+
+- Separate `Schedulers` and `Dispatchers` services (merged into one `Broker Worker` tier).
+- Separate `Receipt Ingest` service (callbacks handled by `Ingress API`).
+- Separate “Receipt Log component” (receipts are Kafka topics; optional compacted `latest_status` for queries).
+- Shard-wide weighted fair scheduling (DRR/weights) in favor of priority queues + per-tenant buckets + round-robin.
+- External checkpointed rate-limit state store (all enforcement is partition-local; restarts rely on replay + conservative ramp-up).
+
+## Operational Notes
+
+- Primary on-call dashboard: **queue age by priority**, plus provider breaker state and in-flight saturation.
+- Backpressure is explicit and bounded: max in-flight per provider, capped retries, strict TTL expiry.
+- Consumer rebalances are treated as routine: replay is normal; receipts make duplicates and retries visible.
+- Receipt documentation is a state machine: `PROVIDER_ACCEPTED` is never “delivered”, and `DELIVERED` is optional.
+```
+tokens used
+9,687
+```markdown
+---
+title: "Push Notification Broker"
+category: "Real-Time & Media"
+difficulty: "Hard"
+tags: ["push", "real-time", "rate-limiting", "prioritization", "kafka", "apns", "fcm"]
+---
+
+## Overview
+
+This system accepts push notification intents, applies priority + rate limits, dispatches to APNS/FCM/web-push, and emits receipts.
+
+The system’s core is a single worker tier that treats “send a push” as a **quota-governed scheduling problem**. Everything else is durable intake (Kafka) and boring I/O to providers.
+
+## Requirements
+
+### Functional Requirements
+- Accept notifications with `tenant`, `audience` (device token or provider topic), `priority` (`critical|high|normal|bulk`), `ttl`, and `idempotency_key`.
+- Enforce rate limits:
+  - per-tenant
+  - per-campaign/job
+  - per-provider constraints (APNS/FCM throttles, connection caps)
+- Prioritize so `critical` is protected under overload while preserving tenant fairness.
+- Provide receipts with clear semantics: `ENQUEUED`, `DISPATCHED`, `PROVIDER_ACCEPTED`, `DELIVERED` (when available), `FAILED` (reasoned).
+- Survive provider outages without dropping critical traffic; degrade bulk first.
+
+### Scale Targets
+- Ingest: **2M notifications/sec sustained**, **10M/sec burst for 60s**.
+- Payload: avg **700B**, p99 **2KB**.
+- Fanout: **1.2 destinations/notification** average.
+- Latency SLO (broker → provider dispatch):
+  - `critical`: p99 **200ms**
+  - `normal`: p99 **2s**
+  - `bulk`: best effort within TTL
+- Receipts: **99.9% emitted** for broker + provider-acceptance states within **30s**.
+
+## Key Design Decisions
+
+- **Kafka is the only durable system of record.**
+  - Intents are append-only; receipts are append-only.
+  - If Kafka is unavailable, the broker does not accept traffic.
+
+- **Partition ownership is the unit of correctness.**
+  - Route by `hash(tenant_id)` so all traffic for a tenant is owned by exactly one Kafka partition at a time.
+  - Rate limits and fairness are enforced only by the worker consuming that partition.
+
+- **Scheduling is simple and explicit.**
+  - Four in-memory queues per partition (`critical/high/normal/bulk`) with TTL enforcement.
+  - `critical` is always attempted first (subject to provider circuit breaker + caps).
+  - Non-critical uses round-robin across active tenants within each priority with per-tenant token buckets (no DRR/weights).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  P["Producers"] --> I["Ingress API"]
+  I --> K["Kafka (intents + receipts topics)"]
+  K --> W["Broker Workers (schedule + dispatch)"]
+  W --> A["APNS / FCM / Web-Push"]
+  A --> I
+```
+
+## Components
+
+- **Ingress API**
+  - Justification: the only public entrypoint for auth/validation and a single, durable write to Kafka.
+  - Behavior:
+    - Validates payload, normalizes priority/TTL, rejects oversized payloads.
+    - Enforces a hard max fanout per request; large audiences must use provider topics.
+    - Emits `ENQUEUED` by writing the intent to Kafka (no synchronous provider calls).
+    - Receives provider callbacks/feedback (when available) and writes receipt events to Kafka.
+
+- **Kafka**
+  - Justification: durable intake + replay, and the receipt fact log.
+  - Topics:
+    - `intents` (append-only): notification intents to be dispatched.
+    - `receipts` (append-only): state transitions and outcomes.
+    - Optional `latest_status` (compacted): best-known status per `notification_id` for cheap queries.
+
+- **Broker Workers**
+  - Justification: the only custom logic—priority + quotas + provider-specific dispatch—in one horizontally scaled tier.
+  - Responsibilities:
+    - Consume `intents`, enqueue by priority, enforce TTL (expire → `FAILED` with `ttl_expired`).
+    - Rate limit at dispatch time:
+      - per-tenant token bucket (QPS + burst)
+      - per-campaign token bucket (within tenant)
+      - per-provider caps (max in-flight + dynamic QPS based on health)
+    - Provider dispatch with bounded retries and strict in-flight limits.
+    - Emit receipts (`DISPATCHED`, `PROVIDER_ACCEPTED`, `FAILED`) to Kafka.
+
+- **APNS / FCM / Web-Push**
+  - Justification: required external dependencies; treated as unreliable and rate-limited.
+
+## Deep Dive: Scheduling Under Priority + Quotas (The Hardest Part)
+
+Each Kafka partition is owned by exactly one worker at a time, so per-tenant state is local and lock-free.
+
+- **Priority**
+  - `critical` is always attempted first, but never bypasses provider safety limits (circuit breaker and in-flight caps).
+  - `bulk` is strictly best-effort: it is the first to be delayed and the first to expire.
+
+- **Fairness**
+  - Within a priority level, the worker cycles through active tenants (round-robin).
+  - Each tenant has its own token bucket; a tenant with no tokens is skipped until refilled.
+
+- **Rate limiting**
+  - Enforced only at the moment of dispatch.
+  - Provider protection is explicit:
+    - max concurrent in-flight per provider per worker
+    - a provider token bucket whose refill rate is reduced when RTT/errors rise
+
+- **Idempotency**
+  - Contract: at-least-once dispatch.
+  - Broker behavior: best-effort de-duplication within a bounded time window per partition keyed by `(tenant_id, idempotency_key)`; duplicates outside the window may be re-sent and are visible via receipts.
+
+- **Receipts semantics**
+  - `ENQUEUED`: intent durably written to Kafka.
+  - `DISPATCHED`: worker attempted a provider send.
+  - `PROVIDER_ACCEPTED`: provider accepted the request (not device delivery).
+  - `DELIVERED`: only when the provider supplies a delivery signal.
+  - `FAILED`: terminal broker decision (e.g., `ttl_expired`, `invalid_token`, `provider_rejected`, `retries_exhausted`).
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Few moving parts (3-engineer operable) | Less independent scaling between “scheduling” and “dispatch” |
+| Strict per-tenant quotas (single-partition ownership) | Hot tenants can be throughput-limited by their partition |
+| Clear receipts as a fact log | At-least-once dispatch unless providers support strong de-dupe |
+| Predictable overload behavior (critical protected, bulk expires) | Some bulk traffic may never send under sustained provider issues |
+
+## Failure Modes
+
+1. **Kafka unavailable**
+   - **What happens:** ingress rejects requests.
+   - **Detect:** produce failures / Kafka client error rate.
+   - **Recover:** return 503; producers retry with `idempotency_key`; once Kafka returns, normal flow resumes.
+
+2. **Provider throttling/outage**
+   - **What happens:** provider circuit breaker opens; dispatch slows; queues grow; bulk expires first.
+   - **Detect:** provider error codes, RTT, open-breaker state, queue age by priority.
+   - **Recover:** shrink provider send rate, cap retries, keep `critical` flowing when possible, emit `FAILED` on TTL expiry.
+
+3. **Network partition: worker can read Kafka but can’t reach providers**
+   - **What happens:** breaker opens quickly; retries stay bounded; intent backlog grows.
+   - **Detect:** simultaneous provider connection failures + rising queue age.
+   - **Recover:** stop sending until connectivity returns; do not amplify with uncontrolled retries; expire by TTL.
+
+4. **Slow component (CPU throttling / RTT p99 jumps)**
+   - **What happens:** in-flight caps are hit; queues age upward before errors appear.
+   - **Detect:** queue age by priority + worker event loop lag + provider RTT.
+   - **Recover:** reduce per-worker concurrency, scale workers, and allow bulk to expire rather than destabilizing critical.
+
+5. **Bad policy/config deploy**
+   - **What happens:** incorrect bucket sizes or caps can starve priorities or overload providers.
+   - **Detect:** abrupt SLO regression in queue age and provider errors after a config change.
+   - **Recover:** bounded config values, fast rollback, and a safe default profile (conservative provider caps, strict bulk shedding).
+
+## What We Removed
+
+- Separate `Schedulers` and `Dispatchers` services (merged into one `Broker Worker` tier).
+- Separate `Receipt Ingest` service (callbacks handled by `Ingress API`).
+- Separate “Receipt Log component” (receipts are Kafka topics; optional compacted `latest_status` for queries).
+- Shard-wide weighted fair scheduling (DRR/weights) in favor of priority queues + per-tenant buckets + round-robin.
+- External checkpointed rate-limit state store (all enforcement is partition-local; restarts rely on replay + conservative ramp-up).
+
+## Operational Notes
+
+- Primary on-call dashboard: **queue age by priority**, plus provider breaker state and in-flight saturation.
+- Backpressure is explicit and bounded: max in-flight per provider, capped retries, strict TTL expiry.
+- Consumer rebalances are treated as routine: replay is normal; receipts make duplicates and retries visible.
+- Receipt documentation is a state machine: `PROVIDER_ACCEPTED` is never “delivered”, and `DELIVERED` is optional.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/04-realtime-media/push-notification-broker.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Push Notification Broker
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/push-notification-broker.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/push-notification-broker.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/04-realtime-media/push-notification-broker.md

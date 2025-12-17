@@ -1,0 +1,1401 @@
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2a08-bb03-7190-af37-0defd1c30b08
+--------
+user
+# System Design Simplifier
+
+You are a pragmatic Staff Engineer who believes the best systems are the simplest ones that meet the requirements. Your job is to produce a clean, minimal design.
+
+## Your Task
+
+Take the input design and produce a **polished, standalone solution document** with a simpler architecture. The output should read as a complete, confident solution - not as a critique or comparison to something more complex.
+
+**Important**:
+- Do NOT modify the title, difficulty, or tags unless the simplification fundamentally changes the problem scope.
+- Do NOT use argumentative language like "We don't need X" or "Instead of X, use Y".
+- DO present the simplified design as THE design, written fresh. The reader has never seen the complex version.
+
+For every component, service, database, cache, queue, or dependency in the input, ask yourself:
+
+1. **Do we actually need this?** What breaks if we remove it?
+2. **Can we merge this with something else?** Two services doing related things → one service
+3. **Can we use a simpler alternative?** Kafka → Redis streams? Cassandra → Postgres? Microservice → library?
+4. **Are we over-engineering for scale we don't have?** Start simple, scale later
+5. **Is this dependency worth the operational cost?** Every new technology = on-call burden
+
+## Simplification Principles
+
+### Remove Before You Add
+- Question every cache layer - do we need it at this scale?
+- Question every queue - can we use synchronous calls?
+- Question every separate service - can it be a library or module?
+- Question every "scalable" database - would Postgres work?
+
+### Merge When Possible
+- Combine services that always deploy together
+- Use one database instead of three specialized ones
+- Use existing infrastructure before adding new
+
+### Challenge Complexity
+- "Eventually consistent" → Can we just use strong consistency?
+- "Sharded across regions" → Do we need multi-region yet?
+- "Event-driven architecture" → Would request/response be simpler?
+- "Microservices" → Would a modular monolith work?
+
+### Keep What's Essential
+- Don't remove things that are genuinely needed for correctness
+- Keep redundancy that's required for the stated availability target
+- Keep components that handle genuinely different scaling dimensions
+
+## Output Format
+
+Return the **complete, simplified document** with:
+
+1. **Simplified architecture** - Fewer boxes in the diagram
+2. **Merged components** - Combine where possible
+3. **Removed dependencies** - Cut unnecessary tech
+4. **Justified complexity** - What remains should have clear reasons
+
+For each major simplification, briefly note what was removed/merged and why it's acceptable.
+
+Add a "## Simplification Notes" section at the end listing:
+- What was removed and why
+- What was merged and why
+- What complexity remains and why it's necessary
+
+Do NOT add other commentary - just output the simplified document.
+
+---
+
+## Document to Simplify
+
+```markdown
+---
+title: "URL Shortener & Link Management"
+category: "Foundational Infrastructure"
+difficulty: "Medium"
+tags: ["url-shortener", "edge-computing", "multi-tenant", "analytics", "abuse-prevention"]
+---
+
+## Overview
+
+A modern URL shortener looks simple—map a short path to a long URL—but production systems are defined by four hard problems:
+
+1. **Extreme read skew + global latency**: redirects can be billions/day and must be fast everywhere.
+2. **Correctness under contention**: custom aliases, branded domains, and updates must not race or “hijack” names.
+3. **Policy + expiration enforcement**: TTL/disable/takedown must be enforced on every redirect and converge globally quickly.
+4. **Abuse resistance**: phishing/malware/spam, link laundering, enumeration, and traffic floods must be handled without breaking legitimate high-volume usage.
+
+The core architectural insight is to split into two planes:
+
+- **Redirect (read) plane**: edge-first lookups (cache/KV), minimal per-request work, resilient to regional failures.
+- **Management (write) plane**: strongly consistent metadata + policy enforcement, then asynchronous propagation to the read model.
+
+Redirects are served from an edge cache/KV backed by a globally replicated read model (KV). Writes commit to a transactional metadata store and publish events to update the KV and edge caches.
+
+---
+
+## Requirements
+
+### Functional Requirements
+
+- Create short links with:
+  - System-generated codes
+  - User-provided **custom aliases** (configurable case and allowed charset)
+- Redirect behavior:
+  - 301/302/307/308 support
+  - Optional query preservation and optional UTM appends
+  - Optional “safe landing page” for blocked/takedown outcomes
+- Link management:
+  - Retrieve/update destination URL
+  - Disable/enable/takedown
+  - Rotate destination
+  - Tags/notes
+  - Optional access controls (e.g., password/one-time token) as an extension
+- Branded domains:
+  - Map `brand.example` → tenant
+  - Enforce per-domain alias namespaces
+- Abuse prevention:
+  - Create-time checks (blocking)
+  - Redirect-time checks (fast allow/block/challenge)
+  - Rate limiting and takedown workflows
+- Analytics:
+  - Click event stream (geo/device/referrer, outcome)
+  - Aggregated reporting and export APIs
+- Bulk operations:
+  - Batch create/update/disable
+  - Import/export
+
+### Non-Functional Requirements (Concrete Targets)
+
+#### Scale
+
+- Redirects: **5–10B/day** globally  
+  - Average QPS: ~58k–116k (10B/day ÷ 86,400 ≈ 115,740 QPS)
+  - Peak: **300k QPS** (campaign bursts)
+- Writes (create/update): **1k QPS avg**, **5k QPS peak**
+- Stored links: **up to 5B total**, with heavy churn (30–70% expire within 7 days)
+- Analytics events: same order as redirects (billions/day)
+
+#### Latency
+
+- Redirect lookup at POP (excluding last-mile):
+  - **P50 < 10ms**, **P99 < 40ms**
+- Create/update:
+  - **P50 < 150ms**, **P99 < 500ms**
+
+#### Availability
+
+- Redirect path: **99.99%** (multi-region + edge)
+- Management APIs: **99.9%**
+
+#### Consistency
+
+- **Strong**: alias reservation, updates (avoid lost updates / alias hijack)
+- **Eventual**: propagation to edge/KV read model, analytics and dashboards
+
+#### Durability / DR
+
+- Metadata (source of truth): **RPO ≈ 0** for acknowledged writes, **RTO < 30 min**
+- Analytics: at-least-once ingestion; tolerate duplicates and small loss with idempotent aggregation
+
+### Constraints & Assumptions
+
+- Multi-tenant SaaS; each tenant can have multiple branded domains.
+- “Aggressive expiration” means: an expired/disabled/takedown link must stop redirecting **within minutes globally**; takedown should converge faster (target: **< 60s**).
+- External reputation services may be expensive or rate-limited; verdicts must be cached.
+- Compliance: minimize PII; truncate/hash IPs; configurable retention (30/90/365 days).
+- Prefer managed services where they reduce operational load.
+
+---
+
+## Architecture
+
+### High-Level Diagram
+
+```mermaid
+flowchart TB
+  subgraph Client["Client Layer"]
+    B["Browsers"]
+    A["API Clients / SDKs"]
+  end
+
+  subgraph Edge["Edge Layer (Global POPs)"]
+    DNS["Anycast DNS + Geo Routing"]
+    CDN["CDN + TLS Termination"]
+    EW["Edge Worker Redirector"]
+    EKV["Edge KV / Cache"]
+    ERL["Edge Rate Limiter"]
+    EBL["Hot Blocklist / Takedown List (small KV)"]
+  end
+
+  subgraph Services["Service Layer (Multi-Region)"]
+    APIGW["API Gateway / WAF"]
+    AUTH["AuthN/AuthZ"]
+    LMS["Link Management Service"]
+    AB["Abuse & Policy Service"]
+    EVT["Event Collector"]
+    JOB["Bulk/Async Jobs"]
+  end
+
+  subgraph Data["Data Layer"]
+    SQL["Metadata DB (strong)\nPostgres/CockroachDB"]
+    MQ["Event Bus\nKafka/PubSub"]
+    RKV["Redirect Read Model KV (global)\nDynamoDB Global Tables / Cassandra"]
+    REDIS["Caches\nRedis / Memcache"]
+    OLAP["Analytics OLAP\nClickHouse/BigQuery/Snowflake"]
+    OBJ["Object Store\nBackups/Exports"]
+  end
+
+  B --> DNS --> CDN --> EW
+  EW --> ERL --> EKV
+  EW --> EBL
+  EW -->|cache miss| RKV
+  A --> APIGW --> AUTH --> LMS
+  LMS --> AB
+  LMS --> SQL
+  LMS --> REDIS
+  LMS -->|publish| MQ
+  MQ -->|materialize| RKV
+  EW -->|click event| EVT --> MQ --> OLAP
+  LMS --> JOB --> MQ
+  LMS --> OBJ
+```
+
+### Key Invariants
+
+- **Redirect plane never depends on SQL** on the hot path.
+- **SQL is the source of truth** for link state, ownership, and alias uniqueness.
+- **Redirect KV is a materialized read model**: rebuilt from SQL + event log if needed.
+- **Edge cache entries are validated** using `expires_at` and `state` fields, not only cache TTL.
+
+---
+
+## Components
+
+### Edge Worker Redirector
+
+**Responsibilities**
+- Parse `{host, alias}`; apply rate limits and minimal abuse checks.
+- Fetch redirect record from edge cache/KV; fall back to global read model KV on miss.
+- Enforce state transitions (`active`, `disabled`, `expired`, `takedown`) and expiration on every request.
+- Emit click events asynchronously.
+
+**Important design details**
+- **Correct expiration**: cache TTL alone is insufficient (clock skew, stale entries). Always compare `now` to `expires_at` stored in the value.
+- **Fast takedown**:
+  - Maintain a small “hot blocklist” (e.g., `key -> blocked_until`) in edge KV with short TTL.
+  - Edge checks this first to override stale redirect records.
+- **Stale behavior**:
+  - For normal updates, stale-while-revalidate is acceptable if `state` remains `active`.
+  - For `takedown`/`disabled`, serve the safe landing page (or 451/403) even if other systems are degraded.
+
+**Typical redirect outcomes**
+- `3xx` with `Location` for active links.
+- `404` for unknown aliases (policy may choose `404` to reduce enumeration signal).
+- `410` for expired links if you want explicit expiry semantics (trade-off with enumeration resistance).
+- `451` or safe landing page for takedowns/blocked.
+
+### Link Management Service (Write Plane)
+
+**Responsibilities**
+- Create/update links, manage domains, enforce tenant plan limits and policies.
+- Support idempotency for create/bulk operations.
+- Publish propagation events to build/update the redirect read model.
+- Provide control-plane endpoints for takedown, audits, and exports.
+
+**Concurrency model**
+- **Alias uniqueness** enforced by the metadata store (unique constraint).
+- **Optimistic concurrency** on link updates via `version` (ETag / If-Match).
+
+### Abuse & Policy Service
+
+**Responsibilities**
+- Create-time validation: destination URL hygiene (scheme, punycode normalization), allow/deny lists, reputation checks.
+- Redirect-time verdicting: fast allow/block/challenge decisions using cached verdicts.
+- Continuous rescans and retroactive takedowns.
+
+**Patterns**
+- Cache-first with TTL; circuit breakers around external dependencies.
+- Store verdict provenance (`source`, `confidence`, `expires_at`) to support explainability and appeals.
+
+### Redirect Read Model KV (Materialized View)
+
+**Role**
+- Serve as the origin read model for redirects when edge cache misses.
+- Hold denormalized records optimized for O(1) lookups.
+
+**Correctness**
+- Records include `version` and `state` so edge can reason about staleness and enforce safe behavior.
+- Updates are applied in-order per key using `version` monotonicity.
+
+### Event Bus + Materializer
+
+**Role**
+- Deliver `LinkUpserted`, `LinkDisabled`, `LinkTakedown`, `DomainMapped`, etc.
+- A consumer (“materializer”) updates the KV and triggers cache invalidation/warm.
+
+**Operational note**
+- Because the KV is derived, the event bus retention (e.g., 3–7 days) is critical for replay and recovery.
+
+### Analytics Pipeline
+
+**Goals**
+- High-throughput ingestion (billions/day), low coupling to redirect latency.
+- Near-real-time rollups (minute-level) for dashboards; exact real-time is not required.
+
+**Approach**
+- Edge emits lightweight click events to collector → event bus → OLAP ingestion/rollups.
+- Enforce privacy by hashing/truncating identifiers and limiting retention.
+
+---
+
+## Data Model
+
+### Canonical Metadata (SQL)
+
+**`tenants`**
+- `tenant_id (pk)`, `name`, `plan`, `created_at`
+
+**`domains`**
+- `domain_id (pk)`, `tenant_id (fk)`, `hostname (unique)`, `status`, `created_at`
+
+**`links`**
+- `link_id (pk, ULID/UUIDv7)`, `tenant_id (fk)`, `domain_id (fk)`
+- `alias (varchar)`, `destination_url (text)`
+- `http_status (int)`, `created_at`, `updated_at`
+- `expires_at (timestamp, nullable)`
+- `state (enum: active|disabled|expired|takedown)`
+- `version (bigint)`  
+- Indexes:
+  - Unique: `(domain_id, alias)`
+  - For ops/reporting: `(tenant_id, created_at)`, `(tenant_id, state)`
+
+**`alias_tombstones`**
+- `domain_id`, `alias`, `tombstone_until`, `reason`, unique `(domain_id, alias)`
+
+**`abuse_verdicts`**
+- `subject_type (link|domain|destination_host|destination_url_hash)`
+- `subject_id/hash`
+- `verdict (allow|block|challenge)`
+- `reason`, `source`, `confidence`
+- `expires_at`
+
+**`idempotency_keys`** (recommended)
+- `tenant_id`, `key`, `request_hash`, `response_blob`, `created_at`, unique `(tenant_id, key)`
+- TTL/cleanup policy: 24h–7d depending on client behavior
+
+### Redirect Read Model KV Record (Denormalized)
+
+- Key: `{hostname}:{alias}`
+- Value:
+  - `link_id`
+  - `tenant_id`
+  - `destination_url`
+  - `http_status`
+  - `state`
+  - `expires_at_ms` (epoch)
+  - `version`
+  - `policy_flags` (e.g., `preserve_query`, `utm_append`, `safe_landing_mode`)
+- TTL strategy:
+  - Use TTL to reduce storage for naturally expiring links
+  - Still enforce `expires_at_ms` at read time for correctness
+
+### Analytics
+
+- Raw event (stream):
+  - `{ts, link_id, tenant_id, hostname, alias, pop, country, ua_hash, referrer_hash, outcome, latency_ms}`
+- OLAP rollups:
+  - Minute/hour/day aggregates keyed by `tenant_id, link_id, dimensions...`
+- Idempotency:
+  - Include `event_id` (e.g., UUIDv7) or deterministic hash and dedupe in rollups where needed.
+
+---
+
+## Data Flows
+
+### Create Link
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant GW as API Gateway
+  participant LMS as Link Mgmt
+  participant AB as Abuse/Policy
+  participant SQL as Metadata DB
+  participant MQ as Event Bus
+  participant MAT as KV Materializer
+  participant RKV as Redirect KV
+
+  C->>GW: POST /v1/links (Idempotency-Key)
+  GW->>LMS: Authenticated request
+  LMS->>AB: Validate destination + tenant policy
+  AB-->>LMS: allow/block (+expires_at TTL for verdict)
+  LMS->>SQL: TX: insert link (unique domain_id+alias), version=1
+  SQL-->>LMS: Commit (link_id, version)
+  LMS->>MQ: Publish LinkUpserted(link_id, hostname, alias, version, state, expires_at)
+  MQ->>MAT: Consume LinkUpserted
+  MAT->>RKV: Upsert redirect record (if version increases)
+  LMS-->>C: 201 Created (short_url, link_id, version)
+```
+
+### Redirect
+
+```mermaid
+sequenceDiagram
+  participant U as User Browser
+  participant EW as Edge Worker
+  participant EBL as Hot Blocklist
+  participant EKV as Edge Cache/KV
+  participant RKV as Redirect KV
+  participant EVT as Event Collector
+
+  U->>EW: GET https://brand.tld/alias
+  EW->>EBL: Check takedown override
+  alt blocked
+    EW-->>U: 451 or Safe Landing Page
+  else not blocked
+    EW->>EKV: Get redirect record
+    alt cache hit
+      EW->>EW: Validate state + expires_at
+      EW-->>U: 3xx / 410 / 404
+    else cache miss
+      EW->>RKV: Get redirect record
+      RKV-->>EW: record or not found
+      EW->>EKV: Put record (bounded TTL)
+      EW-->>U: 3xx / 410 / 404
+    end
+  end
+  EW-->>EVT: Emit click event (async, best-effort)
+```
+
+### Takedown / Disable (Fast Convergence)
+
+```mermaid
+sequenceDiagram
+  participant Ops as Admin/Abuse Ops
+  participant LMS as Link Mgmt
+  participant SQL as Metadata DB
+  participant MQ as Event Bus
+  participant MAT as KV Materializer
+  participant RKV as Redirect KV
+  participant EBL as Hot Blocklist
+
+  Ops->>LMS: POST /v1/links/{id}/takedown
+  LMS->>SQL: TX: set state=takedown, version=version+1
+  SQL-->>LMS: Commit
+  LMS->>MQ: Publish LinkTakedown(link_id, hostname, alias, version)
+  MQ->>MAT: Consume LinkTakedown
+  MAT->>RKV: Upsert state=takedown (monotonic by version)
+  MAT->>EBL: Add key to hot blocklist (short TTL, refreshed)
+```
+
+---
+
+## API Design
+
+### Create Link
+
+- `POST /v1/links`
+- Headers:
+  - `Authorization: Bearer ...`
+  - `Idempotency-Key: <uuid>`
+- Request:
+  ```json
+  {
+    "domain": "brand.example",
+    "alias": "spring-sale",
+    "destination_url": "https://shop.example/products?x=1",
+    "http_status": 302,
+    "expires_at": "2026-01-01T00:00:00Z",
+    "preserve_query": true,
+    "utm_append": {
+      "utm_source": "shortener",
+      "utm_campaign": "spring-sale"
+    }
+  }
+  ```
+- Response `201`:
+  ```json
+  {
+    "link_id": "01J9...ULID",
+    "short_url": "https://brand.example/spring-sale",
+    "version": 1,
+    "state": "active",
+    "expires_at": "2026-01-01T00:00:00Z"
+  }
+  ```
+- Errors (examples):
+  - `400 INVALID_URL` / `400 INVALID_EXPIRES_AT` / `400 INVALID_ALIAS`
+  - `401 UNAUTHORIZED` / `403 FORBIDDEN`
+  - `403 POLICY_VIOLATION` (max TTL, forbidden destination, plan limits)
+  - `409 ALIAS_TAKEN` / `409 IDPOTENCY_KEY_CONFLICT`
+  - `429 RATE_LIMITED`
+  - `451 BLOCKED` (create-time verdict)
+
+**Idempotency**
+- Store `(tenant_id, Idempotency-Key) -> response` for 24h+.
+- If the same key is reused with a different request hash, return `409 IDPOTENCY_KEY_CONFLICT`.
+
+### Update Link
+
+- `PATCH /v1/links/{link_id}`
+- Headers: `If-Match: "<version>"`
+- Request:
+  ```json
+  {
+    "destination_url": "https://shop.example/new",
+    "expires_at": "2026-02-01T00:00:00Z",
+    "http_status": 308
+  }
+  ```
+- Responses:
+  - `200 OK` with updated `version`
+  - `409 VERSION_CONFLICT` if `If-Match` fails
+- Side effects: publishes `LinkUpserted` to propagate to KV/edge.
+
+### Resolve (Debug / Programmatic)
+
+- `GET /v1/resolve/{domain}/{alias}`
+- Returns the current redirect record (including `state`, `expires_at`, `version`) without performing a redirect.
+- Useful for SDKs, admin tooling, and troubleshooting propagation.
+
+### Bulk Operations (Async)
+
+- `POST /v1/bulk/links`
+  - Accepts a list of creates/updates; returns `job_id`
+- `GET /v1/bulk/jobs/{job_id}`
+  - Status and per-item results (including alias collisions)
+
+### Analytics (Aggregated)
+
+- `GET /v1/analytics/links/{link_id}?from=...&to=...&granularity=hour`
+- Returns rollups; raw event access is typically restricted to higher tiers due to cost/PII.
+
+---
+
+## Scaling & Performance
+
+### Capacity Sketch (Order of Magnitude)
+
+- Redirects: 10B/day at peak periods implies sustained high throughput.
+  - If an edge cache hit is ~1–2ms compute + KV lookup, you can keep origin reads low with a hit ratio >95%.
+  - With 300k QPS peak and 95% hit ratio, origin KV sees ~15k QPS—manageable for a global KV.
+- Redirect record size:
+  - Assume ~0.5–1.5 KB compressed JSON/binary.
+  - 5B links * 1 KB ≈ 5 TB of logical data (KV storage and replication overhead varies by provider).
+- Analytics:
+  - If events average 200 bytes and you ingest 10B/day, raw is ~2 TB/day before indexing/overhead; prefer rollups and retention policies.
+
+### Bottlenecks & Mitigations
+
+- **Redirect hot keys (viral links)**:
+  - Edge caching per POP and request coalescing reduce amplification.
+  - Optional “shield POP” can further reduce KV fanout on misses.
+- **Propagation lag**:
+  - Normal updates tolerate seconds-to-minutes eventual consistency.
+  - Takedowns require a fast path via hot blocklist and prioritized events.
+- **Abuse checks**:
+  - External calls are slow/unreliable → cached verdicts + circuit breakers + async rescans.
+- **Enumeration/scanning**:
+  - Per-POP rate limits + negative caching + anomaly detection by ASN/prefix.
+
+### Code / Alias Generation (Interview-Relevant)
+
+- Generated codes should be:
+  - Short (Base62 or Crockford Base32), URL-safe, configurable length.
+  - Non-sequential to reduce enumeration (use random or keyed encoding).
+- Common approaches:
+  - **Random Base62** (6–8 chars): simple; collision probability managed with retries + unique constraint.
+  - **ULID/UUIDv7 + encoding**: sortable IDs for ops, but still expose patterns unless encoded with a keyed transform.
+  - **Snowflake-like IDs**: scalable generation, but sequential patterns require obfuscation for public codes.
+- Custom aliases always go through the same uniqueness enforcement as generated codes.
+
+### Caching Strategy
+
+- **Edge cache/KV**:
+  - Key: `{host}:{alias}`
+  - Store the full redirect record with `expires_at_ms` and `state`.
+  - TTL: bounded (e.g., min(24h, time_to_expiry)) to balance freshness vs churn.
+- **Negative caching**:
+  - Cache not-found for 30–120s to dampen scans and reduce origin load.
+- **Invalidation**:
+  - Prefer versioned reads (refresh if cached version < origin version when detectable).
+  - For takedowns: hot blocklist override + prioritized propagation events.
+
+---
+
+## Trade-offs & Alternatives
+
+### Trade-offs (At Least 3)
+
+1. **Edge-first redirects with eventual propagation**
+   - Pros: best global latency/availability; SQL outages don’t break redirects.
+   - Cons: updates are not instantly visible everywhere; requires careful takedown fast path.
+
+2. **Strong alias uniqueness (unique index / conditional put)**
+   - Pros: prevents collisions and security issues; simple correctness story.
+   - Cons: slightly higher write latency; write path must handle contention gracefully.
+
+3. **Asynchronous analytics pipeline (at-least-once)**
+   - Pros: redirect path stays fast; cost scales better; durable event log supports reprocessing.
+   - Cons: dashboards are eventually consistent; duplicates must be handled in aggregation.
+
+4. **Dual-store model (SQL source + KV read model)**
+   - Pros: each store is used for what it’s good at (transactions vs massive reads).
+   - Cons: requires materialization, replay, and operational tooling to ensure convergence.
+
+### Alternatives
+
+- **Single global SQL for redirects**
+  - Simpler, but hard to hit global P99 and risks overload during spikes.
+- **CDN-only caching without a KV read model**
+  - Fast and cheap for immutable links, but invalidation/state changes become unreliable at scale.
+- **Per-region independent namespaces**
+  - Improves write locality, but complicates branded domains/custom aliases and user expectations.
+- **Redirect service at origin only**
+  - Easier debugging, but global latency and availability suffer; edges become underutilized.
+
+---
+
+## Failure Modes & Mitigations
+
+### Failure Scenarios (At Least 3)
+
+1. **Global KV replication lag / partial region impairment**
+   - Impact: some POPs may serve stale records.
+   - Detection: replication lag metrics, version skew sampling, elevated cache miss + origin latency.
+   - Mitigation: version monotonicity; edge refresh on miss; prioritize takedown via hot blocklist; route origin reads to nearest healthy region.
+
+2. **Edge cache poisoning / record tampering**
+   - Impact: malicious redirects or incorrect destinations.
+   - Detection: validation failures, anomaly detection on destination host shifts, audit logs.
+   - Mitigation: only materializer writes to KV; strict URL validation (scheme allowlist, punycode normalization); optionally sign records (HMAC) and verify at edge.
+
+3. **Abuse traffic spike (enumeration, bot floods, credential stuffing)**
+   - Impact: increased cost, degraded tail latency, management API disruption.
+   - Detection: WAF/rate limit metrics, spikes in unknown-alias requests, per-ASN anomalies.
+   - Mitigation: layered rate limiting (edge + gateway), bot challenges, negative caching, adaptive throttles, separate management and redirect capacity pools.
+
+4. **Metadata DB outage**
+   - Impact: cannot create/update; redirects continue (read plane decoupled).
+   - Detection: DB health checks, elevated 5xx on management endpoints.
+   - Mitigation: multi-AZ + PITR; degrade to read-only admin views; queue writes only if business can tolerate delayed creates (often not recommended without strict semantics).
+
+5. **Clock skew impacts expiration**
+   - Impact: early/late expiry at some POPs.
+   - Detection: skew monitoring, mismatch audits between POP logs and canonical time.
+   - Mitigation: enforce expiry using epoch times; NTP discipline; add small safety window (e.g., treat expired if `now_ms >= expires_at_ms - 2000`).
+
+### Disaster Recovery
+
+- Targets:
+  - Redirect: **RTO < 15 min**
+  - Metadata: **RPO ≈ 0**, **RTO < 30 min**
+  - Analytics: **RPO up to 15 min** acceptable
+- Backups:
+  - Metadata DB: continuous PITR + daily snapshots to object store; regular restore tests.
+  - KV: derived; rebuild from SQL + event replay.
+  - Event bus: retain 3–7 days for replay; store compacted topics for latest state if supported.
+
+---
+
+## Operations
+
+### Observability (SLO-Driven)
+
+- Redirect:
+  - P50/P95/P99 latency per POP
+  - Cache hit ratio and origin fallback rate
+  - 3xx/4xx/5xx rates by outcome (active/expired/takedown)
+- Management:
+  - Create/update latency and error rates
+  - `409 ALIAS_TAKEN` and `409 VERSION_CONFLICT` rates
+  - DB saturation (connections, locks), job queue depth/lag
+- Abuse:
+  - Block/challenge rates, false-positive appeal rate
+  - External reputation API latency/error rate
+- Analytics:
+  - Ingestion lag, dropped/late events, OLAP query latency, rollup completeness
+
+Example alerts
+- Redirect P99 > 60ms for 5 minutes in any top-10 POP.
+- Origin fallback > 5% globally for 10 minutes.
+- Propagation lag > 2 minutes on `LinkUpserted` topic.
+- Sudden spike in unknown-alias requests from a single ASN.
+
+### Deployment & Change Management
+
+- Progressive delivery:
+  - Canary by region/POP for edge workers; gradual ramp.
+  - Blue/green or rolling deploy for services; feature flags for policy changes.
+- Schema evolution:
+  - Expand/contract; versioned redirect records; backward-compatible event payloads.
+- Rollback:
+  - Instant edge worker rollback to previous version.
+  - Service rollback with safe degradation (e.g., disable new policy checks via flag).
+
+### Security & Privacy
+
+- Auth:
+  - OAuth/JWT for APIs; strict tenant scoping; audit logs for privileged actions.
+- Redirect safety:
+  - Enforce allowed schemes (`https`, optionally `http`), block `javascript:` etc.
+  - Normalize and validate internationalized domains (punycode).
+- Privacy:
+  - Hash/truncate IP; avoid storing raw user agents where possible; retention controls by tenant/plan.
+- Key management:
+  - Rotate signing/HMAC keys; short-lived credentials for services.
+
+---
+
+## References & Further Reading
+
+- DynamoDB Global Tables: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GlobalTables.html
+- Cloudflare Workers & KV: https://developers.cloudflare.com/workers/ and https://developers.cloudflare.com/kv/
+- Google Safe Browsing API: https://developers.google.com/safe-browsing
+- Rate limiting patterns: https://cloud.google.com/architecture/rate-limiting-strategies-techniques
+- Practical URL shortener considerations (Bitly blog): https://bitly.com/blog/
+```
+
+---
+
+Output the complete, simplified document now.
+mcp startup: no servers
+
+
+
+
+
+thinking
+**Simplifying design document**
+
+I need to create a simplified standalone design document, keeping elements like title, difficulty, and tags, unless simplifying changes the scope. I’ll work on reducing the architecture’s complexity to fewer components while meeting requirements like extreme scale, global edge, multi-tenant use, abuse prevention, and analytics. 
+
+I can streamline from microservices and multiple datastores to an edge worker with a single backend service, using Postgres as the source and Redis for redirects, cache, and rate limiting. A global key-value store might be necessary to manage a high global queries per second (QPS). 
+
+One approach could involve using a CDN edge and an edge KV store for redirects, with Postgres for persistence. For a global low-latency KV, options include Cloudflare KV or DynamoDB global table. I can eliminate Kafka by relying on Postgres logical replication or using an outbox with a worker to update the KV. Direct writes to the KV can help avoid the need for an event bus, ensuring fast convergence while allowing for eventual consistency. I can implement a dual-write within a transaction through an outbox, where the worker pushes to the KV and triggers cache purges.
+thinking
+**Structuring the async job pipeline**
+
+I’m considering using a single queue like SQS for handling async jobs and click data ingestion, or maybe managed log ingestion tools like Kinesis or Cloudflare Analytics Engine. To keep things simple, click events could be directed to object storage via edge logs or sent to a collector that writes directly to BigQuery.
+
+Even though scaling is a concern, I want to maintain a straightforward pipeline: the edge emits to an HTTP endpoint for the collector, which batches data to OLAP without using Kafka. For bulk jobs, I’ll run them in the same service with a background job runner and a database queue. 
+
+To address abuse and policy, I can implement a module within the backend, storing cached verdicts in Postgres alongside Redis. For redirect-time checks, I’ll keep a small edge blocklist in a KV store, plus a global blocklist to maintain record states. For rate limiting, CDN's built-in capabilities, along with per-tenant limits at the API, will help. Finally, I’ll avoid using a separate API Gateway and instead use a managed WAF in front of the backend.
+thinking
+**Designing the datastore architecture**
+
+I’m planning to use Postgres for metadata, along with a global key-value store for redirect records and the blocklist. For analytics, I’ll rely on OLAP options like BigQuery or ClickHouse, and also use object storage for exports and backups. 
+
+Redis could be optional; I might use it for management API rate limits and caching external reputation results. Alternatively, I could store verdicts in Postgres and utilize an in-process cache. 
+
+To keep it simple, I think using Postgres for job management, idempotency, and verdicts is the way to go, while potentially employing Redis for caching only when necessary. For external reputation caching, I’ll consider storing it in Postgres with a time-to-live (TTL) and in a memory LRU cache.
+
+On the edge, I plan to implement anycast DNS, CDN, Workers, and Edge Cache/KV, treating the edge KV as one globally replicated store accessible across several providers.
+thinking
+**Structuring the edge KV model**
+
+I won’t need a separate RKV since the edge KV will function as the read model for redirects. This simplifies things because edge reads data from the KV, and on a miss, it won't call the origin. Although KV has eventual consistency, it's acceptable for handling large reads, say around 10 billion per day.
+
+For management writes, the backend will write metadata to Postgres and update the edge KV redirect record in the same request, with a background reconciler ensuring the KV stays in sync with Postgres using an outbox table to avoid Kafka.
+
+For takedowns, the backend will update the state and push immediate overrides to the edge KV blocklist, again following the best-effort principle recorded in the outbox. Workers will enforce state based on the records or blocklists.
+
+For analytics, I think the simplest route is to send edge logs to an analytics store like Cloudflare Logpush, while keeping the documentation vendor-neutral. I can either route click events via HTTP to a collector that batches data to OLAP, or use managed log streaming from the CDN to object storage, then conduct periodic ETL, with requirements for near-real-time, minute-level processing.
+thinking
+**Crafting the simplified design document**
+
+I’m planning to retain the collector service with in-memory batching while storing raw events in either an OLAP or append-only table, utilizing scheduled queries for rollups. To simplify services, I think I can create a single "Control Plane API" that manages various functions including authentication and analytics, possibly through a scaled endpoint within the same service. 
+
+In terms of architecture, the design will feature a unified edge-based redirect plane, where the CDN and worker would leverage edge KV for redirect records and caching. The Control Plane will serve as a monolithic service that interacts with Postgres for source-of-truth operations.
+
+For analytics, edge workers will send click events to an ingestion endpoint which batches and writes to OLAP. I will ensure provisions for asynchronous bulk operations using Postgres job tables. The data model will include essential attributes like tenants, domains, and links. Additionally, I plan to implement failure handling and security measures to maintain service reliability.
+
+Ultimately, I’ll compile this information into a markdown document with clearly defined sections, noting any simplifications and the rationale for the design decisions. These will include an architecture overview, merged components, removed dependencies, and justified complexity while keeping it concise and clear for easy understanding.
+codex
+```markdown
+---
+title: "URL Shortener & Link Management"
+category: "Foundational Infrastructure"
+difficulty: "Medium"
+tags: ["url-shortener", "edge-computing", "multi-tenant", "analytics", "abuse-prevention"]
+---
+
+## Overview
+
+This system provides a multi-tenant URL shortener with branded domains, custom aliases, fast global redirects, enforcement of expiration/disable/takedown, abuse controls, and analytics.
+
+The design separates two concerns:
+
+- **Redirect path (read-heavy):** served at the edge for low latency and high availability.
+- **Management path (write-heavy):** strongly consistent updates with reliable propagation to the edge.
+
+## Requirements
+
+### Functional Requirements
+- Create short links with system-generated codes and user-provided custom aliases.
+- Redirect support for 301/302/307/308; optional query preservation; optional UTM appends.
+- Link management: retrieve/update destination, enable/disable/takedown, rotate destination, tags/notes.
+- Branded domains: map hostname → tenant; alias namespaces per domain.
+- Abuse prevention: create-time checks; redirect-time allow/block/challenge; rate limiting; takedown workflows.
+- Analytics: click events and aggregated reporting/export APIs.
+- Bulk operations: batch create/update/disable; import/export.
+
+### Non-Functional Targets
+- Redirects: 5–10B/day globally, ~300k QPS peak.
+- Writes: 1k QPS avg, 5k QPS peak.
+- Redirect lookup at POP: P50 < 10ms, P99 < 40ms (excluding last-mile).
+- Availability: redirects 99.99%, management APIs 99.9%.
+- Consistency: strong for alias reservation/updates; eventual for edge propagation and analytics.
+- Aggressive enforcement: disabled/expired/takedown converge globally within minutes; takedown target < 60s.
+
+---
+
+## Simplified Architecture
+
+```mermaid
+flowchart TB
+  subgraph Edge["Edge (Global POPs)"]
+    DNS["Anycast DNS"]
+    CDN["CDN + TLS"]
+    EW["Edge Redirect Worker"]
+    EKV["Edge KV (redirect records + takedown overrides)"]
+    ERL["Edge Rate Limiting (CDN/Worker)"]
+  end
+
+  subgraph Control["Control Plane (Multi-Region)"]
+    API["Link API (modular monolith)"]
+    PG["Postgres (metadata source of truth)"]
+    OLAP["Analytics Store (OLAP)"]
+    OBJ["Object Store (exports/backups)"]
+    EXT["External Reputation APIs (optional)"]
+  end
+
+  DNS --> CDN --> EW --> ERL
+  EW --> EKV
+  EW -->|click event| API
+  API --> PG
+  API --> EKV
+  API --> OLAP
+  API --> OBJ
+  API --> EXT
+```
+
+### Key Invariants
+- Redirects are served from the **edge** using a single **edge KV** read model.
+- Alias uniqueness and link state changes are **strongly consistent** in Postgres.
+- Edge KV records include `state`, `expires_at`, and `version` so edge can enforce correctness independently of cache TTL.
+
+---
+
+## Merged Components
+
+- **Link API (single service):** auth, tenants/domains/links, abuse policy, bulk jobs, propagation worker, analytics APIs.
+- **Propagation as an internal worker:** a background loop in the Link API uses a Postgres outbox to push changes to edge KV and keep it converged.
+- **Analytics ingestion as an API endpoint:** the edge worker posts lightweight click events to the Link API, which batches into OLAP.
+
+---
+
+## Removed Dependencies
+
+- **No external event bus required:** propagation uses a Postgres outbox table and a background worker.
+- **No separate “materializer” service:** KV updates are performed by the Link API worker.
+- **No dedicated cache cluster required:** redirect lookups use edge KV; control-plane caching is handled with small in-process caches and TTL tables in Postgres.
+
+---
+
+## Justified Complexity
+
+- **Edge execution + edge KV** is required to meet global redirect latency and availability targets at very high QPS.
+- **Postgres as source of truth** is required for correctness under contention (custom aliases, branded domains) and auditability.
+- **Outbox-based propagation** is required for reliable, replayable convergence from strong writes to an eventually consistent edge read model.
+- **An OLAP store** is required to query billions/day of events efficiently without impacting redirect latency.
+
+---
+
+## Components
+
+### Edge Redirect Worker
+**Responsibilities**
+- Parse `{hostname, alias}` and apply rate limiting.
+- Read a **takedown override key** first for fast enforcement.
+- Fetch redirect record from edge KV and enforce `state` and `expires_at` on every request.
+- Emit click events asynchronously (best-effort) to the analytics ingest endpoint.
+
+**Redirect outcomes**
+- `3xx` for active links.
+- `404` for unknown aliases (optionally used to reduce enumeration signals).
+- `410` for expired links (optional policy).
+- `451` (or a safe landing page) for takedown/blocked.
+
+**Fast takedown**
+- Edge KV stores a small override key per `{hostname, alias}` (e.g., `blocked_until_ms`) with short TTL; the Link API refreshes it while a takedown is active.
+
+### Link API (Modular Monolith)
+**Responsibilities**
+- Create/update/disable/takedown links; manage domains and tenants.
+- Enforce alias uniqueness and optimistic concurrency (`version`).
+- Run create-time abuse checks (normalization, allow/deny lists, reputation checks).
+- Maintain an outbox to propagate redirect records and takedowns to edge KV.
+- Provide bulk job endpoints and export APIs.
+- Ingest click events and write rollups to OLAP.
+
+**Concurrency**
+- Alias uniqueness: Postgres unique constraint on `(domain_id, alias)`.
+- Updates: `If-Match` / `version` optimistic concurrency to prevent lost updates.
+- Idempotency: store `(tenant_id, key) -> response` for safe retries.
+
+---
+
+## Data Model
+
+### Postgres (Source of Truth)
+
+**`tenants`**
+- `tenant_id (pk)`, `name`, `plan`, `created_at`
+
+**`domains`**
+- `domain_id (pk)`, `tenant_id (fk)`, `hostname (unique)`, `status`, `created_at`
+
+**`links`**
+- `link_id (pk, ULID/UUIDv7)`, `tenant_id (fk)`, `domain_id (fk)`
+- `alias (varchar)`, `destination_url (text)`
+- `http_status (int)`, `preserve_query (bool)`, `utm_append (jsonb, nullable)`
+- `state (enum: active|disabled|expired|takedown)`
+- `expires_at (timestamp, nullable)`
+- `version (bigint)`, `created_at`, `updated_at`
+- Indexes:
+  - Unique: `(domain_id, alias)`
+  - Ops: `(tenant_id, created_at)`, `(tenant_id, state)`
+
+**`alias_tombstones`**
+- `(domain_id, alias)` unique, `tombstone_until`, `reason`
+- Prevents immediate alias reuse after deletion/expiry per policy.
+
+**`abuse_verdicts`** (optional but practical)
+- `subject_type`, `subject_key`, `verdict (allow|block|challenge)`, `reason`, `source`, `confidence`, `expires_at`
+- Used for both create-time and operational rescans.
+
+**`idempotency_keys`**
+- `(tenant_id, key)` unique, `request_hash`, `response_blob`, `created_at`, `expires_at`
+
+**`outbox_events`**
+- `event_id (pk)`, `event_type`, `aggregate_key` (e.g., `{hostname}:{alias}`), `payload (jsonb)`, `created_at`, `processed_at (nullable)`
+- Drives reliable propagation to edge KV and takedown overrides.
+
+**`bulk_jobs` / `bulk_job_items`** (optional)
+- Tracks async batch operations and per-item results.
+
+### Edge KV Record (Redirect Read Model)
+- Key: `{hostname}:{alias}`
+- Value:
+  - `link_id`, `tenant_id`
+  - `destination_url`, `http_status`
+  - `preserve_query`, `utm_append`, `safe_landing_mode`
+  - `state`, `expires_at_ms`, `version`
+
+### Edge KV Takedown Override
+- Key: `{hostname}:{alias}:blocked`
+- Value: `{blocked_until_ms, reason_code}`
+- Short TTL; refreshed while takedown is active for fast global convergence.
+
+---
+
+## Data Flows
+
+### Create/Update Link (Strong + Propagate)
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant API as Link API
+  participant PG as Postgres
+  participant KV as Edge KV
+
+  C->>API: POST/PATCH (Idempotency-Key / If-Match)
+  API->>API: Validate + abuse checks
+  API->>PG: TX: upsert link, bump version
+  API->>PG: TX: insert outbox event (LinkUpserted)
+  PG-->>API: Commit
+  API-->>C: 200/201 (link_id, version)
+  API->>KV: Async: write redirect record (via outbox worker)
+```
+
+### Redirect (Edge Only)
+```mermaid
+sequenceDiagram
+  participant U as User
+  participant EW as Edge Worker
+  participant KV as Edge KV
+
+  U->>EW: GET https://brand.tld/alias
+  EW->>KV: GET {host}:{alias}:blocked
+  alt blocked
+    EW-->>U: 451 / Safe Landing
+  else not blocked
+    EW->>KV: GET {host}:{alias}
+    EW->>EW: Enforce state + expires_at_ms
+    EW-->>U: 3xx / 404 / 410
+  end
+```
+
+### Takedown (Fast Path)
+```mermaid
+sequenceDiagram
+  participant Ops as Admin/Ops
+  participant API as Link API
+  participant PG as Postgres
+  participant KV as Edge KV
+
+  Ops->>API: POST /links/{id}/takedown
+  API->>PG: TX: state=takedown, version++
+  API->>PG: TX: outbox LinkTakedown
+  PG-->>API: Commit
+  API-->>Ops: 200 OK
+  API->>KV: Async: set {host}:{alias}:blocked (short TTL)
+  API->>KV: Async: update redirect record state=takedown
+```
+
+---
+
+## API Design (Minimal)
+
+### Create Link
+- `POST /v1/links` with `Idempotency-Key`
+- Returns `link_id`, `short_url`, `version`, `state`, `expires_at`
+
+### Update Link
+- `PATCH /v1/links/{link_id}` with `If-Match: "<version>"`
+- Returns updated `version`
+
+### Takedown / Disable / Enable
+- `POST /v1/links/{link_id}/takedown`
+- `POST /v1/links/{link_id}/disable`
+- `POST /v1/links/{link_id}/enable`
+
+### Resolve (Debug)
+- `GET /v1/resolve/{domain}/{alias}`
+- Returns the canonical redirect record from Postgres plus current propagated version (useful for troubleshooting).
+
+### Bulk
+- `POST /v1/bulk/links` → `job_id`
+- `GET /v1/bulk/jobs/{job_id}`
+
+### Analytics (Aggregated)
+- `GET /v1/analytics/links/{link_id}?from=...&to=...&granularity=hour`
+
+---
+
+## Scaling & Performance
+
+- **Redirects:** edge worker + edge KV keeps latency low and avoids centralized hot paths.
+- **Hot keys (viral links):** edge KV and POP-local caching absorb bursts; rate limiting reduces abuse amplification.
+- **Propagation:** outbox worker runs continuously; takedown events are prioritized and set the override key first.
+- **Analytics ingestion:** edge posts small events; the Link API batches inserts and rollups to OLAP to keep per-event overhead low.
+- **Expiration churn:** edge KV records use TTL aligned to `expires_at` while still enforcing `expires_at_ms` at read time.
+
+---
+
+## Failure Modes & Mitigations
+
+- **Edge KV degraded/unavailable:** edge worker serves stale POP cache where available; otherwise returns a safe error response. Redirect correctness is still enforced via `state`/`expires_at_ms` when cached.
+- **Postgres outage:** management APIs fail closed; redirects continue from edge KV.
+- **Propagation lag:** metrics track outbox backlog age; takedown uses a dedicated override key with short TTL and prioritized processing.
+- **Abuse spikes/enumeration:** edge rate limits, negative caching for not-found, and tenant/domain throttles on management endpoints.
+
+---
+
+## Operations & Security
+
+- **Observability:** redirect latency/codes by POP; edge KV hit/miss; outbox backlog age; management error rates; takedown time-to-effect; analytics ingestion lag.
+- **Privacy:** hash/truncate IPs; minimize raw UA storage; retention controls by tenant/plan.
+- **Safety:** strict URL validation (scheme allowlist, punycode normalization); audit log for privileged actions; least-privilege credentials for edge KV writes from the Link API.
+
+---
+
+## Simplification Notes
+
+- Removed: `Kafka/PubSub` event bus; propagation uses `outbox_events` in Postgres for reliable replay and operational simplicity.
+- Removed: separate `Abuse & Policy Service`, `Bulk/Async Jobs` service, and `KV materializer`; consolidated into the single `Link API` codebase with background workers.
+- Removed: dedicated `Redis/Memcache` layer; edge KV is the redirect read model, and control-plane caching uses TTL tables and small in-process caches.
+- Merged: click collection into the `Link API` as an ingest endpoint; batching handles throughput while keeping redirect latency isolated at the edge.
+- Complexity that remains: edge execution + edge KV (global latency/availability), Postgres constraints/versioning (correctness under contention), outbox propagation (convergence), OLAP analytics store (billions/day queryability).
+```
+tokens used
+11,797
+```markdown
+---
+title: "URL Shortener & Link Management"
+category: "Foundational Infrastructure"
+difficulty: "Medium"
+tags: ["url-shortener", "edge-computing", "multi-tenant", "analytics", "abuse-prevention"]
+---
+
+## Overview
+
+This system provides a multi-tenant URL shortener with branded domains, custom aliases, fast global redirects, enforcement of expiration/disable/takedown, abuse controls, and analytics.
+
+The design separates two concerns:
+
+- **Redirect path (read-heavy):** served at the edge for low latency and high availability.
+- **Management path (write-heavy):** strongly consistent updates with reliable propagation to the edge.
+
+## Requirements
+
+### Functional Requirements
+- Create short links with system-generated codes and user-provided custom aliases.
+- Redirect support for 301/302/307/308; optional query preservation; optional UTM appends.
+- Link management: retrieve/update destination, enable/disable/takedown, rotate destination, tags/notes.
+- Branded domains: map hostname → tenant; alias namespaces per domain.
+- Abuse prevention: create-time checks; redirect-time allow/block/challenge; rate limiting; takedown workflows.
+- Analytics: click events and aggregated reporting/export APIs.
+- Bulk operations: batch create/update/disable; import/export.
+
+### Non-Functional Targets
+- Redirects: 5–10B/day globally, ~300k QPS peak.
+- Writes: 1k QPS avg, 5k QPS peak.
+- Redirect lookup at POP: P50 < 10ms, P99 < 40ms (excluding last-mile).
+- Availability: redirects 99.99%, management APIs 99.9%.
+- Consistency: strong for alias reservation/updates; eventual for edge propagation and analytics.
+- Aggressive enforcement: disabled/expired/takedown converge globally within minutes; takedown target < 60s.
+
+---
+
+## Simplified Architecture
+
+```mermaid
+flowchart TB
+  subgraph Edge["Edge (Global POPs)"]
+    DNS["Anycast DNS"]
+    CDN["CDN + TLS"]
+    EW["Edge Redirect Worker"]
+    EKV["Edge KV (redirect records + takedown overrides)"]
+    ERL["Edge Rate Limiting (CDN/Worker)"]
+  end
+
+  subgraph Control["Control Plane (Multi-Region)"]
+    API["Link API (modular monolith)"]
+    PG["Postgres (metadata source of truth)"]
+    OLAP["Analytics Store (OLAP)"]
+    OBJ["Object Store (exports/backups)"]
+    EXT["External Reputation APIs (optional)"]
+  end
+
+  DNS --> CDN --> EW --> ERL
+  EW --> EKV
+  EW -->|click event| API
+  API --> PG
+  API --> EKV
+  API --> OLAP
+  API --> OBJ
+  API --> EXT
+```
+
+### Key Invariants
+- Redirects are served from the **edge** using a single **edge KV** read model.
+- Alias uniqueness and link state changes are **strongly consistent** in Postgres.
+- Edge KV records include `state`, `expires_at`, and `version` so edge can enforce correctness independently of cache TTL.
+
+---
+
+## Merged Components
+
+- **Link API (single service):** auth, tenants/domains/links, abuse policy, bulk jobs, propagation worker, analytics APIs.
+- **Propagation as an internal worker:** a background loop in the Link API uses a Postgres outbox to push changes to edge KV and keep it converged.
+- **Analytics ingestion as an API endpoint:** the edge worker posts lightweight click events to the Link API, which batches into OLAP.
+
+---
+
+## Removed Dependencies
+
+- **No external event bus required:** propagation uses a Postgres outbox table and a background worker.
+- **No separate “materializer” service:** KV updates are performed by the Link API worker.
+- **No dedicated cache cluster required:** redirect lookups use edge KV; control-plane caching is handled with small in-process caches and TTL tables in Postgres.
+
+---
+
+## Justified Complexity
+
+- **Edge execution + edge KV** is required to meet global redirect latency and availability targets at very high QPS.
+- **Postgres as source of truth** is required for correctness under contention (custom aliases, branded domains) and auditability.
+- **Outbox-based propagation** is required for reliable, replayable convergence from strong writes to an eventually consistent edge read model.
+- **An OLAP store** is required to query billions/day of events efficiently without impacting redirect latency.
+
+---
+
+## Components
+
+### Edge Redirect Worker
+**Responsibilities**
+- Parse `{hostname, alias}` and apply rate limiting.
+- Read a **takedown override key** first for fast enforcement.
+- Fetch redirect record from edge KV and enforce `state` and `expires_at` on every request.
+- Emit click events asynchronously (best-effort) to the analytics ingest endpoint.
+
+**Redirect outcomes**
+- `3xx` for active links.
+- `404` for unknown aliases (optionally used to reduce enumeration signals).
+- `410` for expired links (optional policy).
+- `451` (or a safe landing page) for takedown/blocked.
+
+**Fast takedown**
+- Edge KV stores a small override key per `{hostname, alias}` (e.g., `blocked_until_ms`) with short TTL; the Link API refreshes it while a takedown is active.
+
+### Link API (Modular Monolith)
+**Responsibilities**
+- Create/update/disable/takedown links; manage domains and tenants.
+- Enforce alias uniqueness and optimistic concurrency (`version`).
+- Run create-time abuse checks (normalization, allow/deny lists, reputation checks).
+- Maintain an outbox to propagate redirect records and takedowns to edge KV.
+- Provide bulk job endpoints and export APIs.
+- Ingest click events and write rollups to OLAP.
+
+**Concurrency**
+- Alias uniqueness: Postgres unique constraint on `(domain_id, alias)`.
+- Updates: `If-Match` / `version` optimistic concurrency to prevent lost updates.
+- Idempotency: store `(tenant_id, key) -> response` for safe retries.
+
+---
+
+## Data Model
+
+### Postgres (Source of Truth)
+
+**`tenants`**
+- `tenant_id (pk)`, `name`, `plan`, `created_at`
+
+**`domains`**
+- `domain_id (pk)`, `tenant_id (fk)`, `hostname (unique)`, `status`, `created_at`
+
+**`links`**
+- `link_id (pk, ULID/UUIDv7)`, `tenant_id (fk)`, `domain_id (fk)`
+- `alias (varchar)`, `destination_url (text)`
+- `http_status (int)`, `preserve_query (bool)`, `utm_append (jsonb, nullable)`
+- `state (enum: active|disabled|expired|takedown)`
+- `expires_at (timestamp, nullable)`
+- `version (bigint)`, `created_at`, `updated_at`
+- Indexes:
+  - Unique: `(domain_id, alias)`
+  - Ops: `(tenant_id, created_at)`, `(tenant_id, state)`
+
+**`alias_tombstones`**
+- `(domain_id, alias)` unique, `tombstone_until`, `reason`
+- Prevents immediate alias reuse after deletion/expiry per policy.
+
+**`abuse_verdicts`** (optional but practical)
+- `subject_type`, `subject_key`, `verdict (allow|block|challenge)`, `reason`, `source`, `confidence`, `expires_at`
+- Used for both create-time and operational rescans.
+
+**`idempotency_keys`**
+- `(tenant_id, key)` unique, `request_hash`, `response_blob`, `created_at`, `expires_at`
+
+**`outbox_events`**
+- `event_id (pk)`, `event_type`, `aggregate_key` (e.g., `{hostname}:{alias}`), `payload (jsonb)`, `created_at`, `processed_at (nullable)`
+- Drives reliable propagation to edge KV and takedown overrides.
+
+**`bulk_jobs` / `bulk_job_items`** (optional)
+- Tracks async batch operations and per-item results.
+
+### Edge KV Record (Redirect Read Model)
+- Key: `{hostname}:{alias}`
+- Value:
+  - `link_id`, `tenant_id`
+  - `destination_url`, `http_status`
+  - `preserve_query`, `utm_append`, `safe_landing_mode`
+  - `state`, `expires_at_ms`, `version`
+
+### Edge KV Takedown Override
+- Key: `{hostname}:{alias}:blocked`
+- Value: `{blocked_until_ms, reason_code}`
+- Short TTL; refreshed while takedown is active for fast global convergence.
+
+---
+
+## Data Flows
+
+### Create/Update Link (Strong + Propagate)
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant API as Link API
+  participant PG as Postgres
+  participant KV as Edge KV
+
+  C->>API: POST/PATCH (Idempotency-Key / If-Match)
+  API->>API: Validate + abuse checks
+  API->>PG: TX: upsert link, bump version
+  API->>PG: TX: insert outbox event (LinkUpserted)
+  PG-->>API: Commit
+  API-->>C: 200/201 (link_id, version)
+  API->>KV: Async: write redirect record (via outbox worker)
+```
+
+### Redirect (Edge Only)
+```mermaid
+sequenceDiagram
+  participant U as User
+  participant EW as Edge Worker
+  participant KV as Edge KV
+
+  U->>EW: GET https://brand.tld/alias
+  EW->>KV: GET {host}:{alias}:blocked
+  alt blocked
+    EW-->>U: 451 / Safe Landing
+  else not blocked
+    EW->>KV: GET {host}:{alias}
+    EW->>EW: Enforce state + expires_at_ms
+    EW-->>U: 3xx / 404 / 410
+  end
+```
+
+### Takedown (Fast Path)
+```mermaid
+sequenceDiagram
+  participant Ops as Admin/Ops
+  participant API as Link API
+  participant PG as Postgres
+  participant KV as Edge KV
+
+  Ops->>API: POST /links/{id}/takedown
+  API->>PG: TX: state=takedown, version++
+  API->>PG: TX: outbox LinkTakedown
+  PG-->>API: Commit
+  API-->>Ops: 200 OK
+  API->>KV: Async: set {host}:{alias}:blocked (short TTL)
+  API->>KV: Async: update redirect record state=takedown
+```
+
+---
+
+## API Design (Minimal)
+
+### Create Link
+- `POST /v1/links` with `Idempotency-Key`
+- Returns `link_id`, `short_url`, `version`, `state`, `expires_at`
+
+### Update Link
+- `PATCH /v1/links/{link_id}` with `If-Match: "<version>"`
+- Returns updated `version`
+
+### Takedown / Disable / Enable
+- `POST /v1/links/{link_id}/takedown`
+- `POST /v1/links/{link_id}/disable`
+- `POST /v1/links/{link_id}/enable`
+
+### Resolve (Debug)
+- `GET /v1/resolve/{domain}/{alias}`
+- Returns the canonical redirect record from Postgres plus current propagated version (useful for troubleshooting).
+
+### Bulk
+- `POST /v1/bulk/links` → `job_id`
+- `GET /v1/bulk/jobs/{job_id}`
+
+### Analytics (Aggregated)
+- `GET /v1/analytics/links/{link_id}?from=...&to=...&granularity=hour`
+
+---
+
+## Scaling & Performance
+
+- **Redirects:** edge worker + edge KV keeps latency low and avoids centralized hot paths.
+- **Hot keys (viral links):** edge KV and POP-local caching absorb bursts; rate limiting reduces abuse amplification.
+- **Propagation:** outbox worker runs continuously; takedown events are prioritized and set the override key first.
+- **Analytics ingestion:** edge posts small events; the Link API batches inserts and rollups to OLAP to keep per-event overhead low.
+- **Expiration churn:** edge KV records use TTL aligned to `expires_at` while still enforcing `expires_at_ms` at read time.
+
+---
+
+## Failure Modes & Mitigations
+
+- **Edge KV degraded/unavailable:** edge worker serves stale POP cache where available; otherwise returns a safe error response. Redirect correctness is still enforced via `state`/`expires_at_ms` when cached.
+- **Postgres outage:** management APIs fail closed; redirects continue from edge KV.
+- **Propagation lag:** metrics track outbox backlog age; takedown uses a dedicated override key with short TTL and prioritized processing.
+- **Abuse spikes/enumeration:** edge rate limits, negative caching for not-found, and tenant/domain throttles on management endpoints.
+
+---
+
+## Operations & Security
+
+- **Observability:** redirect latency/codes by POP; edge KV hit/miss; outbox backlog age; management error rates; takedown time-to-effect; analytics ingestion lag.
+- **Privacy:** hash/truncate IPs; minimize raw UA storage; retention controls by tenant/plan.
+- **Safety:** strict URL validation (scheme allowlist, punycode normalization); audit log for privileged actions; least-privilege credentials for edge KV writes from the Link API.
+
+---
+
+## Simplification Notes
+
+- Removed: `Kafka/PubSub` event bus; propagation uses `outbox_events` in Postgres for reliable replay and operational simplicity.
+- Removed: separate `Abuse & Policy Service`, `Bulk/Async Jobs` service, and `KV materializer`; consolidated into the single `Link API` codebase with background workers.
+- Removed: dedicated `Redis/Memcache` layer; edge KV is the redirect read model, and control-plane caching uses TTL tables and small in-process caches.
+- Merged: click collection into the `Link API` as an ingest endpoint; batching handles throughput while keeping redirect latency isolated at the edge.
+- Complexity that remains: edge execution + edge KV (global latency/availability), Postgres constraints/versioning (correctness under contention), outbox propagation (convergence), OLAP analytics store (billions/day queryability).
+```
+Done: url-shortener

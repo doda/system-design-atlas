@@ -1,0 +1,1552 @@
+==========================================
+Generating (v2): Key Management System (KMS)
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2ece-7bf0-860d-f014ede41107
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Key Management System (KMS)
+**Category**: Security & Access Control
+
+**Problem Statement**:
+Design a service for generating and managing cryptographic keys, supporting rotation and hardware-backed storage.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+thinking
+**Considering design elements**
+
+I think design should definitely incorporate client-side caching with TTL and limits. There are some operational notes to consider, like dual control, tamper-evident audit logs, and key usage metrics. Choosing between Postgres or NATS for data storage seems tough. For queuing, I’m leaning towards SQS for simplicity over Kafka. Append-only audit logs need to be stored with WORM for immutability. For authentication, I’m considering OPA, but I might keep it simple by using company IAM policies with key policies evaluated against JWT claims.
+thinking
+**Refining policy articulate**
+
+I'm thinking it's elegant to keep policy expressiveness focused on manageable concepts. It's key to teach the non-obvious ideas, like limiting policy language and separating authorization from cryptography. Another important insight is that HSMs are for key wrapping/unwrapping, not data plane encryption, and that rotation is primarily a metadata flip with a potential background rewrap. So the architecture flow would be: Clients -> KMS API -> AuthZ -> Crypto Engine (HSM) -> Metadata store (Postgres) -> Audit log. Plus, I'll need a queue for rotation/rewrap, totaling six nodes. And of course, I should mention hardware-backed storage with HSM clusters. Let's document this in Markdown with YAML front matter!
+codex
+```markdown
+---
+title: "Key Management System (KMS)"
+category: "Security & Access Control"
+difficulty: "Hard"
+tags: ["security", "kms", "hsm", "envelope-encryption", "key-rotation", "audit", "compliance"]
+---
+
+## Overview
+
+This KMS generates and manages cryptographic keys with **hardware-backed root protection**, **versioned rotation**, and **high-integrity auditability**. The elegant core is a strict split between two planes: an **HSM-backed key-wrapping control plane** and a **high-throughput data plane that never asks the HSM to encrypt your data**—it only asks the HSM to protect the keys that encrypt your data.
+
+The key insight: treat “encryption” as **envelope encryption**. Applications encrypt payloads locally with fast symmetric DEKs, while the KMS/HSM protects CMKs that **wrap/unwrap** those DEKs. This keeps performance predictable, makes rotation a metadata problem, and confines the blast radius of compromise.
+
+## What Makes This Hard
+
+Naive KMS designs fail in two places:
+
+1. **They turn the HSM into the data plane.** If every Encrypt/Decrypt streams bytes through the KMS/HSM, you inherit HSM throughput limits, latency spikes, and operational fragility. Teams then add caches or shortcuts that quietly violate security boundaries.
+2. **They treat rotation as “replace the key.”** Real systems have ciphertext produced across months/years; rotation must preserve decryptability, support gradual migration, and produce forensics-grade audit trails without turning every service into a crypto expert.
+
+## Requirements
+
+### Functional Requirements
+- **CMK lifecycle**: create, disable, schedule deletion, rotate (new version), aliasing (stable key names).
+- **Envelope encryption primitives**:
+  - `GenerateDataKey`: return plaintext DEK + DEK wrapped under CMK.
+  - `DecryptDataKey`: unwrap wrapped DEK under an allowed CMK version.
+  - `ReEncrypt`: unwrap under old CMK version and rewrap under new version (no plaintext DEK leaves the service).
+- **Hardware-backed storage**: CMK private material never leaves HSM in plaintext; all CMK wrap/unwrap performed inside HSM.
+- **Strong authorization**: per-key policy for operations (`GenerateDataKey`, `DecryptDataKey`, `ReEncrypt`, admin actions).
+- **Audit**: append-only, tamper-evident log of every key operation and admin change.
+- **Multi-AZ availability**: tolerate AZ loss without losing keys or violating policy enforcement.
+
+### Scale Targets
+- **Key inventory**: 50k CMKs, average 5 versions each (rotation history + overlap).
+- **Traffic**: 3k RPS steady, 15k RPS peak for `GenerateDataKey`/`DecryptDataKey` (driven by storage/object encryption, session token sealing, etc.).
+- **Latency**: p99 < 25ms for data-key ops (HSM op dominates; target 5–10ms HSM + network + auth).
+- **Audit throughput**: 20k events/sec peak, with end-to-end durability < 2s.
+These numbers matter because HSMs scale differently than stateless services: you size for **HSM ops/sec**, not CPU.
+
+## Key Design Decisions
+
+- **We chose envelope encryption with DEKs generated per object/record**
+  - Rejected: encrypting application payloads inside KMS
+  - Why: keeps HSM out of the data plane, makes throughput linear with stateless API replicas, and confines HSM usage to wrap/unwrap.
+
+- **We chose versioned CMKs with “primary version” and backward decrypt**
+  - Rejected: “rotation replaces key” semantics
+  - Why: rotation becomes a safe pointer flip for new writes while old ciphertext remains decryptable; migration becomes a controlled background process.
+
+- **We chose a deliberately small policy model (ABAC-lite), not a general-purpose policy language**
+  - Rejected: embedding a full DSL that on-call must debug
+  - Why: KMS authorization must be explainable under incident pressure; limited expressiveness yields reliable reasoning and fewer bypasses.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[Workloads] --> B[KMS API]
+  B --> C[AuthZ Policy]
+  B --> D[HSM Cluster]
+  B --> E[(Postgres Metadata)]
+  B --> F[Audit Log]
+  B --> G[Rotation Worker]
+  G --> D
+  G --> E
+```
+
+### Components
+
+- **KMS API**: stateless gRPC/HTTP service that validates requests, enforces policy, calls HSM, and emits audit events. Statelessness is what lets you scale the service normally.
+- **AuthZ Policy**: per-key policies stored with the key (and cached in-memory). Policy evaluation uses request identity (mTLS SPIFFE ID or OIDC subject), action, environment (prod/dev), and key tags.
+- **HSM Cluster**: holds CMK material and performs wrap/unwrap/sign operations. Multi-AZ HSMs with quorum-backed key creation (dual control).
+- **Postgres Metadata**: source of truth for key aliases, versions, state machine, policies, and idempotency tokens. Postgres earns its place because consistency matters more than horizontal scale here.
+- **Audit Log**: append-only event stream persisted to WORM-capable storage (e.g., object lock) for tamper resistance; indexed for search but anchored by immutable storage.
+- **Rotation Worker**: asynchronous jobs for scheduled rotation, rewrap campaigns, and key state transitions; keeps the API fast and predictable.
+
+## Deep Dive: Rotation Without Breaking Decrypt
+
+The hard part is making rotation **operationally boring**. The trick is to define a key as an *identity* (alias) with *versions*, and make ciphertext reference the alias + version used to wrap the DEK.
+
+**State model**
+- Key alias (e.g., `payments/pii`) points to a **primary version** for new encryptions.
+- Each version has state: `Enabled`, `Disabled`, `PendingDeletion`.
+- `DecryptDataKey` accepts any `Enabled` version; `GenerateDataKey` uses only the primary `Enabled` version.
+
+**Rotation flow**
+1. Create new key version inside the HSM; store version metadata in Postgres.
+2. Atomically flip alias primary to the new version (single transaction).
+3. From that point forward, all new writes use the new version automatically—no client coordination.
+4. Old ciphertext continues to decrypt because old versions remain `Enabled` for a defined overlap window (e.g., 90 days).
+
+**Rewrapping (optional but often required)**
+- When you want to retire old versions, you run a background **rewrap campaign**:
+  - The client (or a batch job) submits wrapped DEKs (or references) to `ReEncrypt`.
+  - KMS unwraps the DEK under old version inside HSM boundaries and immediately rewraps under the primary version.
+  - KMS never returns plaintext DEKs for `ReEncrypt`; it returns only the rewrapped DEK blob.
+- This is the subtle win: rotation does not require bulk data re-encryption. You rewrap keys, not terabytes.
+
+**Guardrails**
+- Idempotency tokens on write APIs prevent duplicate versions and double-rotation during retries.
+- Dual-control for destructive actions (disable/delete) via approval workflow integrated with IAM.
+- A “break-glass” role exists but is noisy: every use pages security and produces high-severity audit events.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Security boundaries (HSM stays authoritative) | Some latency per key operation |
+| Simple, explainable rotation | Less flexible policy expressiveness |
+| Strong consistency for key state | Postgres becomes a critical dependency |
+| Audit integrity & forensics | Higher storage/processing cost for logs |
+
+## Failure Modes
+
+- **HSM partial outage (one AZ)**
+  - Happens: elevated latency / errors for wrap/unwrap, some keys unavailable if capacity drops.
+  - Detect: HSM op error rate, queue depth for rotation jobs, p99 latency spikes.
+  - Recover: fail over to healthy AZ HSMs, shed non-essential ops (pause rewrap), keep decrypt prioritized via per-op rate limits.
+
+- **Postgres unavailable**
+  - Happens: cannot resolve aliases/policies/version states; KMS must fail closed.
+  - Detect: DB health checks + transaction error rate; sudden increase in 5xx.
+  - Recover: automatic failover (managed HA), read replicas don’t help for correctness; keep a small in-memory cache for *metadata reads* but never for bypassing state transitions.
+
+- **Audit pipeline degradation**
+  - Happens: risk of losing forensic visibility; compliance impact.
+  - Detect: audit enqueue failures, lag to durable store, missing sequence gaps.
+  - Recover: API continues only if audit is durably accepted (local WAL/spool). If durable audit can’t be guaranteed, KMS rejects requests rather than operating “silently.”
+
+## What I'd Do Differently At...
+
+- **10x scale:** introduce regional shards of KMS API + HSM capacity; add client-side DEK caching with strict TTL and key-usage limits to cut steady-state RPS without weakening security posture.
+- **100x scale:** move to multi-region active-active with regional CMKs and deterministic routing; redesign audit indexing separately from immutable storage; implement per-tenant isolation at the HSM partition level.
+
+## Operational Notes
+
+- Treat **HSM ops/sec** as your real capacity metric; everything else is secondary.
+- Use **per-operation rate limits** so `ReEncrypt` can’t starve `DecryptDataKey` during incidents.
+- Key state changes must be **transactional** (alias flip + version enablement) and always audited.
+- Run regular drills: restore from backups, HSM AZ loss, and “compromised workload identity” scenarios (prove authZ stops it).
+```
+tokens used
+3,354
+```markdown
+---
+title: "Key Management System (KMS)"
+category: "Security & Access Control"
+difficulty: "Hard"
+tags: ["security", "kms", "hsm", "envelope-encryption", "key-rotation", "audit", "compliance"]
+---
+
+## Overview
+
+This KMS generates and manages cryptographic keys with **hardware-backed root protection**, **versioned rotation**, and **high-integrity auditability**. The elegant core is a strict split between two planes: an **HSM-backed key-wrapping control plane** and a **high-throughput data plane that never asks the HSM to encrypt your data**—it only asks the HSM to protect the keys that encrypt your data.
+
+The key insight: treat “encryption” as **envelope encryption**. Applications encrypt payloads locally with fast symmetric DEKs, while the KMS/HSM protects CMKs that **wrap/unwrap** those DEKs. This keeps performance predictable, makes rotation a metadata problem, and confines the blast radius of compromise.
+
+## What Makes This Hard
+
+Naive KMS designs fail in two places:
+
+1. **They turn the HSM into the data plane.** If every Encrypt/Decrypt streams bytes through the KMS/HSM, you inherit HSM throughput limits, latency spikes, and operational fragility. Teams then add caches or shortcuts that quietly violate security boundaries.
+2. **They treat rotation as “replace the key.”** Real systems have ciphertext produced across months/years; rotation must preserve decryptability, support gradual migration, and produce forensics-grade audit trails without turning every service into a crypto expert.
+
+## Requirements
+
+### Functional Requirements
+- **CMK lifecycle**: create, disable, schedule deletion, rotate (new version), aliasing (stable key names).
+- **Envelope encryption primitives**:
+  - `GenerateDataKey`: return plaintext DEK + DEK wrapped under CMK.
+  - `DecryptDataKey`: unwrap wrapped DEK under an allowed CMK version.
+  - `ReEncrypt`: unwrap under old CMK version and rewrap under new version (no plaintext DEK leaves the service).
+- **Hardware-backed storage**: CMK private material never leaves HSM in plaintext; all CMK wrap/unwrap performed inside HSM.
+- **Strong authorization**: per-key policy for operations (`GenerateDataKey`, `DecryptDataKey`, `ReEncrypt`, admin actions).
+- **Audit**: append-only, tamper-evident log of every key operation and admin change.
+- **Multi-AZ availability**: tolerate AZ loss without losing keys or violating policy enforcement.
+
+### Scale Targets
+- **Key inventory**: 50k CMKs, average 5 versions each (rotation history + overlap).
+- **Traffic**: 3k RPS steady, 15k RPS peak for `GenerateDataKey`/`DecryptDataKey` (driven by storage/object encryption, session token sealing, etc.).
+- **Latency**: p99 < 25ms for data-key ops (HSM op dominates; target 5–10ms HSM + network + auth).
+- **Audit throughput**: 20k events/sec peak, with end-to-end durability < 2s.
+These numbers matter because HSMs scale differently than stateless services: you size for **HSM ops/sec**, not CPU.
+
+## Key Design Decisions
+
+- **We chose envelope encryption with DEKs generated per object/record**
+  - Rejected: encrypting application payloads inside KMS
+  - Why: keeps HSM out of the data plane, makes throughput linear with stateless API replicas, and confines HSM usage to wrap/unwrap.
+
+- **We chose versioned CMKs with “primary version” and backward decrypt**
+  - Rejected: “rotation replaces key” semantics
+  - Why: rotation becomes a safe pointer flip for new writes while old ciphertext remains decryptable; migration becomes a controlled background process.
+
+- **We chose a deliberately small policy model (ABAC-lite), not a general-purpose policy language**
+  - Rejected: embedding a full DSL that on-call must debug
+  - Why: KMS authorization must be explainable under incident pressure; limited expressiveness yields reliable reasoning and fewer bypasses.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[Workloads] --> B[KMS API]
+  B --> C[AuthZ Policy]
+  B --> D[HSM Cluster]
+  B --> E[(Postgres Metadata)]
+  B --> F[Audit Log]
+  B --> G[Rotation Worker]
+  G --> D
+  G --> E
+```
+
+### Components
+
+- **KMS API**: stateless gRPC/HTTP service that validates requests, enforces policy, calls HSM, and emits audit events. Statelessness is what lets you scale the service normally.
+- **AuthZ Policy**: per-key policies stored with the key (and cached in-memory). Policy evaluation uses request identity (mTLS SPIFFE ID or OIDC subject), action, environment (prod/dev), and key tags.
+- **HSM Cluster**: holds CMK material and performs wrap/unwrap/sign operations. Multi-AZ HSMs with quorum-backed key creation (dual control).
+- **Postgres Metadata**: source of truth for key aliases, versions, state machine, policies, and idempotency tokens. Postgres earns its place because consistency matters more than horizontal scale here.
+- **Audit Log**: append-only event stream persisted to WORM-capable storage (e.g., object lock) for tamper resistance; indexed for search but anchored by immutable storage.
+- **Rotation Worker**: asynchronous jobs for scheduled rotation, rewrap campaigns, and key state transitions; keeps the API fast and predictable.
+
+## Deep Dive: Rotation Without Breaking Decrypt
+
+The hard part is making rotation **operationally boring**. The trick is to define a key as an *identity* (alias) with *versions*, and make ciphertext reference the alias + version used to wrap the DEK.
+
+**State model**
+- Key alias (e.g., `payments/pii`) points to a **primary version** for new encryptions.
+- Each version has state: `Enabled`, `Disabled`, `PendingDeletion`.
+- `DecryptDataKey` accepts any `Enabled` version; `GenerateDataKey` uses only the primary `Enabled` version.
+
+**Rotation flow**
+1. Create new key version inside the HSM; store version metadata in Postgres.
+2. Atomically flip alias primary to the new version (single transaction).
+3. From that point forward, all new writes use the new version automatically—no client coordination.
+4. Old ciphertext continues to decrypt because old versions remain `Enabled` for a defined overlap window (e.g., 90 days).
+
+**Rewrapping (optional but often required)**
+- When you want to retire old versions, you run a background **rewrap campaign**:
+  - The client (or a batch job) submits wrapped DEKs (or references) to `ReEncrypt`.
+  - KMS unwraps the DEK under old version inside HSM boundaries and immediately rewraps under the primary version.
+  - KMS never returns plaintext DEKs for `ReEncrypt`; it returns only the rewrapped DEK blob.
+- This is the subtle win: rotation does not require bulk data re-encryption. You rewrap keys, not terabytes.
+
+**Guardrails**
+- Idempotency tokens on write APIs prevent duplicate versions and double-rotation during retries.
+- Dual-control for destructive actions (disable/delete) via approval workflow integrated with IAM.
+- A “break-glass” role exists but is noisy: every use pages security and produces high-severity audit events.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Security boundaries (HSM stays authoritative) | Some latency per key operation |
+| Simple, explainable rotation | Less flexible policy expressiveness |
+| Strong consistency for key state | Postgres becomes a critical dependency |
+| Audit integrity & forensics | Higher storage/processing cost for logs |
+
+## Failure Modes
+
+- **HSM partial outage (one AZ)**
+  - Happens: elevated latency / errors for wrap/unwrap, some keys unavailable if capacity drops.
+  - Detect: HSM op error rate, queue depth for rotation jobs, p99 latency spikes.
+  - Recover: fail over to healthy AZ HSMs, shed non-essential ops (pause rewrap), keep decrypt prioritized via per-op rate limits.
+
+- **Postgres unavailable**
+  - Happens: cannot resolve aliases/policies/version states; KMS must fail closed.
+  - Detect: DB health checks + transaction error rate; sudden increase in 5xx.
+  - Recover: automatic failover (managed HA), read replicas don’t help for correctness; keep a small in-memory cache for *metadata reads* but never for bypassing state transitions.
+
+- **Audit pipeline degradation**
+  - Happens: risk of losing forensic visibility; compliance impact.
+  - Detect: audit enqueue failures, lag to durable store, missing sequence gaps.
+  - Recover: API continues only if audit is durably accepted (local WAL/spool). If durable audit can’t be guaranteed, KMS rejects requests rather than operating “silently.”
+
+## What I'd Do Differently At...
+
+- **10x scale:** introduce regional shards of KMS API + HSM capacity; add client-side DEK caching with strict TTL and key-usage limits to cut steady-state RPS without weakening security posture.
+- **100x scale:** move to multi-region active-active with regional CMKs and deterministic routing; redesign audit indexing separately from immutable storage; implement per-tenant isolation at the HSM partition level.
+
+## Operational Notes
+
+- Treat **HSM ops/sec** as your real capacity metric; everything else is secondary.
+- Use **per-operation rate limits** so `ReEncrypt` can’t starve `DecryptDataKey` during incidents.
+- Key state changes must be **transactional** (alias flip + version enablement) and always audited.
+- Run regular drills: restore from backups, HSM AZ loss, and “compromised workload identity” scenarios (prove authZ stops it).
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/key-management-system.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-b32c-76d3-a4fe-1da2c80baaac
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Key Management System (KMS)"
+category: "Security & Access Control"
+difficulty: "Hard"
+tags: ["security", "kms", "hsm", "envelope-encryption", "key-rotation", "audit", "compliance"]
+---
+
+## Overview
+
+This KMS generates and manages cryptographic keys with **hardware-backed root protection**, **versioned rotation**, and **high-integrity auditability**. The elegant core is a strict split between two planes: an **HSM-backed key-wrapping control plane** and a **high-throughput data plane that never asks the HSM to encrypt your data**—it only asks the HSM to protect the keys that encrypt your data.
+
+The key insight: treat “encryption” as **envelope encryption**. Applications encrypt payloads locally with fast symmetric DEKs, while the KMS/HSM protects CMKs that **wrap/unwrap** those DEKs. This keeps performance predictable, makes rotation a metadata problem, and confines the blast radius of compromise.
+
+## What Makes This Hard
+
+Naive KMS designs fail in two places:
+
+1. **They turn the HSM into the data plane.** If every Encrypt/Decrypt streams bytes through the KMS/HSM, you inherit HSM throughput limits, latency spikes, and operational fragility. Teams then add caches or shortcuts that quietly violate security boundaries.
+2. **They treat rotation as “replace the key.”** Real systems have ciphertext produced across months/years; rotation must preserve decryptability, support gradual migration, and produce forensics-grade audit trails without turning every service into a crypto expert.
+
+## Requirements
+
+### Functional Requirements
+- **CMK lifecycle**: create, disable, schedule deletion, rotate (new version), aliasing (stable key names).
+- **Envelope encryption primitives**:
+  - `GenerateDataKey`: return plaintext DEK + DEK wrapped under CMK.
+  - `DecryptDataKey`: unwrap wrapped DEK under an allowed CMK version.
+  - `ReEncrypt`: unwrap under old CMK version and rewrap under new version (no plaintext DEK leaves the service).
+- **Hardware-backed storage**: CMK private material never leaves HSM in plaintext; all CMK wrap/unwrap performed inside HSM.
+- **Strong authorization**: per-key policy for operations (`GenerateDataKey`, `DecryptDataKey`, `ReEncrypt`, admin actions).
+- **Audit**: append-only, tamper-evident log of every key operation and admin change.
+- **Multi-AZ availability**: tolerate AZ loss without losing keys or violating policy enforcement.
+
+### Scale Targets
+- **Key inventory**: 50k CMKs, average 5 versions each (rotation history + overlap).
+- **Traffic**: 3k RPS steady, 15k RPS peak for `GenerateDataKey`/`DecryptDataKey` (driven by storage/object encryption, session token sealing, etc.).
+- **Latency**: p99 < 25ms for data-key ops (HSM op dominates; target 5–10ms HSM + network + auth).
+- **Audit throughput**: 20k events/sec peak, with end-to-end durability < 2s.
+These numbers matter because HSMs scale differently than stateless services: you size for **HSM ops/sec**, not CPU.
+
+## Key Design Decisions
+
+- **We chose envelope encryption with DEKs generated per object/record**
+  - Rejected: encrypting application payloads inside KMS
+  - Why: keeps HSM out of the data plane, makes throughput linear with stateless API replicas, and confines HSM usage to wrap/unwrap.
+
+- **We chose versioned CMKs with “primary version” and backward decrypt**
+  - Rejected: “rotation replaces key” semantics
+  - Why: rotation becomes a safe pointer flip for new writes while old ciphertext remains decryptable; migration becomes a controlled background process.
+
+- **We chose a deliberately small policy model (ABAC-lite), not a general-purpose policy language**
+  - Rejected: embedding a full DSL that on-call must debug
+  - Why: KMS authorization must be explainable under incident pressure; limited expressiveness yields reliable reasoning and fewer bypasses.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[Workloads] --> B[KMS API]
+  B --> C[AuthZ Policy]
+  B --> D[HSM Cluster]
+  B --> E[(Postgres Metadata)]
+  B --> F[Audit Log]
+  B --> G[Rotation Worker]
+  G --> D
+  G --> E
+```
+
+### Components
+
+- **KMS API**: stateless gRPC/HTTP service that validates requests, enforces policy, calls HSM, and emits audit events. Statelessness is what lets you scale the service normally.
+- **AuthZ Policy**: per-key policies stored with the key (and cached in-memory). Policy evaluation uses request identity (mTLS SPIFFE ID or OIDC subject), action, environment (prod/dev), and key tags.
+- **HSM Cluster**: holds CMK material and performs wrap/unwrap/sign operations. Multi-AZ HSMs with quorum-backed key creation (dual control).
+- **Postgres Metadata**: source of truth for key aliases, versions, state machine, policies, and idempotency tokens. Postgres earns its place because consistency matters more than horizontal scale here.
+- **Audit Log**: append-only event stream persisted to WORM-capable storage (e.g., object lock) for tamper resistance; indexed for search but anchored by immutable storage.
+- **Rotation Worker**: asynchronous jobs for scheduled rotation, rewrap campaigns, and key state transitions; keeps the API fast and predictable.
+
+## Deep Dive: Rotation Without Breaking Decrypt
+
+The hard part is making rotation **operationally boring**. The trick is to define a key as an *identity* (alias) with *versions*, and make ciphertext reference the alias + version used to wrap the DEK.
+
+**State model**
+- Key alias (e.g., `payments/pii`) points to a **primary version** for new encryptions.
+- Each version has state: `Enabled`, `Disabled`, `PendingDeletion`.
+- `DecryptDataKey` accepts any `Enabled` version; `GenerateDataKey` uses only the primary `Enabled` version.
+
+**Rotation flow**
+1. Create new key version inside the HSM; store version metadata in Postgres.
+2. Atomically flip alias primary to the new version (single transaction).
+3. From that point forward, all new writes use the new version automatically—no client coordination.
+4. Old ciphertext continues to decrypt because old versions remain `Enabled` for a defined overlap window (e.g., 90 days).
+
+**Rewrapping (optional but often required)**
+- When you want to retire old versions, you run a background **rewrap campaign**:
+  - The client (or a batch job) submits wrapped DEKs (or references) to `ReEncrypt`.
+  - KMS unwraps the DEK under old version inside HSM boundaries and immediately rewraps under the primary version.
+  - KMS never returns plaintext DEKs for `ReEncrypt`; it returns only the rewrapped DEK blob.
+- This is the subtle win: rotation does not require bulk data re-encryption. You rewrap keys, not terabytes.
+
+**Guardrails**
+- Idempotency tokens on write APIs prevent duplicate versions and double-rotation during retries.
+- Dual-control for destructive actions (disable/delete) via approval workflow integrated with IAM.
+- A “break-glass” role exists but is noisy: every use pages security and produces high-severity audit events.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Security boundaries (HSM stays authoritative) | Some latency per key operation |
+| Simple, explainable rotation | Less flexible policy expressiveness |
+| Strong consistency for key state | Postgres becomes a critical dependency |
+| Audit integrity & forensics | Higher storage/processing cost for logs |
+
+## Failure Modes
+
+- **HSM partial outage (one AZ)**
+  - Happens: elevated latency / errors for wrap/unwrap, some keys unavailable if capacity drops.
+  - Detect: HSM op error rate, queue depth for rotation jobs, p99 latency spikes.
+  - Recover: fail over to healthy AZ HSMs, shed non-essential ops (pause rewrap), keep decrypt prioritized via per-op rate limits.
+
+- **Postgres unavailable**
+  - Happens: cannot resolve aliases/policies/version states; KMS must fail closed.
+  - Detect: DB health checks + transaction error rate; sudden increase in 5xx.
+  - Recover: automatic failover (managed HA), read replicas don’t help for correctness; keep a small in-memory cache for *metadata reads* but never for bypassing state transitions.
+
+- **Audit pipeline degradation**
+  - Happens: risk of losing forensic visibility; compliance impact.
+  - Detect: audit enqueue failures, lag to durable store, missing sequence gaps.
+  - Recover: API continues only if audit is durably accepted (local WAL/spool). If durable audit can’t be guaranteed, KMS rejects requests rather than operating “silently.”
+
+## What I'd Do Differently At...
+
+- **10x scale:** introduce regional shards of KMS API + HSM capacity; add client-side DEK caching with strict TTL and key-usage limits to cut steady-state RPS without weakening security posture.
+- **100x scale:** move to multi-region active-active with regional CMKs and deterministic routing; redesign audit indexing separately from immutable storage; implement per-tenant isolation at the HSM partition level.
+
+## Operational Notes
+
+- Treat **HSM ops/sec** as your real capacity metric; everything else is secondary.
+- Use **per-operation rate limits** so `ReEncrypt` can’t starve `DecryptDataKey` during incidents.
+- Key state changes must be **transactional** (alias flip + version enablement) and always audited.
+- Run regular drills: restore from backups, HSM AZ loss, and “compromised workload identity” scenarios (prove authZ stops it).
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+Reconnecting... 1/5
+
+
+
+
+
+thinking
+**Providing structured critique**
+
+I need to create a structured critique without using any tools. I'll highlight the core insights and components that could be simplified. For instance, we might consider using Postgres for audit purposes through logical replication. Alternatively, Kafka combined with S3 could replace custom solutions. I wonder if the audit log could be simplified with immutability. Stress tests must include scenarios like database downtime, HSM slowdowns, and configuration mistakes. Lastly, I should define cache semantics and make sure the audit spool is tamper-evident.
+thinking
+**Structuring encryption and audit strategies**
+
+I need to ensure nonce and IV are generated per request. Since GenerateDataKey returns plaintext DEK, clients must handle it securely, so I might suggest the `GenerateDataKeyWithoutPlaintext` option. Caching data keys can reduce HSM load, but it comes with trade-offs. For simplification, perhaps managed KMS/HSM options like HashiCorp Vault with HSM backend or AWS KMS could work, but I might lean towards open-source solutions. For audit, utilizing Postgres append-only tables combined with a hash chain could streamline things. Smaller teams might prefer a simpler setup using Postgres and S3.
+thinking
+**Identifying HSM design issues**
+
+I need to address potential failures with the HSM cluster, particularly since key creation requires a quorum. What happens if an AZ becomes isolated? It might be helpful to explore using per-AZ partitions for better resilience. I should outline 3-5 failure scenarios clearly in markdown format while keeping the recommendations succinct yet thorough. 
+
+Core insights involve strict separation of key identity, aliasing versions, and re-wrapping keys instead of data. Simplification opportunities include integrating with existing IAM/OPA/Cedar and leveraging Postgres outbox with S3 object lock for audit logs.
+thinking
+**Addressing performance and encryption responsibilities**
+
+I'm looking at important performance targets, like needing 15k RPS and HSM response times between 5-10ms, which means we could hit 150k operations per second. To achieve this, I might suggest implementing data key caching or batch operations. 
+
+It’s crucial to note that when returning plaintext DEK, it means the service sees it, which is by design. I need to define the responsibilities for envelope encryption, ensuring apps only store wrapped keys. For audit processes, ensuring the audit is accepted before a response is key, perhaps using an outbox pattern to persist logs securely in Postgres while maintaining strong coupling.
+thinking
+**Crafting security and performance strategies**
+
+I'm considering how to handle the decryption of known aliases and think a read-only cache for recent keys and policies could work, with a short TTL to ensure freshness. This cache should be tied to a signed policy snapshot version to maintain fail-closed protocols. 
+
+Keeping a hot cache could allow limited-time access to decrypt keys if the DB is down, though alerting would be essential for that grace mode. I need to ensure that no plaintext DEK leaves the service, particularly in memory. Also, considering key management across multiple AZs, I might suggest using managed services like AWS KMS for simplification. Finally, I should address policy changes during caching and propose a clear structure for documenting sections like Elegance Check, Stress Test, Recommendations, and What's Working Well.
+codex
+## Elegance Check
+
+### The Core Insight
+Envelope encryption + **key identity (alias) with versioned CMKs** turns “rotation” into a safe metadata flip and makes “migration” a **rewrap-of-DEKs** problem, keeping the HSM off the bulk-data path.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| HSM Cluster | Root-of-trust that keeps CMK material non-exportable and constrains the blast radius of a KMS/API compromise. |
+| KMS API (stateless) | Centralizes policy enforcement + idempotency + consistent audit emission; scales independently of HSM capacity. |
+| Postgres Metadata | Strong consistency for alias→primary version, state machine, idempotency tokens, and policy storage. |
+| Rotation Worker | Makes rotation/rewrap operationally boring and keeps latency-sensitive APIs predictable. |
+| Tamper-evident Audit Store | Compliance/forensics-grade trace of every cryptographic/admin action; must survive attacker-in-the-control-plane scenarios. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Separate “Audit Log” pipeline + indexing + WORM storage | **Transactional outbox in Postgres** (append-only audit table in same tx as key ops) + async export to WORM S3/Object Lock | Strong coupling is simpler and safer; Postgres becomes even more critical (but it already is). |
+| In-memory policy cache (unspecified invalidation) | Postgres `LISTEN/NOTIFY` for **cache invalidation** keyed by `key_id/policy_version` | Adds a DB channel dependency; still need fallback when notifications drop. |
+| ReEncrypt described as “unwrap then rewrap” | Prefer **HSM-native rewrap** (unwrap+wrap without releasing plaintext to KMS memory) | Requires HSM support / vendor-specific APIs; otherwise be explicit that plaintext DEK exists in KMS RAM. |
+| Custom “ABAC-lite” evaluator | Use a proven library/model (e.g., **Cedar**, OPA with a constrained policy set, or managed IAM-style statements) while keeping expressiveness limited | More dependencies; but fewer footguns and better tooling (tests, explain, diff). |
+| Rotation worker as a bespoke job system | Use Postgres row-locking + `SKIP LOCKED` as the queue, with **advisory locks** for singleton tasks | Less throughput than a dedicated queue; usually fine for rotation/rewrap workloads. |
+| “Fail closed if Postgres down” as a blanket rule | Add an explicit **degraded-read mode**: allow `DecryptDataKey` for a tiny “hot set” with short-lived, signed metadata snapshots | Improves availability but weakens “always consult source of truth”; needs tight time bounds + loud alerting. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres is down for 5 minutes**
+   - Design’s answer: fail closed; “small in-memory cache for metadata reads but never for bypassing state transitions”
+   - Recommendation: Strengthen — define *exactly* what “fail closed” means per operation (at least `DecryptDataKey` vs admin), and specify cache rules (TTL, required freshness, how disables/deletes propagate).
+
+2. **HSM is slow (not down) and p99 balloons**
+   - Design’s answer: rate-limit per op; shed rewrap first; prioritize decrypt
+   - Recommendation: Strengthen — add backpressure semantics (queue vs reject), tenant fairness, and an explicit capacity model (“HSM ops/sec budget” → max RPS per API) so 10x traffic becomes controlled degradation, not cascading timeouts.
+
+3. **Audit sink is degraded/unavailable**
+   - Design’s answer: API only continues if audit is durably accepted (local WAL/spool); otherwise reject
+   - Recommendation: Strengthen — clarify what “durably accepted” is (fsync to local disk? replicated?), how you prevent spool tampering, and how you drain without reordering/duplication (hash-chain + sequence gaps + checkpointing).
+
+4. **Network partition between KMS API and HSM (or one AZ isolated)**
+   - Design’s answer: partial HSM outage handling at AZ level
+   - Recommendation: Strengthen — define routing/failover policy (stickiness vs any-AZ), what happens to in-flight requests, and how you prevent “split brain” during key creation/dual control workflows.
+
+5. **Bad policy/config deploy accidentally permits decrypt**
+   - Design’s answer: “ABAC-lite” for explainability; break-glass is noisy
+   - Recommendation: Strengthen — require policy change safety rails: staged rollout/canary, automated diff checks (“this change expands principals/actions”), and an emergency “deny-all” kill switch that is itself dual-controlled and audited.
+
+## Recommendations
+
+### Must Fix
+- Make `ReEncrypt` boundary honest: either mandate **HSM rewrap** (plaintext never reaches KMS memory) or explicitly document plaintext DEK exposure in KMS RAM and how it’s protected (process isolation, memory handling, crash dumps, debugging).
+- Specify **audit durability and tamper evidence** end-to-end (hash chain, signed checkpoints/anchors, replay/dup detection, exact semantics of “accepted before response”).
+- Define cache semantics for metadata/policy: **invalidation, TTL, and failure behavior** so “fail closed” remains true under partitions and stale caches.
+
+### Should Consider
+- Collapse audit into a Postgres outbox + WORM export to reduce moving parts while increasing correctness.
+- Add explicit **capacity math** (HSM ops/sec, concurrency limits, retry budgets) and per-tenant fairness to avoid self-inflicted outages under peak/retry storms.
+- Provide a safer API variant: `GenerateDataKeyWithoutPlaintext` (many real KMSes do) for workloads that can avoid handling raw DEKs.
+
+### Nice to Have
+- Formalize key state machine invariants (e.g., “cannot disable primary unless another enabled version exists”) and enforce with DB constraints/transactions.
+- Add “decision ID” to every authZ evaluation (policy version, inputs hash) to make incident forensics and rollbacks faster.
+
+## What's Working Well
+- The **two-plane split** (HSM protects keys, not data) is the right simplicity lever for performance and operability.
+- Versioned aliases + atomic primary flip is a clean, low-coordination rotation story.
+- Treating `ReEncrypt` as “rewrap keys, not terabytes” is the right operational framing.
+- You explicitly prioritize **decrypt availability** over rewrap during incidents and acknowledge Postgres as a correctness dependency (good design honesty).
+tokens used
+2,804
+## Elegance Check
+
+### The Core Insight
+Envelope encryption + **key identity (alias) with versioned CMKs** turns “rotation” into a safe metadata flip and makes “migration” a **rewrap-of-DEKs** problem, keeping the HSM off the bulk-data path.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| HSM Cluster | Root-of-trust that keeps CMK material non-exportable and constrains the blast radius of a KMS/API compromise. |
+| KMS API (stateless) | Centralizes policy enforcement + idempotency + consistent audit emission; scales independently of HSM capacity. |
+| Postgres Metadata | Strong consistency for alias→primary version, state machine, idempotency tokens, and policy storage. |
+| Rotation Worker | Makes rotation/rewrap operationally boring and keeps latency-sensitive APIs predictable. |
+| Tamper-evident Audit Store | Compliance/forensics-grade trace of every cryptographic/admin action; must survive attacker-in-the-control-plane scenarios. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Separate “Audit Log” pipeline + indexing + WORM storage | **Transactional outbox in Postgres** (append-only audit table in same tx as key ops) + async export to WORM S3/Object Lock | Strong coupling is simpler and safer; Postgres becomes even more critical (but it already is). |
+| In-memory policy cache (unspecified invalidation) | Postgres `LISTEN/NOTIFY` for **cache invalidation** keyed by `key_id/policy_version` | Adds a DB channel dependency; still need fallback when notifications drop. |
+| ReEncrypt described as “unwrap then rewrap” | Prefer **HSM-native rewrap** (unwrap+wrap without releasing plaintext to KMS memory) | Requires HSM support / vendor-specific APIs; otherwise be explicit that plaintext DEK exists in KMS RAM. |
+| Custom “ABAC-lite” evaluator | Use a proven library/model (e.g., **Cedar**, OPA with a constrained policy set, or managed IAM-style statements) while keeping expressiveness limited | More dependencies; but fewer footguns and better tooling (tests, explain, diff). |
+| Rotation worker as a bespoke job system | Use Postgres row-locking + `SKIP LOCKED` as the queue, with **advisory locks** for singleton tasks | Less throughput than a dedicated queue; usually fine for rotation/rewrap workloads. |
+| “Fail closed if Postgres down” as a blanket rule | Add an explicit **degraded-read mode**: allow `DecryptDataKey` for a tiny “hot set” with short-lived, signed metadata snapshots | Improves availability but weakens “always consult source of truth”; needs tight time bounds + loud alerting. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres is down for 5 minutes**
+   - Design’s answer: fail closed; “small in-memory cache for metadata reads but never for bypassing state transitions”
+   - Recommendation: Strengthen — define *exactly* what “fail closed” means per operation (at least `DecryptDataKey` vs admin), and specify cache rules (TTL, required freshness, how disables/deletes propagate).
+
+2. **HSM is slow (not down) and p99 balloons**
+   - Design’s answer: rate-limit per op; shed rewrap first; prioritize decrypt
+   - Recommendation: Strengthen — add backpressure semantics (queue vs reject), tenant fairness, and an explicit capacity model (“HSM ops/sec budget” → max RPS per API) so 10x traffic becomes controlled degradation, not cascading timeouts.
+
+3. **Audit sink is degraded/unavailable**
+   - Design’s answer: API only continues if audit is durably accepted (local WAL/spool); otherwise reject
+   - Recommendation: Strengthen — clarify what “durably accepted” is (fsync to local disk? replicated?), how you prevent spool tampering, and how you drain without reordering/duplication (hash-chain + sequence gaps + checkpointing).
+
+4. **Network partition between KMS API and HSM (or one AZ isolated)**
+   - Design’s answer: partial HSM outage handling at AZ level
+   - Recommendation: Strengthen — define routing/failover policy (stickiness vs any-AZ), what happens to in-flight requests, and how you prevent “split brain” during key creation/dual control workflows.
+
+5. **Bad policy/config deploy accidentally permits decrypt**
+   - Design’s answer: “ABAC-lite” for explainability; break-glass is noisy
+   - Recommendation: Strengthen — require policy change safety rails: staged rollout/canary, automated diff checks (“this change expands principals/actions”), and an emergency “deny-all” kill switch that is itself dual-controlled and audited.
+
+## Recommendations
+
+### Must Fix
+- Make `ReEncrypt` boundary honest: either mandate **HSM rewrap** (plaintext never reaches KMS memory) or explicitly document plaintext DEK exposure in KMS RAM and how it’s protected (process isolation, memory handling, crash dumps, debugging).
+- Specify **audit durability and tamper evidence** end-to-end (hash chain, signed checkpoints/anchors, replay/dup detection, exact semantics of “accepted before response”).
+- Define cache semantics for metadata/policy: **invalidation, TTL, and failure behavior** so “fail closed” remains true under partitions and stale caches.
+
+### Should Consider
+- Collapse audit into a Postgres outbox + WORM export to reduce moving parts while increasing correctness.
+- Add explicit **capacity math** (HSM ops/sec, concurrency limits, retry budgets) and per-tenant fairness to avoid self-inflicted outages under peak/retry storms.
+- Provide a safer API variant: `GenerateDataKeyWithoutPlaintext` (many real KMSes do) for workloads that can avoid handling raw DEKs.
+
+### Nice to Have
+- Formalize key state machine invariants (e.g., “cannot disable primary unless another enabled version exists”) and enforce with DB constraints/transactions.
+- Add “decision ID” to every authZ evaluation (policy version, inputs hash) to make incident forensics and rollbacks faster.
+
+## What's Working Well
+- The **two-plane split** (HSM protects keys, not data) is the right simplicity lever for performance and operability.
+- Versioned aliases + atomic primary flip is a clean, low-coordination rotation story.
+- Treating `ReEncrypt` as “rewrap keys, not terabytes” is the right operational framing.
+- You explicitly prioritize **decrypt availability** over rewrap during incidents and acknowledge Postgres as a correctness dependency (good design honesty).
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/key-management-system.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afc-a0bf-7832-86b7-d9dfafe9094f
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Key Management System (KMS)"
+category: "Security & Access Control"
+difficulty: "Hard"
+tags: ["security", "kms", "hsm", "envelope-encryption", "key-rotation", "audit", "compliance"]
+---
+
+## Overview
+
+This KMS generates and manages cryptographic keys with **hardware-backed root protection**, **versioned rotation**, and **high-integrity auditability**. The elegant core is a strict split between two planes: an **HSM-backed key-wrapping control plane** and a **high-throughput data plane that never asks the HSM to encrypt your data**—it only asks the HSM to protect the keys that encrypt your data.
+
+The key insight: treat “encryption” as **envelope encryption**. Applications encrypt payloads locally with fast symmetric DEKs, while the KMS/HSM protects CMKs that **wrap/unwrap** those DEKs. This keeps performance predictable, makes rotation a metadata problem, and confines the blast radius of compromise.
+
+## What Makes This Hard
+
+Naive KMS designs fail in two places:
+
+1. **They turn the HSM into the data plane.** If every Encrypt/Decrypt streams bytes through the KMS/HSM, you inherit HSM throughput limits, latency spikes, and operational fragility. Teams then add caches or shortcuts that quietly violate security boundaries.
+2. **They treat rotation as “replace the key.”** Real systems have ciphertext produced across months/years; rotation must preserve decryptability, support gradual migration, and produce forensics-grade audit trails without turning every service into a crypto expert.
+
+## Requirements
+
+### Functional Requirements
+- **CMK lifecycle**: create, disable, schedule deletion, rotate (new version), aliasing (stable key names).
+- **Envelope encryption primitives**:
+  - `GenerateDataKey`: return plaintext DEK + DEK wrapped under CMK.
+  - `DecryptDataKey`: unwrap wrapped DEK under an allowed CMK version.
+  - `ReEncrypt`: unwrap under old CMK version and rewrap under new version (no plaintext DEK leaves the service).
+- **Hardware-backed storage**: CMK private material never leaves HSM in plaintext; all CMK wrap/unwrap performed inside HSM.
+- **Strong authorization**: per-key policy for operations (`GenerateDataKey`, `DecryptDataKey`, `ReEncrypt`, admin actions).
+- **Audit**: append-only, tamper-evident log of every key operation and admin change.
+- **Multi-AZ availability**: tolerate AZ loss without losing keys or violating policy enforcement.
+
+### Scale Targets
+- **Key inventory**: 50k CMKs, average 5 versions each (rotation history + overlap).
+- **Traffic**: 3k RPS steady, 15k RPS peak for `GenerateDataKey`/`DecryptDataKey` (driven by storage/object encryption, session token sealing, etc.).
+- **Latency**: p99 < 25ms for data-key ops (HSM op dominates; target 5–10ms HSM + network + auth).
+- **Audit throughput**: 20k events/sec peak, with end-to-end durability < 2s.
+These numbers matter because HSMs scale differently than stateless services: you size for **HSM ops/sec**, not CPU.
+
+## Key Design Decisions
+
+- **We chose envelope encryption with DEKs generated per object/record**
+  - Rejected: encrypting application payloads inside KMS
+  - Why: keeps HSM out of the data plane, makes throughput linear with stateless API replicas, and confines HSM usage to wrap/unwrap.
+
+- **We chose versioned CMKs with “primary version” and backward decrypt**
+  - Rejected: “rotation replaces key” semantics
+  - Why: rotation becomes a safe pointer flip for new writes while old ciphertext remains decryptable; migration becomes a controlled background process.
+
+- **We chose a deliberately small policy model (ABAC-lite), not a general-purpose policy language**
+  - Rejected: embedding a full DSL that on-call must debug
+  - Why: KMS authorization must be explainable under incident pressure; limited expressiveness yields reliable reasoning and fewer bypasses.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[Workloads] --> B[KMS API]
+  B --> C[AuthZ Policy]
+  B --> D[HSM Cluster]
+  B --> E[(Postgres Metadata)]
+  B --> F[Audit Log]
+  B --> G[Rotation Worker]
+  G --> D
+  G --> E
+```
+
+### Components
+
+- **KMS API**: stateless gRPC/HTTP service that validates requests, enforces policy, calls HSM, and emits audit events. Statelessness is what lets you scale the service normally.
+- **AuthZ Policy**: per-key policies stored with the key (and cached in-memory). Policy evaluation uses request identity (mTLS SPIFFE ID or OIDC subject), action, environment (prod/dev), and key tags.
+- **HSM Cluster**: holds CMK material and performs wrap/unwrap/sign operations. Multi-AZ HSMs with quorum-backed key creation (dual control).
+- **Postgres Metadata**: source of truth for key aliases, versions, state machine, policies, and idempotency tokens. Postgres earns its place because consistency matters more than horizontal scale here.
+- **Audit Log**: append-only event stream persisted to WORM-capable storage (e.g., object lock) for tamper resistance; indexed for search but anchored by immutable storage.
+- **Rotation Worker**: asynchronous jobs for scheduled rotation, rewrap campaigns, and key state transitions; keeps the API fast and predictable.
+
+## Deep Dive: Rotation Without Breaking Decrypt
+
+The hard part is making rotation **operationally boring**. The trick is to define a key as an *identity* (alias) with *versions*, and make ciphertext reference the alias + version used to wrap the DEK.
+
+**State model**
+- Key alias (e.g., `payments/pii`) points to a **primary version** for new encryptions.
+- Each version has state: `Enabled`, `Disabled`, `PendingDeletion`.
+- `DecryptDataKey` accepts any `Enabled` version; `GenerateDataKey` uses only the primary `Enabled` version.
+
+**Rotation flow**
+1. Create new key version inside the HSM; store version metadata in Postgres.
+2. Atomically flip alias primary to the new version (single transaction).
+3. From that point forward, all new writes use the new version automatically—no client coordination.
+4. Old ciphertext continues to decrypt because old versions remain `Enabled` for a defined overlap window (e.g., 90 days).
+
+**Rewrapping (optional but often required)**
+- When you want to retire old versions, you run a background **rewrap campaign**:
+  - The client (or a batch job) submits wrapped DEKs (or references) to `ReEncrypt`.
+  - KMS unwraps the DEK under old version inside HSM boundaries and immediately rewraps under the primary version.
+  - KMS never returns plaintext DEKs for `ReEncrypt`; it returns only the rewrapped DEK blob.
+- This is the subtle win: rotation does not require bulk data re-encryption. You rewrap keys, not terabytes.
+
+**Guardrails**
+- Idempotency tokens on write APIs prevent duplicate versions and double-rotation during retries.
+- Dual-control for destructive actions (disable/delete) via approval workflow integrated with IAM.
+- A “break-glass” role exists but is noisy: every use pages security and produces high-severity audit events.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Security boundaries (HSM stays authoritative) | Some latency per key operation |
+| Simple, explainable rotation | Less flexible policy expressiveness |
+| Strong consistency for key state | Postgres becomes a critical dependency |
+| Audit integrity & forensics | Higher storage/processing cost for logs |
+
+## Failure Modes
+
+- **HSM partial outage (one AZ)**
+  - Happens: elevated latency / errors for wrap/unwrap, some keys unavailable if capacity drops.
+  - Detect: HSM op error rate, queue depth for rotation jobs, p99 latency spikes.
+  - Recover: fail over to healthy AZ HSMs, shed non-essential ops (pause rewrap), keep decrypt prioritized via per-op rate limits.
+
+- **Postgres unavailable**
+  - Happens: cannot resolve aliases/policies/version states; KMS must fail closed.
+  - Detect: DB health checks + transaction error rate; sudden increase in 5xx.
+  - Recover: automatic failover (managed HA), read replicas don’t help for correctness; keep a small in-memory cache for *metadata reads* but never for bypassing state transitions.
+
+- **Audit pipeline degradation**
+  - Happens: risk of losing forensic visibility; compliance impact.
+  - Detect: audit enqueue failures, lag to durable store, missing sequence gaps.
+  - Recover: API continues only if audit is durably accepted (local WAL/spool). If durable audit can’t be guaranteed, KMS rejects requests rather than operating “silently.”
+
+## What I'd Do Differently At...
+
+- **10x scale:** introduce regional shards of KMS API + HSM capacity; add client-side DEK caching with strict TTL and key-usage limits to cut steady-state RPS without weakening security posture.
+- **100x scale:** move to multi-region active-active with regional CMKs and deterministic routing; redesign audit indexing separately from immutable storage; implement per-tenant isolation at the HSM partition level.
+
+## Operational Notes
+
+- Treat **HSM ops/sec** as your real capacity metric; everything else is secondary.
+- Use **per-operation rate limits** so `ReEncrypt` can’t starve `DecryptDataKey` during incidents.
+- Key state changes must be **transactional** (alias flip + version enablement) and always audited.
+- Run regular drills: restore from backups, HSM AZ loss, and “compromised workload identity” scenarios (prove authZ stops it).
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Envelope encryption + **key identity (alias) with versioned CMKs** turns “rotation” into a safe metadata flip and makes “migration” a **rewrap-of-DEKs** problem, keeping the HSM off the bulk-data path.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| HSM Cluster | Root-of-trust that keeps CMK material non-exportable and constrains the blast radius of a KMS/API compromise. |
+| KMS API (stateless) | Centralizes policy enforcement + idempotency + consistent audit emission; scales independently of HSM capacity. |
+| Postgres Metadata | Strong consistency for alias→primary version, state machine, idempotency tokens, and policy storage. |
+| Rotation Worker | Makes rotation/rewrap operationally boring and keeps latency-sensitive APIs predictable. |
+| Tamper-evident Audit Store | Compliance/forensics-grade trace of every cryptographic/admin action; must survive attacker-in-the-control-plane scenarios. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Separate “Audit Log” pipeline + indexing + WORM storage | **Transactional outbox in Postgres** (append-only audit table in same tx as key ops) + async export to WORM S3/Object Lock | Strong coupling is simpler and safer; Postgres becomes even more critical (but it already is). |
+| In-memory policy cache (unspecified invalidation) | Postgres `LISTEN/NOTIFY` for **cache invalidation** keyed by `key_id/policy_version` | Adds a DB channel dependency; still need fallback when notifications drop. |
+| ReEncrypt described as “unwrap then rewrap” | Prefer **HSM-native rewrap** (unwrap+wrap without releasing plaintext to KMS memory) | Requires HSM support / vendor-specific APIs; otherwise be explicit that plaintext DEK exists in KMS RAM. |
+| Custom “ABAC-lite” evaluator | Use a proven library/model (e.g., **Cedar**, OPA with a constrained policy set, or managed IAM-style statements) while keeping expressiveness limited | More dependencies; but fewer footguns and better tooling (tests, explain, diff). |
+| Rotation worker as a bespoke job system | Use Postgres row-locking + `SKIP LOCKED` as the queue, with **advisory locks** for singleton tasks | Less throughput than a dedicated queue; usually fine for rotation/rewrap workloads. |
+| “Fail closed if Postgres down” as a blanket rule | Add an explicit **degraded-read mode**: allow `DecryptDataKey` for a tiny “hot set” with short-lived, signed metadata snapshots | Improves availability but weakens “always consult source of truth”; needs tight time bounds + loud alerting. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres is down for 5 minutes**
+   - Design’s answer: fail closed; “small in-memory cache for metadata reads but never for bypassing state transitions”
+   - Recommendation: Strengthen — define *exactly* what “fail closed” means per operation (at least `DecryptDataKey` vs admin), and specify cache rules (TTL, required freshness, how disables/deletes propagate).
+
+2. **HSM is slow (not down) and p99 balloons**
+   - Design’s answer: rate-limit per op; shed rewrap first; prioritize decrypt
+   - Recommendation: Strengthen — add backpressure semantics (queue vs reject), tenant fairness, and an explicit capacity model (“HSM ops/sec budget” → max RPS per API) so 10x traffic becomes controlled degradation, not cascading timeouts.
+
+3. **Audit sink is degraded/unavailable**
+   - Design’s answer: API only continues if audit is durably accepted (local WAL/spool); otherwise reject
+   - Recommendation: Strengthen — clarify what “durably accepted” is (fsync to local disk? replicated?), how you prevent spool tampering, and how you drain without reordering/duplication (hash-chain + sequence gaps + checkpointing).
+
+4. **Network partition between KMS API and HSM (or one AZ isolated)**
+   - Design’s answer: partial HSM outage handling at AZ level
+   - Recommendation: Strengthen — define routing/failover policy (stickiness vs any-AZ), what happens to in-flight requests, and how you prevent “split brain” during key creation/dual control workflows.
+
+5. **Bad policy/config deploy accidentally permits decrypt**
+   - Design’s answer: “ABAC-lite” for explainability; break-glass is noisy
+   - Recommendation: Strengthen — require policy change safety rails: staged rollout/canary, automated diff checks (“this change expands principals/actions”), and an emergency “deny-all” kill switch that is itself dual-controlled and audited.
+
+## Recommendations
+
+### Must Fix
+- Make `ReEncrypt` boundary honest: either mandate **HSM rewrap** (plaintext never reaches KMS memory) or explicitly document plaintext DEK exposure in KMS RAM and how it’s protected (process isolation, memory handling, crash dumps, debugging).
+- Specify **audit durability and tamper evidence** end-to-end (hash chain, signed checkpoints/anchors, replay/dup detection, exact semantics of “accepted before response”).
+- Define cache semantics for metadata/policy: **invalidation, TTL, and failure behavior** so “fail closed” remains true under partitions and stale caches.
+
+### Should Consider
+- Collapse audit into a Postgres outbox + WORM export to reduce moving parts while increasing correctness.
+- Add explicit **capacity math** (HSM ops/sec, concurrency limits, retry budgets) and per-tenant fairness to avoid self-inflicted outages under peak/retry storms.
+- Provide a safer API variant: `GenerateDataKeyWithoutPlaintext` (many real KMSes do) for workloads that can avoid handling raw DEKs.
+
+### Nice to Have
+- Formalize key state machine invariants (e.g., “cannot disable primary unless another enabled version exists”) and enforce with DB constraints/transactions.
+- Add “decision ID” to every authZ evaluation (policy version, inputs hash) to make incident forensics and rollbacks faster.
+
+## What's Working Well
+- The **two-plane split** (HSM protects keys, not data) is the right simplicity lever for performance and operability.
+- Versioned aliases + atomic primary flip is a clean, low-coordination rotation story.
+- Treating `ReEncrypt` as “rewrap keys, not terabytes” is the right operational framing.
+- You explicitly prioritize **decrypt availability** over rewrap during incidents and acknowledge Postgres as a correctness dependency (good design honesty).
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+
+thinking
+**Organizing design sections**
+
+I need to adjust the output format and structure. Instead of introducing a new heading, I'll create a bolded paragraph under an existing section like "Key Design Decisions" or "Operational Notes." The order will focus on minimal architecture, justification, what was removed, and trade-offs. For the minimal architecture, I'll have a flowchart under "Architecture." Justifications can be in a list. The existing "Critique to Address" section will become "What We Removed" to highlight those aspects clearly.
+thinking
+**Simplifying the document**
+
+To meet the user's request, I can cut the critique sections entirely, as they specified not to add new ones. Although I'm tempted to rename "Critique to Address," I'll avoid that and keep the heading as is. Instead, I'll include an explicit "What We Removed" inside that section. Additionally, I'll address failure scenarios within the "Failure Modes" section, defining fail-closed semantics and elements like backpressure and audit durability. For simplicity, I can collapse the audit pipeline into a Postgres audit table with async export.
+thinking
+**Merging workers for simplicity**
+
+I'm considering merging the export worker with the Rotation Worker. I can't add a new component, so I can either broaden the responsibilities of the Rotation Worker to include both rotation and audit export or integrate audit exporting into the KMS API. I could remove the Rotation Worker altogether and handle tasks with cron/pg queue within the KMS API. However, I want to maintain a single worker process for efficiency. For minimal architecture, I might keep KMS API, HSM, and Postgres, while ensuring audit WORM storage requirements are met through the Postgres append-only model with periodic exports to S3. This keeps things streamlined!
+thinking
+**Refining the architecture**
+
+In the architecture diagram, I can remove the separate "AuthZ Policy" component and incorporate it into the Postgres metadata or policy evaluator in the API. While it’s currently separate, merging it with KMS API and Postgres simplifies things. The Rotation Worker might be optional, but to maintain simplicity, I think I’ll keep it, implementing it as an internal background job within the API. For the queue, I’d prefer a Postgres-based approach without an external component. I could define a simple TTL cache with Postgres LISTEN/NOTIFY for invalidation, but I might just query Postgres directly to avoid added complexity.
+thinking
+**Simplifying the operational plan**
+
+To keep things minimal, I'll focus on one Postgres read/transaction per operation using prepared statements and a connection pool. A small team might not need caching to start. I must ensure failure scenarios are managed, meaning if Postgres is down, we should fail closed. While the critique suggested "degraded-read mode," I'll skip that for simplicity and address failures explicitly in each operation. I’ll define that the `ReEncrypt` process uses an HSM when available, ensuring plaintext never leaves the service. For audit durability, I'll use an append-only audit table in Postgres with regular exports to a WORM storage setup. Overall, the design minimizes components while ensuring critical functionalities are present.
+thinking
+**Streamlining the design document**
+
+In the original plan, I’ll maintain the "Audit Log" and "Rotation Worker" titles while simplifying the audit log. I’ll keep envelope encryption and versioned keys, focusing on core operations while removing excessive features like ABAC-lite. For the design document, I’ll condense sections like "What I'd Do Differently At..." and potentially cut others like "Critique to Address" and "Recommendations." Instead, I’ll repurpose "Critique to Address" into a bulleted list under a bold heading "What We Removed." I’ll also trim the "Key Design Decisions" to focus on essential elements, such as envelope encryption and audit export. The architecture will use the mermaid format while ensuring justifications are clear in the components list.
+codex
+```markdown
+---
+title: "Key Management System (KMS)"
+category: "Security & Access Control"
+difficulty: "Hard"
+tags: ["security", "kms", "hsm", "envelope-encryption", "key-rotation", "audit", "compliance"]
+---
+
+## Overview
+
+This KMS provides **envelope encryption** with **HSM-backed customer master keys (CMKs)**, **versioned rotation**, and **tamper-evident auditing**. Applications encrypt data locally with fast symmetric DEKs; the KMS only generates and unwraps DEKs and manages the CMKs that wrap them.
+
+Keys are identities (aliases) with versions. Rotation is an atomic “primary version” flip for new encryptions while old ciphertext remains decryptable.
+
+## What Makes This Hard
+
+1. **Making the HSM the data plane** creates latency and throughput ceilings.
+2. **Rotation without breaking decrypt** requires versioned semantics plus auditable state transitions.
+
+## Requirements
+
+### Functional Requirements
+- **CMK lifecycle**: create, disable, schedule deletion, rotate (new version), aliasing (stable key names).
+- **Envelope primitives**:
+  - `GenerateDataKey`: return plaintext DEK + DEK wrapped under the CMK primary version.
+  - `DecryptDataKey`: unwrap a wrapped DEK under an allowed CMK version.
+  - `ReEncrypt`: rewrap a wrapped DEK from an old CMK version to the current primary version.
+- **Hardware-backed root**: CMK private material never leaves the HSM in plaintext; wrap/unwrap uses HSM keys.
+- **Authorization**: per-key policy for all operations (data-key ops + admin).
+- **Audit**: append-only, tamper-evident record of every operation and admin change.
+- **Multi-AZ availability**: tolerate AZ loss without losing keys or bypassing policy.
+
+### Scale Targets
+- **Key inventory**: 50k CMKs, average 5 versions each.
+- **Traffic**: 3k RPS steady, 15k RPS peak for `GenerateDataKey`/`DecryptDataKey`.
+- **Latency**: p99 < 25ms for data-key ops.
+- **Audit throughput**: 20k events/sec peak, durable acceptance before response.
+
+## Key Design Decisions
+
+- **Envelope encryption only**
+  - KMS never encrypts application payload bytes.
+- **Alias + versioned CMKs**
+  - Alias has one primary enabled version for new DEKs; old enabled versions remain decryptable.
+- **Simple, explicit authorization**
+  - Policies are stored with the key and evaluated in the KMS API from identity + action + key tags + environment.
+- **Audit is transactional with key operations**
+  - Every request writes an audit row in Postgres before returning success; export to immutable storage is asynchronous.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[Workloads] --> B[KMS API]
+  B --> C[HSM Cluster]
+  B --> D[(Postgres: metadata + audit)]
+  B --> E[Rotation Worker]
+  E --> C
+  E --> D
+  E --> F[WORM Audit Archive]
+```
+
+### Components
+
+- **KMS API**: stateless gRPC/HTTP service that validates requests, enforces policy, calls the HSM, and commits audit + metadata changes. Justification: centralizes correctness (authz, idempotency, auditing) and scales independently.
+- **HSM Cluster**: holds CMK material and performs wrap/unwrap (and audit checkpoint signing). Justification: non-exportable root-of-trust that limits blast radius of KMS compromise.
+- **Postgres (metadata + audit)**: source of truth for aliases, versions, states, policies, idempotency tokens, and an append-only audit table. Justification: single consistent store for all decisions the API must enforce.
+- **Rotation Worker**: one background worker that runs rotations, rewrap campaigns, deletion schedules, and audit export using Postgres row-locking (`SKIP LOCKED`). Justification: keeps the API latency path predictable and avoids a separate queue system.
+- **WORM Audit Archive**: immutable object storage with retention (e.g., S3 Object Lock) containing exported audit segments + signed checkpoints. Justification: tamper resistance against control-plane attackers and compliance retention.
+
+## Deep Dive: Rotation Without Breaking Decrypt
+
+**State model**
+- Alias (e.g., `payments/pii`) points to a **primary version**.
+- Version state: `Enabled`, `Disabled`, `PendingDeletion`.
+- `GenerateDataKey` uses the primary `Enabled` version.
+- `DecryptDataKey` accepts any `Enabled` version.
+
+**Rotation flow**
+1. Create a new CMK version in the HSM and insert version metadata in Postgres.
+2. Atomically flip the alias primary version in one DB transaction.
+3. Keep old versions `Enabled` for a defined overlap window.
+
+**Rewrapping**
+- `ReEncrypt` takes a wrapped DEK and returns the same DEK rewrapped under the current primary version.
+- When the HSM supports native rewrap, it performs unwrap+wrap without exposing plaintext outside the HSM.
+- Otherwise, plaintext DEK exists briefly in KMS process memory during rewrap and is never returned by `ReEncrypt`.
+
+**Guardrails**
+- Idempotency tokens on create/rotate/admin operations.
+- Dual-control for destructive actions and policy changes.
+- Break-glass role exists; every use is audited at high severity.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Few moving parts (DB as metadata + audit) | Postgres becomes an even harder dependency |
+| Rotation as a metadata flip | Old versions must stay enabled during overlap |
+| Strong audit correctness (commit before success) | Higher write load on Postgres |
+| Clear, minimal policy model | Limited expressiveness |
+
+## Failure Modes
+
+- **Postgres down**
+  - Happens: alias/policy/version resolution and audit commit cannot proceed.
+  - Result: all operations fail closed (including `DecryptDataKey`), because policy and key state cannot be proven.
+  - Recover: managed HA failover; API returns errors until DB is healthy.
+
+- **HSM slow (not down)**
+  - Happens: p99 increases; retries amplify load.
+  - Result: API enforces strict concurrency limits and short timeouts; returns `429`/`503` quickly when saturated; worker pauses `ReEncrypt` first.
+  - Recover: shed non-essential ops, restore HSM capacity, then drain worker.
+
+- **Audit export (WORM archive) degraded/unavailable**
+  - Happens: immutable archive lags.
+  - Result: requests continue as long as the audit row is committed in Postgres; if the audit write fails, the request fails.
+  - Recover: worker resumes export from the last checkpoint without reordering.
+
+- **Network partition between KMS API and HSM / AZ isolation**
+  - Happens: one AZ can’t reach its local HSM or loses capacity.
+  - Result: API routes to any healthy HSM AZ; key creation and destructive workflows require quorum/dual-control and block during partitions.
+  - Recover: restore connectivity; unblock workflows; worker resumes.
+
+- **Bad policy/config deploy accidentally permits decrypt**
+  - Happens: expanded principal/action scope.
+  - Result: policy changes are versioned and dual-controlled; an emergency deny-all flag in Postgres (also dual-controlled) can halt data-key ops.
+  - Recover: roll back policy version; audit shows exact policy version used per request.
+
+## Operational Notes
+
+- Capacity is sized by **HSM ops/sec**; API enforces fixed per-operation concurrency budgets.
+- All key state changes are transactional and audited (state change + audit row commit).
+- Audit export writes ordered segments plus signed checkpoints (hash-chain per segment) to immutable storage.
+```
+
+tokens used
+9,597
+```markdown
+---
+title: "Key Management System (KMS)"
+category: "Security & Access Control"
+difficulty: "Hard"
+tags: ["security", "kms", "hsm", "envelope-encryption", "key-rotation", "audit", "compliance"]
+---
+
+## Overview
+
+This KMS provides **envelope encryption** with **HSM-backed customer master keys (CMKs)**, **versioned rotation**, and **tamper-evident auditing**. Applications encrypt data locally with fast symmetric DEKs; the KMS only generates and unwraps DEKs and manages the CMKs that wrap them.
+
+Keys are identities (aliases) with versions. Rotation is an atomic “primary version” flip for new encryptions while old ciphertext remains decryptable.
+
+## What Makes This Hard
+
+1. **Making the HSM the data plane** creates latency and throughput ceilings.
+2. **Rotation without breaking decrypt** requires versioned semantics plus auditable state transitions.
+
+## Requirements
+
+### Functional Requirements
+- **CMK lifecycle**: create, disable, schedule deletion, rotate (new version), aliasing (stable key names).
+- **Envelope primitives**:
+  - `GenerateDataKey`: return plaintext DEK + DEK wrapped under the CMK primary version.
+  - `DecryptDataKey`: unwrap a wrapped DEK under an allowed CMK version.
+  - `ReEncrypt`: rewrap a wrapped DEK from an old CMK version to the current primary version.
+- **Hardware-backed root**: CMK private material never leaves the HSM in plaintext; wrap/unwrap uses HSM keys.
+- **Authorization**: per-key policy for all operations (data-key ops + admin).
+- **Audit**: append-only, tamper-evident record of every operation and admin change.
+- **Multi-AZ availability**: tolerate AZ loss without losing keys or bypassing policy.
+
+### Scale Targets
+- **Key inventory**: 50k CMKs, average 5 versions each.
+- **Traffic**: 3k RPS steady, 15k RPS peak for `GenerateDataKey`/`DecryptDataKey`.
+- **Latency**: p99 < 25ms for data-key ops.
+- **Audit throughput**: 20k events/sec peak, durable acceptance before response.
+
+## Key Design Decisions
+
+- **Envelope encryption only**
+  - KMS never encrypts application payload bytes.
+- **Alias + versioned CMKs**
+  - Alias has one primary enabled version for new DEKs; old enabled versions remain decryptable.
+- **Simple, explicit authorization**
+  - Policies are stored with the key and evaluated in the KMS API from identity + action + key tags + environment.
+- **Audit is transactional with key operations**
+  - Every request writes an audit row in Postgres before returning success; export to immutable storage is asynchronous.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[Workloads] --> B[KMS API]
+  B --> C[HSM Cluster]
+  B --> D[(Postgres: metadata + audit)]
+  B --> E[Rotation Worker]
+  E --> C
+  E --> D
+  E --> F[WORM Audit Archive]
+```
+
+### Components
+
+- **KMS API**: stateless gRPC/HTTP service that validates requests, enforces policy, calls the HSM, and commits audit + metadata changes. Justification: centralizes correctness (authz, idempotency, auditing) and scales independently.
+- **HSM Cluster**: holds CMK material and performs wrap/unwrap (and audit checkpoint signing). Justification: non-exportable root-of-trust that limits blast radius of KMS compromise.
+- **Postgres (metadata + audit)**: source of truth for aliases, versions, states, policies, idempotency tokens, and an append-only audit table. Justification: single consistent store for all decisions the API must enforce.
+- **Rotation Worker**: one background worker that runs rotations, rewrap campaigns, deletion schedules, and audit export using Postgres row-locking (`SKIP LOCKED`). Justification: keeps the API latency path predictable and avoids a separate queue system.
+- **WORM Audit Archive**: immutable object storage with retention (e.g., S3 Object Lock) containing exported audit segments + signed checkpoints. Justification: tamper resistance against control-plane attackers and compliance retention.
+
+## Deep Dive: Rotation Without Breaking Decrypt
+
+**State model**
+- Alias (e.g., `payments/pii`) points to a **primary version**.
+- Version state: `Enabled`, `Disabled`, `PendingDeletion`.
+- `GenerateDataKey` uses the primary `Enabled` version.
+- `DecryptDataKey` accepts any `Enabled` version.
+
+**Rotation flow**
+1. Create a new CMK version in the HSM and insert version metadata in Postgres.
+2. Atomically flip the alias primary version in one DB transaction.
+3. Keep old versions `Enabled` for a defined overlap window.
+
+**Rewrapping**
+- `ReEncrypt` takes a wrapped DEK and returns the same DEK rewrapped under the current primary version.
+- When the HSM supports native rewrap, it performs unwrap+wrap without exposing plaintext outside the HSM.
+- Otherwise, plaintext DEK exists briefly in KMS process memory during rewrap and is never returned by `ReEncrypt`.
+
+**Guardrails**
+- Idempotency tokens on create/rotate/admin operations.
+- Dual-control for destructive actions and policy changes.
+- Break-glass role exists; every use is audited at high severity.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Few moving parts (DB as metadata + audit) | Postgres becomes an even harder dependency |
+| Rotation as a metadata flip | Old versions must stay enabled during overlap |
+| Strong audit correctness (commit before success) | Higher write load on Postgres |
+| Clear, minimal policy model | Limited expressiveness |
+
+## Failure Modes
+
+- **Postgres down**
+  - Happens: alias/policy/version resolution and audit commit cannot proceed.
+  - Result: all operations fail closed (including `DecryptDataKey`), because policy and key state cannot be proven.
+  - Recover: managed HA failover; API returns errors until DB is healthy.
+
+- **HSM slow (not down)**
+  - Happens: p99 increases; retries amplify load.
+  - Result: API enforces strict concurrency limits and short timeouts; returns `429`/`503` quickly when saturated; worker pauses `ReEncrypt` first.
+  - Recover: shed non-essential ops, restore HSM capacity, then drain worker.
+
+- **Audit export (WORM archive) degraded/unavailable**
+  - Happens: immutable archive lags.
+  - Result: requests continue as long as the audit row is committed in Postgres; if the audit write fails, the request fails.
+  - Recover: worker resumes export from the last checkpoint without reordering.
+
+- **Network partition between KMS API and HSM / AZ isolation**
+  - Happens: one AZ can’t reach its local HSM or loses capacity.
+  - Result: API routes to any healthy HSM AZ; key creation and destructive workflows require quorum/dual-control and block during partitions.
+  - Recover: restore connectivity; unblock workflows; worker resumes.
+
+- **Bad policy/config deploy accidentally permits decrypt**
+  - Happens: expanded principal/action scope.
+  - Result: policy changes are versioned and dual-controlled; an emergency deny-all flag in Postgres (also dual-controlled) can halt data-key ops.
+  - Recover: roll back policy version; audit shows exact policy version used per request.
+
+## Operational Notes
+
+- Capacity is sized by **HSM ops/sec**; API enforces fixed per-operation concurrency budgets.
+- All key state changes are transactional and audited (state change + audit row commit).
+- Audit export writes ordered segments plus signed checkpoints (hash-chain per segment) to immutable storage.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/08-security-access-control/key-management-system.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Key Management System (KMS)
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/key-management-system.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/key-management-system.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/08-security-access-control/key-management-system.md

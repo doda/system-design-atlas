@@ -1,0 +1,211 @@
+---
+title: "Social News Feed"
+category: "Social & Discovery"
+difficulty: "Hard"
+tags: ["news-feed", "fanout", "kafka", "hybrid-timeline", "ranking"]
+---
+
+## Overview
+
+This system serves a fast, relevant home feed while handling extreme follower-count skew. It uses a hybrid timeline:
+
+- **Push**: For most authors, write lightweight feed references into followers’ inboxes asynchronously.
+- **Pull**: For high-fanout authors, fetch recent posts on demand during feed reads.
+- **Merge + Filter + Rank**: The feed endpoint merges candidates, enforces visibility (blocks/mutes/deletes/moderation), then ranks and paginates.
+
+The design is built as a single backend service with background workers, a single primary datastore, and one optional cache.
+
+---
+
+## Requirements
+
+### Functional
+- Create/edit/delete posts (text + media) and show them in followers’ home feeds.
+- Follow/unfollow, block, mute; relationships affect feed visibility.
+- Ranked feed reads with cursor-based pagination.
+- Deleted/moderated/private content disappears quickly and is reliably filtered.
+- Optional “mark seen” to reduce repeats and improve continuity.
+- High-fanout authors must not cause unbounded write amplification.
+- Author sees their own new post immediately (read-your-writes UX).
+
+### Non-Functional Targets
+- Feed reads: P50 ~80ms, P99 ~250ms, availability 99.99%.
+- Post create: ack after durable write; fanout async; availability 99.95%.
+- Strong for authoritative writes (posts, edges); eventual for inbox propagation and caches.
+
+---
+
+## Simplified Architecture
+
+```mermaid
+graph TB
+  C[Clients] --> E[CDN/Edge]
+  E --> A[Backend API]
+  A --> PG[(Postgres)]
+  A --> R[(Redis)]
+  A --> S[(Object Storage)]
+  PG --> W[Fanout Worker]
+  W --> PG
+```
+
+### Components
+- **Backend API**: One service containing modules for Posts, Graph (follows/blocks/mutes), Feed, and Ranking.
+- **Postgres** (managed, multi-AZ): Source of truth for posts, graph edges, inbox references, and the outbox queue.
+- **Fanout Worker**: A background process (same codebase) that reads outbox rows and materializes inbox references for push-tier authors.
+- **Redis** (optional but recommended): Caches hydrated posts and the first feed page to absorb refresh storms and reduce tail latency.
+- **Object Storage**: Stores media; posts store only references/metadata.
+
+---
+
+## Feed Read Path
+
+```mermaid
+flowchart LR
+  I[Inbox refs] --> M[Merge + dedup]
+  P[Celeb posts] --> M
+  S[Self posts] --> M
+  M --> F[Filter rules]
+  F --> R[Rank]
+  R --> G[Cursor page]
+```
+
+### Candidate Sources (bounded)
+- **Inbox refs**: Read the newest references for the user (over-fetch, e.g., 200 refs to return 30).
+- **Celeb posts**: For celeb follows, fetch recent posts per author (cap per author, e.g., 10–20) and merge by recency.
+- **Self posts**: Always include the author’s most recent posts directly from the posts table to guarantee read-your-writes.
+
+### Filtering (authoritative)
+Applied after hydration using the latest state from Postgres:
+- Post `state` (active/deleted/moderated), visibility, and viewer permissions.
+- Blocks and mutes (viewer ↔ author) with clear precedence rules.
+
+### Ranking (fast, bounded)
+- Default ranking is a lightweight scorer (recency + affinity + engagement signals) computed inside the Backend API with strict time limits.
+- If scoring exceeds budget, fall back to recency ordering.
+
+---
+
+## Write Path (Post Create)
+
+1. **Backend API** writes the post durably in Postgres and creates an **outbox event** in the same transaction.
+2. The API responds `201` immediately after commit.
+3. **Fanout Worker** polls outbox rows, and for push-tier authors:
+   - Enumerates followers in pages.
+   - Inserts `(user_id, post_id, created_at, author_id, source)` into follower inbox tables idempotently.
+
+This keeps user-facing writes simple and moves amplification to an asynchronous worker with backpressure.
+
+---
+
+## Data Model (Postgres)
+
+### Posts
+- `posts`
+  - `post_id` (PK), `author_id`, `created_at`, `text`, `media_refs`, `visibility`, `state`, `version`
+  - Index: `(author_id, created_at DESC, post_id)` for author timelines (pull tier + self posts)
+
+### Graph (Follows/Blocks/Mutes)
+- `follows`
+  - `(user_id, target_id)` (PK), `created_at`
+  - Index: `(target_id, user_id)` for follower enumeration
+- `blocks`
+  - `(user_id, target_id)` (PK)
+- `mutes`
+  - `(user_id, target_id)` (PK)
+
+### Inbox (Materialized References)
+- `inbox_items`
+  - `user_id`, `created_at`, `post_id`, `author_id`, `source`
+  - Primary access pattern: newest-by-user
+  - Partitioning: time-based partitions (daily/weekly) + index on `(user_id, created_at DESC, post_id)` to keep reads predictable and retention easy.
+
+### Outbox + Idempotency
+- `outbox_events`
+  - `event_id` (PK), `type`, `post_id`, `author_id`, `created_at`, `payload`, `processed_at`
+  - Worker claims rows using `FOR UPDATE SKIP LOCKED`.
+- `idempotency_keys`
+  - `(user_id, key)` (PK), `request_hash`, `response_blob`, `expires_at`
+
+### Optional Seen State
+- `seen_items`
+  - `user_id`, `post_id`, `seen_at` (TTL/retention policy)
+  - Used as a ranking/input hint; correctness never depends on it.
+
+---
+
+## Tiering (Hybrid Push/Pull)
+
+A periodic job computes author tier from follower count (and optionally post rate):
+- **Push tier**: fanout on write into followers’ inboxes.
+- **Pull tier**: do not fanout; only read from author timeline during feed reads.
+
+The threshold is configurable and can be adjusted safely without schema changes.
+
+---
+
+## API Design
+
+### Create Post
+- `POST /v1/posts`
+- Headers: `Idempotency-Key: <uuid>`
+- Response `201`: `{ "post_id": "...", "created_at": "..." }`
+
+### Delete Post
+- `DELETE /v1/posts/{post_id}`
+- Marks `state=deleted` and enqueues an outbox event for cache invalidation (optional); feed filtering enforces immediately.
+
+### Follow / Unfollow / Block / Mute
+- Follow: `PUT /v1/users/{user_id}/following/{target_id}`
+- Unfollow: `DELETE /v1/users/{user_id}/following/{target_id}`
+- Block: `PUT /v1/users/{user_id}/blocks/{target_id}`
+- Mute: `PUT /v1/users/{user_id}/mutes/{target_id}`
+- Response `204`
+
+### Get Feed
+- `GET /v1/feed?cursor=<opaque>&limit=30`
+- Response `200`: items + `next_cursor` + `server_time`
+
+**Cursor**
+- Opaque, signed blob containing `(anchor_time, last_created_at, last_post_id)`.
+- Pages are served from a stable time window: “older than last item, not newer than anchor,” which keeps pagination consistent while merging sources.
+
+### Mark Seen (Optional)
+- `POST /v1/feed/seen` with `{ "post_ids": [...], "seen_at": "..." }`
+- Best-effort.
+
+---
+
+## Caching
+
+- **Hydrated post cache (Redis)**: `post_id -> hydrated payload` (short TTL, longer for trending).
+- **First page cache (Redis)**: per-user first-page cache for 10–30s to absorb refresh storms.
+- Cache is always safe to bypass because authoritative filtering is applied on read.
+
+---
+
+## Consistency & Correctness
+
+- **Authoritative writes**: posts and graph edges commit in Postgres and are immediately visible to reads.
+- **Inbox propagation**: eventual; the system remains correct because filtering uses the latest post/graph state at read time.
+- **Deletes/moderation**: enforced during hydration/filtering. Optional cache eviction via outbox event reduces exposure time further.
+- **Read-your-writes**: the feed always includes the viewer’s own recent posts from the posts table independent of fanout.
+
+---
+
+## Operations & Reliability
+
+- Run the Backend API and Worker across multiple instances in multiple AZs.
+- Use managed Postgres with multi-AZ and read replicas (feed reads can prefer replicas; edge writes use primary).
+- Degrade gracefully:
+  - If scoring times out, return recency ordering.
+  - If inbox reads degrade, increase pull coverage for a recent window and rely on cached first page when safe.
+
+---
+
+## Simplification Notes
+
+- Removed: Kafka-based event bus; replaced with `outbox_events` in Postgres and a worker using `SKIP LOCKED` for durable, low-ops fanout processing.
+- Removed: Separate Post/Graph/Feed/Ranking services; merged into a single Backend API with clear internal modules and shared deployment.
+- Removed: Dedicated feature stores; ranking uses bounded, locally computed signals with an optional path to add richer features later.
+- Kept: Hybrid push/pull tiering because it’s required to handle high-fanout authors without overwhelming write capacity.
+- Kept: Post hydration + authoritative read-time filtering because it’s necessary to enforce deletes/moderation/blocks reliably even with eventual inbox propagation.

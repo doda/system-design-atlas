@@ -1,0 +1,1750 @@
+==========================================
+Generating (v2): Offline-First Application Sync
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2c46-7c33-9f41-c78f81b6a890
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Offline-First Application Sync
+**Category**: Strategic Problems
+
+**Problem Statement**:
+Design the sync protocol for a field-operations app that may go offline for days and needs to merge conflicts upon reconnection.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+thinking
+**Generating a technical document**
+
+The user wants me to create a document without coding, using markdown with front matter. I’ll focus on key issues like conflict resolution and the complexities involved. I need to decide whether to use CRDTs for offline tasks, as not all fields will be mergeable, requiring human intervention sometimes. 
+
+The big picture involves treating writes as operations, making the server the authoritative sequencer, and navigating offline scenarios with provisional IDs. I think using Postgres with an append-only operations table could be the right approach.
+thinking
+**Designing sync architecture**
+
+I’m considering using gRPC/HTTP for mobile sync, focusing on per-tenant or per-user partitioning. I'm targeting around 50,000 agents and handling bursts of 5,000 concurrent syncs, with each device having about 10,000 records and 1,000 changes per day—those numbers feel important!
+
+Mermaid diagrams could illustrate components like the Mobile App, Sync API, and Auth. I need to detail conflict detection, using per-field clocks to manage edits and represent state effectively. I want to keep the design simple, using operation-based sync with monotonic sequences while avoiding complex CRDT libraries. Maybe vector clocks are too heavy?
+thinking
+**Refining the merging strategy**
+
+I’m thinking about using a per-object "change token" from the server that increments with each revision, where the client sends an `ifMatchRev` to detect conflicts. This should work even after multiple offline edits. If the client sends a patch with the base revision, the server can detect a mismatch and auto-merge if possible, or create a conflict for the user to handle.
+
+For concurrent edits across devices, I'm considering a 3-way merge approach using base, client, and server versions, which seems elegant. Incremental sync is essential, and I can use an operations log since the last cursor to avoid sending full snapshots. It sounds like the biggest challenges will be managing merges and ensuring efficient log compaction.
+thinking
+**Enhancing the merge strategy**
+
+I’m considering using "mergeable patches" and storing the base revision for efficient 3-way merging. The server will need a reliable base version, which can be included in the client's request, but the server can't fully trust it. So, I'll keep a limited history of previous revisions for a short window and create a per-object `revisions` table for the last N versions or days.
+
+Storing the current state as a canonical row along with a history table for JSON diffs sounds like a solid plan. Using Postgres `jsonb` for data management is essential, while attachments will be stored separately. For syncing, I think a `POST /sync` protocol with device ID and acknowledgment sequences will work well, ensuring security with per-tenant auth and operation signing.
+thinking
+**Identifying failure modes and documentation**
+
+I need to consider potential failure modes like partial syncs, duplicate operations, and clock skew. To avoid issues, I’ll rely on server sequences and client local monotonic counters instead of wall clocks. 
+
+Operationally, I should monitor lag, backlog size, conflict rates, and dead letters while also accounting for compaction. Next, I'll draft a document with clear guidelines, avoiding hedge words and optional language. I want to be opinionated in my recommendations for Postgres, JSONB, and HTTP2/ gRPC, and include a Mermaid diagram with seven nodes representing key components. This will keep it straightforward.
+codex
+```markdown
+---
+title: "Offline-First Application Sync"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["offline-first", "sync", "conflict-resolution", "event-log", "postgres"]
+---
+
+## Overview
+
+This system is the sync protocol for a field-operations app where devices go offline for days, accumulate edits, and later reconnect to merge with edits from other devices. The elegant core is to treat **every client change as an idempotent operation** and to make the server the **single sequencer** for ordering those operations—while still allowing clients to work fully offline.
+
+The key insight: you don’t “sync databases”; you sync **intent + causality**. Clients send operations annotated with the **base revision they edited**, and the server resolves them using a **deterministic 3‑way merge** (base/server/client). Most conflicts become automatic field-level merges; the remainder become explicit conflict objects that a human can resolve without corrupting data.
+
+## What Makes This Hard
+
+Naive implementations try “last write wins” with timestamps. That silently destroys data because clocks drift, edits are multi-field, and offline edits arrive late. The real trap is thinking conflicts are rare; at field-ops scale, concurrent edits are normal (multiple devices, supervisors editing the same job, bulk status updates), and “just prompt the user” collapses under operational reality.
+
+The other hard part is performance over long outages: if you rely on replaying an unbounded log, a device offline for 10 days returns and your sync endpoint melts. The design needs a log for incremental sync *and* a compaction strategy that keeps merges correct.
+
+## Requirements
+
+### Functional Requirements
+- Support offline edits for **7+ days** with no network.
+- Merge on reconnect across **multiple devices per user** and **multiple users per workspace**.
+- Deterministic resolution for mergeable fields; explicit conflicts for non-mergeable edits.
+- Idempotent sync: retries never duplicate updates.
+- Attachments (photos, PDFs) sync independently from metadata edits.
+
+### Scale Targets
+- 50k field agents, 10k daily active, 2k concurrently syncing at shift changes.
+- Per device: 5k–50k entities cached; 200–2k edits/day; bursts of 1k ops on reconnect.
+- Server: sustain 5k ops/sec ingest during bursts; return incremental deltas in <2s p95 for typical reconnects.
+- Offline for days implies backlog sizes in the hundreds of thousands of ops across a workspace; compaction is mandatory.
+
+## Key Design Decisions
+
+- **Chosen: operation-based sync with server sequencing**
+  - Rejected: timestamp-based LWW and “sync full records”
+  - Why: ops are idempotent, compressible, and mergeable; server sequencing gives a single, auditable history.
+
+- **Chosen: 3-way merge using base revision**
+  - Rejected: always prompting users on version mismatch
+  - Why: most conflicts are field-disjoint; 3-way merge auto-resolves safely and deterministically.
+
+- **Chosen: Postgres as the system of record (ops + materialized state)**
+  - Rejected: Kafka-first architectures and custom CRDT stores
+  - Why: Postgres gives transactions, constraints, and queryability for field ops; the hard part is merge logic, not distributed storage.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Field App"] --> B["Sync API"]
+  B --> C["Auth"]
+  B --> D["Ops Log (Postgres)"]
+  B --> E["State Store (Postgres)"]
+  B --> F["Cache (Redis)"]
+  A <--> G["Object Store"]
+```
+
+### Components
+
+- **Field App**
+  - Stores a local replica (SQLite) and an outbound op queue; never blocks UX on network.
+- **Sync API**
+  - Validates ops, deduplicates, assigns server sequence, runs merge, emits deltas.
+- **Auth**
+  - Enforces workspace membership and per-entity ACL; sync never trusts client claims.
+- **Ops Log (Postgres)**
+  - Append-only table of accepted ops with a global `seq` per workspace for incremental sync cursors.
+- **State Store (Postgres)**
+  - Materialized “current state” tables (often `jsonb` for flexible forms + typed columns for indexing).
+- **Cache (Redis)**
+  - Speeds up hot reads (latest workspace `seq`, entity headers) and reduces DB roundtrips during bursts.
+- **Object Store**
+  - Direct upload/download for attachments with signed URLs; metadata references are synced via ops.
+
+## Deep Dive: Deterministic Conflict Resolution (3-Way Merge)
+
+### Data model
+
+Every entity row has:
+- `entity_id` (client-generated ULID/UUID; supports offline creation)
+- `rev` (integer, server-controlled, increments on accepted change)
+- `data` (`jsonb`, canonical current document)
+- `updated_at` (server time for observability, never for correctness)
+
+Every client operation includes:
+- `op_id` (UUID, idempotency key)
+- `entity_id`
+- `base_rev` (the `rev` the client edited against)
+- `patch` (JSON Patch or domain patch, e.g., `{set: {status: "done"}}`)
+- `actor_id`, `device_id`
+
+Server keeps short revision history for merge:
+- `entity_history(entity_id, rev, data_snapshot_or_reverse_patch, created_at)`
+- Retain last N revisions or last M days (e.g., 50 revs or 14 days), enough to cover “offline for days”.
+
+### Apply algorithm (server-side)
+
+1. **Deduplicate** by `(workspace_id, op_id)`. If seen, return prior result.
+2. **Load current** `(rev_current, data_current)`.
+3. If `base_rev == rev_current`: apply patch, bump `rev`, write op + state in one transaction.
+4. If `base_rev < rev_current`: run **3-way merge**:
+   - Reconstruct `data_base` at `base_rev` from `entity_history`.
+   - Compute `data_client` by applying the patch to `data_base`.
+   - Merge `(data_base, data_current, data_client)` field-by-field using explicit rules:
+     - **Scalar fields**: if only one side changed from base, take that; if both changed, conflict.
+     - **Sets/tags**: treat as add/remove operations (commutative); merge without conflict.
+     - **Checklists**: items are entities (stable IDs), so reordering and completion merge cleanly.
+     - **Notes/comments**: append-only list, merge by ID.
+   - If merge produces conflicts, persist a `conflict` record:
+     - Stores `base_rev`, `server_rev`, `client_candidate`, and a minimal conflict payload for UI.
+     - Entity state still advances with non-conflicting fields applied (prevents “all-or-nothing” paralysis).
+5. If `base_rev` is missing from history (too old): fall back to **safe mode**:
+   - Reject with `409 NEEDS_RESYNC` and return a fresh snapshot for that entity (or workspace chunk), forcing the client to rebase and resend a new op.
+   - This is rare if retention covers expected offline duration; when it happens, it fails loudly instead of corrupting data.
+
+### Why this works
+
+- Correctness doesn’t depend on clocks.
+- Conflicts are explicit artifacts, not silent overwrites.
+- Most real-world edits are disjoint: status vs. assignee vs. timestamps vs. checklist; 3-way merge turns “conflict” into “merge”.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Deterministic merges and auditability | Some write amplification (ops + history + state) |
+| Simple client logic (queue ops, apply deltas) | Server complexity in merge + history retention |
+| Fast incremental sync via `seq` cursors | Periodic compaction work |
+| Minimal data loss risk | Occasional hard rejects requiring rebase |
+
+## Failure Modes
+
+- **Duplicate sends / retry storms**
+  - What happens: clients retry the same ops after timeouts.
+  - Detect: high rate of repeated `op_id` hits.
+  - Recover: idempotency by `op_id`; return prior ack + deltas without reapplying.
+
+- **Thundering herd at reconnect (shift start)**
+  - What happens: 2k devices sync within minutes; DB hot spots on popular entities.
+  - Detect: elevated sync latency, lock waits on entity rows.
+  - Recover: workspace-level rate limiting, batch op ingestion per device, and row-level merge done in short transactions; cache latest entity headers to reduce reads.
+
+- **History too short for 3-way merge**
+  - What happens: device offline longer than retention; `base_rev` not reconstructable.
+  - Detect: `409 NEEDS_RESYNC` rate.
+  - Recover: serve snapshot for affected entities/workspace chunk; client rebases and resubmits ops, preserving intent instead of overwriting.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Partition ops and state by `workspace_id` (hash partitions), add read replicas for sync reads, and move heavy conflict UIs to async resolution workflows.
+
+- **100x scale:**
+  - Split “ops ingest” from “materialization”: accept ops into an append-only log and materialize state asynchronously (still deterministic), with per-workspace sequencers to keep merges correct under higher concurrency.
+
+## Operational Notes
+
+- Monitor: `sync_lag_seq` per device, conflict rate by entity type, history-miss (`NEEDS_RESYNC`) rate, and p95 time in merge.
+- Keep merge rules versioned; changing merge semantics without versioning creates non-reproducible history.
+- Treat attachments as separate reliability domain: metadata ops reference immutable object keys; upload failures never block saving the work item itself.
+```
+tokens used
+4,227
+```markdown
+---
+title: "Offline-First Application Sync"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["offline-first", "sync", "conflict-resolution", "event-log", "postgres"]
+---
+
+## Overview
+
+This system is the sync protocol for a field-operations app where devices go offline for days, accumulate edits, and later reconnect to merge with edits from other devices. The elegant core is to treat **every client change as an idempotent operation** and to make the server the **single sequencer** for ordering those operations—while still allowing clients to work fully offline.
+
+The key insight: you don’t “sync databases”; you sync **intent + causality**. Clients send operations annotated with the **base revision they edited**, and the server resolves them using a **deterministic 3‑way merge** (base/server/client). Most conflicts become automatic field-level merges; the remainder become explicit conflict objects that a human can resolve without corrupting data.
+
+## What Makes This Hard
+
+Naive implementations try “last write wins” with timestamps. That silently destroys data because clocks drift, edits are multi-field, and offline edits arrive late. The real trap is thinking conflicts are rare; at field-ops scale, concurrent edits are normal (multiple devices, supervisors editing the same job, bulk status updates), and “just prompt the user” collapses under operational reality.
+
+The other hard part is performance over long outages: if you rely on replaying an unbounded log, a device offline for 10 days returns and your sync endpoint melts. The design needs a log for incremental sync *and* a compaction strategy that keeps merges correct.
+
+## Requirements
+
+### Functional Requirements
+- Support offline edits for **7+ days** with no network.
+- Merge on reconnect across **multiple devices per user** and **multiple users per workspace**.
+- Deterministic resolution for mergeable fields; explicit conflicts for non-mergeable edits.
+- Idempotent sync: retries never duplicate updates.
+- Attachments (photos, PDFs) sync independently from metadata edits.
+
+### Scale Targets
+- 50k field agents, 10k daily active, 2k concurrently syncing at shift changes.
+- Per device: 5k–50k entities cached; 200–2k edits/day; bursts of 1k ops on reconnect.
+- Server: sustain 5k ops/sec ingest during bursts; return incremental deltas in <2s p95 for typical reconnects.
+- Offline for days implies backlog sizes in the hundreds of thousands of ops across a workspace; compaction is mandatory.
+
+## Key Design Decisions
+
+- **Chosen: operation-based sync with server sequencing**
+  - Rejected: timestamp-based LWW and “sync full records”
+  - Why: ops are idempotent, compressible, and mergeable; server sequencing gives a single, auditable history.
+
+- **Chosen: 3-way merge using base revision**
+  - Rejected: always prompting users on version mismatch
+  - Why: most conflicts are field-disjoint; 3-way merge auto-resolves safely and deterministically.
+
+- **Chosen: Postgres as the system of record (ops + materialized state)**
+  - Rejected: Kafka-first architectures and custom CRDT stores
+  - Why: Postgres gives transactions, constraints, and queryability for field ops; the hard part is merge logic, not distributed storage.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Field App"] --> B["Sync API"]
+  B --> C["Auth"]
+  B --> D["Ops Log (Postgres)"]
+  B --> E["State Store (Postgres)"]
+  B --> F["Cache (Redis)"]
+  A <--> G["Object Store"]
+```
+
+### Components
+
+- **Field App**
+  - Stores a local replica (SQLite) and an outbound op queue; never blocks UX on network.
+- **Sync API**
+  - Validates ops, deduplicates, assigns server sequence, runs merge, emits deltas.
+- **Auth**
+  - Enforces workspace membership and per-entity ACL; sync never trusts client claims.
+- **Ops Log (Postgres)**
+  - Append-only table of accepted ops with a global `seq` per workspace for incremental sync cursors.
+- **State Store (Postgres)**
+  - Materialized “current state” tables (often `jsonb` for flexible forms + typed columns for indexing).
+- **Cache (Redis)**
+  - Speeds up hot reads (latest workspace `seq`, entity headers) and reduces DB roundtrips during bursts.
+- **Object Store**
+  - Direct upload/download for attachments with signed URLs; metadata references are synced via ops.
+
+## Deep Dive: Deterministic Conflict Resolution (3-Way Merge)
+
+### Data model
+
+Every entity row has:
+- `entity_id` (client-generated ULID/UUID; supports offline creation)
+- `rev` (integer, server-controlled, increments on accepted change)
+- `data` (`jsonb`, canonical current document)
+- `updated_at` (server time for observability, never for correctness)
+
+Every client operation includes:
+- `op_id` (UUID, idempotency key)
+- `entity_id`
+- `base_rev` (the `rev` the client edited against)
+- `patch` (JSON Patch or domain patch, e.g., `{set: {status: "done"}}`)
+- `actor_id`, `device_id`
+
+Server keeps short revision history for merge:
+- `entity_history(entity_id, rev, data_snapshot_or_reverse_patch, created_at)`
+- Retain last N revisions or last M days (e.g., 50 revs or 14 days), enough to cover “offline for days”.
+
+### Apply algorithm (server-side)
+
+1. **Deduplicate** by `(workspace_id, op_id)`. If seen, return prior result.
+2. **Load current** `(rev_current, data_current)`.
+3. If `base_rev == rev_current`: apply patch, bump `rev`, write op + state in one transaction.
+4. If `base_rev < rev_current`: run **3-way merge**:
+   - Reconstruct `data_base` at `base_rev` from `entity_history`.
+   - Compute `data_client` by applying the patch to `data_base`.
+   - Merge `(data_base, data_current, data_client)` field-by-field using explicit rules:
+     - **Scalar fields**: if only one side changed from base, take that; if both changed, conflict.
+     - **Sets/tags**: treat as add/remove operations (commutative); merge without conflict.
+     - **Checklists**: items are entities (stable IDs), so reordering and completion merge cleanly.
+     - **Notes/comments**: append-only list, merge by ID.
+   - If merge produces conflicts, persist a `conflict` record:
+     - Stores `base_rev`, `server_rev`, `client_candidate`, and a minimal conflict payload for UI.
+     - Entity state still advances with non-conflicting fields applied (prevents “all-or-nothing” paralysis).
+5. If `base_rev` is missing from history (too old): fall back to **safe mode**:
+   - Reject with `409 NEEDS_RESYNC` and return a fresh snapshot for that entity (or workspace chunk), forcing the client to rebase and resend a new op.
+   - This is rare if retention covers expected offline duration; when it happens, it fails loudly instead of corrupting data.
+
+### Why this works
+
+- Correctness doesn’t depend on clocks.
+- Conflicts are explicit artifacts, not silent overwrites.
+- Most real-world edits are disjoint: status vs. assignee vs. timestamps vs. checklist; 3-way merge turns “conflict” into “merge”.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Deterministic merges and auditability | Some write amplification (ops + history + state) |
+| Simple client logic (queue ops, apply deltas) | Server complexity in merge + history retention |
+| Fast incremental sync via `seq` cursors | Periodic compaction work |
+| Minimal data loss risk | Occasional hard rejects requiring rebase |
+
+## Failure Modes
+
+- **Duplicate sends / retry storms**
+  - What happens: clients retry the same ops after timeouts.
+  - Detect: high rate of repeated `op_id` hits.
+  - Recover: idempotency by `op_id`; return prior ack + deltas without reapplying.
+
+- **Thundering herd at reconnect (shift start)**
+  - What happens: 2k devices sync within minutes; DB hot spots on popular entities.
+  - Detect: elevated sync latency, lock waits on entity rows.
+  - Recover: workspace-level rate limiting, batch op ingestion per device, and row-level merge done in short transactions; cache latest entity headers to reduce reads.
+
+- **History too short for 3-way merge**
+  - What happens: device offline longer than retention; `base_rev` not reconstructable.
+  - Detect: `409 NEEDS_RESYNC` rate.
+  - Recover: serve snapshot for affected entities/workspace chunk; client rebases and resubmits ops, preserving intent instead of overwriting.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Partition ops and state by `workspace_id` (hash partitions), add read replicas for sync reads, and move heavy conflict UIs to async resolution workflows.
+
+- **100x scale:**
+  - Split “ops ingest” from “materialization”: accept ops into an append-only log and materialize state asynchronously (still deterministic), with per-workspace sequencers to keep merges correct under higher concurrency.
+
+## Operational Notes
+
+- Monitor: `sync_lag_seq` per device, conflict rate by entity type, history-miss (`NEEDS_RESYNC`) rate, and p95 time in merge.
+- Keep merge rules versioned; changing merge semantics without versioning creates non-reproducible history.
+- Treat attachments as separate reliability domain: metadata ops reference immutable object keys; upload failures never block saving the work item itself.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/offline-first-application-sync.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-adfc-7e43-8d6a-63dc11fad8fe
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Offline-First Application Sync"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["offline-first", "sync", "conflict-resolution", "event-log", "postgres"]
+---
+
+## Overview
+
+This system is the sync protocol for a field-operations app where devices go offline for days, accumulate edits, and later reconnect to merge with edits from other devices. The elegant core is to treat **every client change as an idempotent operation** and to make the server the **single sequencer** for ordering those operations—while still allowing clients to work fully offline.
+
+The key insight: you don’t “sync databases”; you sync **intent + causality**. Clients send operations annotated with the **base revision they edited**, and the server resolves them using a **deterministic 3‑way merge** (base/server/client). Most conflicts become automatic field-level merges; the remainder become explicit conflict objects that a human can resolve without corrupting data.
+
+## What Makes This Hard
+
+Naive implementations try “last write wins” with timestamps. That silently destroys data because clocks drift, edits are multi-field, and offline edits arrive late. The real trap is thinking conflicts are rare; at field-ops scale, concurrent edits are normal (multiple devices, supervisors editing the same job, bulk status updates), and “just prompt the user” collapses under operational reality.
+
+The other hard part is performance over long outages: if you rely on replaying an unbounded log, a device offline for 10 days returns and your sync endpoint melts. The design needs a log for incremental sync *and* a compaction strategy that keeps merges correct.
+
+## Requirements
+
+### Functional Requirements
+- Support offline edits for **7+ days** with no network.
+- Merge on reconnect across **multiple devices per user** and **multiple users per workspace**.
+- Deterministic resolution for mergeable fields; explicit conflicts for non-mergeable edits.
+- Idempotent sync: retries never duplicate updates.
+- Attachments (photos, PDFs) sync independently from metadata edits.
+
+### Scale Targets
+- 50k field agents, 10k daily active, 2k concurrently syncing at shift changes.
+- Per device: 5k–50k entities cached; 200–2k edits/day; bursts of 1k ops on reconnect.
+- Server: sustain 5k ops/sec ingest during bursts; return incremental deltas in <2s p95 for typical reconnects.
+- Offline for days implies backlog sizes in the hundreds of thousands of ops across a workspace; compaction is mandatory.
+
+## Key Design Decisions
+
+- **Chosen: operation-based sync with server sequencing**
+  - Rejected: timestamp-based LWW and “sync full records”
+  - Why: ops are idempotent, compressible, and mergeable; server sequencing gives a single, auditable history.
+
+- **Chosen: 3-way merge using base revision**
+  - Rejected: always prompting users on version mismatch
+  - Why: most conflicts are field-disjoint; 3-way merge auto-resolves safely and deterministically.
+
+- **Chosen: Postgres as the system of record (ops + materialized state)**
+  - Rejected: Kafka-first architectures and custom CRDT stores
+  - Why: Postgres gives transactions, constraints, and queryability for field ops; the hard part is merge logic, not distributed storage.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Field App"] --> B["Sync API"]
+  B --> C["Auth"]
+  B --> D["Ops Log (Postgres)"]
+  B --> E["State Store (Postgres)"]
+  B --> F["Cache (Redis)"]
+  A <--> G["Object Store"]
+```
+
+### Components
+
+- **Field App**
+  - Stores a local replica (SQLite) and an outbound op queue; never blocks UX on network.
+- **Sync API**
+  - Validates ops, deduplicates, assigns server sequence, runs merge, emits deltas.
+- **Auth**
+  - Enforces workspace membership and per-entity ACL; sync never trusts client claims.
+- **Ops Log (Postgres)**
+  - Append-only table of accepted ops with a global `seq` per workspace for incremental sync cursors.
+- **State Store (Postgres)**
+  - Materialized “current state” tables (often `jsonb` for flexible forms + typed columns for indexing).
+- **Cache (Redis)**
+  - Speeds up hot reads (latest workspace `seq`, entity headers) and reduces DB roundtrips during bursts.
+- **Object Store**
+  - Direct upload/download for attachments with signed URLs; metadata references are synced via ops.
+
+## Deep Dive: Deterministic Conflict Resolution (3-Way Merge)
+
+### Data model
+
+Every entity row has:
+- `entity_id` (client-generated ULID/UUID; supports offline creation)
+- `rev` (integer, server-controlled, increments on accepted change)
+- `data` (`jsonb`, canonical current document)
+- `updated_at` (server time for observability, never for correctness)
+
+Every client operation includes:
+- `op_id` (UUID, idempotency key)
+- `entity_id`
+- `base_rev` (the `rev` the client edited against)
+- `patch` (JSON Patch or domain patch, e.g., `{set: {status: "done"}}`)
+- `actor_id`, `device_id`
+
+Server keeps short revision history for merge:
+- `entity_history(entity_id, rev, data_snapshot_or_reverse_patch, created_at)`
+- Retain last N revisions or last M days (e.g., 50 revs or 14 days), enough to cover “offline for days”.
+
+### Apply algorithm (server-side)
+
+1. **Deduplicate** by `(workspace_id, op_id)`. If seen, return prior result.
+2. **Load current** `(rev_current, data_current)`.
+3. If `base_rev == rev_current`: apply patch, bump `rev`, write op + state in one transaction.
+4. If `base_rev < rev_current`: run **3-way merge**:
+   - Reconstruct `data_base` at `base_rev` from `entity_history`.
+   - Compute `data_client` by applying the patch to `data_base`.
+   - Merge `(data_base, data_current, data_client)` field-by-field using explicit rules:
+     - **Scalar fields**: if only one side changed from base, take that; if both changed, conflict.
+     - **Sets/tags**: treat as add/remove operations (commutative); merge without conflict.
+     - **Checklists**: items are entities (stable IDs), so reordering and completion merge cleanly.
+     - **Notes/comments**: append-only list, merge by ID.
+   - If merge produces conflicts, persist a `conflict` record:
+     - Stores `base_rev`, `server_rev`, `client_candidate`, and a minimal conflict payload for UI.
+     - Entity state still advances with non-conflicting fields applied (prevents “all-or-nothing” paralysis).
+5. If `base_rev` is missing from history (too old): fall back to **safe mode**:
+   - Reject with `409 NEEDS_RESYNC` and return a fresh snapshot for that entity (or workspace chunk), forcing the client to rebase and resend a new op.
+   - This is rare if retention covers expected offline duration; when it happens, it fails loudly instead of corrupting data.
+
+### Why this works
+
+- Correctness doesn’t depend on clocks.
+- Conflicts are explicit artifacts, not silent overwrites.
+- Most real-world edits are disjoint: status vs. assignee vs. timestamps vs. checklist; 3-way merge turns “conflict” into “merge”.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Deterministic merges and auditability | Some write amplification (ops + history + state) |
+| Simple client logic (queue ops, apply deltas) | Server complexity in merge + history retention |
+| Fast incremental sync via `seq` cursors | Periodic compaction work |
+| Minimal data loss risk | Occasional hard rejects requiring rebase |
+
+## Failure Modes
+
+- **Duplicate sends / retry storms**
+  - What happens: clients retry the same ops after timeouts.
+  - Detect: high rate of repeated `op_id` hits.
+  - Recover: idempotency by `op_id`; return prior ack + deltas without reapplying.
+
+- **Thundering herd at reconnect (shift start)**
+  - What happens: 2k devices sync within minutes; DB hot spots on popular entities.
+  - Detect: elevated sync latency, lock waits on entity rows.
+  - Recover: workspace-level rate limiting, batch op ingestion per device, and row-level merge done in short transactions; cache latest entity headers to reduce reads.
+
+- **History too short for 3-way merge**
+  - What happens: device offline longer than retention; `base_rev` not reconstructable.
+  - Detect: `409 NEEDS_RESYNC` rate.
+  - Recover: serve snapshot for affected entities/workspace chunk; client rebases and resubmits ops, preserving intent instead of overwriting.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Partition ops and state by `workspace_id` (hash partitions), add read replicas for sync reads, and move heavy conflict UIs to async resolution workflows.
+
+- **100x scale:**
+  - Split “ops ingest” from “materialization”: accept ops into an append-only log and materialize state asynchronously (still deterministic), with per-workspace sequencers to keep merges correct under higher concurrency.
+
+## Operational Notes
+
+- Monitor: `sync_lag_seq` per device, conflict rate by entity type, history-miss (`NEEDS_RESYNC`) rate, and p95 time in merge.
+- Keep merge rules versioned; changing merge semantics without versioning creates non-reproducible history.
+- Treat attachments as separate reliability domain: metadata ops reference immutable object keys; upload failures never block saving the work item itself.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+thinking
+**Structuring a Database Critique**
+
+I need to respond with a structured critique in markdown, following the template closely. I’ll keep my points concise yet substantial, addressing various categories like simplicity and failure scenarios. Mentioning possible Postgres features, Redis, and advisory locks will be crucial.
+
+I should stress test for scenarios like DB downtime, network issues, slow components, and human mistakes. I’ll also highlight key insights, necessary components, and provide a simplification table with trade-offs. 
+
+Let’s also consider operational complexity for a small team, suggesting necessary fixes, considerations, and things that are working well. I should aim for elegance, potentially avoiding Redis if Postgres can manage, or using logical replication instead. But I wonder about the effects of sequencing and suggest considering globally unique identifiers for operations.
+thinking
+**Considering Workspace Sequencing**
+
+I’m realizing that strict ordering is necessary per workspace. I can use `bigserial` and filter by workspace, which provides a global order, but not per workspace. A possible solution is using `pg_advisory_xact_lock(workspace_id)` during ingestion to assign per-workspace sequences through a `workspace_seq` table. It might be a bit heavy, though.
+
+Alternatively, I could explore per-workspace "hi/lo" range allocation for a single sequencer. I might need to accept that sequences are more for cursoring than causality, using ingestion time ordering instead. I also need to consider handling conflicts and ensuring `entity_history` retention, which might complicate implementation. Plus, attachments should have their separate domain and ensure idempotency with multipart uploads.
+thinking
+**Addressing Incremental Deltas**
+
+I need to consider how to handle incremental deltas. I might use a `seq` cursor and send either ops or materialized changes, likely opting for entity diffs or patches. Privacy is key, so I must implement per-entity ACLs and ensure changes are appropriately filtered.
+
+With per-workspace sequences, I can’t send all ops due to differing ACLs, requiring per-actor redaction. This suggests a need for per-user projections. Also, I should think about 3-way merges with schema rules and versioning for backward compatibility. To simplify, I might explore JSON merge patch libraries or CRDTs, but I wonder about the trade-offs. Lastly, I’ll need a strategy for compaction and vacuuming to manage history effectively.
+thinking
+**Managing Multi-Device Operations**
+
+I’m considering the challenge of multi-device usage per user, especially how to handle base references. What happens if a device creates an entity offline and another device modifies it? I need creation operations linked to entity IDs and base revisions, assuming base_rev=0 if the entity doesn’t exist.
+
+I also have to manage duplicates and ensure uniqueness. The server needs to act as the sequencer, but independent entities may process concurrently, utilizing per-entity locks. While I could assign sequences on insert without locking, that would affect per-workspace ordering. 
+
+Perhaps I could streamline this by using a global `op_seq` (bigint) indexed by `(workspace_id, op_seq)`, enabling each device to maintain one cursor for all workspaces.
+thinking
+**Evaluating Database Structure**
+
+This setup simplifies processes and avoids hotspots, so I should highlight it. The current design suggests a global sequence per workspace, which could be unnecessary. Instead, I might propose a “global monotonic op_seq” together with workspace_id for cursors, knowing that gaps per workspace won't affect functionality.
+
+Could I eliminate Redis? If it’s only for latest sequences and headers, Postgres might suffice with the right indexes and connection pooling. If Redis is kept, it should be optional. 
+
+For reconstructing entity history, I could keep periodic snapshots and consider patch chains. Addressing potential issues like bad config deployments is vital, incorporating versioning and feature flags. 
+
+In terms of components, managing the Sync API with Postgres and Redis seems reasonable for a small team, yet adding per-entity rules and compaction jobs could complicate things. 
+
+The structure can include elements like a field app local store, sync API, and an optional Redis. I’m thinking of simplification opportunities, like changing per-workspace sequences to a global op_seq and relying more on Postgres. 
+
+Possible failure scenarios include DB downtime and network partitions, requiring a strategy that ensures atomicity and proper client handling of operations. I’ll mention recommendations such as ACL filtering, atomic operations, and offline history management, while keeping in mind what aspects could be simplified.
+codex
+```markdown
+## Elegance Check
+
+### The Core Insight
+Treat sync as **idempotent intent + causality** (ops with `op_id` + `base_rev`), and make the server a **single sequencer** so merges are deterministic and auditable without relying on clocks.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Field App (SQLite + outbound op queue) | Offline-first UX and durable retry; enables “days offline” without data loss. |
+| Sync API | Central place to validate, dedupe, sequence, merge, and produce deltas consistently. |
+| Postgres (ops + materialized state) | Transactions + constraints + queryability; the right place to keep both the audit trail and the current view. |
+| Entity revision history | Makes 3-way merge possible and keeps conflict resolution deterministic. |
+| Object store + signed URLs | Attachments have different failure modes and bandwidth; decoupling is correct. |
+| Auth/ACL enforcement | Prevents replay/forgery and enforces workspace/entity access during sync. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| “Global `seq` per workspace” | Use a single global monotonically increasing `op_seq` (Postgres `bigint identity`) and index `(workspace_id, op_seq)` for cursors | Per-workspace seq becomes non-contiguous (usually fine); simplifies sequencing/hot counters and avoids per-workspace coordination. |
+| Redis for “latest seq” + “entity headers” | Start with Postgres + proper indexes + connection pooling; add Redis only if proven | Might lose a bit of burst performance initially; operationally much simpler for a small team. |
+| Dedup described as app logic | Enforce idempotency in DB: `UNIQUE(workspace_id, op_id)` + `INSERT ... ON CONFLICT ... RETURNING` | Requires careful “return prior result” storage (store ack payload or op outcome). |
+| Row-level contention handled implicitly | Use `SELECT ... FOR UPDATE` on the entity row (or `pg_advisory_xact_lock(entity_id)`) during merge/apply | Limits concurrency per entity (good); needs backpressure to avoid pileups on hot entities. |
+| Full snapshots in `entity_history` (implied option) | Store periodic snapshots (every K revs) + forward patches (or reverse patches) between snapshots | More implementation complexity, less storage/write amplification at scale. |
+| Conflicts as separate records plus partial apply | Consider representing conflicts as a first-class “pending_resolution” state in the entity (plus conflict table for indexing) | Simpler client discovery; slightly couples entity reads to conflict UX. |
+| “Compaction is mandatory” but vague | Make compaction a boring, explicit job: partition ops by time/workspace, TTL old partitions, vacuum strategy | Adds a background worker, but makes ops log survivable and predictable. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Postgres is down for 5 minutes**
+   - Design's answer: not addressed (client retries are implied)
+   - Recommendation: Strengthen — define server behavior (`503` + `Retry-After`), client backoff/jitter, and ensure attachment uploads don’t block metadata saves (queue “attachment_ref op” only after successful upload).
+
+2. **Network partition / partial failure between Sync API ↔ Postgres/Redis**
+   - Design's answer: partly addressed (single transaction for op+state is implied)
+   - Recommendation: Strengthen — make Redis strictly best-effort (no correctness dependency), and guarantee op ingestion + state update + history write are in one DB transaction (or fail all). Define replay behavior after timeouts (return the persisted ack for `(workspace_id, op_id)`).
+
+3. **One hot entity causes lock contention during reconnect storms**
+   - Design's answer: addressed at a high level (short transactions, caching)
+   - Recommendation: Strengthen — add explicit per-entity serialization + bounded work: limit ops per request, cap merge CPU/time, and return “accepted, continue cursor” style responses so one device can’t monopolize merges.
+
+4. **Bad merge rule deploy changes semantics**
+   - Design's answer: addressed (“keep merge rules versioned”)
+   - Recommendation: Strengthen — record `merge_rules_version` on each accepted op and on conflict artifacts; require canary + rollback plan; clarify whether historical re-materialization is required and, if so, how you re-run merges deterministically.
+
+5. **ACL changes while a device is offline (user removed from workspace / entity)**
+   - Design's answer: not addressed
+   - Recommendation: Strengthen — define: (a) whether to reject queued ops with `403` (preferred) vs quarantine, (b) how to compute deltas when the client’s cursor spans ops it’s no longer allowed to see, and (c) how to handle “I edited it offline but lost access” without leaking data.
+
+## Recommendations
+
+### Must Fix
+- Define **delta/ACL semantics** with a workspace-level cursor: you can’t blindly “send ops since seq” if visibility differs per client; specify filtered deltas + how cursors advance safely without leaking.
+- Make idempotency fully **DB-enforced** and able to return the **same ack** (assigned seq/rev/conflicts) on retry.
+- Specify **compaction concretely** (partitioning, retention, vacuum, history trimming) so “days offline” doesn’t turn into “years of ops table pain”.
+
+### Should Consider
+- Drop Redis from the first version (or make it purely opportunistic) to keep the “interesting” part—merge semantics—front and center operationally.
+- Prefer a **global `op_seq`** over “per-workspace seq” unless you can show per-workspace ordering is required beyond cursoring.
+- Add explicit **backpressure contracts**: max ops per sync call, server-side rate limits, and client retry guidance to survive shift-change herds.
+
+### Nice to Have
+- “3am operator” tools: per-device stuck cursor introspection, replay last N acks, conflict rate dashboards by entity type/field.
+- A clear **client migration story** when merge rules or entity schemas evolve (old clients rebase behavior, server compatibility windows).
+
+## What's Working Well
+- The design is honest about the hard part: **merge correctness**, not storage novelty.
+- 3-way merge with explicit conflicts is the right direction for field ops; “fails loudly” (`NEEDS_RESYNC`) is a good safety valve.
+- Separating attachments into an independent reliability domain is pragmatic and reduces sync blast radius.
+- The write path is naturally auditable (ops log) while still serving fast reads (materialized state), which is a strong, maintainable core.
+```
+tokens used
+6,104
+```markdown
+## Elegance Check
+
+### The Core Insight
+Treat sync as **idempotent intent + causality** (ops with `op_id` + `base_rev`), and make the server a **single sequencer** so merges are deterministic and auditable without relying on clocks.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Field App (SQLite + outbound op queue) | Offline-first UX and durable retry; enables “days offline” without data loss. |
+| Sync API | Central place to validate, dedupe, sequence, merge, and produce deltas consistently. |
+| Postgres (ops + materialized state) | Transactions + constraints + queryability; the right place to keep both the audit trail and the current view. |
+| Entity revision history | Makes 3-way merge possible and keeps conflict resolution deterministic. |
+| Object store + signed URLs | Attachments have different failure modes and bandwidth; decoupling is correct. |
+| Auth/ACL enforcement | Prevents replay/forgery and enforces workspace/entity access during sync. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| “Global `seq` per workspace” | Use a single global monotonically increasing `op_seq` (Postgres `bigint identity`) and index `(workspace_id, op_seq)` for cursors | Per-workspace seq becomes non-contiguous (usually fine); simplifies sequencing/hot counters and avoids per-workspace coordination. |
+| Redis for “latest seq” + “entity headers” | Start with Postgres + proper indexes + connection pooling; add Redis only if proven | Might lose a bit of burst performance initially; operationally much simpler for a small team. |
+| Dedup described as app logic | Enforce idempotency in DB: `UNIQUE(workspace_id, op_id)` + `INSERT ... ON CONFLICT ... RETURNING` | Requires careful “return prior result” storage (store ack payload or op outcome). |
+| Row-level contention handled implicitly | Use `SELECT ... FOR UPDATE` on the entity row (or `pg_advisory_xact_lock(entity_id)`) during merge/apply | Limits concurrency per entity (good); needs backpressure to avoid pileups on hot entities. |
+| Full snapshots in `entity_history` (implied option) | Store periodic snapshots (every K revs) + forward patches (or reverse patches) between snapshots | More implementation complexity, less storage/write amplification at scale. |
+| Conflicts as separate records plus partial apply | Consider representing conflicts as a first-class “pending_resolution” state in the entity (plus conflict table for indexing) | Simpler client discovery; slightly couples entity reads to conflict UX. |
+| “Compaction is mandatory” but vague | Make compaction a boring, explicit job: partition ops by time/workspace, TTL old partitions, vacuum strategy | Adds a background worker, but makes ops log survivable and predictable. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Postgres is down for 5 minutes**
+   - Design's answer: not addressed (client retries are implied)
+   - Recommendation: Strengthen — define server behavior (`503` + `Retry-After`), client backoff/jitter, and ensure attachment uploads don’t block metadata saves (queue “attachment_ref op” only after successful upload).
+
+2. **Network partition / partial failure between Sync API ↔ Postgres/Redis**
+   - Design's answer: partly addressed (single transaction for op+state is implied)
+   - Recommendation: Strengthen — make Redis strictly best-effort (no correctness dependency), and guarantee op ingestion + state update + history write are in one DB transaction (or fail all). Define replay behavior after timeouts (return the persisted ack for `(workspace_id, op_id)`).
+
+3. **One hot entity causes lock contention during reconnect storms**
+   - Design's answer: addressed at a high level (short transactions, caching)
+   - Recommendation: Strengthen — add explicit per-entity serialization + bounded work: limit ops per request, cap merge CPU/time, and return “accepted, continue cursor” style responses so one device can’t monopolize merges.
+
+4. **Bad merge rule deploy changes semantics**
+   - Design's answer: addressed (“keep merge rules versioned”)
+   - Recommendation: Strengthen — record `merge_rules_version` on each accepted op and on conflict artifacts; require canary + rollback plan; clarify whether historical re-materialization is required and, if so, how you re-run merges deterministically.
+
+5. **ACL changes while a device is offline (user removed from workspace / entity)**
+   - Design's answer: not addressed
+   - Recommendation: Strengthen — define: (a) whether to reject queued ops with `403` (preferred) vs quarantine, (b) how to compute deltas when the client’s cursor spans ops it’s no longer allowed to see, and (c) how to handle “I edited it offline but lost access” without leaking data.
+
+## Recommendations
+
+### Must Fix
+- Define **delta/ACL semantics** with a workspace-level cursor: you can’t blindly “send ops since seq” if visibility differs per client; specify filtered deltas + how cursors advance safely without leaking.
+- Make idempotency fully **DB-enforced** and able to return the **same ack** (assigned seq/rev/conflicts) on retry.
+- Specify **compaction concretely** (partitioning, retention, vacuum, history trimming) so “days offline” doesn’t turn into “years of ops table pain”.
+
+### Should Consider
+- Drop Redis from the first version (or make it purely opportunistic) to keep the “interesting” part—merge semantics—front and center operationally.
+- Prefer a **global `op_seq`** over “per-workspace seq” unless you can show per-workspace ordering is required beyond cursoring.
+- Add explicit **backpressure contracts**: max ops per sync call, server-side rate limits, and client retry guidance to survive shift-change herds.
+
+### Nice to Have
+- “3am operator” tools: per-device stuck cursor introspection, replay last N acks, conflict rate dashboards by entity type/field.
+- A clear **client migration story** when merge rules or entity schemas evolve (old clients rebase behavior, server compatibility windows).
+
+## What's Working Well
+- The design is honest about the hard part: **merge correctness**, not storage novelty.
+- 3-way merge with explicit conflicts is the right direction for field ops; “fails loudly” (`NEEDS_RESYNC`) is a good safety valve.
+- Separating attachments into an independent reliability domain is pragmatic and reduces sync blast radius.
+- The write path is naturally auditable (ops log) while still serving fast reads (materialized state), which is a strong, maintainable core.
+```
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/offline-first-application-sync.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afc-560b-7bf2-9383-17e3bbba8e69
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Offline-First Application Sync"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["offline-first", "sync", "conflict-resolution", "event-log", "postgres"]
+---
+
+## Overview
+
+This system is the sync protocol for a field-operations app where devices go offline for days, accumulate edits, and later reconnect to merge with edits from other devices. The elegant core is to treat **every client change as an idempotent operation** and to make the server the **single sequencer** for ordering those operations—while still allowing clients to work fully offline.
+
+The key insight: you don’t “sync databases”; you sync **intent + causality**. Clients send operations annotated with the **base revision they edited**, and the server resolves them using a **deterministic 3‑way merge** (base/server/client). Most conflicts become automatic field-level merges; the remainder become explicit conflict objects that a human can resolve without corrupting data.
+
+## What Makes This Hard
+
+Naive implementations try “last write wins” with timestamps. That silently destroys data because clocks drift, edits are multi-field, and offline edits arrive late. The real trap is thinking conflicts are rare; at field-ops scale, concurrent edits are normal (multiple devices, supervisors editing the same job, bulk status updates), and “just prompt the user” collapses under operational reality.
+
+The other hard part is performance over long outages: if you rely on replaying an unbounded log, a device offline for 10 days returns and your sync endpoint melts. The design needs a log for incremental sync *and* a compaction strategy that keeps merges correct.
+
+## Requirements
+
+### Functional Requirements
+- Support offline edits for **7+ days** with no network.
+- Merge on reconnect across **multiple devices per user** and **multiple users per workspace**.
+- Deterministic resolution for mergeable fields; explicit conflicts for non-mergeable edits.
+- Idempotent sync: retries never duplicate updates.
+- Attachments (photos, PDFs) sync independently from metadata edits.
+
+### Scale Targets
+- 50k field agents, 10k daily active, 2k concurrently syncing at shift changes.
+- Per device: 5k–50k entities cached; 200–2k edits/day; bursts of 1k ops on reconnect.
+- Server: sustain 5k ops/sec ingest during bursts; return incremental deltas in <2s p95 for typical reconnects.
+- Offline for days implies backlog sizes in the hundreds of thousands of ops across a workspace; compaction is mandatory.
+
+## Key Design Decisions
+
+- **Chosen: operation-based sync with server sequencing**
+  - Rejected: timestamp-based LWW and “sync full records”
+  - Why: ops are idempotent, compressible, and mergeable; server sequencing gives a single, auditable history.
+
+- **Chosen: 3-way merge using base revision**
+  - Rejected: always prompting users on version mismatch
+  - Why: most conflicts are field-disjoint; 3-way merge auto-resolves safely and deterministically.
+
+- **Chosen: Postgres as the system of record (ops + materialized state)**
+  - Rejected: Kafka-first architectures and custom CRDT stores
+  - Why: Postgres gives transactions, constraints, and queryability for field ops; the hard part is merge logic, not distributed storage.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Field App"] --> B["Sync API"]
+  B --> C["Auth"]
+  B --> D["Ops Log (Postgres)"]
+  B --> E["State Store (Postgres)"]
+  B --> F["Cache (Redis)"]
+  A <--> G["Object Store"]
+```
+
+### Components
+
+- **Field App**
+  - Stores a local replica (SQLite) and an outbound op queue; never blocks UX on network.
+- **Sync API**
+  - Validates ops, deduplicates, assigns server sequence, runs merge, emits deltas.
+- **Auth**
+  - Enforces workspace membership and per-entity ACL; sync never trusts client claims.
+- **Ops Log (Postgres)**
+  - Append-only table of accepted ops with a global `seq` per workspace for incremental sync cursors.
+- **State Store (Postgres)**
+  - Materialized “current state” tables (often `jsonb` for flexible forms + typed columns for indexing).
+- **Cache (Redis)**
+  - Speeds up hot reads (latest workspace `seq`, entity headers) and reduces DB roundtrips during bursts.
+- **Object Store**
+  - Direct upload/download for attachments with signed URLs; metadata references are synced via ops.
+
+## Deep Dive: Deterministic Conflict Resolution (3-Way Merge)
+
+### Data model
+
+Every entity row has:
+- `entity_id` (client-generated ULID/UUID; supports offline creation)
+- `rev` (integer, server-controlled, increments on accepted change)
+- `data` (`jsonb`, canonical current document)
+- `updated_at` (server time for observability, never for correctness)
+
+Every client operation includes:
+- `op_id` (UUID, idempotency key)
+- `entity_id`
+- `base_rev` (the `rev` the client edited against)
+- `patch` (JSON Patch or domain patch, e.g., `{set: {status: "done"}}`)
+- `actor_id`, `device_id`
+
+Server keeps short revision history for merge:
+- `entity_history(entity_id, rev, data_snapshot_or_reverse_patch, created_at)`
+- Retain last N revisions or last M days (e.g., 50 revs or 14 days), enough to cover “offline for days”.
+
+### Apply algorithm (server-side)
+
+1. **Deduplicate** by `(workspace_id, op_id)`. If seen, return prior result.
+2. **Load current** `(rev_current, data_current)`.
+3. If `base_rev == rev_current`: apply patch, bump `rev`, write op + state in one transaction.
+4. If `base_rev < rev_current`: run **3-way merge**:
+   - Reconstruct `data_base` at `base_rev` from `entity_history`.
+   - Compute `data_client` by applying the patch to `data_base`.
+   - Merge `(data_base, data_current, data_client)` field-by-field using explicit rules:
+     - **Scalar fields**: if only one side changed from base, take that; if both changed, conflict.
+     - **Sets/tags**: treat as add/remove operations (commutative); merge without conflict.
+     - **Checklists**: items are entities (stable IDs), so reordering and completion merge cleanly.
+     - **Notes/comments**: append-only list, merge by ID.
+   - If merge produces conflicts, persist a `conflict` record:
+     - Stores `base_rev`, `server_rev`, `client_candidate`, and a minimal conflict payload for UI.
+     - Entity state still advances with non-conflicting fields applied (prevents “all-or-nothing” paralysis).
+5. If `base_rev` is missing from history (too old): fall back to **safe mode**:
+   - Reject with `409 NEEDS_RESYNC` and return a fresh snapshot for that entity (or workspace chunk), forcing the client to rebase and resend a new op.
+   - This is rare if retention covers expected offline duration; when it happens, it fails loudly instead of corrupting data.
+
+### Why this works
+
+- Correctness doesn’t depend on clocks.
+- Conflicts are explicit artifacts, not silent overwrites.
+- Most real-world edits are disjoint: status vs. assignee vs. timestamps vs. checklist; 3-way merge turns “conflict” into “merge”.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Deterministic merges and auditability | Some write amplification (ops + history + state) |
+| Simple client logic (queue ops, apply deltas) | Server complexity in merge + history retention |
+| Fast incremental sync via `seq` cursors | Periodic compaction work |
+| Minimal data loss risk | Occasional hard rejects requiring rebase |
+
+## Failure Modes
+
+- **Duplicate sends / retry storms**
+  - What happens: clients retry the same ops after timeouts.
+  - Detect: high rate of repeated `op_id` hits.
+  - Recover: idempotency by `op_id`; return prior ack + deltas without reapplying.
+
+- **Thundering herd at reconnect (shift start)**
+  - What happens: 2k devices sync within minutes; DB hot spots on popular entities.
+  - Detect: elevated sync latency, lock waits on entity rows.
+  - Recover: workspace-level rate limiting, batch op ingestion per device, and row-level merge done in short transactions; cache latest entity headers to reduce reads.
+
+- **History too short for 3-way merge**
+  - What happens: device offline longer than retention; `base_rev` not reconstructable.
+  - Detect: `409 NEEDS_RESYNC` rate.
+  - Recover: serve snapshot for affected entities/workspace chunk; client rebases and resubmits ops, preserving intent instead of overwriting.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Partition ops and state by `workspace_id` (hash partitions), add read replicas for sync reads, and move heavy conflict UIs to async resolution workflows.
+
+- **100x scale:**
+  - Split “ops ingest” from “materialization”: accept ops into an append-only log and materialize state asynchronously (still deterministic), with per-workspace sequencers to keep merges correct under higher concurrency.
+
+## Operational Notes
+
+- Monitor: `sync_lag_seq` per device, conflict rate by entity type, history-miss (`NEEDS_RESYNC`) rate, and p95 time in merge.
+- Keep merge rules versioned; changing merge semantics without versioning creates non-reproducible history.
+- Treat attachments as separate reliability domain: metadata ops reference immutable object keys; upload failures never block saving the work item itself.
+```
+
+---
+
+## Critique to Address
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+Treat sync as **idempotent intent + causality** (ops with `op_id` + `base_rev`), and make the server a **single sequencer** so merges are deterministic and auditable without relying on clocks.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Field App (SQLite + outbound op queue) | Offline-first UX and durable retry; enables “days offline” without data loss. |
+| Sync API | Central place to validate, dedupe, sequence, merge, and produce deltas consistently. |
+| Postgres (ops + materialized state) | Transactions + constraints + queryability; the right place to keep both the audit trail and the current view. |
+| Entity revision history | Makes 3-way merge possible and keeps conflict resolution deterministic. |
+| Object store + signed URLs | Attachments have different failure modes and bandwidth; decoupling is correct. |
+| Auth/ACL enforcement | Prevents replay/forgery and enforces workspace/entity access during sync. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| “Global `seq` per workspace” | Use a single global monotonically increasing `op_seq` (Postgres `bigint identity`) and index `(workspace_id, op_seq)` for cursors | Per-workspace seq becomes non-contiguous (usually fine); simplifies sequencing/hot counters and avoids per-workspace coordination. |
+| Redis for “latest seq” + “entity headers” | Start with Postgres + proper indexes + connection pooling; add Redis only if proven | Might lose a bit of burst performance initially; operationally much simpler for a small team. |
+| Dedup described as app logic | Enforce idempotency in DB: `UNIQUE(workspace_id, op_id)` + `INSERT ... ON CONFLICT ... RETURNING` | Requires careful “return prior result” storage (store ack payload or op outcome). |
+| Row-level contention handled implicitly | Use `SELECT ... FOR UPDATE` on the entity row (or `pg_advisory_xact_lock(entity_id)`) during merge/apply | Limits concurrency per entity (good); needs backpressure to avoid pileups on hot entities. |
+| Full snapshots in `entity_history` (implied option) | Store periodic snapshots (every K revs) + forward patches (or reverse patches) between snapshots | More implementation complexity, less storage/write amplification at scale. |
+| Conflicts as separate records plus partial apply | Consider representing conflicts as a first-class “pending_resolution” state in the entity (plus conflict table for indexing) | Simpler client discovery; slightly couples entity reads to conflict UX. |
+| “Compaction is mandatory” but vague | Make compaction a boring, explicit job: partition ops by time/workspace, TTL old partitions, vacuum strategy | Adds a background worker, but makes ops log survivable and predictable. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Postgres is down for 5 minutes**
+   - Design's answer: not addressed (client retries are implied)
+   - Recommendation: Strengthen — define server behavior (`503` + `Retry-After`), client backoff/jitter, and ensure attachment uploads don’t block metadata saves (queue “attachment_ref op” only after successful upload).
+
+2. **Network partition / partial failure between Sync API ↔ Postgres/Redis**
+   - Design's answer: partly addressed (single transaction for op+state is implied)
+   - Recommendation: Strengthen — make Redis strictly best-effort (no correctness dependency), and guarantee op ingestion + state update + history write are in one DB transaction (or fail all). Define replay behavior after timeouts (return the persisted ack for `(workspace_id, op_id)`).
+
+3. **One hot entity causes lock contention during reconnect storms**
+   - Design's answer: addressed at a high level (short transactions, caching)
+   - Recommendation: Strengthen — add explicit per-entity serialization + bounded work: limit ops per request, cap merge CPU/time, and return “accepted, continue cursor” style responses so one device can’t monopolize merges.
+
+4. **Bad merge rule deploy changes semantics**
+   - Design's answer: addressed (“keep merge rules versioned”)
+   - Recommendation: Strengthen — record `merge_rules_version` on each accepted op and on conflict artifacts; require canary + rollback plan; clarify whether historical re-materialization is required and, if so, how you re-run merges deterministically.
+
+5. **ACL changes while a device is offline (user removed from workspace / entity)**
+   - Design's answer: not addressed
+   - Recommendation: Strengthen — define: (a) whether to reject queued ops with `403` (preferred) vs quarantine, (b) how to compute deltas when the client’s cursor spans ops it’s no longer allowed to see, and (c) how to handle “I edited it offline but lost access” without leaking data.
+
+## Recommendations
+
+### Must Fix
+- Define **delta/ACL semantics** with a workspace-level cursor: you can’t blindly “send ops since seq” if visibility differs per client; specify filtered deltas + how cursors advance safely without leaking.
+- Make idempotency fully **DB-enforced** and able to return the **same ack** (assigned seq/rev/conflicts) on retry.
+- Specify **compaction concretely** (partitioning, retention, vacuum, history trimming) so “days offline” doesn’t turn into “years of ops table pain”.
+
+### Should Consider
+- Drop Redis from the first version (or make it purely opportunistic) to keep the “interesting” part—merge semantics—front and center operationally.
+- Prefer a **global `op_seq`** over “per-workspace seq” unless you can show per-workspace ordering is required beyond cursoring.
+- Add explicit **backpressure contracts**: max ops per sync call, server-side rate limits, and client retry guidance to survive shift-change herds.
+
+### Nice to Have
+- “3am operator” tools: per-device stuck cursor introspection, replay last N acks, conflict rate dashboards by entity type/field.
+- A clear **client migration story** when merge rules or entity schemas evolve (old clients rebase behavior, server compatibility windows).
+
+## What's Working Well
+- The design is honest about the hard part: **merge correctness**, not storage novelty.
+- 3-way merge with explicit conflicts is the right direction for field ops; “fails loudly” (`NEEDS_RESYNC`) is a good safety valve.
+- Separating attachments into an independent reliability domain is pragmatic and reduces sync blast radius.
+- The write path is naturally auditable (ops log) while still serving fast reads (materialized state), which is a strong, maintainable core.
+```
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+
+thinking
+**Simplifying delta semantics**
+
+I'm thinking about simplifying delta semantics for server operations. The server computes deltas by reading the changed entity states since the cursor, filtered by ACL at query time. The cursor may advance, but the client could miss some operations due to permissions. If the cursor is treated as the highest op_seq offered to the client, they can advance even if filtered. If access changes, a full snapshot will be necessary, but I see a trade-off in keeping the design minimal.
+thinking
+**Ensuring data security with cursor advances**
+
+I'm focused on meeting the requirement of not leaking data while ensuring the cursor advances safely. I could define the cursor as server-side, where the client sends `since_cursor`, and the server uses it just for selecting candidate operations without returning them. Instead, it returns the entity state for visible entities. Another thought is to skip streaming operations and send only "changed entities since cursor." I could maintain an `entity_last_op_seq` column and perform incremental syncs to avoid heavy scanning for reads while keeping everything in the same Postgres store.
+thinking
+**Considering background worker implementation**
+
+I’m exploring the idea of a background worker, which could be a cron or DB job but isn't technically a new component. They’ve suggested removing complexity, so I think I can frame it as a "daily SQL job" run by the existing Sync API process, which keeps things simple. Regarding failure scenarios, if Postgres is down, I would use a 503 Retry-After with client backoff. I'll also enforce idempotency for retries and handle entity lock contention carefully with `SELECT FOR UPDATE`. Additionally, I'll ensure that ACL changes are managed safely with appropriate rejections.
+thinking
+**Creating a minimal architecture output**
+
+I need to draft a minimal architecture and provide justifications for each component. The Components section will list only the Field App, Sync API, Postgres, and Object Store, folding Auth into the Sync API while treating revision history as a table in Postgres without needing a separate component. I should create a "What We Removed" list after the components section. It makes sense to condense some parts, like removing "What I'd Do Differently" entirely. I must also clarify compaction by partitioning ops, retaining history, and structuring "Operational Notes" accordingly, all while keeping in mind that this is for a small team of three engineers.
+thinking
+**Drafting a minimal architecture document**
+
+I need to streamline the architecture by removing Redis, the per-workspace sequencer, and microservices, retaining only Postgres and an object store. The global op_seq still acts as the single sequencer. Key details will include a data model with an ops table. I want to communicate key trade-offs and remove unnecessary sections like "What I'd Do Differently." Instead, I’ll summarize in existing sections, ensuring we highlight what was removed clearly. The final document should convey these changes concisely, focusing on components and their justifications while maintaining minimal complexity for clarity.
+thinking
+**Finalizing the markdown design document**
+
+I need to address criticisms about "compaction concretely" and "delta/ACL semantics" in the markdown doc. While we're not making code changes or using any tools, I’ll ensure the front matter and overall structure remain intact. 
+
+The architecture section will include a minimal mermaid diagram and a list of essential components: Field App, Sync API, Postgres, and Object Store. I’ll also specify how the sync flow works, detailing client-server interactions, authentication, and handling conflicts. I'll incorporate a succinct "What We Removed" section, but present everything as the final design without argumentative tones.
+codex
+```markdown
+---
+title: "Offline-First Application Sync"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["offline-first", "sync", "conflict-resolution", "event-log", "postgres"]
+---
+
+## Overview
+
+This system syncs a field-operations app where devices go offline for days, accumulate edits, and later reconnect to merge with edits from other devices. Clients send **idempotent operations** (`op_id`) annotated with the **base revision** they edited (`base_rev`). The server is the **single sequencer** and resolves concurrency via a **deterministic 3‑way merge** (base/server/client). Non-mergeable overlap becomes explicit conflict artifacts.
+
+## What Makes This Hard
+
+Offline edits arrive late and concurrently. Timestamp-based “last write wins” silently loses data. The system must merge safely, stay idempotent under retries, and keep reconnect performance stable after long outages.
+
+## Requirements
+
+### Functional Requirements
+- Support offline edits for **7+ days** with no network.
+- Merge on reconnect across **multiple devices per user** and **multiple users per workspace**.
+- Deterministic resolution for mergeable fields; explicit conflicts for non-mergeable edits.
+- Idempotent sync: retries never duplicate updates.
+- Attachments (photos, PDFs) sync independently from metadata edits.
+
+### Scale Targets
+- 50k field agents, 10k daily active, 2k concurrently syncing at shift changes.
+- Per device: 5k–50k entities cached; 200–2k edits/day; bursts of 1k ops on reconnect.
+- Server: sustain 5k ops/sec ingest during bursts; return incremental deltas in <2s p95 for typical reconnects.
+
+## Key Design Decisions
+
+- **Operation-based sync with server sequencing**
+  - Each accepted op gets a monotonically increasing server `op_seq` for cursoring and backpressure-friendly incremental sync.
+
+- **3-way merge using `base_rev`**
+  - Server reconstructs `data_base`, applies patch to compute `data_client`, then merges with current state deterministically.
+
+- **Postgres as the system of record**
+  - Postgres stores the ops log, current materialized state, revision history needed for merges, and conflict artifacts.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Field App"] --> B["Sync API"]
+  B --> C["Postgres"]
+  A <--> D["Object Store"]
+```
+
+### Components
+
+- **Field App**
+  - SQLite replica + outbound op queue; applies inbound deltas; never blocks UX on network.
+
+- **Sync API**
+  - Auth + ACL enforcement, op validation, DB-enforced idempotency, sequencing, merge, conflict creation, and delta generation.
+
+- **Postgres**
+  - Transactions for “accept op + update entity + write history/conflict + persist ack”; supports incremental sync via server cursors.
+
+- **Object Store**
+  - Signed upload/download for attachments; metadata references are synced via ops.
+
+**What We Removed**
+- Redis cache (start with Postgres + indexes + pooling).
+- Separate Auth service (auth/ACLs live in the Sync API).
+- Per-workspace sequencers (use a single global `op_seq` and index by workspace).
+
+## Deep Dive: Deterministic Conflict Resolution (3-Way Merge)
+
+### Data model
+
+**Entities (materialized state)**
+- `entities(workspace_id, entity_id, rev, data jsonb, last_op_seq bigint, deleted bool, updated_at)`
+- `last_op_seq` is the newest server `op_seq` that affected the entity (drives fast incremental sync).
+
+**Ops log (idempotency + audit + retries)**
+- `ops(workspace_id, op_id uuid, op_seq bigint identity, entity_id, base_rev int, patch jsonb, actor_id, device_id, merge_rules_version, outcome jsonb, created_at)`
+- Enforce idempotency: `UNIQUE(workspace_id, op_id)` and persist `outcome` to return the exact same ack on retry.
+
+**History (for base reconstruction)**
+- `entity_history(workspace_id, entity_id, rev, data_snapshot jsonb, created_at)`
+- Retain enough to cover expected offline duration (e.g., 14 days or last 50 revs per entity).
+
+**Conflicts**
+- `conflicts(workspace_id, conflict_id, entity_id, base_rev, server_rev, client_candidate jsonb, payload jsonb, merge_rules_version, created_at, resolved_at)`
+
+### Sync protocol (single endpoint)
+
+Client sends:
+- `cursor` (last applied `op_seq` for the workspace)
+- a batch of outbound ops (each with `op_id`, `entity_id`, `base_rev`, `patch`)
+
+Server returns:
+- per-op ack (including assigned `op_seq`, resulting `rev`, and any `conflict_id`s)
+- deltas since `cursor` (current entity docs + tombstones + conflicts visible to the client)
+- `next_cursor`
+
+### Apply algorithm (server-side, per op)
+
+1. **Authenticate + authorize**: validate workspace membership and per-entity ACL for the operation.
+2. **DB-enforced idempotency**:
+   - `INSERT` the op row with `UNIQUE(workspace_id, op_id)`.
+   - If it already exists, return the stored `outcome` (same `op_seq`/rev/conflicts).
+3. **Serialize per entity**:
+   - `SELECT ... FOR UPDATE` the entity row (or `pg_advisory_xact_lock(entity_id)`).
+4. **Merge and write (single transaction)**:
+   - If `base_rev == rev_current`: apply patch to current.
+   - Else reconstruct `data_base` from `entity_history` at `base_rev`, compute `data_client`, then 3-way merge.
+   - Persist:
+     - updated `entities` row (`rev = rev+1`, `data`, `last_op_seq = op_seq`)
+     - `entity_history` snapshot for the new rev
+     - any `conflicts` rows
+     - `ops.outcome` (the ack payload)
+5. **Safe mode**:
+   - If `base_rev` is not reconstructable (history miss), reject with `409 NEEDS_RESYNC` and include a fresh entity snapshot so the client can rebase and resend intent.
+
+### Incremental deltas and ACL safety
+
+- Deltas are computed from `entities.last_op_seq > cursor` and filtered by the caller’s current ACLs; the server never streams “all ops since cursor” to avoid leaking hidden entities.
+- `next_cursor` advances to the server’s current max `op_seq` even if some changes are filtered; if a client later gains access, it performs a resync for that workspace/entity set to populate newly visible state.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Deterministic merges without clocks | Server merge complexity + revision history retention |
+| Idempotent retries with exact same ack | Extra writes (`ops.outcome`, history, conflicts) |
+| Fast incremental sync | Requires `last_op_seq` maintenance and indexes |
+| Simple ops log management | Audit/history retention is time-bounded |
+
+## Failure Modes
+
+- **Postgres is down**
+  - Server returns `503` + `Retry-After`; clients back off with jitter and keep ops queued.
+  - Attachment uploads stay independent (only enqueue attachment-reference ops after successful upload).
+
+- **Duplicate sends / retry storms**
+  - `(workspace_id, op_id)` uniqueness returns the persisted `ops.outcome` without reapplying.
+
+- **Reconnect herds and hot entities**
+  - Per-entity serialization keeps correctness; the API enforces bounded work (max ops per request, time/CPU caps) and returns cursor-based continuation responses.
+
+- **History too short**
+  - `409 NEEDS_RESYNC` with a snapshot; intent is preserved by rebasing and resubmitting a new op.
+
+- **Merge rule deploy changes semantics**
+  - Record `merge_rules_version` on every op and conflict; roll forward only (no retroactive re-materialization required for correctness).
+
+- **ACL changes while a device is offline**
+  - Reject unauthorized queued ops with `403`.
+  - Deltas are filtered by current ACLs; cursor advances without leaking hidden changes.
+
+## Operational Notes
+
+- Indexes: `ops(workspace_id, op_seq)`, `ops(workspace_id, op_id)`, `entities(workspace_id, last_op_seq)`, `entities(workspace_id, entity_id)`.
+- Compaction is routine SQL:
+  - Partition `ops` by time; drop old partitions after retention (e.g., 30–90 days).
+  - Trim `entity_history` to the offline window (e.g., 14 days / 50 revs).
+- Monitor: p95 sync latency, `NEEDS_RESYNC` rate, conflict rate by entity type, lock wait time on entities, and per-device cursor lag.
+```
+tokens used
+9,437
+```markdown
+---
+title: "Offline-First Application Sync"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["offline-first", "sync", "conflict-resolution", "event-log", "postgres"]
+---
+
+## Overview
+
+This system syncs a field-operations app where devices go offline for days, accumulate edits, and later reconnect to merge with edits from other devices. Clients send **idempotent operations** (`op_id`) annotated with the **base revision** they edited (`base_rev`). The server is the **single sequencer** and resolves concurrency via a **deterministic 3‑way merge** (base/server/client). Non-mergeable overlap becomes explicit conflict artifacts.
+
+## What Makes This Hard
+
+Offline edits arrive late and concurrently. Timestamp-based “last write wins” silently loses data. The system must merge safely, stay idempotent under retries, and keep reconnect performance stable after long outages.
+
+## Requirements
+
+### Functional Requirements
+- Support offline edits for **7+ days** with no network.
+- Merge on reconnect across **multiple devices per user** and **multiple users per workspace**.
+- Deterministic resolution for mergeable fields; explicit conflicts for non-mergeable edits.
+- Idempotent sync: retries never duplicate updates.
+- Attachments (photos, PDFs) sync independently from metadata edits.
+
+### Scale Targets
+- 50k field agents, 10k daily active, 2k concurrently syncing at shift changes.
+- Per device: 5k–50k entities cached; 200–2k edits/day; bursts of 1k ops on reconnect.
+- Server: sustain 5k ops/sec ingest during bursts; return incremental deltas in <2s p95 for typical reconnects.
+
+## Key Design Decisions
+
+- **Operation-based sync with server sequencing**
+  - Each accepted op gets a monotonically increasing server `op_seq` for cursoring and backpressure-friendly incremental sync.
+
+- **3-way merge using `base_rev`**
+  - Server reconstructs `data_base`, applies patch to compute `data_client`, then merges with current state deterministically.
+
+- **Postgres as the system of record**
+  - Postgres stores the ops log, current materialized state, revision history needed for merges, and conflict artifacts.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Field App"] --> B["Sync API"]
+  B --> C["Postgres"]
+  A <--> D["Object Store"]
+```
+
+### Components
+
+- **Field App**
+  - SQLite replica + outbound op queue; applies inbound deltas; never blocks UX on network.
+
+- **Sync API**
+  - Auth + ACL enforcement, op validation, DB-enforced idempotency, sequencing, merge, conflict creation, and delta generation.
+
+- **Postgres**
+  - Transactions for “accept op + update entity + write history/conflict + persist ack”; supports incremental sync via server cursors.
+
+- **Object Store**
+  - Signed upload/download for attachments; metadata references are synced via ops.
+
+**What We Removed**
+- Redis cache (start with Postgres + indexes + pooling).
+- Separate Auth service (auth/ACLs live in the Sync API).
+- Per-workspace sequencers (use a single global `op_seq` and index by workspace).
+
+## Deep Dive: Deterministic Conflict Resolution (3-Way Merge)
+
+### Data model
+
+**Entities (materialized state)**
+- `entities(workspace_id, entity_id, rev, data jsonb, last_op_seq bigint, deleted bool, updated_at)`
+- `last_op_seq` is the newest server `op_seq` that affected the entity (drives fast incremental sync).
+
+**Ops log (idempotency + audit + retries)**
+- `ops(workspace_id, op_id uuid, op_seq bigint identity, entity_id, base_rev int, patch jsonb, actor_id, device_id, merge_rules_version, outcome jsonb, created_at)`
+- Enforce idempotency: `UNIQUE(workspace_id, op_id)` and persist `outcome` to return the exact same ack on retry.
+
+**History (for base reconstruction)**
+- `entity_history(workspace_id, entity_id, rev, data_snapshot jsonb, created_at)`
+- Retain enough to cover expected offline duration (e.g., 14 days or last 50 revs per entity).
+
+**Conflicts**
+- `conflicts(workspace_id, conflict_id, entity_id, base_rev, server_rev, client_candidate jsonb, payload jsonb, merge_rules_version, created_at, resolved_at)`
+
+### Sync protocol (single endpoint)
+
+Client sends:
+- `cursor` (last applied `op_seq` for the workspace)
+- a batch of outbound ops (each with `op_id`, `entity_id`, `base_rev`, `patch`)
+
+Server returns:
+- per-op ack (including assigned `op_seq`, resulting `rev`, and any `conflict_id`s)
+- deltas since `cursor` (current entity docs + tombstones + conflicts visible to the client)
+- `next_cursor`
+
+### Apply algorithm (server-side, per op)
+
+1. **Authenticate + authorize**: validate workspace membership and per-entity ACL for the operation.
+2. **DB-enforced idempotency**:
+   - `INSERT` the op row with `UNIQUE(workspace_id, op_id)`.
+   - If it already exists, return the stored `outcome` (same `op_seq`/rev/conflicts).
+3. **Serialize per entity**:
+   - `SELECT ... FOR UPDATE` the entity row (or `pg_advisory_xact_lock(entity_id)`).
+4. **Merge and write (single transaction)**:
+   - If `base_rev == rev_current`: apply patch to current.
+   - Else reconstruct `data_base` from `entity_history` at `base_rev`, compute `data_client`, then 3-way merge.
+   - Persist:
+     - updated `entities` row (`rev = rev+1`, `data`, `last_op_seq = op_seq`)
+     - `entity_history` snapshot for the new rev
+     - any `conflicts` rows
+     - `ops.outcome` (the ack payload)
+5. **Safe mode**:
+   - If `base_rev` is not reconstructable (history miss), reject with `409 NEEDS_RESYNC` and include a fresh entity snapshot so the client can rebase and resend intent.
+
+### Incremental deltas and ACL safety
+
+- Deltas are computed from `entities.last_op_seq > cursor` and filtered by the caller’s current ACLs; the server never streams “all ops since cursor” to avoid leaking hidden entities.
+- `next_cursor` advances to the server’s current max `op_seq` even if some changes are filtered; if a client later gains access, it performs a resync for that workspace/entity set to populate newly visible state.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Deterministic merges without clocks | Server merge complexity + revision history retention |
+| Idempotent retries with exact same ack | Extra writes (`ops.outcome`, history, conflicts) |
+| Fast incremental sync | Requires `last_op_seq` maintenance and indexes |
+| Simple ops log management | Audit/history retention is time-bounded |
+
+## Failure Modes
+
+- **Postgres is down**
+  - Server returns `503` + `Retry-After`; clients back off with jitter and keep ops queued.
+  - Attachment uploads stay independent (only enqueue attachment-reference ops after successful upload).
+
+- **Duplicate sends / retry storms**
+  - `(workspace_id, op_id)` uniqueness returns the persisted `ops.outcome` without reapplying.
+
+- **Reconnect herds and hot entities**
+  - Per-entity serialization keeps correctness; the API enforces bounded work (max ops per request, time/CPU caps) and returns cursor-based continuation responses.
+
+- **History too short**
+  - `409 NEEDS_RESYNC` with a snapshot; intent is preserved by rebasing and resubmitting a new op.
+
+- **Merge rule deploy changes semantics**
+  - Record `merge_rules_version` on every op and conflict; roll forward only (no retroactive re-materialization required for correctness).
+
+- **ACL changes while a device is offline**
+  - Reject unauthorized queued ops with `403`.
+  - Deltas are filtered by current ACLs; cursor advances without leaking hidden changes.
+
+## Operational Notes
+
+- Indexes: `ops(workspace_id, op_seq)`, `ops(workspace_id, op_id)`, `entities(workspace_id, last_op_seq)`, `entities(workspace_id, entity_id)`.
+- Compaction is routine SQL:
+  - Partition `ops` by time; drop old partitions after retention (e.g., 30–90 days).
+  - Trim `entity_history` to the offline window (e.g., 14 days / 50 revs).
+- Monitor: p95 sync latency, `NEEDS_RESYNC` rate, conflict rate by entity type, lock wait time on entities, and per-device cursor lag.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/10-strategic-problems/offline-first-application-sync.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Offline-First Application Sync
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/offline-first-application-sync.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/offline-first-application-sync.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/10-strategic-problems/offline-first-application-sync.md

@@ -1,0 +1,1592 @@
+==========================================
+Generating (v2): Service Discovery
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-1c62-71e3-acb0-0f247c044126
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Service Discovery
+**Category**: Foundational Infrastructure
+
+**Problem Statement**:
+Design a system for multi-cluster environments (e.g., Kubernetes) with health-based routing and eventual consistency handling.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+thinking
+**Producing documentation on service discovery**
+
+I'm focusing on service discovery and planning to use "two-phase gating," where the endpoint must be healthy in the local cluster before it’s advertised globally. I need to ensure proxies handle health checks to avoid stale endpoints. I'll implement eventual consistency with monotonic versioning and tombstones to prevent unwanted resurrection while using TTL for endpoint removal. I'll write this concisely as a markdown document with a title, category, and difficulty rating.
+codex
+```markdown
+---
+title: "Service Discovery"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["service-discovery", "multi-cluster", "kubernetes", "health-routing", "eventual-consistency", "envoy", "consul"]
+---
+
+## Overview
+
+This system provides **multi-cluster service discovery** with **health-based routing** across Kubernetes clusters. The key idea is to separate **(1) discovery state** (what endpoints exist) from **(2) routing safety** (which endpoints are safe to send traffic to right now). Most outages in “global discovery” are not caused by missing endpoints—they’re caused by **stale or wrong health** being treated as truth.
+
+We use **Consul as a global service catalog** (boring, proven) and **Envoy as the data plane** for routing decisions (also boring, proven). Kubernetes remains the source of endpoint membership; Consul becomes the **distribution and query layer** for cross-cluster clients.
+
+Elegance comes from one rule: **only advertise endpoints globally as soft-state with TTL**, and make the data plane resilient to lies via **passive health (outlier ejection) + locality-first routing + fast local failover**. Eventual consistency becomes survivable because it’s no longer trusted with correctness.
+
+## What Makes This Hard
+
+Naive designs treat discovery as a strongly consistent database problem (“just replicate the registry”), but the real trap is that **health is inherently time-sensitive**. In a multi-cluster world, by the time a “healthy” signal crosses regions and caches, it may already be wrong. That’s how you get **traffic blackholes**: the control plane says an endpoint is alive; the data plane keeps sending requests; users see timeouts.
+
+The second trap is coupling failure domains: if your “global catalog” is down, naive clients lose the ability to resolve services at all. A discovery system must fail in a way that preserves a **local happy path** and degrades cross-cluster traffic gracefully.
+
+## Requirements
+
+### Functional Requirements
+- Discover service endpoints across multiple Kubernetes clusters under a single logical service name.
+- Route requests based on **health**, preferring same-cluster endpoints and failing over to other clusters.
+- Handle eventual consistency explicitly: endpoints may be added/removed/partitioned while traffic continues.
+- Support gradual rollouts: new endpoints must not receive global traffic until they’re demonstrably ready.
+- Provide a control-plane API for operators: “what is routing to what, and why?”
+
+### Scale Targets
+- **Clusters:** 20 (typical large org footprint); design should not fall apart at 100.
+- **Services:** 5,000; large enough that full-table polling is unacceptable.
+- **Endpoints:** 200,000 total; forces watch/stream distribution and compact representations.
+- **Discovery QPS:** 50k lookups/s equivalent at the edge (handled via xDS push + local caches, not synchronous queries).
+- **Update rate:** 1,000 endpoint changes/s during deploy storms; requires incremental updates and TTL-based cleanup.
+
+## Key Design Decisions
+
+- **Chose:** Consul as the global catalog (multi-datacenter semantics, health checks, proven operational model)  
+  **Rejected:** Building a custom “global Kubernetes API” replica  
+  **Why:** The hard part is correctness under staleness, not storage. Consul gives a mature distribution/query layer and reduces bespoke failure modes.
+
+- **Chose:** Envoy xDS (EDS/CDS) for endpoint distribution and health-aware routing  
+  **Rejected:** DNS-only multi-cluster discovery  
+  **Why:** DNS can tell you “where,” but not safely answer “who is healthy right now” at request time. Envoy can do locality preference, outlier ejection, circuit breaking, and fast failover.
+
+- **Chose:** TTL-based soft-state advertisement from clusters  
+  **Rejected:** “Write once, delete explicitly” endpoint records  
+  **Why:** Deletes are the first thing you lose during partitions. TTL makes disappearance the default, preventing endpoint resurrection and long-lived ghosts.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> E[Envoy Proxy]
+  E --> CP["Discovery Control Plane"]
+  CP --> G["Consul (Global Catalog)"]
+
+  subgraph K["Kubernetes Cluster"]
+    K8S["K8s API (EndpointSlice)"] --> A["Cluster Discovery Agent"]
+    A --> G
+    A --> H["Health Prober"]
+  end
+
+  E --> S["Service Endpoints"]
+```
+
+### Components
+
+- `Cluster Discovery Agent`
+  - Watches Kubernetes `EndpointSlice` and `Service` objects.
+  - Translates them into Consul service instances with **TTL** and metadata (`cluster`, `zone`, `revision`, `port`, `protocol`).
+  - Enforces a gating rule: **only publish globally after local readiness is stable** (see deep dive).
+
+- `Health Prober`
+  - Runs close to endpoints (same cluster) to avoid cross-region health lies.
+  - Produces a **liveness signal for discovery** (TTL renewal) and a **richer signal for routing** (success rates/latency buckets exported to the control plane).
+
+- `Consul (Global Catalog)`
+  - Stores the union of service instances across clusters as soft-state.
+  - Acts as the distribution backbone (watch streams) for the control plane.
+
+- `Discovery Control Plane`
+  - Watches Consul changes and publishes **xDS snapshots/deltas** to Envoy.
+  - Encodes routing policy: locality-first, cluster failover order, and safety knobs (max remote %, panic thresholds).
+
+- `Envoy Proxy`
+  - Consumes xDS and makes per-request decisions.
+  - Protects users from stale control-plane state via **passive health** (outlier ejection) and **fast retries** with bounded budgets.
+
+## Deep Dive: Health-Based Routing Under Eventual Consistency
+
+The hardest part is preventing a globally consistent-looking system from confidently routing to dead endpoints. This design uses three layers of defense, each assuming the layer above can be wrong:
+
+1) **Advertise only stable readiness (publish gating)**  
+Kubernetes readiness is noisy during deploys (warmup, cache fill, JVM compilation, etc.). The agent does not immediately publish a new endpoint globally when it appears in `EndpointSlice`. Instead it requires a short stability window (e.g., N consecutive successful probes over M seconds) before creating the Consul instance. This single rule eliminates the common “deploy storm causes global brownout” failure mode.
+
+2) **TTL as the only source of truth for existence**  
+Every advertised instance is soft-state with a short TTL (e.g., 15–30s) renewed by the agent. If the cluster is partitioned from the catalog, renewals stop and instances **expire automatically**. This is intentionally biased toward removing endpoints too aggressively rather than keeping ghosts. That bias is correct because Envoy can retry/failover quickly; users cannot tolerate long hangs caused by dead routes.
+
+3) **Data-plane skepticism (passive health and locality policy)**  
+Even with TTL, health can be wrong for seconds to minutes (GC pauses, node-level issues, partial outages). Envoy treats the catalog as a hint:
+- **Locality-first routing:** prefer same-cluster, then same-region, then other regions.
+- **Outlier ejection:** a small number of consecutive 5xx/timeouts ejects an endpoint quickly, independent of control-plane health.
+- **Bounded retries:** retries only on safe failures, with strict budgets to avoid amplifying incidents.
+This makes eventual consistency an availability concern, not a correctness concern.
+
+The net effect is that “global discovery” can be stale and you still don’t blackhole traffic: the data plane self-corrects faster than the control plane can converge.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Fast failover, fewer blackholes | Strong global correctness guarantees |
+| Operational simplicity (Consul + Envoy) | Pure Kubernetes-native minimalism |
+| Safe deploy storms (publish gating + outlier ejection) | Slightly slower global traffic ramp-up for new endpoints |
+| Partition tolerance via TTL | More churn in the catalog during unstable networks |
+
+## Failure Modes
+
+- **Stale “healthy” endpoints (ghost routes)**
+  - What happens: callers hit dead pods, see timeouts.
+  - Detect: elevated Envoy upstream timeouts + increasing outlier ejections for a cluster.
+  - Recover: outlier ejection stops sending traffic within seconds; TTL expiry removes ghosts from future snapshots.
+
+- **Catalog/control-plane outage**
+  - What happens: xDS updates stop; naive clients would fail resolution.
+  - Detect: Envoy xDS disconnects + snapshot age alerts.
+  - Recover: Envoy continues routing on last-known-good config; local-first policy keeps same-cluster traffic working. Operators restore catalog/control plane without immediate user impact.
+
+- **Network partition between a cluster and the global catalog**
+  - What happens: that cluster’s endpoints expire globally; cross-cluster traffic stops flowing to it.
+  - Detect: missing TTL renewals + sudden drop in advertised instances for that cluster.
+  - Recover: when connectivity returns, the agent republishes; publish gating prevents half-ready endpoints from immediately taking traffic.
+
+## What I'd Do Differently At...
+
+- **10x scale:** shard the control plane by service namespace/team, and push **delta xDS** aggressively to reduce fanout; introduce per-service rate limits on update propagation to survive deploy storms.
+- **100x scale:** replace a single global catalog with **regional catalogs + federation**, and move from “endpoint-level global routing” toward “cluster-level routing” (send traffic to a cluster gateway, then do local service discovery inside the destination cluster). Endpoint-level global state becomes too large and too noisy.
+
+## Operational Notes
+
+- Tune TTL and ejection thresholds together: short TTL with aggressive ejection can cause flapping; keep TTL moderately short and rely on passive health for second-level decisions.
+- Alert on **snapshot age** and **outlier ejection rate**; they’re better early-warning signals than raw health-check counts.
+- During incidents, your safest lever is policy: force “local-only” or “region-only” routing at the control plane; don’t hand-edit catalogs.
+```
+tokens used
+4,053
+```markdown
+---
+title: "Service Discovery"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["service-discovery", "multi-cluster", "kubernetes", "health-routing", "eventual-consistency", "envoy", "consul"]
+---
+
+## Overview
+
+This system provides **multi-cluster service discovery** with **health-based routing** across Kubernetes clusters. The key idea is to separate **(1) discovery state** (what endpoints exist) from **(2) routing safety** (which endpoints are safe to send traffic to right now). Most outages in “global discovery” are not caused by missing endpoints—they’re caused by **stale or wrong health** being treated as truth.
+
+We use **Consul as a global service catalog** (boring, proven) and **Envoy as the data plane** for routing decisions (also boring, proven). Kubernetes remains the source of endpoint membership; Consul becomes the **distribution and query layer** for cross-cluster clients.
+
+Elegance comes from one rule: **only advertise endpoints globally as soft-state with TTL**, and make the data plane resilient to lies via **passive health (outlier ejection) + locality-first routing + fast local failover**. Eventual consistency becomes survivable because it’s no longer trusted with correctness.
+
+## What Makes This Hard
+
+Naive designs treat discovery as a strongly consistent database problem (“just replicate the registry”), but the real trap is that **health is inherently time-sensitive**. In a multi-cluster world, by the time a “healthy” signal crosses regions and caches, it may already be wrong. That’s how you get **traffic blackholes**: the control plane says an endpoint is alive; the data plane keeps sending requests; users see timeouts.
+
+The second trap is coupling failure domains: if your “global catalog” is down, naive clients lose the ability to resolve services at all. A discovery system must fail in a way that preserves a **local happy path** and degrades cross-cluster traffic gracefully.
+
+## Requirements
+
+### Functional Requirements
+- Discover service endpoints across multiple Kubernetes clusters under a single logical service name.
+- Route requests based on **health**, preferring same-cluster endpoints and failing over to other clusters.
+- Handle eventual consistency explicitly: endpoints may be added/removed/partitioned while traffic continues.
+- Support gradual rollouts: new endpoints must not receive global traffic until they’re demonstrably ready.
+- Provide a control-plane API for operators: “what is routing to what, and why?”
+
+### Scale Targets
+- **Clusters:** 20 (typical large org footprint); design should not fall apart at 100.
+- **Services:** 5,000; large enough that full-table polling is unacceptable.
+- **Endpoints:** 200,000 total; forces watch/stream distribution and compact representations.
+- **Discovery QPS:** 50k lookups/s equivalent at the edge (handled via xDS push + local caches, not synchronous queries).
+- **Update rate:** 1,000 endpoint changes/s during deploy storms; requires incremental updates and TTL-based cleanup.
+
+## Key Design Decisions
+
+- **Chose:** Consul as the global catalog (multi-datacenter semantics, health checks, proven operational model)  
+  **Rejected:** Building a custom “global Kubernetes API” replica  
+  **Why:** The hard part is correctness under staleness, not storage. Consul gives a mature distribution/query layer and reduces bespoke failure modes.
+
+- **Chose:** Envoy xDS (EDS/CDS) for endpoint distribution and health-aware routing  
+  **Rejected:** DNS-only multi-cluster discovery  
+  **Why:** DNS can tell you “where,” but not safely answer “who is healthy right now” at request time. Envoy can do locality preference, outlier ejection, circuit breaking, and fast failover.
+
+- **Chose:** TTL-based soft-state advertisement from clusters  
+  **Rejected:** “Write once, delete explicitly” endpoint records  
+  **Why:** Deletes are the first thing you lose during partitions. TTL makes disappearance the default, preventing endpoint resurrection and long-lived ghosts.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> E[Envoy Proxy]
+  E --> CP["Discovery Control Plane"]
+  CP --> G["Consul (Global Catalog)"]
+
+  subgraph K["Kubernetes Cluster"]
+    K8S["K8s API (EndpointSlice)"] --> A["Cluster Discovery Agent"]
+    A --> G
+    A --> H["Health Prober"]
+  end
+
+  E --> S["Service Endpoints"]
+```
+
+### Components
+
+- `Cluster Discovery Agent`
+  - Watches Kubernetes `EndpointSlice` and `Service` objects.
+  - Translates them into Consul service instances with **TTL** and metadata (`cluster`, `zone`, `revision`, `port`, `protocol`).
+  - Enforces a gating rule: **only publish globally after local readiness is stable** (see deep dive).
+
+- `Health Prober`
+  - Runs close to endpoints (same cluster) to avoid cross-region health lies.
+  - Produces a **liveness signal for discovery** (TTL renewal) and a **richer signal for routing** (success rates/latency buckets exported to the control plane).
+
+- `Consul (Global Catalog)`
+  - Stores the union of service instances across clusters as soft-state.
+  - Acts as the distribution backbone (watch streams) for the control plane.
+
+- `Discovery Control Plane`
+  - Watches Consul changes and publishes **xDS snapshots/deltas** to Envoy.
+  - Encodes routing policy: locality-first, cluster failover order, and safety knobs (max remote %, panic thresholds).
+
+- `Envoy Proxy`
+  - Consumes xDS and makes per-request decisions.
+  - Protects users from stale control-plane state via **passive health** (outlier ejection) and **fast retries** with bounded budgets.
+
+## Deep Dive: Health-Based Routing Under Eventual Consistency
+
+The hardest part is preventing a globally consistent-looking system from confidently routing to dead endpoints. This design uses three layers of defense, each assuming the layer above can be wrong:
+
+1) **Advertise only stable readiness (publish gating)**  
+Kubernetes readiness is noisy during deploys (warmup, cache fill, JVM compilation, etc.). The agent does not immediately publish a new endpoint globally when it appears in `EndpointSlice`. Instead it requires a short stability window (e.g., N consecutive successful probes over M seconds) before creating the Consul instance. This single rule eliminates the common “deploy storm causes global brownout” failure mode.
+
+2) **TTL as the only source of truth for existence**  
+Every advertised instance is soft-state with a short TTL (e.g., 15–30s) renewed by the agent. If the cluster is partitioned from the catalog, renewals stop and instances **expire automatically**. This is intentionally biased toward removing endpoints too aggressively rather than keeping ghosts. That bias is correct because Envoy can retry/failover quickly; users cannot tolerate long hangs caused by dead routes.
+
+3) **Data-plane skepticism (passive health and locality policy)**  
+Even with TTL, health can be wrong for seconds to minutes (GC pauses, node-level issues, partial outages). Envoy treats the catalog as a hint:
+- **Locality-first routing:** prefer same-cluster, then same-region, then other regions.
+- **Outlier ejection:** a small number of consecutive 5xx/timeouts ejects an endpoint quickly, independent of control-plane health.
+- **Bounded retries:** retries only on safe failures, with strict budgets to avoid amplifying incidents.
+This makes eventual consistency an availability concern, not a correctness concern.
+
+The net effect is that “global discovery” can be stale and you still don’t blackhole traffic: the data plane self-corrects faster than the control plane can converge.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Fast failover, fewer blackholes | Strong global correctness guarantees |
+| Operational simplicity (Consul + Envoy) | Pure Kubernetes-native minimalism |
+| Safe deploy storms (publish gating + outlier ejection) | Slightly slower global traffic ramp-up for new endpoints |
+| Partition tolerance via TTL | More churn in the catalog during unstable networks |
+
+## Failure Modes
+
+- **Stale “healthy” endpoints (ghost routes)**
+  - What happens: callers hit dead pods, see timeouts.
+  - Detect: elevated Envoy upstream timeouts + increasing outlier ejections for a cluster.
+  - Recover: outlier ejection stops sending traffic within seconds; TTL expiry removes ghosts from future snapshots.
+
+- **Catalog/control-plane outage**
+  - What happens: xDS updates stop; naive clients would fail resolution.
+  - Detect: Envoy xDS disconnects + snapshot age alerts.
+  - Recover: Envoy continues routing on last-known-good config; local-first policy keeps same-cluster traffic working. Operators restore catalog/control plane without immediate user impact.
+
+- **Network partition between a cluster and the global catalog**
+  - What happens: that cluster’s endpoints expire globally; cross-cluster traffic stops flowing to it.
+  - Detect: missing TTL renewals + sudden drop in advertised instances for that cluster.
+  - Recover: when connectivity returns, the agent republishes; publish gating prevents half-ready endpoints from immediately taking traffic.
+
+## What I'd Do Differently At...
+
+- **10x scale:** shard the control plane by service namespace/team, and push **delta xDS** aggressively to reduce fanout; introduce per-service rate limits on update propagation to survive deploy storms.
+- **100x scale:** replace a single global catalog with **regional catalogs + federation**, and move from “endpoint-level global routing” toward “cluster-level routing” (send traffic to a cluster gateway, then do local service discovery inside the destination cluster). Endpoint-level global state becomes too large and too noisy.
+
+## Operational Notes
+
+- Tune TTL and ejection thresholds together: short TTL with aggressive ejection can cause flapping; keep TTL moderately short and rely on passive health for second-level decisions.
+- Alert on **snapshot age** and **outlier ejection rate**; they’re better early-warning signals than raw health-check counts.
+- During incidents, your safest lever is policy: force “local-only” or “region-only” routing at the control plane; don’t hand-edit catalogs.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/service-discovery.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-feb5-7080-b87c-4ba2139d7f41
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Service Discovery"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["service-discovery", "multi-cluster", "kubernetes", "health-routing", "eventual-consistency", "envoy", "consul"]
+---
+
+## Overview
+
+This system provides **multi-cluster service discovery** with **health-based routing** across Kubernetes clusters. The key idea is to separate **(1) discovery state** (what endpoints exist) from **(2) routing safety** (which endpoints are safe to send traffic to right now). Most outages in “global discovery” are not caused by missing endpoints—they’re caused by **stale or wrong health** being treated as truth.
+
+We use **Consul as a global service catalog** (boring, proven) and **Envoy as the data plane** for routing decisions (also boring, proven). Kubernetes remains the source of endpoint membership; Consul becomes the **distribution and query layer** for cross-cluster clients.
+
+Elegance comes from one rule: **only advertise endpoints globally as soft-state with TTL**, and make the data plane resilient to lies via **passive health (outlier ejection) + locality-first routing + fast local failover**. Eventual consistency becomes survivable because it’s no longer trusted with correctness.
+
+## What Makes This Hard
+
+Naive designs treat discovery as a strongly consistent database problem (“just replicate the registry”), but the real trap is that **health is inherently time-sensitive**. In a multi-cluster world, by the time a “healthy” signal crosses regions and caches, it may already be wrong. That’s how you get **traffic blackholes**: the control plane says an endpoint is alive; the data plane keeps sending requests; users see timeouts.
+
+The second trap is coupling failure domains: if your “global catalog” is down, naive clients lose the ability to resolve services at all. A discovery system must fail in a way that preserves a **local happy path** and degrades cross-cluster traffic gracefully.
+
+## Requirements
+
+### Functional Requirements
+- Discover service endpoints across multiple Kubernetes clusters under a single logical service name.
+- Route requests based on **health**, preferring same-cluster endpoints and failing over to other clusters.
+- Handle eventual consistency explicitly: endpoints may be added/removed/partitioned while traffic continues.
+- Support gradual rollouts: new endpoints must not receive global traffic until they’re demonstrably ready.
+- Provide a control-plane API for operators: “what is routing to what, and why?”
+
+### Scale Targets
+- **Clusters:** 20 (typical large org footprint); design should not fall apart at 100.
+- **Services:** 5,000; large enough that full-table polling is unacceptable.
+- **Endpoints:** 200,000 total; forces watch/stream distribution and compact representations.
+- **Discovery QPS:** 50k lookups/s equivalent at the edge (handled via xDS push + local caches, not synchronous queries).
+- **Update rate:** 1,000 endpoint changes/s during deploy storms; requires incremental updates and TTL-based cleanup.
+
+## Key Design Decisions
+
+- **Chose:** Consul as the global catalog (multi-datacenter semantics, health checks, proven operational model)  
+  **Rejected:** Building a custom “global Kubernetes API” replica  
+  **Why:** The hard part is correctness under staleness, not storage. Consul gives a mature distribution/query layer and reduces bespoke failure modes.
+
+- **Chose:** Envoy xDS (EDS/CDS) for endpoint distribution and health-aware routing  
+  **Rejected:** DNS-only multi-cluster discovery  
+  **Why:** DNS can tell you “where,” but not safely answer “who is healthy right now” at request time. Envoy can do locality preference, outlier ejection, circuit breaking, and fast failover.
+
+- **Chose:** TTL-based soft-state advertisement from clusters  
+  **Rejected:** “Write once, delete explicitly” endpoint records  
+  **Why:** Deletes are the first thing you lose during partitions. TTL makes disappearance the default, preventing endpoint resurrection and long-lived ghosts.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> E[Envoy Proxy]
+  E --> CP["Discovery Control Plane"]
+  CP --> G["Consul (Global Catalog)"]
+
+  subgraph K["Kubernetes Cluster"]
+    K8S["K8s API (EndpointSlice)"] --> A["Cluster Discovery Agent"]
+    A --> G
+    A --> H["Health Prober"]
+  end
+
+  E --> S["Service Endpoints"]
+```
+
+### Components
+
+- `Cluster Discovery Agent`
+  - Watches Kubernetes `EndpointSlice` and `Service` objects.
+  - Translates them into Consul service instances with **TTL** and metadata (`cluster`, `zone`, `revision`, `port`, `protocol`).
+  - Enforces a gating rule: **only publish globally after local readiness is stable** (see deep dive).
+
+- `Health Prober`
+  - Runs close to endpoints (same cluster) to avoid cross-region health lies.
+  - Produces a **liveness signal for discovery** (TTL renewal) and a **richer signal for routing** (success rates/latency buckets exported to the control plane).
+
+- `Consul (Global Catalog)`
+  - Stores the union of service instances across clusters as soft-state.
+  - Acts as the distribution backbone (watch streams) for the control plane.
+
+- `Discovery Control Plane`
+  - Watches Consul changes and publishes **xDS snapshots/deltas** to Envoy.
+  - Encodes routing policy: locality-first, cluster failover order, and safety knobs (max remote %, panic thresholds).
+
+- `Envoy Proxy`
+  - Consumes xDS and makes per-request decisions.
+  - Protects users from stale control-plane state via **passive health** (outlier ejection) and **fast retries** with bounded budgets.
+
+## Deep Dive: Health-Based Routing Under Eventual Consistency
+
+The hardest part is preventing a globally consistent-looking system from confidently routing to dead endpoints. This design uses three layers of defense, each assuming the layer above can be wrong:
+
+1) **Advertise only stable readiness (publish gating)**  
+Kubernetes readiness is noisy during deploys (warmup, cache fill, JVM compilation, etc.). The agent does not immediately publish a new endpoint globally when it appears in `EndpointSlice`. Instead it requires a short stability window (e.g., N consecutive successful probes over M seconds) before creating the Consul instance. This single rule eliminates the common “deploy storm causes global brownout” failure mode.
+
+2) **TTL as the only source of truth for existence**  
+Every advertised instance is soft-state with a short TTL (e.g., 15–30s) renewed by the agent. If the cluster is partitioned from the catalog, renewals stop and instances **expire automatically**. This is intentionally biased toward removing endpoints too aggressively rather than keeping ghosts. That bias is correct because Envoy can retry/failover quickly; users cannot tolerate long hangs caused by dead routes.
+
+3) **Data-plane skepticism (passive health and locality policy)**  
+Even with TTL, health can be wrong for seconds to minutes (GC pauses, node-level issues, partial outages). Envoy treats the catalog as a hint:
+- **Locality-first routing:** prefer same-cluster, then same-region, then other regions.
+- **Outlier ejection:** a small number of consecutive 5xx/timeouts ejects an endpoint quickly, independent of control-plane health.
+- **Bounded retries:** retries only on safe failures, with strict budgets to avoid amplifying incidents.
+This makes eventual consistency an availability concern, not a correctness concern.
+
+The net effect is that “global discovery” can be stale and you still don’t blackhole traffic: the data plane self-corrects faster than the control plane can converge.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Fast failover, fewer blackholes | Strong global correctness guarantees |
+| Operational simplicity (Consul + Envoy) | Pure Kubernetes-native minimalism |
+| Safe deploy storms (publish gating + outlier ejection) | Slightly slower global traffic ramp-up for new endpoints |
+| Partition tolerance via TTL | More churn in the catalog during unstable networks |
+
+## Failure Modes
+
+- **Stale “healthy” endpoints (ghost routes)**
+  - What happens: callers hit dead pods, see timeouts.
+  - Detect: elevated Envoy upstream timeouts + increasing outlier ejections for a cluster.
+  - Recover: outlier ejection stops sending traffic within seconds; TTL expiry removes ghosts from future snapshots.
+
+- **Catalog/control-plane outage**
+  - What happens: xDS updates stop; naive clients would fail resolution.
+  - Detect: Envoy xDS disconnects + snapshot age alerts.
+  - Recover: Envoy continues routing on last-known-good config; local-first policy keeps same-cluster traffic working. Operators restore catalog/control plane without immediate user impact.
+
+- **Network partition between a cluster and the global catalog**
+  - What happens: that cluster’s endpoints expire globally; cross-cluster traffic stops flowing to it.
+  - Detect: missing TTL renewals + sudden drop in advertised instances for that cluster.
+  - Recover: when connectivity returns, the agent republishes; publish gating prevents half-ready endpoints from immediately taking traffic.
+
+## What I'd Do Differently At...
+
+- **10x scale:** shard the control plane by service namespace/team, and push **delta xDS** aggressively to reduce fanout; introduce per-service rate limits on update propagation to survive deploy storms.
+- **100x scale:** replace a single global catalog with **regional catalogs + federation**, and move from “endpoint-level global routing” toward “cluster-level routing” (send traffic to a cluster gateway, then do local service discovery inside the destination cluster). Endpoint-level global state becomes too large and too noisy.
+
+## Operational Notes
+
+- Tune TTL and ejection thresholds together: short TTL with aggressive ejection can cause flapping; keep TTL moderately short and rely on passive health for second-level decisions.
+- Alert on **snapshot age** and **outlier ejection rate**; they’re better early-warning signals than raw health-check counts.
+- During incidents, your safest lever is policy: force “local-only” or “region-only” routing at the control plane; don’t hand-edit catalogs.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+thinking
+**Identifying simplification opportunities**
+
+I'm aiming to be constructive by focusing on the core insights: we want to separate existence from routability and think critically about data plane skepticism. There are components that can enhance the system, like Envoy, Consul, and agents. I consider whether we can simplify health checks using Envoy's active checks or Kubernetes readiness. It’s intriguing that Consul has xDS integration, which could help streamline the control plane, presenting an opportunity for simplification! We could also explore Kubernetes MCS API and the benefits of a global load balancer.
+thinking
+**Addressing Consul architecture concerns**
+
+I’m considering the TTL-based registration with Consul, which utilizes TTL checks and sessions, but I need to ensure there's a per-instance service ID to avoid thundering herd problems during TTL renewals. Using longer TTLs with jitter and anti-entropy sync helps mitigate these issues. When partitions happen, there's a risk of losing remote endpoints, leading to overloads. I’m thinking about rate limiting, weighted failover, and the importance of a reliable outlier ejection process. Config issues are also a concern since they can break all proxies, so careful deployment strategies are needed.
+thinking
+**Optimizing cross-cluster discovery**
+
+I’m focused on ensuring cross-cluster discovery doesn't leak endpoints to other tenants, so I’ll definitely mention RBAC. There’s the unique challenge of split-brain scenarios when two agents register the same endpoint. To avoid duplicates, I’ll need to use deterministic IDs with pod UID. Handling endpoint changes quickly is crucial, so I prefer watch-based methods over polling. I’m considering the operational complexity of using Consul combined with custom control planes, and I wonder if a smaller team can effectively manage it all. Simplifying by utilizing existing tools could help!
+thinking
+**Planning traffic ramp-up strategies**
+
+I’m thinking about implementing a progressive traffic ramp-up strategy that involves weights and maximum remote percentages. It's important to consider a "global warmup" phase distinct from local readiness. Initially, we should allow local traffic and, over time, adjust the remote weights based on SLO signals. I’ll explore multi-stage gating to differentiate between local and global readiness. Additionally, I need to address issues related to TTL expiration and ensure that we have high availability for agents, possibly through deployments or DaemonSets.
+thinking
+**Evaluating endpoint management strategies**
+
+I'm considering the endpoint management in a per-cluster agent setup. When an agent goes down, all endpoints could expire, leading to a global outage, yet local-first approaches would maintain local connectivity. However, if the cluster is healthy but the agent failed, we still lose remote access. To improve this, I think using multiple agents with separate sessions could be beneficial. Implementing Consul TTLs per instance might help survival during restarts, along with leader election among replicas. Also, understanding the complexities of health checks with Envoy’s outlier ejection is crucial for maintaining availability.
+codex
+## Elegance Check
+
+### The Core Insight
+You’re treating “global discovery” as **soft truth** and pushing correctness back into the **data plane** (TTL for existence + Envoy skepticism for routability). That’s the right non-obvious move: it converts eventual consistency from “blackhole risk” into “degraded preference.”
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Envoy | Per-request, fast feedback loop (outlier ejection/retries/locality) that can correct stale control-plane state. |
+| TTL-based registration | Makes partitions fail “safe” (ghost prevention) without relying on perfect deletes. |
+| Cluster Discovery Agent | Bridges K8s EndpointSlice → global catalog and enforces “don’t publish noise” gating. |
+| Consul (as catalog/distribution) | Proven watch semantics + operational model; avoids inventing a global registry + anti-entropy. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom `Discovery Control Plane` that translates Consul → xDS | Use **Consul Connect’s built-in xDS** (or a minimal adapter that only applies policy overlays) | Less bespoke logic; you may give up some custom debug/“why” API unless you build it as a thin sidecar service. |
+| `Health Prober` as a separate component | Rely on **K8s readiness gating + Envoy passive health**, add **Envoy active HC only for cross-cluster** paths | Loses “richer signal for routing” unless you standardize on metrics-driven policy later; reduces moving parts. |
+| Endpoint-level global routing for all traffic | **Cluster-level global routing** (publish only cluster gateways globally; do endpoint discovery locally) | Fewer objects/updates; slightly higher hop and requires gateway capacity planning; but dramatically simpler ops and scale. |
+| Publish gating based on N/M probes | Two-stage gate: **LocalReady** (K8s/readiness) then **GlobalReady** (time/slow-start/limited remote%) | Slower global ramp, but avoids “globally ready” meaning “ready for remote load.” |
+| “Global catalog down → last-known-good” only | Add **explicit local-only mode** baked into Envoy config (static local cluster; xDS only for remote) | Slightly more config complexity, but makes the local happy path independent of global control-plane correctness. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Consul is down for 5 minutes (or returns stale watch results)**
+   - Design's answer: Envoy routes on last-known-good; local-first keeps same-cluster working.
+   - Recommendation: Strengthen — ensure Envoy has a **static local cluster** and that “remote” is an optional additive layer; also document **staleness bounds** (max snapshot age before forcing local-only).
+
+2. **Agent fails or loses leadership (but the cluster is healthy)**
+   - Design's answer: Not addressed explicitly; TTL expiry will withdraw the cluster globally.
+   - Recommendation: Strengthen — run the agent with **leader election** (K8s Lease) and make renewal robust (jitter, batching). Otherwise one bad rollout of the agent can “disappear” an entire cluster from global traffic.
+
+3. **Network partition isolates one cluster from Consul**
+   - Design's answer: Endpoints expire; cross-cluster traffic stops going there; rejoin republishes with gating.
+   - Recommendation: Acceptable — but add a guardrail: sudden withdrawal can cause **load concentration** elsewhere; cap remote failover with **max_remote_percent / overload protection** and document the expected behavior during partial partitions.
+
+4. **One component is slow (control plane/xDS lag) but not failing**
+   - Design's answer: Indirectly addressed via Envoy’s last-known-good and passive health.
+   - Recommendation: Strengthen — define SLOs and alerts for **propagation lag** (Consul watch lag, snapshot build time, xDS ACK latency). “Slow” is where deploy storms turn into queue buildup and then thundering herds.
+
+5. **Bad config / policy push (wrong failover order, retries too aggressive)**
+   - Design's answer: Not addressed (operators “change policy,” but no safety rails described).
+   - Recommendation: Must fix — add **staged rollout** for routing policy (canary a subset of Envoys), config validation, and an emergency “**force local-only**” toggle that doesn’t require Consul to be healthy.
+
+## Recommendations
+
+### Must Fix
+- Define **agent HA/leadership** and renewal behavior so “agent outage” doesn’t equal “cluster vanished” accidentally.
+- Add a **safe config rollout story** for routing policy/xDS (canary, validation, fast rollback, and a local-only escape hatch).
+- Clarify **identity and authorization**: who may register endpoints to Consul, how tenants/namespaces are isolated, and how Envoy authenticates upstreams cross-cluster (mTLS/SPIFFE/etc.). This is easy to under-spec and hard to retrofit.
+
+### Should Consider
+- Prefer **cluster-gateway global routing** sooner than “100x scale” if the team is small; it removes huge endpoint churn and makes health semantics cleaner.
+- Make publish gating explicitly **two-stage** (ready vs globally eligible) and tie it to slow-start/weights rather than a binary “appears globally.”
+- Document retry/outlier defaults as a **safety budget** (per-try timeout, max attempts, retry-on, hedging stance) to avoid self-inflicted retry storms.
+
+### Nice to Have
+- A concrete “**why am I routing here?**” debug surface: per-request headers or admin endpoint that reports chosen locality, ejection status, panic mode, and config version.
+- “Degraded mode” runbooks: what to do at 3am (flip to local-only, freeze updates, reduce retries), and which alerts map to which levers.
+
+## What's Working Well
+- The separation of **existence (TTL soft-state)** from **routability (Envoy skepticism)** is clean and honest about distributed-systems reality.
+- You’re explicitly designing for **deploy storms** (publish gating + deltas), which is where multi-cluster systems usually fail first.
+- The failure-mode section is practical and operationally oriented (snapshot age + outlier ejection rate are good leading indicators).
+- The scale “escape hatches” are directionally correct; tightening the “gateway vs endpoint-level” choice earlier can make the whole design easier to own.
+tokens used
+5,861
+## Elegance Check
+
+### The Core Insight
+You’re treating “global discovery” as **soft truth** and pushing correctness back into the **data plane** (TTL for existence + Envoy skepticism for routability). That’s the right non-obvious move: it converts eventual consistency from “blackhole risk” into “degraded preference.”
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Envoy | Per-request, fast feedback loop (outlier ejection/retries/locality) that can correct stale control-plane state. |
+| TTL-based registration | Makes partitions fail “safe” (ghost prevention) without relying on perfect deletes. |
+| Cluster Discovery Agent | Bridges K8s EndpointSlice → global catalog and enforces “don’t publish noise” gating. |
+| Consul (as catalog/distribution) | Proven watch semantics + operational model; avoids inventing a global registry + anti-entropy. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom `Discovery Control Plane` that translates Consul → xDS | Use **Consul Connect’s built-in xDS** (or a minimal adapter that only applies policy overlays) | Less bespoke logic; you may give up some custom debug/“why” API unless you build it as a thin sidecar service. |
+| `Health Prober` as a separate component | Rely on **K8s readiness gating + Envoy passive health**, add **Envoy active HC only for cross-cluster** paths | Loses “richer signal for routing” unless you standardize on metrics-driven policy later; reduces moving parts. |
+| Endpoint-level global routing for all traffic | **Cluster-level global routing** (publish only cluster gateways globally; do endpoint discovery locally) | Fewer objects/updates; slightly higher hop and requires gateway capacity planning; but dramatically simpler ops and scale. |
+| Publish gating based on N/M probes | Two-stage gate: **LocalReady** (K8s/readiness) then **GlobalReady** (time/slow-start/limited remote%) | Slower global ramp, but avoids “globally ready” meaning “ready for remote load.” |
+| “Global catalog down → last-known-good” only | Add **explicit local-only mode** baked into Envoy config (static local cluster; xDS only for remote) | Slightly more config complexity, but makes the local happy path independent of global control-plane correctness. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Consul is down for 5 minutes (or returns stale watch results)**
+   - Design's answer: Envoy routes on last-known-good; local-first keeps same-cluster working.
+   - Recommendation: Strengthen — ensure Envoy has a **static local cluster** and that “remote” is an optional additive layer; also document **staleness bounds** (max snapshot age before forcing local-only).
+
+2. **Agent fails or loses leadership (but the cluster is healthy)**
+   - Design's answer: Not addressed explicitly; TTL expiry will withdraw the cluster globally.
+   - Recommendation: Strengthen — run the agent with **leader election** (K8s Lease) and make renewal robust (jitter, batching). Otherwise one bad rollout of the agent can “disappear” an entire cluster from global traffic.
+
+3. **Network partition isolates one cluster from Consul**
+   - Design's answer: Endpoints expire; cross-cluster traffic stops going there; rejoin republishes with gating.
+   - Recommendation: Acceptable — but add a guardrail: sudden withdrawal can cause **load concentration** elsewhere; cap remote failover with **max_remote_percent / overload protection** and document the expected behavior during partial partitions.
+
+4. **One component is slow (control plane/xDS lag) but not failing**
+   - Design's answer: Indirectly addressed via Envoy’s last-known-good and passive health.
+   - Recommendation: Strengthen — define SLOs and alerts for **propagation lag** (Consul watch lag, snapshot build time, xDS ACK latency). “Slow” is where deploy storms turn into queue buildup and then thundering herds.
+
+5. **Bad config / policy push (wrong failover order, retries too aggressive)**
+   - Design's answer: Not addressed (operators “change policy,” but no safety rails described).
+   - Recommendation: Must fix — add **staged rollout** for routing policy (canary a subset of Envoys), config validation, and an emergency “**force local-only**” toggle that doesn’t require Consul to be healthy.
+
+## Recommendations
+
+### Must Fix
+- Define **agent HA/leadership** and renewal behavior so “agent outage” doesn’t equal “cluster vanished” accidentally.
+- Add a **safe config rollout story** for routing policy/xDS (canary, validation, fast rollback, and a local-only escape hatch).
+- Clarify **identity and authorization**: who may register endpoints to Consul, how tenants/namespaces are isolated, and how Envoy authenticates upstreams cross-cluster (mTLS/SPIFFE/etc.). This is easy to under-spec and hard to retrofit.
+
+### Should Consider
+- Prefer **cluster-gateway global routing** sooner than “100x scale” if the team is small; it removes huge endpoint churn and makes health semantics cleaner.
+- Make publish gating explicitly **two-stage** (ready vs globally eligible) and tie it to slow-start/weights rather than a binary “appears globally.”
+- Document retry/outlier defaults as a **safety budget** (per-try timeout, max attempts, retry-on, hedging stance) to avoid self-inflicted retry storms.
+
+### Nice to Have
+- A concrete “**why am I routing here?**” debug surface: per-request headers or admin endpoint that reports chosen locality, ejection status, panic mode, and config version.
+- “Degraded mode” runbooks: what to do at 3am (flip to local-only, freeze updates, reduce retries), and which alerts map to which levers.
+
+## What's Working Well
+- The separation of **existence (TTL soft-state)** from **routability (Envoy skepticism)** is clean and honest about distributed-systems reality.
+- You’re explicitly designing for **deploy storms** (publish gating + deltas), which is where multi-cluster systems usually fail first.
+- The failure-mode section is practical and operationally oriented (snapshot age + outlier ejection rate are good leading indicators).
+- The scale “escape hatches” are directionally correct; tightening the “gateway vs endpoint-level” choice earlier can make the whole design easier to own.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/service-discovery.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afa-2026-7953-be7a-0cf07cfa62fa
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Service Discovery"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["service-discovery", "multi-cluster", "kubernetes", "health-routing", "eventual-consistency", "envoy", "consul"]
+---
+
+## Overview
+
+This system provides **multi-cluster service discovery** with **health-based routing** across Kubernetes clusters. The key idea is to separate **(1) discovery state** (what endpoints exist) from **(2) routing safety** (which endpoints are safe to send traffic to right now). Most outages in “global discovery” are not caused by missing endpoints—they’re caused by **stale or wrong health** being treated as truth.
+
+We use **Consul as a global service catalog** (boring, proven) and **Envoy as the data plane** for routing decisions (also boring, proven). Kubernetes remains the source of endpoint membership; Consul becomes the **distribution and query layer** for cross-cluster clients.
+
+Elegance comes from one rule: **only advertise endpoints globally as soft-state with TTL**, and make the data plane resilient to lies via **passive health (outlier ejection) + locality-first routing + fast local failover**. Eventual consistency becomes survivable because it’s no longer trusted with correctness.
+
+## What Makes This Hard
+
+Naive designs treat discovery as a strongly consistent database problem (“just replicate the registry”), but the real trap is that **health is inherently time-sensitive**. In a multi-cluster world, by the time a “healthy” signal crosses regions and caches, it may already be wrong. That’s how you get **traffic blackholes**: the control plane says an endpoint is alive; the data plane keeps sending requests; users see timeouts.
+
+The second trap is coupling failure domains: if your “global catalog” is down, naive clients lose the ability to resolve services at all. A discovery system must fail in a way that preserves a **local happy path** and degrades cross-cluster traffic gracefully.
+
+## Requirements
+
+### Functional Requirements
+- Discover service endpoints across multiple Kubernetes clusters under a single logical service name.
+- Route requests based on **health**, preferring same-cluster endpoints and failing over to other clusters.
+- Handle eventual consistency explicitly: endpoints may be added/removed/partitioned while traffic continues.
+- Support gradual rollouts: new endpoints must not receive global traffic until they’re demonstrably ready.
+- Provide a control-plane API for operators: “what is routing to what, and why?”
+
+### Scale Targets
+- **Clusters:** 20 (typical large org footprint); design should not fall apart at 100.
+- **Services:** 5,000; large enough that full-table polling is unacceptable.
+- **Endpoints:** 200,000 total; forces watch/stream distribution and compact representations.
+- **Discovery QPS:** 50k lookups/s equivalent at the edge (handled via xDS push + local caches, not synchronous queries).
+- **Update rate:** 1,000 endpoint changes/s during deploy storms; requires incremental updates and TTL-based cleanup.
+
+## Key Design Decisions
+
+- **Chose:** Consul as the global catalog (multi-datacenter semantics, health checks, proven operational model)  
+  **Rejected:** Building a custom “global Kubernetes API” replica  
+  **Why:** The hard part is correctness under staleness, not storage. Consul gives a mature distribution/query layer and reduces bespoke failure modes.
+
+- **Chose:** Envoy xDS (EDS/CDS) for endpoint distribution and health-aware routing  
+  **Rejected:** DNS-only multi-cluster discovery  
+  **Why:** DNS can tell you “where,” but not safely answer “who is healthy right now” at request time. Envoy can do locality preference, outlier ejection, circuit breaking, and fast failover.
+
+- **Chose:** TTL-based soft-state advertisement from clusters  
+  **Rejected:** “Write once, delete explicitly” endpoint records  
+  **Why:** Deletes are the first thing you lose during partitions. TTL makes disappearance the default, preventing endpoint resurrection and long-lived ghosts.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> E[Envoy Proxy]
+  E --> CP["Discovery Control Plane"]
+  CP --> G["Consul (Global Catalog)"]
+
+  subgraph K["Kubernetes Cluster"]
+    K8S["K8s API (EndpointSlice)"] --> A["Cluster Discovery Agent"]
+    A --> G
+    A --> H["Health Prober"]
+  end
+
+  E --> S["Service Endpoints"]
+```
+
+### Components
+
+- `Cluster Discovery Agent`
+  - Watches Kubernetes `EndpointSlice` and `Service` objects.
+  - Translates them into Consul service instances with **TTL** and metadata (`cluster`, `zone`, `revision`, `port`, `protocol`).
+  - Enforces a gating rule: **only publish globally after local readiness is stable** (see deep dive).
+
+- `Health Prober`
+  - Runs close to endpoints (same cluster) to avoid cross-region health lies.
+  - Produces a **liveness signal for discovery** (TTL renewal) and a **richer signal for routing** (success rates/latency buckets exported to the control plane).
+
+- `Consul (Global Catalog)`
+  - Stores the union of service instances across clusters as soft-state.
+  - Acts as the distribution backbone (watch streams) for the control plane.
+
+- `Discovery Control Plane`
+  - Watches Consul changes and publishes **xDS snapshots/deltas** to Envoy.
+  - Encodes routing policy: locality-first, cluster failover order, and safety knobs (max remote %, panic thresholds).
+
+- `Envoy Proxy`
+  - Consumes xDS and makes per-request decisions.
+  - Protects users from stale control-plane state via **passive health** (outlier ejection) and **fast retries** with bounded budgets.
+
+## Deep Dive: Health-Based Routing Under Eventual Consistency
+
+The hardest part is preventing a globally consistent-looking system from confidently routing to dead endpoints. This design uses three layers of defense, each assuming the layer above can be wrong:
+
+1) **Advertise only stable readiness (publish gating)**  
+Kubernetes readiness is noisy during deploys (warmup, cache fill, JVM compilation, etc.). The agent does not immediately publish a new endpoint globally when it appears in `EndpointSlice`. Instead it requires a short stability window (e.g., N consecutive successful probes over M seconds) before creating the Consul instance. This single rule eliminates the common “deploy storm causes global brownout” failure mode.
+
+2) **TTL as the only source of truth for existence**  
+Every advertised instance is soft-state with a short TTL (e.g., 15–30s) renewed by the agent. If the cluster is partitioned from the catalog, renewals stop and instances **expire automatically**. This is intentionally biased toward removing endpoints too aggressively rather than keeping ghosts. That bias is correct because Envoy can retry/failover quickly; users cannot tolerate long hangs caused by dead routes.
+
+3) **Data-plane skepticism (passive health and locality policy)**  
+Even with TTL, health can be wrong for seconds to minutes (GC pauses, node-level issues, partial outages). Envoy treats the catalog as a hint:
+- **Locality-first routing:** prefer same-cluster, then same-region, then other regions.
+- **Outlier ejection:** a small number of consecutive 5xx/timeouts ejects an endpoint quickly, independent of control-plane health.
+- **Bounded retries:** retries only on safe failures, with strict budgets to avoid amplifying incidents.
+This makes eventual consistency an availability concern, not a correctness concern.
+
+The net effect is that “global discovery” can be stale and you still don’t blackhole traffic: the data plane self-corrects faster than the control plane can converge.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Fast failover, fewer blackholes | Strong global correctness guarantees |
+| Operational simplicity (Consul + Envoy) | Pure Kubernetes-native minimalism |
+| Safe deploy storms (publish gating + outlier ejection) | Slightly slower global traffic ramp-up for new endpoints |
+| Partition tolerance via TTL | More churn in the catalog during unstable networks |
+
+## Failure Modes
+
+- **Stale “healthy” endpoints (ghost routes)**
+  - What happens: callers hit dead pods, see timeouts.
+  - Detect: elevated Envoy upstream timeouts + increasing outlier ejections for a cluster.
+  - Recover: outlier ejection stops sending traffic within seconds; TTL expiry removes ghosts from future snapshots.
+
+- **Catalog/control-plane outage**
+  - What happens: xDS updates stop; naive clients would fail resolution.
+  - Detect: Envoy xDS disconnects + snapshot age alerts.
+  - Recover: Envoy continues routing on last-known-good config; local-first policy keeps same-cluster traffic working. Operators restore catalog/control plane without immediate user impact.
+
+- **Network partition between a cluster and the global catalog**
+  - What happens: that cluster’s endpoints expire globally; cross-cluster traffic stops flowing to it.
+  - Detect: missing TTL renewals + sudden drop in advertised instances for that cluster.
+  - Recover: when connectivity returns, the agent republishes; publish gating prevents half-ready endpoints from immediately taking traffic.
+
+## What I'd Do Differently At...
+
+- **10x scale:** shard the control plane by service namespace/team, and push **delta xDS** aggressively to reduce fanout; introduce per-service rate limits on update propagation to survive deploy storms.
+- **100x scale:** replace a single global catalog with **regional catalogs + federation**, and move from “endpoint-level global routing” toward “cluster-level routing” (send traffic to a cluster gateway, then do local service discovery inside the destination cluster). Endpoint-level global state becomes too large and too noisy.
+
+## Operational Notes
+
+- Tune TTL and ejection thresholds together: short TTL with aggressive ejection can cause flapping; keep TTL moderately short and rely on passive health for second-level decisions.
+- Alert on **snapshot age** and **outlier ejection rate**; they’re better early-warning signals than raw health-check counts.
+- During incidents, your safest lever is policy: force “local-only” or “region-only” routing at the control plane; don’t hand-edit catalogs.
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+You’re treating “global discovery” as **soft truth** and pushing correctness back into the **data plane** (TTL for existence + Envoy skepticism for routability). That’s the right non-obvious move: it converts eventual consistency from “blackhole risk” into “degraded preference.”
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Envoy | Per-request, fast feedback loop (outlier ejection/retries/locality) that can correct stale control-plane state. |
+| TTL-based registration | Makes partitions fail “safe” (ghost prevention) without relying on perfect deletes. |
+| Cluster Discovery Agent | Bridges K8s EndpointSlice → global catalog and enforces “don’t publish noise” gating. |
+| Consul (as catalog/distribution) | Proven watch semantics + operational model; avoids inventing a global registry + anti-entropy. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom `Discovery Control Plane` that translates Consul → xDS | Use **Consul Connect’s built-in xDS** (or a minimal adapter that only applies policy overlays) | Less bespoke logic; you may give up some custom debug/“why” API unless you build it as a thin sidecar service. |
+| `Health Prober` as a separate component | Rely on **K8s readiness gating + Envoy passive health**, add **Envoy active HC only for cross-cluster** paths | Loses “richer signal for routing” unless you standardize on metrics-driven policy later; reduces moving parts. |
+| Endpoint-level global routing for all traffic | **Cluster-level global routing** (publish only cluster gateways globally; do endpoint discovery locally) | Fewer objects/updates; slightly higher hop and requires gateway capacity planning; but dramatically simpler ops and scale. |
+| Publish gating based on N/M probes | Two-stage gate: **LocalReady** (K8s/readiness) then **GlobalReady** (time/slow-start/limited remote%) | Slower global ramp, but avoids “globally ready” meaning “ready for remote load.” |
+| “Global catalog down → last-known-good” only | Add **explicit local-only mode** baked into Envoy config (static local cluster; xDS only for remote) | Slightly more config complexity, but makes the local happy path independent of global control-plane correctness. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Consul is down for 5 minutes (or returns stale watch results)**
+   - Design's answer: Envoy routes on last-known-good; local-first keeps same-cluster working.
+   - Recommendation: Strengthen — ensure Envoy has a **static local cluster** and that “remote” is an optional additive layer; also document **staleness bounds** (max snapshot age before forcing local-only).
+
+2. **Agent fails or loses leadership (but the cluster is healthy)**
+   - Design's answer: Not addressed explicitly; TTL expiry will withdraw the cluster globally.
+   - Recommendation: Strengthen — run the agent with **leader election** (K8s Lease) and make renewal robust (jitter, batching). Otherwise one bad rollout of the agent can “disappear” an entire cluster from global traffic.
+
+3. **Network partition isolates one cluster from Consul**
+   - Design's answer: Endpoints expire; cross-cluster traffic stops going there; rejoin republishes with gating.
+   - Recommendation: Acceptable — but add a guardrail: sudden withdrawal can cause **load concentration** elsewhere; cap remote failover with **max_remote_percent / overload protection** and document the expected behavior during partial partitions.
+
+4. **One component is slow (control plane/xDS lag) but not failing**
+   - Design's answer: Indirectly addressed via Envoy’s last-known-good and passive health.
+   - Recommendation: Strengthen — define SLOs and alerts for **propagation lag** (Consul watch lag, snapshot build time, xDS ACK latency). “Slow” is where deploy storms turn into queue buildup and then thundering herds.
+
+5. **Bad config / policy push (wrong failover order, retries too aggressive)**
+   - Design's answer: Not addressed (operators “change policy,” but no safety rails described).
+   - Recommendation: Must fix — add **staged rollout** for routing policy (canary a subset of Envoys), config validation, and an emergency “**force local-only**” toggle that doesn’t require Consul to be healthy.
+
+## Recommendations
+
+### Must Fix
+- Define **agent HA/leadership** and renewal behavior so “agent outage” doesn’t equal “cluster vanished” accidentally.
+- Add a **safe config rollout story** for routing policy/xDS (canary, validation, fast rollback, and a local-only escape hatch).
+- Clarify **identity and authorization**: who may register endpoints to Consul, how tenants/namespaces are isolated, and how Envoy authenticates upstreams cross-cluster (mTLS/SPIFFE/etc.). This is easy to under-spec and hard to retrofit.
+
+### Should Consider
+- Prefer **cluster-gateway global routing** sooner than “100x scale” if the team is small; it removes huge endpoint churn and makes health semantics cleaner.
+- Make publish gating explicitly **two-stage** (ready vs globally eligible) and tie it to slow-start/weights rather than a binary “appears globally.”
+- Document retry/outlier defaults as a **safety budget** (per-try timeout, max attempts, retry-on, hedging stance) to avoid self-inflicted retry storms.
+
+### Nice to Have
+- A concrete “**why am I routing here?**” debug surface: per-request headers or admin endpoint that reports chosen locality, ejection status, panic mode, and config version.
+- “Degraded mode” runbooks: what to do at 3am (flip to local-only, freeze updates, reduce retries), and which alerts map to which levers.
+
+## What's Working Well
+- The separation of **existence (TTL soft-state)** from **routability (Envoy skepticism)** is clean and honest about distributed-systems reality.
+- You’re explicitly designing for **deploy storms** (publish gating + deltas), which is where multi-cluster systems usually fail first.
+- The failure-mode section is practical and operationally oriented (snapshot age + outlier ejection rate are good leading indicators).
+- The scale “escape hatches” are directionally correct; tightening the “gateway vs endpoint-level” choice earlier can make the whole design easier to own.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+thinking
+**Navigating document requirements**
+
+I’m considering the user's request about the Envoy and its local and remote cluster endpoints. It seems like I need to incorporate a "why" API, but maybe I should drop that and stick with the Envoy admin endpoints and Consul UI. There’s a requirement to keep the control-plane API for operators, but could we argue it's too much? The instructions say to rewrite with minimal architecture and clear justifications for what we remove, but there’s confusion about needing a "What We Removed" section. That seems contradictory!
+thinking
+**Resolving format conflicts**
+
+I need to navigate the seemingly conflicting instructions the user provided. The output format seems to expect a new section, but the system indicates I shouldn't add sections. Can I satisfy the key intent by renaming an existing section to "What We Removed"? It doesn't explicitly say I can't alter section headings. My challenge is balancing the requirement to rewrite the document with specified sections while ensuring I stick to the minimal architecture. So, could I fold "What We Removed" into "Key Design Decisions" or "Trade-offs"?
+thinking
+**Finding the right format**
+
+I'm thinking about how to handle the "What I'd Do Differently At..." section. Renaming it to "What We Removed" isn't ideal since that might lose important content. Maybe I can keep the existing headings and instead add a bullet list under "Key Design Decisions" titled "What We Removed" in bold text, which would meet the requirement without creating a new section. I also need to ensure that I present a minimal architecture overview and justify each component clearly, along with listing items factually in "What We Removed."
+thinking
+**Finalizing design details**
+
+I need to ensure the markdown is complete while avoiding over-engineering, like specifying too many clusters or scaling numbers. It seems like keeping scale targets is important, but maybe I can condense them for simplicity. The simplifier shouldn’t change, though, so I’ll aim for only 1-3 custom components, including a Cluster Discovery Agent and possibly some configuration. I’ll also utilize managed services like Consul, Envoy, and Kubernetes. My potential simplified design would focus on global discovery for remote failover and local standard Kubernetes service usage.
+thinking
+**Streamlining architecture**
+
+I want to keep things simple by using Kubernetes DNS for local upstream and Consul xDS for remote upstream. Actually, it is possible to have static clusters for local and dynamic clusters for remote using xDS. I’ll mention that Envoy’s bootstrap will contain static local clusters and dynamic remote clusters from Consul. For routing policies, I’ll prioritize local connections, only using remote if there's a failure or overload. I’ll also simplify the control-plane API to focus on observability by keeping key elements like Envoy’s admin endpoint and access logs.
+codex
+```markdown
+---
+title: "Service Discovery"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["service-discovery", "multi-cluster", "kubernetes", "health-routing", "eventual-consistency", "envoy", "consul"]
+---
+
+## Overview
+
+This system provides **multi-cluster service discovery** with **health-based routing** across Kubernetes clusters by keeping “global discovery” intentionally small: it is only used for **remote failover**, while the **local path stays independent**.
+
+Kubernetes remains the source of truth for local endpoints. Consul holds a **TTL-based global catalog of cluster-level endpoints** (one per service per cluster, not every pod). Envoy makes per-request decisions and treats global state as a hint: **prefer local**, use remote only when needed, and stop trusting remote quickly when it misbehaves.
+
+## What Makes This Hard
+
+In multi-cluster routing, the hardest failure is **confidently routing to dead capacity** because health signals are stale. The second failure is making “global discovery” a dependency for the local happy path.
+
+This design avoids both by (1) keeping global state coarse (cluster-level) and soft (TTL), and (2) making Envoy safe under staleness (local-first + passive health + bounded retries).
+
+## Requirements
+
+### Functional Requirements
+- Discover service endpoints across multiple Kubernetes clusters under a single logical service name.
+- Route requests based on **health**, preferring same-cluster endpoints and failing over to other clusters.
+- Handle eventual consistency explicitly: endpoints may be added/removed/partitioned while traffic continues.
+- Support gradual rollouts: new endpoints must not receive global traffic until they’re demonstrably ready.
+- Provide a control-plane API for operators: “what is routing to what, and why?”
+
+### Scale Targets
+- **Clusters:** 20 (typical large org footprint); design should not fall apart at 100.
+- **Services:** 5,000; large enough that full-table polling is unacceptable.
+- **Endpoints:** 200,000 total; forces watch/stream distribution and compact representations.
+- **Discovery QPS:** 50k lookups/s equivalent at the edge (handled via xDS push + local caches, not synchronous queries).
+- **Update rate:** 1,000 endpoint changes/s during deploy storms; requires incremental updates and TTL-based cleanup.
+
+## Key Design Decisions
+
+- **Chose:** Cluster-level global endpoints (per service, per cluster) with TTL  
+  **Rejected:** Pod-level global endpoint replication  
+  **Why:** Remote failover does not need pod granularity; it needs a safe remote target. This removes most churn and makes eventual consistency survivable.
+
+- **Chose:** Consul as the global catalog **and** xDS server  
+  **Rejected:** A custom discovery control plane  
+  **Why:** The system only needs a catalog + watch distribution. Policy stays minimal and lives in Envoy config and Consul config entries.
+
+- **Chose:** Envoy for routing safety (locality + outlier ejection + bounded retries)  
+  **Rejected:** DNS-only multi-cluster discovery  
+  **Why:** Routing safety is a data-plane problem; Envoy can stop trusting bad upstreams quickly.
+
+- **Chose:** Two-stage gating for remote eligibility  
+  **Rejected:** “Publish immediately when it appears”  
+  **Why:** “Ready locally” is not the same as “safe for remote traffic.” Remote is opt-in after stability.
+
+**What We Removed**
+- Custom `Discovery Control Plane` → replaced by Consul’s built-in xDS distribution.
+- Separate `Health Prober` → replaced by K8s readiness for eligibility and Envoy passive health for routing safety.
+- Global pod endpoint advertisement → replaced by per-cluster service endpoints.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> E[Envoy Proxy]
+
+  subgraph K["Kubernetes Cluster"]
+    K8S["K8s API (Service/EndpointSlice)"] --> A["Cluster Discovery Agent"]
+  end
+
+  A --> G["Consul (Global Catalog + xDS)"]
+  E -->|xDS| G
+
+  E --> L["Local Service Endpoints (Kubernetes)"]
+  E --> R["Remote Service Endpoints (per-cluster)"]
+```
+
+### Components
+
+- `Cluster Discovery Agent`
+  - Watches Kubernetes `Service` + `EndpointSlice`.
+  - Registers **one remote target per service per cluster** into Consul with **TTL** and metadata (`cluster`, `region/zone`, `revision`, `protocol`, `port`).
+  - Two-stage gate:
+    - **LocalReady:** service has ready endpoints (Kubernetes readiness).
+    - **GlobalReady:** LocalReady has been stable for a short window; remote weight ramps up slowly.
+  - HA and safety:
+    - Runs as a Deployment with **leader election** (K8s Lease); only the leader renews TTLs.
+    - Renews with jitter/batching to survive deploy storms.
+
+- `Consul (Global Catalog + xDS)`
+  - Stores soft-state remote targets with TTL.
+  - Streams updates to Envoy over xDS.
+  - Enforces who may register via ACLs (registration is not open-ended).
+
+- `Envoy Proxy`
+  - Has a **static local cluster** (Kubernetes service discovery) so local traffic works without Consul.
+  - Uses Consul xDS only for the **remote failover layer**.
+  - Routing safety:
+    - **Local-first** routing; remote only on local failure/overload.
+    - **Outlier ejection** to stop sending traffic to bad remote targets quickly.
+    - **Bounded retries** with strict budgets to avoid retry storms.
+  - Debug surface:
+    - Envoy admin and access logs expose chosen cluster/endpoint, ejection status, and config version (the “why” signal).
+
+## Deep Dive: Health-Based Routing Under Eventual Consistency
+
+1) **Global state is eligibility, not truth**  
+Consul only answers: “which clusters are currently eligible targets for this service?” Eligibility is TTL-based and expires quickly.
+
+2) **Remote eligibility is gated and slow-started**  
+A service becomes remotely eligible only after LocalReady is stable. Remote traffic ramps via weights/slow-start so “globally visible” does not mean “take full remote load.”
+
+3) **Data plane corrects faster than the catalog converges**  
+Envoy treats remote targets skeptically: if a target times out/5xx’s, it is ejected quickly and traffic fails over without waiting for catalog updates.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Few moving parts (Consul + Envoy + small agent) | Fine-grained global endpoint steering |
+| Safe local happy path independent of global systems | Remote routing is coarser (cluster-level) |
+| Fast protection from stale health (Envoy passive health) | Less “rich” active health signal |
+| Deploy-storm resilience (TTL + gating + slow-start) | Slightly slower remote ramp-up |
+
+## Failure Modes
+
+- **Consul outage or stale watch results**
+  - What happens: remote updates stop.
+  - Recover: Envoy continues routing locally using static config; remote is additive and can be automatically disabled if xDS is too old.
+
+- **Agent failure / bad rollout (cluster is healthy)**
+  - What happens: TTL renewals stop; that cluster’s remote eligibility expires.
+  - Recover: local traffic remains unaffected; once the agent leader is healthy again, eligibility returns after gating.
+
+- **Network partition between a cluster and Consul**
+  - What happens: that cluster stops receiving remote traffic as TTLs expire.
+  - Recover: other clusters continue; when connectivity returns, targets reappear after gating and slow-start.
+
+- **Slow control-plane propagation (lag, not outage)**
+  - What happens: remote changes arrive late.
+  - Recover: Envoy’s passive health prevents persistent blackholes; alerts focus on snapshot age / xDS ACK latency to keep lag from turning into incident.
+
+- **Bad retry/failover policy push**
+  - What happens: self-inflicted retry storms or wrong failover order.
+  - Recover: keep policy surface small; use versioned config and fast rollback; Envoy bootstrap supports an emergency local-only mode that does not depend on Consul being healthy.
+
+## What I'd Do Differently At...
+
+- **10x scale:** keep the same shape; reduce remote churn further by tightening “remote eligibility” to only the clusters intended to take remote traffic (explicit allowlists/weights per service).
+- **100x scale:** stop thinking in endpoints entirely; remote routing stays cluster-level and becomes the default abstraction (everything else stays local).
+
+## Operational Notes
+
+- TTL is for *eligibility*, Envoy passive health is for *routability*; tune them together, but let Envoy make the fast decision.
+- Alert on **xDS staleness**, **xDS ACK latency**, and **outlier ejection rate**; they catch “slow” before it becomes “down.”
+- Keep retries boring: small per-try timeouts, low max attempts, strict budgets; default to local-first.
+- Registration is privileged: Consul ACLs restrict which agents may register which service names; cross-cluster transport uses mTLS when enabled in the mesh.
+```
+tokens used
+8,562
+```markdown
+---
+title: "Service Discovery"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["service-discovery", "multi-cluster", "kubernetes", "health-routing", "eventual-consistency", "envoy", "consul"]
+---
+
+## Overview
+
+This system provides **multi-cluster service discovery** with **health-based routing** across Kubernetes clusters by keeping “global discovery” intentionally small: it is only used for **remote failover**, while the **local path stays independent**.
+
+Kubernetes remains the source of truth for local endpoints. Consul holds a **TTL-based global catalog of cluster-level endpoints** (one per service per cluster, not every pod). Envoy makes per-request decisions and treats global state as a hint: **prefer local**, use remote only when needed, and stop trusting remote quickly when it misbehaves.
+
+## What Makes This Hard
+
+In multi-cluster routing, the hardest failure is **confidently routing to dead capacity** because health signals are stale. The second failure is making “global discovery” a dependency for the local happy path.
+
+This design avoids both by (1) keeping global state coarse (cluster-level) and soft (TTL), and (2) making Envoy safe under staleness (local-first + passive health + bounded retries).
+
+## Requirements
+
+### Functional Requirements
+- Discover service endpoints across multiple Kubernetes clusters under a single logical service name.
+- Route requests based on **health**, preferring same-cluster endpoints and failing over to other clusters.
+- Handle eventual consistency explicitly: endpoints may be added/removed/partitioned while traffic continues.
+- Support gradual rollouts: new endpoints must not receive global traffic until they’re demonstrably ready.
+- Provide a control-plane API for operators: “what is routing to what, and why?”
+
+### Scale Targets
+- **Clusters:** 20 (typical large org footprint); design should not fall apart at 100.
+- **Services:** 5,000; large enough that full-table polling is unacceptable.
+- **Endpoints:** 200,000 total; forces watch/stream distribution and compact representations.
+- **Discovery QPS:** 50k lookups/s equivalent at the edge (handled via xDS push + local caches, not synchronous queries).
+- **Update rate:** 1,000 endpoint changes/s during deploy storms; requires incremental updates and TTL-based cleanup.
+
+## Key Design Decisions
+
+- **Chose:** Cluster-level global endpoints (per service, per cluster) with TTL  
+  **Rejected:** Pod-level global endpoint replication  
+  **Why:** Remote failover does not need pod granularity; it needs a safe remote target. This removes most churn and makes eventual consistency survivable.
+
+- **Chose:** Consul as the global catalog **and** xDS server  
+  **Rejected:** A custom discovery control plane  
+  **Why:** The system only needs a catalog + watch distribution. Policy stays minimal and lives in Envoy config and Consul config entries.
+
+- **Chose:** Envoy for routing safety (locality + outlier ejection + bounded retries)  
+  **Rejected:** DNS-only multi-cluster discovery  
+  **Why:** Routing safety is a data-plane problem; Envoy can stop trusting bad upstreams quickly.
+
+- **Chose:** Two-stage gating for remote eligibility  
+  **Rejected:** “Publish immediately when it appears”  
+  **Why:** “Ready locally” is not the same as “safe for remote traffic.” Remote is opt-in after stability.
+
+**What We Removed**
+- Custom `Discovery Control Plane` → replaced by Consul’s built-in xDS distribution.
+- Separate `Health Prober` → replaced by K8s readiness for eligibility and Envoy passive health for routing safety.
+- Global pod endpoint advertisement → replaced by per-cluster service endpoints.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> E[Envoy Proxy]
+
+  subgraph K["Kubernetes Cluster"]
+    K8S["K8s API (Service/EndpointSlice)"] --> A["Cluster Discovery Agent"]
+  end
+
+  A --> G["Consul (Global Catalog + xDS)"]
+  E -->|xDS| G
+
+  E --> L["Local Service Endpoints (Kubernetes)"]
+  E --> R["Remote Service Endpoints (per-cluster)"]
+```
+
+### Components
+
+- `Cluster Discovery Agent`
+  - Watches Kubernetes `Service` + `EndpointSlice`.
+  - Registers **one remote target per service per cluster** into Consul with **TTL** and metadata (`cluster`, `region/zone`, `revision`, `protocol`, `port`).
+  - Two-stage gate:
+    - **LocalReady:** service has ready endpoints (Kubernetes readiness).
+    - **GlobalReady:** LocalReady has been stable for a short window; remote weight ramps up slowly.
+  - HA and safety:
+    - Runs as a Deployment with **leader election** (K8s Lease); only the leader renews TTLs.
+    - Renews with jitter/batching to survive deploy storms.
+
+- `Consul (Global Catalog + xDS)`
+  - Stores soft-state remote targets with TTL.
+  - Streams updates to Envoy over xDS.
+  - Enforces who may register via ACLs (registration is not open-ended).
+
+- `Envoy Proxy`
+  - Has a **static local cluster** (Kubernetes service discovery) so local traffic works without Consul.
+  - Uses Consul xDS only for the **remote failover layer**.
+  - Routing safety:
+    - **Local-first** routing; remote only on local failure/overload.
+    - **Outlier ejection** to stop sending traffic to bad remote targets quickly.
+    - **Bounded retries** with strict budgets to avoid retry storms.
+  - Debug surface:
+    - Envoy admin and access logs expose chosen cluster/endpoint, ejection status, and config version (the “why” signal).
+
+## Deep Dive: Health-Based Routing Under Eventual Consistency
+
+1) **Global state is eligibility, not truth**  
+Consul only answers: “which clusters are currently eligible targets for this service?” Eligibility is TTL-based and expires quickly.
+
+2) **Remote eligibility is gated and slow-started**  
+A service becomes remotely eligible only after LocalReady is stable. Remote traffic ramps via weights/slow-start so “globally visible” does not mean “take full remote load.”
+
+3) **Data plane corrects faster than the catalog converges**  
+Envoy treats remote targets skeptically: if a target times out/5xx’s, it is ejected quickly and traffic fails over without waiting for catalog updates.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Few moving parts (Consul + Envoy + small agent) | Fine-grained global endpoint steering |
+| Safe local happy path independent of global systems | Remote routing is coarser (cluster-level) |
+| Fast protection from stale health (Envoy passive health) | Less “rich” active health signal |
+| Deploy-storm resilience (TTL + gating + slow-start) | Slightly slower remote ramp-up |
+
+## Failure Modes
+
+- **Consul outage or stale watch results**
+  - What happens: remote updates stop.
+  - Recover: Envoy continues routing locally using static config; remote is additive and can be automatically disabled if xDS is too old.
+
+- **Agent failure / bad rollout (cluster is healthy)**
+  - What happens: TTL renewals stop; that cluster’s remote eligibility expires.
+  - Recover: local traffic remains unaffected; once the agent leader is healthy again, eligibility returns after gating.
+
+- **Network partition between a cluster and Consul**
+  - What happens: that cluster stops receiving remote traffic as TTLs expire.
+  - Recover: other clusters continue; when connectivity returns, targets reappear after gating and slow-start.
+
+- **Slow control-plane propagation (lag, not outage)**
+  - What happens: remote changes arrive late.
+  - Recover: Envoy’s passive health prevents persistent blackholes; alerts focus on snapshot age / xDS ACK latency to keep lag from turning into incident.
+
+- **Bad retry/failover policy push**
+  - What happens: self-inflicted retry storms or wrong failover order.
+  - Recover: keep policy surface small; use versioned config and fast rollback; Envoy bootstrap supports an emergency local-only mode that does not depend on Consul being healthy.
+
+## What I'd Do Differently At...
+
+- **10x scale:** keep the same shape; reduce remote churn further by tightening “remote eligibility” to only the clusters intended to take remote traffic (explicit allowlists/weights per service).
+- **100x scale:** stop thinking in endpoints entirely; remote routing stays cluster-level and becomes the default abstraction (everything else stays local).
+
+## Operational Notes
+
+- TTL is for *eligibility*, Envoy passive health is for *routability*; tune them together, but let Envoy make the fast decision.
+- Alert on **xDS staleness**, **xDS ACK latency**, and **outlier ejection rate**; they catch “slow” before it becomes “down.”
+- Keep retries boring: small per-try timeouts, low max attempts, strict budgets; default to local-first.
+- Registration is privileged: Consul ACLs restrict which agents may register which service names; cross-cluster transport uses mTLS when enabled in the mesh.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/01-foundational-infrastructure/service-discovery.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Service Discovery
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/service-discovery.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/service-discovery.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/01-foundational-infrastructure/service-discovery.md

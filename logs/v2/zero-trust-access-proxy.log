@@ -1,0 +1,1616 @@
+==========================================
+Generating (v2): Zero-Trust Access Proxy
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2d4c-72c2-8f35-5f74bbb15f54
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Zero-Trust Access Proxy
+**Category**: Security & Access Control
+
+**Problem Statement**:
+Design a gateway that replaces VPNs, authenticating every request based on identity and device health before routing to internal apps.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+thinking
+**Drafting zero-trust access proxy design**
+
+I need to create a markdown document with a focus on an opinionated design for a zero-trust access proxy. The key insight should be about continuous authorization using short-lived tokens and a policy engine, alongside device health attestation. Components will include IdP OIDC, device posture service, and an Envoy-based access proxy, among others. I’ll explore request evaluation, caching, and failure modes like IdP down. I should also prepare a Mermaid diagram with a maximum of eight nodes.
+codex
+```markdown
+---
+title: "Zero-Trust Access Proxy"
+category: "Security & Access Control"
+difficulty: "Hard"
+tags: ["zero-trust", "iap", "ztna", "oidc", "mTLS", "policy", "device-posture", "audit"]
+---
+
+## Overview
+
+This system is a Zero-Trust Access Proxy (ZTAP) that replaces a VPN by authenticating and authorizing **every request** to internal applications using **user identity + device health** + fine-grained policy. Users reach internal apps through a gateway that enforces policy at L7, then forwards requests over mutually-authenticated transport to private services. The goal is to make “being on the network” irrelevant; the only thing that matters is *who you are, what device you’re on, and what you’re trying to do right now*.
+
+The key insight that makes this design elegant is separating **identity proof** from **access decisions** and making both *cheap to evaluate per-request*. Identity is proven once via OIDC and represented as **short-lived, audience-bound tokens**. Access decisions are computed by a **central policy engine** using cached posture signals and request attributes, then enforced at the proxy. This avoids the two common failure modes: (1) “session equals trust” VPN semantics and (2) embedding authorization logic into every app.
+
+Everything else is boring by design: Envoy/NGINX for the proxy, OIDC for identity, OPA (or Cedar) for policy, Postgres for configuration, append-only logging for audit, and mTLS for service-side enforcement.
+
+## What Makes This Hard
+
+Naive implementations authenticate the user once, then silently treat subsequent traffic as trusted (“VPN with SSO”). The trap is **stale trust**: device posture changes (EDR disabled, jailbroken device, certificate revoked) *after* login, and you only discover it after damage is done. Zero-trust means the decision must be continuously revalidated with bounded staleness.
+
+The second trap is pushing policy into applications. Teams end up with inconsistent enforcement, divergent interpretations of “device healthy,” and no single place to answer “who accessed what and why was it allowed.” You want one enforcement point and one decision model, or you’ll never get predictable security outcomes.
+
+## Requirements
+
+### Functional Requirements
+- Enforce access on **every request** using: user identity, device identity, device posture, app/resource, method/path, and risk signals.
+- Support both **browser apps** (cookie/redirect flows) and **API clients** (non-interactive token flows).
+- Provide **continuous access** semantics: access can be revoked within minutes (or faster for high-risk).
+- Strong auditability: for each decision, record **inputs, policy version, decision result**, and downstream target.
+- Minimal app changes: internal apps should not implement authentication; they should verify **mTLS + forwarded identity** and trust the proxy boundary.
+
+### Scale Targets
+- **Users:** 50k employees/contractors; **devices:** 80k managed endpoints.
+- **Traffic:** 20k RPS average, 80k RPS peak (login storms + CI systems); p95 proxy-added latency < 25ms.
+- **Policy eval:** must be sub-millisecond with caching; posture freshness target 60s (normal), 5–10s (high-risk apps).
+- **Audit:** 100–300M events/day at peak organizations (requests + decisions + posture changes).
+
+These numbers force: stateless proxy scaling, cached decision inputs, and an audit pipeline that can ingest continuously without back-pressuring the proxy.
+
+## Key Design Decisions
+
+- **Decision 1: Central policy decision, distributed enforcement**
+  - **Chose:** Envoy-based proxy calls a Policy Decision Point (PDP) (OPA) for allow/deny + constraints; proxy enforces.
+  - **Rejected:** Hardcoding rules in proxy config; pushing authorization logic to apps.
+  - **Why:** You need a single source of truth, versioned policy, explainable decisions, and consistent enforcement without app rewrites.
+
+- **Decision 2: Short-lived, audience-bound identity + continuous posture**
+  - **Chose:** OIDC login produces a short-lived session; each request is evaluated against **current posture** (cached with strict TTL).
+  - **Rejected:** Long-lived sessions; “device checked at login only.”
+  - **Why:** Stale trust is the real enemy. Bounding token lifetime and posture TTL gives you predictable worst-case exposure.
+
+- **Decision 3: mTLS to upstream + identity propagation contract**
+  - **Chose:** Proxy-to-app mTLS with SPIFFE-like identities; forward identity in signed headers (or JWT exchange) with strict audience.
+  - **Rejected:** Plain HTTP to apps; letting apps accept user JWTs directly from the internet.
+  - **Why:** Apps must be able to prove “this request came through the proxy” and get a tamper-resistant user context.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[User/Client] --> P[Access Proxy]
+  P --> I[OIDC IdP]
+  P --> D[Device Posture]
+  P --> O[Policy Engine]
+  P --> A[Internal Apps]
+  P --> L[Audit Log]
+  C[Admin Console] --> S[Config Store]
+  O --> S
+```
+
+### Components
+
+- `Access Proxy`: The only public entry point. Terminates TLS, runs OIDC flows, normalizes requests, calls policy, enforces decisions, and forwards to internal apps over mTLS. Must be horizontally scalable and largely stateless.
+- `OIDC IdP`: Workforce identity (Okta/AzureAD/Google). Issues identity tokens; the proxy treats it as the authority for user auth, not for fine-grained access.
+- `Device Posture`: Aggregates device signals (MDM compliance, EDR running, disk encrypted, cert validity). Exposes a fast “device_id -> posture summary + timestamp” API.
+- `Policy Engine`: PDP that evaluates requests (principal, device posture, app, route, method, risk, time) against versioned policy and returns allow/deny plus constraints (headers, max session age, step-up requirement).
+- `Internal Apps`: Private services reachable only from the proxy. Validate mTLS client identity (proxy) and consume forwarded identity claims per a strict contract.
+- `Audit Log`: Append-only event stream for decisions and access, designed so the proxy can log asynchronously without blocking user traffic.
+- `Config Store`: Stores routes, app definitions, policy bundles, device posture thresholds, and keys; versioned and auditable.
+- `Admin Console`: Manages apps/routes/policies, with change review and rollout controls (canary policy versions, emergency lock-down).
+
+## Deep Dive: Continuous AuthZ With Bounded Staleness
+
+The hardest part is making “authorize every request” both **secure** and **fast**. The correct model is: *every request produces an authorization decision derived from fresh-enough identity and posture signals, with explicit staleness bounds.*
+
+**1) Identity proof is cheap, but must be constrained.**  
+The proxy uses OIDC for browser flows (authorization code + PKCE) and issues its own **proxy session** (HTTP-only cookie) that maps to a short-lived internal session record (or a signed token) with: `user_id`, `groups`, `idp_issuer`, `auth_time`, `mfa_level`. For API clients, the proxy supports OIDC token exchange or mTLS client auth to mint an internal token. Critically, all tokens are **audience-bound to the proxy**; internal apps never accept raw IdP tokens from the outside world.
+
+**2) Posture is evaluated per-request, but fetched amortized.**  
+Calling an MDM/EDR API on every request is impossible. Instead, a Posture Service maintains a cached, normalized posture document per device:
+- `device_id`, `compliance_state`, `edr_state`, `cert_status`, `last_seen`, `risk_score`, `timestamp`
+The proxy fetches posture with aggressive caching and strict TTLs:
+- Normal apps: accept posture up to 60s old.
+- High-risk apps: 5–10s TTL or require step-up on stale posture.
+If posture is older than TTL, the decision becomes **deny or step-up**, not “allow anyway.” This is the “bounded staleness” guarantee that makes revocation real.
+
+**3) Policy is evaluated on a compact input and returns constraints, not just allow/deny.**  
+The proxy sends a minimal, deterministic input to the PDP:
+- `principal` (user + groups + auth_time + mfa_level)
+- `device` (posture summary + timestamp)
+- `request` (app_id, route_id, method, path template, source IP/geo if relevant)
+- `context` (time, policy_version, emergency_mode)
+The PDP response is richer than a boolean:
+- `decision`: allow/deny
+- `reason`: machine-readable code for audit
+- `max_session_age`: force re-auth if auth is old
+- `require_step_up`: trigger MFA for sensitive routes
+- `headers_to_add`: signed identity context for upstream
+This lets you express “allow, but only if auth is recent” without embedding authentication logic into policy or vice versa.
+
+**4) Upstream identity propagation must be tamper-resistant.**  
+Once allowed, the proxy forwards:
+- mTLS to upstream with a stable proxy identity (and optionally per-tenant proxy identities).
+- A signed, short-lived “upstream assertion” (JWT) containing `sub`, `groups`, `device_id`, `decision_id`, `issued_at`, `expires_at`, `app_audience`.
+Apps verify signature and audience; they do not need to call the IdP or PDP. This gives apps a trustworthy user context while keeping the enforcement boundary at the proxy.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Fast, consistent enforcement at a single choke point | Some proxy complexity and operational criticality |
+| Real revocation via bounded posture/token staleness | Occasional “deny on stale signals” during outages |
+| Minimal app changes (mTLS + assertion verify) | Apps must adopt a standard identity propagation contract |
+
+## Failure Modes
+
+- **IdP outage or latency spike**
+  - **What happens:** New logins and step-up flows fail; existing sessions might continue until max age.
+  - **Detect:** Elevated OIDC error rates, auth callback timeouts, step-up failures.
+  - **Recover:** Use short grace windows for already-authenticated sessions (bounded by `max_session_age`), degrade to “no step-up allowed → deny sensitive routes,” and page quickly—this is a hard dependency by design.
+
+- **Posture service stale or unavailable**
+  - **What happens:** Proxy cannot refresh posture; risk of stale trust if you fail open.
+  - **Detect:** Posture fetch error rate, posture age histogram drifting beyond TTL.
+  - **Recover:** Default to **fail closed for high-risk apps**, fail to step-up or limited allow for low-risk apps only if posture age is within a tight emergency TTL. This is an explicit policy-mode switch (audited).
+
+- **Bad policy rollout**
+  - **What happens:** Accidental lockout or over-permissive access at scale.
+  - **Detect:** Canary policy metrics (deny rate shifts), admin-change alerts, sampled decision diffs between versions.
+  - **Recover:** Instant rollback to last known-good policy bundle; “break glass” admin path with strong controls and full audit.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Push PDP closer to proxies (regional PDPs) and add decision-result caching keyed by `(principal, device_posture_hash, route_id)` with millisecond-level invalidation on policy version bump.
+- **100x scale:** Make posture a streaming system (device events -> materialized posture state) and move to a multi-tenant policy distribution model with signed bundles and per-tenant isolation; audit becomes a dedicated pipeline with enforced schemas and tiered retention.
+
+## Operational Notes
+
+- Treat the proxy as a **tier-0** service: deploy multi-region, use fast health checks, and test “policy rollback” as a routine game day.
+- Monitor **posture freshness** as a first-class SLO; it’s the practical meaning of “continuous trust.”
+- Require mTLS on the internal side and ensure apps only accept traffic from the proxy identity; otherwise you’ve rebuilt a VPN with nicer login.
+- Make every decision explainable: log `policy_version`, `reason`, `inputs_hash`, and a stable `decision_id` to correlate proxy logs with app logs.
+```
+tokens used
+3,030
+```markdown
+---
+title: "Zero-Trust Access Proxy"
+category: "Security & Access Control"
+difficulty: "Hard"
+tags: ["zero-trust", "iap", "ztna", "oidc", "mTLS", "policy", "device-posture", "audit"]
+---
+
+## Overview
+
+This system is a Zero-Trust Access Proxy (ZTAP) that replaces a VPN by authenticating and authorizing **every request** to internal applications using **user identity + device health** + fine-grained policy. Users reach internal apps through a gateway that enforces policy at L7, then forwards requests over mutually-authenticated transport to private services. The goal is to make “being on the network” irrelevant; the only thing that matters is *who you are, what device you’re on, and what you’re trying to do right now*.
+
+The key insight that makes this design elegant is separating **identity proof** from **access decisions** and making both *cheap to evaluate per-request*. Identity is proven once via OIDC and represented as **short-lived, audience-bound tokens**. Access decisions are computed by a **central policy engine** using cached posture signals and request attributes, then enforced at the proxy. This avoids the two common failure modes: (1) “session equals trust” VPN semantics and (2) embedding authorization logic into every app.
+
+Everything else is boring by design: Envoy/NGINX for the proxy, OIDC for identity, OPA (or Cedar) for policy, Postgres for configuration, append-only logging for audit, and mTLS for service-side enforcement.
+
+## What Makes This Hard
+
+Naive implementations authenticate the user once, then silently treat subsequent traffic as trusted (“VPN with SSO”). The trap is **stale trust**: device posture changes (EDR disabled, jailbroken device, certificate revoked) *after* login, and you only discover it after damage is done. Zero-trust means the decision must be continuously revalidated with bounded staleness.
+
+The second trap is pushing policy into applications. Teams end up with inconsistent enforcement, divergent interpretations of “device healthy,” and no single place to answer “who accessed what and why was it allowed.” You want one enforcement point and one decision model, or you’ll never get predictable security outcomes.
+
+## Requirements
+
+### Functional Requirements
+- Enforce access on **every request** using: user identity, device identity, device posture, app/resource, method/path, and risk signals.
+- Support both **browser apps** (cookie/redirect flows) and **API clients** (non-interactive token flows).
+- Provide **continuous access** semantics: access can be revoked within minutes (or faster for high-risk).
+- Strong auditability: for each decision, record **inputs, policy version, decision result**, and downstream target.
+- Minimal app changes: internal apps should not implement authentication; they should verify **mTLS + forwarded identity** and trust the proxy boundary.
+
+### Scale Targets
+- **Users:** 50k employees/contractors; **devices:** 80k managed endpoints.
+- **Traffic:** 20k RPS average, 80k RPS peak (login storms + CI systems); p95 proxy-added latency < 25ms.
+- **Policy eval:** must be sub-millisecond with caching; posture freshness target 60s (normal), 5–10s (high-risk apps).
+- **Audit:** 100–300M events/day at peak organizations (requests + decisions + posture changes).
+
+These numbers force: stateless proxy scaling, cached decision inputs, and an audit pipeline that can ingest continuously without back-pressuring the proxy.
+
+## Key Design Decisions
+
+- **Decision 1: Central policy decision, distributed enforcement**
+  - **Chose:** Envoy-based proxy calls a Policy Decision Point (PDP) (OPA) for allow/deny + constraints; proxy enforces.
+  - **Rejected:** Hardcoding rules in proxy config; pushing authorization logic to apps.
+  - **Why:** You need a single source of truth, versioned policy, explainable decisions, and consistent enforcement without app rewrites.
+
+- **Decision 2: Short-lived, audience-bound identity + continuous posture**
+  - **Chose:** OIDC login produces a short-lived session; each request is evaluated against **current posture** (cached with strict TTL).
+  - **Rejected:** Long-lived sessions; “device checked at login only.”
+  - **Why:** Stale trust is the real enemy. Bounding token lifetime and posture TTL gives you predictable worst-case exposure.
+
+- **Decision 3: mTLS to upstream + identity propagation contract**
+  - **Chose:** Proxy-to-app mTLS with SPIFFE-like identities; forward identity in signed headers (or JWT exchange) with strict audience.
+  - **Rejected:** Plain HTTP to apps; letting apps accept user JWTs directly from the internet.
+  - **Why:** Apps must be able to prove “this request came through the proxy” and get a tamper-resistant user context.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[User/Client] --> P[Access Proxy]
+  P --> I[OIDC IdP]
+  P --> D[Device Posture]
+  P --> O[Policy Engine]
+  P --> A[Internal Apps]
+  P --> L[Audit Log]
+  C[Admin Console] --> S[Config Store]
+  O --> S
+```
+
+### Components
+
+- `Access Proxy`: The only public entry point. Terminates TLS, runs OIDC flows, normalizes requests, calls policy, enforces decisions, and forwards to internal apps over mTLS. Must be horizontally scalable and largely stateless.
+- `OIDC IdP`: Workforce identity (Okta/AzureAD/Google). Issues identity tokens; the proxy treats it as the authority for user auth, not for fine-grained access.
+- `Device Posture`: Aggregates device signals (MDM compliance, EDR running, disk encrypted, cert validity). Exposes a fast “device_id -> posture summary + timestamp” API.
+- `Policy Engine`: PDP that evaluates requests (principal, device posture, app, route, method, risk, time) against versioned policy and returns allow/deny plus constraints (headers, max session age, step-up requirement).
+- `Internal Apps`: Private services reachable only from the proxy. Validate mTLS client identity (proxy) and consume forwarded identity claims per a strict contract.
+- `Audit Log`: Append-only event stream for decisions and access, designed so the proxy can log asynchronously without blocking user traffic.
+- `Config Store`: Stores routes, app definitions, policy bundles, device posture thresholds, and keys; versioned and auditable.
+- `Admin Console`: Manages apps/routes/policies, with change review and rollout controls (canary policy versions, emergency lock-down).
+
+## Deep Dive: Continuous AuthZ With Bounded Staleness
+
+The hardest part is making “authorize every request” both **secure** and **fast**. The correct model is: *every request produces an authorization decision derived from fresh-enough identity and posture signals, with explicit staleness bounds.*
+
+**1) Identity proof is cheap, but must be constrained.**  
+The proxy uses OIDC for browser flows (authorization code + PKCE) and issues its own **proxy session** (HTTP-only cookie) that maps to a short-lived internal session record (or a signed token) with: `user_id`, `groups`, `idp_issuer`, `auth_time`, `mfa_level`. For API clients, the proxy supports OIDC token exchange or mTLS client auth to mint an internal token. Critically, all tokens are **audience-bound to the proxy**; internal apps never accept raw IdP tokens from the outside world.
+
+**2) Posture is evaluated per-request, but fetched amortized.**  
+Calling an MDM/EDR API on every request is impossible. Instead, a Posture Service maintains a cached, normalized posture document per device:
+- `device_id`, `compliance_state`, `edr_state`, `cert_status`, `last_seen`, `risk_score`, `timestamp`
+The proxy fetches posture with aggressive caching and strict TTLs:
+- Normal apps: accept posture up to 60s old.
+- High-risk apps: 5–10s TTL or require step-up on stale posture.
+If posture is older than TTL, the decision becomes **deny or step-up**, not “allow anyway.” This is the “bounded staleness” guarantee that makes revocation real.
+
+**3) Policy is evaluated on a compact input and returns constraints, not just allow/deny.**  
+The proxy sends a minimal, deterministic input to the PDP:
+- `principal` (user + groups + auth_time + mfa_level)
+- `device` (posture summary + timestamp)
+- `request` (app_id, route_id, method, path template, source IP/geo if relevant)
+- `context` (time, policy_version, emergency_mode)
+The PDP response is richer than a boolean:
+- `decision`: allow/deny
+- `reason`: machine-readable code for audit
+- `max_session_age`: force re-auth if auth is old
+- `require_step_up`: trigger MFA for sensitive routes
+- `headers_to_add`: signed identity context for upstream
+This lets you express “allow, but only if auth is recent” without embedding authentication logic into policy or vice versa.
+
+**4) Upstream identity propagation must be tamper-resistant.**  
+Once allowed, the proxy forwards:
+- mTLS to upstream with a stable proxy identity (and optionally per-tenant proxy identities).
+- A signed, short-lived “upstream assertion” (JWT) containing `sub`, `groups`, `device_id`, `decision_id`, `issued_at`, `expires_at`, `app_audience`.
+Apps verify signature and audience; they do not need to call the IdP or PDP. This gives apps a trustworthy user context while keeping the enforcement boundary at the proxy.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Fast, consistent enforcement at a single choke point | Some proxy complexity and operational criticality |
+| Real revocation via bounded posture/token staleness | Occasional “deny on stale signals” during outages |
+| Minimal app changes (mTLS + assertion verify) | Apps must adopt a standard identity propagation contract |
+
+## Failure Modes
+
+- **IdP outage or latency spike**
+  - **What happens:** New logins and step-up flows fail; existing sessions might continue until max age.
+  - **Detect:** Elevated OIDC error rates, auth callback timeouts, step-up failures.
+  - **Recover:** Use short grace windows for already-authenticated sessions (bounded by `max_session_age`), degrade to “no step-up allowed → deny sensitive routes,” and page quickly—this is a hard dependency by design.
+
+- **Posture service stale or unavailable**
+  - **What happens:** Proxy cannot refresh posture; risk of stale trust if you fail open.
+  - **Detect:** Posture fetch error rate, posture age histogram drifting beyond TTL.
+  - **Recover:** Default to **fail closed for high-risk apps**, fail to step-up or limited allow for low-risk apps only if posture age is within a tight emergency TTL. This is an explicit policy-mode switch (audited).
+
+- **Bad policy rollout**
+  - **What happens:** Accidental lockout or over-permissive access at scale.
+  - **Detect:** Canary policy metrics (deny rate shifts), admin-change alerts, sampled decision diffs between versions.
+  - **Recover:** Instant rollback to last known-good policy bundle; “break glass” admin path with strong controls and full audit.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Push PDP closer to proxies (regional PDPs) and add decision-result caching keyed by `(principal, device_posture_hash, route_id)` with millisecond-level invalidation on policy version bump.
+- **100x scale:** Make posture a streaming system (device events -> materialized posture state) and move to a multi-tenant policy distribution model with signed bundles and per-tenant isolation; audit becomes a dedicated pipeline with enforced schemas and tiered retention.
+
+## Operational Notes
+
+- Treat the proxy as a **tier-0** service: deploy multi-region, use fast health checks, and test “policy rollback” as a routine game day.
+- Monitor **posture freshness** as a first-class SLO; it’s the practical meaning of “continuous trust.”
+- Require mTLS on the internal side and ensure apps only accept traffic from the proxy identity; otherwise you’ve rebuilt a VPN with nicer login.
+- Make every decision explainable: log `policy_version`, `reason`, `inputs_hash`, and a stable `decision_id` to correlate proxy logs with app logs.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/zero-trust-access-proxy.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-49ad-7852-9de1-e6a9776fe200
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Zero-Trust Access Proxy"
+category: "Security & Access Control"
+difficulty: "Hard"
+tags: ["zero-trust", "iap", "ztna", "oidc", "mTLS", "policy", "device-posture", "audit"]
+---
+
+## Overview
+
+This system is a Zero-Trust Access Proxy (ZTAP) that replaces a VPN by authenticating and authorizing **every request** to internal applications using **user identity + device health** + fine-grained policy. Users reach internal apps through a gateway that enforces policy at L7, then forwards requests over mutually-authenticated transport to private services. The goal is to make “being on the network” irrelevant; the only thing that matters is *who you are, what device you’re on, and what you’re trying to do right now*.
+
+The key insight that makes this design elegant is separating **identity proof** from **access decisions** and making both *cheap to evaluate per-request*. Identity is proven once via OIDC and represented as **short-lived, audience-bound tokens**. Access decisions are computed by a **central policy engine** using cached posture signals and request attributes, then enforced at the proxy. This avoids the two common failure modes: (1) “session equals trust” VPN semantics and (2) embedding authorization logic into every app.
+
+Everything else is boring by design: Envoy/NGINX for the proxy, OIDC for identity, OPA (or Cedar) for policy, Postgres for configuration, append-only logging for audit, and mTLS for service-side enforcement.
+
+## What Makes This Hard
+
+Naive implementations authenticate the user once, then silently treat subsequent traffic as trusted (“VPN with SSO”). The trap is **stale trust**: device posture changes (EDR disabled, jailbroken device, certificate revoked) *after* login, and you only discover it after damage is done. Zero-trust means the decision must be continuously revalidated with bounded staleness.
+
+The second trap is pushing policy into applications. Teams end up with inconsistent enforcement, divergent interpretations of “device healthy,” and no single place to answer “who accessed what and why was it allowed.” You want one enforcement point and one decision model, or you’ll never get predictable security outcomes.
+
+## Requirements
+
+### Functional Requirements
+- Enforce access on **every request** using: user identity, device identity, device posture, app/resource, method/path, and risk signals.
+- Support both **browser apps** (cookie/redirect flows) and **API clients** (non-interactive token flows).
+- Provide **continuous access** semantics: access can be revoked within minutes (or faster for high-risk).
+- Strong auditability: for each decision, record **inputs, policy version, decision result**, and downstream target.
+- Minimal app changes: internal apps should not implement authentication; they should verify **mTLS + forwarded identity** and trust the proxy boundary.
+
+### Scale Targets
+- **Users:** 50k employees/contractors; **devices:** 80k managed endpoints.
+- **Traffic:** 20k RPS average, 80k RPS peak (login storms + CI systems); p95 proxy-added latency < 25ms.
+- **Policy eval:** must be sub-millisecond with caching; posture freshness target 60s (normal), 5–10s (high-risk apps).
+- **Audit:** 100–300M events/day at peak organizations (requests + decisions + posture changes).
+
+These numbers force: stateless proxy scaling, cached decision inputs, and an audit pipeline that can ingest continuously without back-pressuring the proxy.
+
+## Key Design Decisions
+
+- **Decision 1: Central policy decision, distributed enforcement**
+  - **Chose:** Envoy-based proxy calls a Policy Decision Point (PDP) (OPA) for allow/deny + constraints; proxy enforces.
+  - **Rejected:** Hardcoding rules in proxy config; pushing authorization logic to apps.
+  - **Why:** You need a single source of truth, versioned policy, explainable decisions, and consistent enforcement without app rewrites.
+
+- **Decision 2: Short-lived, audience-bound identity + continuous posture**
+  - **Chose:** OIDC login produces a short-lived session; each request is evaluated against **current posture** (cached with strict TTL).
+  - **Rejected:** Long-lived sessions; “device checked at login only.”
+  - **Why:** Stale trust is the real enemy. Bounding token lifetime and posture TTL gives you predictable worst-case exposure.
+
+- **Decision 3: mTLS to upstream + identity propagation contract**
+  - **Chose:** Proxy-to-app mTLS with SPIFFE-like identities; forward identity in signed headers (or JWT exchange) with strict audience.
+  - **Rejected:** Plain HTTP to apps; letting apps accept user JWTs directly from the internet.
+  - **Why:** Apps must be able to prove “this request came through the proxy” and get a tamper-resistant user context.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[User/Client] --> P[Access Proxy]
+  P --> I[OIDC IdP]
+  P --> D[Device Posture]
+  P --> O[Policy Engine]
+  P --> A[Internal Apps]
+  P --> L[Audit Log]
+  C[Admin Console] --> S[Config Store]
+  O --> S
+```
+
+### Components
+
+- `Access Proxy`: The only public entry point. Terminates TLS, runs OIDC flows, normalizes requests, calls policy, enforces decisions, and forwards to internal apps over mTLS. Must be horizontally scalable and largely stateless.
+- `OIDC IdP`: Workforce identity (Okta/AzureAD/Google). Issues identity tokens; the proxy treats it as the authority for user auth, not for fine-grained access.
+- `Device Posture`: Aggregates device signals (MDM compliance, EDR running, disk encrypted, cert validity). Exposes a fast “device_id -> posture summary + timestamp” API.
+- `Policy Engine`: PDP that evaluates requests (principal, device posture, app, route, method, risk, time) against versioned policy and returns allow/deny plus constraints (headers, max session age, step-up requirement).
+- `Internal Apps`: Private services reachable only from the proxy. Validate mTLS client identity (proxy) and consume forwarded identity claims per a strict contract.
+- `Audit Log`: Append-only event stream for decisions and access, designed so the proxy can log asynchronously without blocking user traffic.
+- `Config Store`: Stores routes, app definitions, policy bundles, device posture thresholds, and keys; versioned and auditable.
+- `Admin Console`: Manages apps/routes/policies, with change review and rollout controls (canary policy versions, emergency lock-down).
+
+## Deep Dive: Continuous AuthZ With Bounded Staleness
+
+The hardest part is making “authorize every request” both **secure** and **fast**. The correct model is: *every request produces an authorization decision derived from fresh-enough identity and posture signals, with explicit staleness bounds.*
+
+**1) Identity proof is cheap, but must be constrained.**  
+The proxy uses OIDC for browser flows (authorization code + PKCE) and issues its own **proxy session** (HTTP-only cookie) that maps to a short-lived internal session record (or a signed token) with: `user_id`, `groups`, `idp_issuer`, `auth_time`, `mfa_level`. For API clients, the proxy supports OIDC token exchange or mTLS client auth to mint an internal token. Critically, all tokens are **audience-bound to the proxy**; internal apps never accept raw IdP tokens from the outside world.
+
+**2) Posture is evaluated per-request, but fetched amortized.**  
+Calling an MDM/EDR API on every request is impossible. Instead, a Posture Service maintains a cached, normalized posture document per device:
+- `device_id`, `compliance_state`, `edr_state`, `cert_status`, `last_seen`, `risk_score`, `timestamp`
+The proxy fetches posture with aggressive caching and strict TTLs:
+- Normal apps: accept posture up to 60s old.
+- High-risk apps: 5–10s TTL or require step-up on stale posture.
+If posture is older than TTL, the decision becomes **deny or step-up**, not “allow anyway.” This is the “bounded staleness” guarantee that makes revocation real.
+
+**3) Policy is evaluated on a compact input and returns constraints, not just allow/deny.**  
+The proxy sends a minimal, deterministic input to the PDP:
+- `principal` (user + groups + auth_time + mfa_level)
+- `device` (posture summary + timestamp)
+- `request` (app_id, route_id, method, path template, source IP/geo if relevant)
+- `context` (time, policy_version, emergency_mode)
+The PDP response is richer than a boolean:
+- `decision`: allow/deny
+- `reason`: machine-readable code for audit
+- `max_session_age`: force re-auth if auth is old
+- `require_step_up`: trigger MFA for sensitive routes
+- `headers_to_add`: signed identity context for upstream
+This lets you express “allow, but only if auth is recent” without embedding authentication logic into policy or vice versa.
+
+**4) Upstream identity propagation must be tamper-resistant.**  
+Once allowed, the proxy forwards:
+- mTLS to upstream with a stable proxy identity (and optionally per-tenant proxy identities).
+- A signed, short-lived “upstream assertion” (JWT) containing `sub`, `groups`, `device_id`, `decision_id`, `issued_at`, `expires_at`, `app_audience`.
+Apps verify signature and audience; they do not need to call the IdP or PDP. This gives apps a trustworthy user context while keeping the enforcement boundary at the proxy.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Fast, consistent enforcement at a single choke point | Some proxy complexity and operational criticality |
+| Real revocation via bounded posture/token staleness | Occasional “deny on stale signals” during outages |
+| Minimal app changes (mTLS + assertion verify) | Apps must adopt a standard identity propagation contract |
+
+## Failure Modes
+
+- **IdP outage or latency spike**
+  - **What happens:** New logins and step-up flows fail; existing sessions might continue until max age.
+  - **Detect:** Elevated OIDC error rates, auth callback timeouts, step-up failures.
+  - **Recover:** Use short grace windows for already-authenticated sessions (bounded by `max_session_age`), degrade to “no step-up allowed → deny sensitive routes,” and page quickly—this is a hard dependency by design.
+
+- **Posture service stale or unavailable**
+  - **What happens:** Proxy cannot refresh posture; risk of stale trust if you fail open.
+  - **Detect:** Posture fetch error rate, posture age histogram drifting beyond TTL.
+  - **Recover:** Default to **fail closed for high-risk apps**, fail to step-up or limited allow for low-risk apps only if posture age is within a tight emergency TTL. This is an explicit policy-mode switch (audited).
+
+- **Bad policy rollout**
+  - **What happens:** Accidental lockout or over-permissive access at scale.
+  - **Detect:** Canary policy metrics (deny rate shifts), admin-change alerts, sampled decision diffs between versions.
+  - **Recover:** Instant rollback to last known-good policy bundle; “break glass” admin path with strong controls and full audit.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Push PDP closer to proxies (regional PDPs) and add decision-result caching keyed by `(principal, device_posture_hash, route_id)` with millisecond-level invalidation on policy version bump.
+- **100x scale:** Make posture a streaming system (device events -> materialized posture state) and move to a multi-tenant policy distribution model with signed bundles and per-tenant isolation; audit becomes a dedicated pipeline with enforced schemas and tiered retention.
+
+## Operational Notes
+
+- Treat the proxy as a **tier-0** service: deploy multi-region, use fast health checks, and test “policy rollback” as a routine game day.
+- Monitor **posture freshness** as a first-class SLO; it’s the practical meaning of “continuous trust.”
+- Require mTLS on the internal side and ensure apps only accept traffic from the proxy identity; otherwise you’ve rebuilt a VPN with nicer login.
+- Make every decision explainable: log `policy_version`, `reason`, `inputs_hash`, and a stable `decision_id` to correlate proxy logs with app logs.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+thinking
+**Crafting a structured critique**
+
+I need to produce a critique in markdown format without using tools. It should include a check for elegance, insights on components, opportunities for simplification, and stress test scenarios. I'll also include constructive recommendations for changes, like using Postgres with RLS for security, and consider Kafka for the audit pipeline. 
+
+I should propose alternatives for caching and discuss policy distribution. Mentioning existing open-source ZTNA products could be valuable. Additionally, I’ll suggest leveraging event-driven architecture for device posture collection.
+thinking
+**Discussing token revocation needs**
+
+I’m thinking about the necessity of a token revocation list and mTLS cert revocation using SPIRE. There's a concern if the proxy issues session cookies that map to internal records, meaning we’d need a storage solution like Redis. Another option could be signed session tokens with rotating keys and short TTLs. I also need to factor in CSRF protections.
+
+I’ll stress test scenarios like a database downtime and network issues. Recommendations should consider operational complexity with multiple services, and I might suggest merging the config store with the policy bundle store into Postgres.
+thinking
+**Addressing security concerns**
+
+I need to mention TLS termination to support WebSockets and gRPC and be cautious about that. For private applications, upstream connection pooling is essential to guard against header injection. I also have to think about replay attacks on upstream assertions and whether to include a nonce, as they could be replayed within a TTL if captured.
+
+To mitigate this, I could bind it to an mTLS channel or include a request hash, but that adds complexity. Additionally, strong device identity proof is crucial for APIs, possibly through mutual TLS or managed device certificates. I should also discuss step-up authentication for OIDC re-authentication.
+thinking
+**Planning the audit schema**
+
+I need to set up an audit process handling 100-300 million records per day, which requires careful planning around schema, partitioning, sampling, and privacy. A columnar store would be beneficial. For simplification, I could consider existing products like Pomerium with OPA or Teleport, or use Envoy with an ext_authz filter alongside OPA and SPIRE for mTLS.
+
+I should create a table of components to determine their importance, like the Access Proxy and the policy engine. For opportunities to simplify, I can look at OPA-as-WASM in the proxy, push updates through Redis, and consider using JWTs for identity propagation. The final output should be structured in markdown with clear sections, including paragraphs, tables, and lists—a format I need to keep in mind!
+thinking
+**Conducting an elegance check**
+
+I need to follow the specified headings, like "## Elegance Check," and provide a crisp critique while keeping within the constraints—concise but not too brief. For stress testing, I should provide 3-5 scenarios. 
+
+Key must-fix items include route normalization, header injection, device identity binding, and policy distribution reliability. It's crucial to ensure that if the Policy Decision Point (PDP) is down, proxies can rely on the last known policy to maintain functionality. Instead of calling the PDP for every request, I could propose using local OPA with bundled policies to enhance resilience. Policy versioning should also be consistent in decision logs.
+codex
+## Elegance Check
+
+### The Core Insight
+Separating **identity proof** (OIDC, short-lived/audience-bound) from **access decisions** (policy + posture, evaluated per request with explicit staleness bounds) is the right “elegant core”—it makes revocation and consistency real without pushing auth into every app.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Access Proxy (Envoy/NGINX) | Single enforcement choke-point, consistent L7 normalization, and the only public entry. |
+| OIDC IdP | Best-in-class workforce identity, MFA, device/user directory integration. |
+| Policy Engine (OPA/Cedar) | Centralized, versioned, explainable authorization logic and constraints. |
+| Device Posture Service | Normalizes many vendor signals into one fast, cacheable “device truth.” |
+| mTLS/SPIFFE (or equivalent) | Proves “came through proxy” and blocks bypass paths on the internal network. |
+| Audit Log / Event Stream | Forensics + compliance require durable, queryable decision provenance at scale. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Per-request remote PDP call from proxy | Run OPA **in-proxy** (WASM) or as a **local sidecar**, distribute signed bundles | Loses “single live brain,” gains lower latency + fewer failure domains. |
+| Separate “Config Store” service | Start with **Postgres** as the config DB (routes/apps/policy metadata), optional LISTEN/NOTIFY for invalidation | Postgres becomes more critical; mitigated via HA + caching. |
+| Custom “append-only audit pipeline” implied | Use **Kafka/Kinesis/PubSub** (or managed log pipeline) with schema enforcement | Less custom code; commits you to operating/using a streaming platform. |
+| Posture fetched on-demand by proxies | Make posture **event-driven** (device events → materialized state), proxies read from Redis/DB cache | Extra pipeline, but reduces hot-path fanout and vendor API coupling. |
+| Signed headers *or* JWT assertion ambiguity | Pick one: **JWT assertion** with strict audience + expiry + key rotation | Slightly more work for apps, but cleaner contract and fewer header-injection pitfalls. |
+| “Emergency mode” as a switch | Make it a **policy capability** (break-glass policy bundle + approvals) | Less bespoke control-plane logic; requires careful policy review discipline. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **PDP unreachable / slow (network partition, overload)**
+   - Design’s answer: partially addressed via “caching,” but hot-path still implies dependency on PDP availability
+   - Recommendation: **Strengthen** — keep policy local to the proxy (bundle distribution) so authZ doesn’t fail on PDP liveness; reserve remote calls for rare “step-up”/exception flows.
+
+2. **Posture source is stale for 5 minutes (vendor API outage)**
+   - Design’s answer: addressed (bounded staleness, fail closed for high-risk; limited allow for low-risk with audited mode)
+   - Recommendation: **Acceptable** — but formalize per-app “staleness budgets,” and ensure posture freshness SLOs drive paging before widespread denies.
+
+3. **Identity/device binding confusion (user authenticates, but device_id is spoofed or not strongly proven)**
+   - Design’s answer: not addressed explicitly (device_id appears as an input, but proof mechanism is unclear, especially for browsers)
+   - Recommendation: **Strengthen** — require a cryptographic device factor (client cert, platform attestation, or managed agent token) and bind it to the proxy session; otherwise “user+device” collapses into “user says device.”
+
+4. **Policy/config rollback during incident (bad policy locks out everyone)**
+   - Design’s answer: addressed (canary + rollback + break glass)
+   - Recommendation: **Strengthen** — make rollback instantaneous and *proxy-local* (previous bundle retained); add “diff-based safety rails” (e.g., deny-rate spike thresholds that auto-halt rollout).
+
+5. **Audit pipeline backpressure (audit ingest down, peak 80k RPS)**
+   - Design’s answer: “log asynchronously without blocking,” but durability/backpressure behavior isn’t defined
+   - Recommendation: **Must clarify** — define local buffering limits and drop/overflow behavior; if you drop, decide what’s acceptable (sample? aggregate?) and how you alert, because audit gaps become a security incident too.
+
+## Recommendations
+
+### Must Fix
+- Make **device identity proof** explicit and strong, and bind it to sessions/tokens (browser and API flows differ).
+- Remove the hot-path dependency on a **remote PDP** (bundle-distributed local evaluation) or define a concrete degraded mode that doesn’t accidentally fail-open.
+- Specify **request normalization + route matching** rules (canonical path, encoded slashes, header canonicalization) to prevent policy bypass and header injection.
+- Define **audit durability/backpressure** semantics (buffering, retries, drop policy, and alerting).
+
+### Should Consider
+- Prefer a single, boring **Postgres-backed control plane** early (apps/routes/policy metadata), with signed policy bundle distribution to proxies.
+- Make posture **event-driven materialization** the default architecture; keep vendor polling out of the request path.
+- Decide on one upstream identity propagation contract (JWT assertion recommended) and publish a minimal verification library for apps.
+
+### Nice to Have
+- Bind upstream assertions to the connection/request more tightly for replay resistance (very short TTL, optional cnf/DPoP-style binding where needed).
+- Add automated “blast radius” controls: per-app canaries, staged rollout by proxy shard/region, and circuit breakers on deny spikes.
+
+## What's Working Well
+- The “bounded staleness” framing is clear, operationally measurable, and security-meaningful.
+- Treating the proxy as tier-0 with multi-region + rollback drills is the right operational posture.
+- Returning constraints (max_session_age, step-up) instead of only allow/deny keeps policy expressive without pushing auth logic into apps.
+- The insistence that apps only trust **mTLS from the proxy + a tamper-resistant assertion** prevents the common “pretty VPN” failure mode.
+tokens used
+5,960
+## Elegance Check
+
+### The Core Insight
+Separating **identity proof** (OIDC, short-lived/audience-bound) from **access decisions** (policy + posture, evaluated per request with explicit staleness bounds) is the right “elegant core”—it makes revocation and consistency real without pushing auth into every app.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Access Proxy (Envoy/NGINX) | Single enforcement choke-point, consistent L7 normalization, and the only public entry. |
+| OIDC IdP | Best-in-class workforce identity, MFA, device/user directory integration. |
+| Policy Engine (OPA/Cedar) | Centralized, versioned, explainable authorization logic and constraints. |
+| Device Posture Service | Normalizes many vendor signals into one fast, cacheable “device truth.” |
+| mTLS/SPIFFE (or equivalent) | Proves “came through proxy” and blocks bypass paths on the internal network. |
+| Audit Log / Event Stream | Forensics + compliance require durable, queryable decision provenance at scale. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Per-request remote PDP call from proxy | Run OPA **in-proxy** (WASM) or as a **local sidecar**, distribute signed bundles | Loses “single live brain,” gains lower latency + fewer failure domains. |
+| Separate “Config Store” service | Start with **Postgres** as the config DB (routes/apps/policy metadata), optional LISTEN/NOTIFY for invalidation | Postgres becomes more critical; mitigated via HA + caching. |
+| Custom “append-only audit pipeline” implied | Use **Kafka/Kinesis/PubSub** (or managed log pipeline) with schema enforcement | Less custom code; commits you to operating/using a streaming platform. |
+| Posture fetched on-demand by proxies | Make posture **event-driven** (device events → materialized state), proxies read from Redis/DB cache | Extra pipeline, but reduces hot-path fanout and vendor API coupling. |
+| Signed headers *or* JWT assertion ambiguity | Pick one: **JWT assertion** with strict audience + expiry + key rotation | Slightly more work for apps, but cleaner contract and fewer header-injection pitfalls. |
+| “Emergency mode” as a switch | Make it a **policy capability** (break-glass policy bundle + approvals) | Less bespoke control-plane logic; requires careful policy review discipline. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **PDP unreachable / slow (network partition, overload)**
+   - Design’s answer: partially addressed via “caching,” but hot-path still implies dependency on PDP availability
+   - Recommendation: **Strengthen** — keep policy local to the proxy (bundle distribution) so authZ doesn’t fail on PDP liveness; reserve remote calls for rare “step-up”/exception flows.
+
+2. **Posture source is stale for 5 minutes (vendor API outage)**
+   - Design’s answer: addressed (bounded staleness, fail closed for high-risk; limited allow for low-risk with audited mode)
+   - Recommendation: **Acceptable** — but formalize per-app “staleness budgets,” and ensure posture freshness SLOs drive paging before widespread denies.
+
+3. **Identity/device binding confusion (user authenticates, but device_id is spoofed or not strongly proven)**
+   - Design’s answer: not addressed explicitly (device_id appears as an input, but proof mechanism is unclear, especially for browsers)
+   - Recommendation: **Strengthen** — require a cryptographic device factor (client cert, platform attestation, or managed agent token) and bind it to the proxy session; otherwise “user+device” collapses into “user says device.”
+
+4. **Policy/config rollback during incident (bad policy locks out everyone)**
+   - Design’s answer: addressed (canary + rollback + break glass)
+   - Recommendation: **Strengthen** — make rollback instantaneous and *proxy-local* (previous bundle retained); add “diff-based safety rails” (e.g., deny-rate spike thresholds that auto-halt rollout).
+
+5. **Audit pipeline backpressure (audit ingest down, peak 80k RPS)**
+   - Design’s answer: “log asynchronously without blocking,” but durability/backpressure behavior isn’t defined
+   - Recommendation: **Must clarify** — define local buffering limits and drop/overflow behavior; if you drop, decide what’s acceptable (sample? aggregate?) and how you alert, because audit gaps become a security incident too.
+
+## Recommendations
+
+### Must Fix
+- Make **device identity proof** explicit and strong, and bind it to sessions/tokens (browser and API flows differ).
+- Remove the hot-path dependency on a **remote PDP** (bundle-distributed local evaluation) or define a concrete degraded mode that doesn’t accidentally fail-open.
+- Specify **request normalization + route matching** rules (canonical path, encoded slashes, header canonicalization) to prevent policy bypass and header injection.
+- Define **audit durability/backpressure** semantics (buffering, retries, drop policy, and alerting).
+
+### Should Consider
+- Prefer a single, boring **Postgres-backed control plane** early (apps/routes/policy metadata), with signed policy bundle distribution to proxies.
+- Make posture **event-driven materialization** the default architecture; keep vendor polling out of the request path.
+- Decide on one upstream identity propagation contract (JWT assertion recommended) and publish a minimal verification library for apps.
+
+### Nice to Have
+- Bind upstream assertions to the connection/request more tightly for replay resistance (very short TTL, optional cnf/DPoP-style binding where needed).
+- Add automated “blast radius” controls: per-app canaries, staged rollout by proxy shard/region, and circuit breakers on deny spikes.
+
+## What's Working Well
+- The “bounded staleness” framing is clear, operationally measurable, and security-meaningful.
+- Treating the proxy as tier-0 with multi-region + rollback drills is the right operational posture.
+- Returning constraints (max_session_age, step-up) instead of only allow/deny keeps policy expressive without pushing auth logic into apps.
+- The insistence that apps only trust **mTLS from the proxy + a tamper-resistant assertion** prevents the common “pretty VPN” failure mode.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/zero-trust-access-proxy.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afb-2dbf-7311-b456-c17dabaf8211
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Zero-Trust Access Proxy"
+category: "Security & Access Control"
+difficulty: "Hard"
+tags: ["zero-trust", "iap", "ztna", "oidc", "mTLS", "policy", "device-posture", "audit"]
+---
+
+## Overview
+
+This system is a Zero-Trust Access Proxy (ZTAP) that replaces a VPN by authenticating and authorizing **every request** to internal applications using **user identity + device health** + fine-grained policy. Users reach internal apps through a gateway that enforces policy at L7, then forwards requests over mutually-authenticated transport to private services. The goal is to make “being on the network” irrelevant; the only thing that matters is *who you are, what device you’re on, and what you’re trying to do right now*.
+
+The key insight that makes this design elegant is separating **identity proof** from **access decisions** and making both *cheap to evaluate per-request*. Identity is proven once via OIDC and represented as **short-lived, audience-bound tokens**. Access decisions are computed by a **central policy engine** using cached posture signals and request attributes, then enforced at the proxy. This avoids the two common failure modes: (1) “session equals trust” VPN semantics and (2) embedding authorization logic into every app.
+
+Everything else is boring by design: Envoy/NGINX for the proxy, OIDC for identity, OPA (or Cedar) for policy, Postgres for configuration, append-only logging for audit, and mTLS for service-side enforcement.
+
+## What Makes This Hard
+
+Naive implementations authenticate the user once, then silently treat subsequent traffic as trusted (“VPN with SSO”). The trap is **stale trust**: device posture changes (EDR disabled, jailbroken device, certificate revoked) *after* login, and you only discover it after damage is done. Zero-trust means the decision must be continuously revalidated with bounded staleness.
+
+The second trap is pushing policy into applications. Teams end up with inconsistent enforcement, divergent interpretations of “device healthy,” and no single place to answer “who accessed what and why was it allowed.” You want one enforcement point and one decision model, or you’ll never get predictable security outcomes.
+
+## Requirements
+
+### Functional Requirements
+- Enforce access on **every request** using: user identity, device identity, device posture, app/resource, method/path, and risk signals.
+- Support both **browser apps** (cookie/redirect flows) and **API clients** (non-interactive token flows).
+- Provide **continuous access** semantics: access can be revoked within minutes (or faster for high-risk).
+- Strong auditability: for each decision, record **inputs, policy version, decision result**, and downstream target.
+- Minimal app changes: internal apps should not implement authentication; they should verify **mTLS + forwarded identity** and trust the proxy boundary.
+
+### Scale Targets
+- **Users:** 50k employees/contractors; **devices:** 80k managed endpoints.
+- **Traffic:** 20k RPS average, 80k RPS peak (login storms + CI systems); p95 proxy-added latency < 25ms.
+- **Policy eval:** must be sub-millisecond with caching; posture freshness target 60s (normal), 5–10s (high-risk apps).
+- **Audit:** 100–300M events/day at peak organizations (requests + decisions + posture changes).
+
+These numbers force: stateless proxy scaling, cached decision inputs, and an audit pipeline that can ingest continuously without back-pressuring the proxy.
+
+## Key Design Decisions
+
+- **Decision 1: Central policy decision, distributed enforcement**
+  - **Chose:** Envoy-based proxy calls a Policy Decision Point (PDP) (OPA) for allow/deny + constraints; proxy enforces.
+  - **Rejected:** Hardcoding rules in proxy config; pushing authorization logic to apps.
+  - **Why:** You need a single source of truth, versioned policy, explainable decisions, and consistent enforcement without app rewrites.
+
+- **Decision 2: Short-lived, audience-bound identity + continuous posture**
+  - **Chose:** OIDC login produces a short-lived session; each request is evaluated against **current posture** (cached with strict TTL).
+  - **Rejected:** Long-lived sessions; “device checked at login only.”
+  - **Why:** Stale trust is the real enemy. Bounding token lifetime and posture TTL gives you predictable worst-case exposure.
+
+- **Decision 3: mTLS to upstream + identity propagation contract**
+  - **Chose:** Proxy-to-app mTLS with SPIFFE-like identities; forward identity in signed headers (or JWT exchange) with strict audience.
+  - **Rejected:** Plain HTTP to apps; letting apps accept user JWTs directly from the internet.
+  - **Why:** Apps must be able to prove “this request came through the proxy” and get a tamper-resistant user context.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[User/Client] --> P[Access Proxy]
+  P --> I[OIDC IdP]
+  P --> D[Device Posture]
+  P --> O[Policy Engine]
+  P --> A[Internal Apps]
+  P --> L[Audit Log]
+  C[Admin Console] --> S[Config Store]
+  O --> S
+```
+
+### Components
+
+- `Access Proxy`: The only public entry point. Terminates TLS, runs OIDC flows, normalizes requests, calls policy, enforces decisions, and forwards to internal apps over mTLS. Must be horizontally scalable and largely stateless.
+- `OIDC IdP`: Workforce identity (Okta/AzureAD/Google). Issues identity tokens; the proxy treats it as the authority for user auth, not for fine-grained access.
+- `Device Posture`: Aggregates device signals (MDM compliance, EDR running, disk encrypted, cert validity). Exposes a fast “device_id -> posture summary + timestamp” API.
+- `Policy Engine`: PDP that evaluates requests (principal, device posture, app, route, method, risk, time) against versioned policy and returns allow/deny plus constraints (headers, max session age, step-up requirement).
+- `Internal Apps`: Private services reachable only from the proxy. Validate mTLS client identity (proxy) and consume forwarded identity claims per a strict contract.
+- `Audit Log`: Append-only event stream for decisions and access, designed so the proxy can log asynchronously without blocking user traffic.
+- `Config Store`: Stores routes, app definitions, policy bundles, device posture thresholds, and keys; versioned and auditable.
+- `Admin Console`: Manages apps/routes/policies, with change review and rollout controls (canary policy versions, emergency lock-down).
+
+## Deep Dive: Continuous AuthZ With Bounded Staleness
+
+The hardest part is making “authorize every request” both **secure** and **fast**. The correct model is: *every request produces an authorization decision derived from fresh-enough identity and posture signals, with explicit staleness bounds.*
+
+**1) Identity proof is cheap, but must be constrained.**  
+The proxy uses OIDC for browser flows (authorization code + PKCE) and issues its own **proxy session** (HTTP-only cookie) that maps to a short-lived internal session record (or a signed token) with: `user_id`, `groups`, `idp_issuer`, `auth_time`, `mfa_level`. For API clients, the proxy supports OIDC token exchange or mTLS client auth to mint an internal token. Critically, all tokens are **audience-bound to the proxy**; internal apps never accept raw IdP tokens from the outside world.
+
+**2) Posture is evaluated per-request, but fetched amortized.**  
+Calling an MDM/EDR API on every request is impossible. Instead, a Posture Service maintains a cached, normalized posture document per device:
+- `device_id`, `compliance_state`, `edr_state`, `cert_status`, `last_seen`, `risk_score`, `timestamp`
+The proxy fetches posture with aggressive caching and strict TTLs:
+- Normal apps: accept posture up to 60s old.
+- High-risk apps: 5–10s TTL or require step-up on stale posture.
+If posture is older than TTL, the decision becomes **deny or step-up**, not “allow anyway.” This is the “bounded staleness” guarantee that makes revocation real.
+
+**3) Policy is evaluated on a compact input and returns constraints, not just allow/deny.**  
+The proxy sends a minimal, deterministic input to the PDP:
+- `principal` (user + groups + auth_time + mfa_level)
+- `device` (posture summary + timestamp)
+- `request` (app_id, route_id, method, path template, source IP/geo if relevant)
+- `context` (time, policy_version, emergency_mode)
+The PDP response is richer than a boolean:
+- `decision`: allow/deny
+- `reason`: machine-readable code for audit
+- `max_session_age`: force re-auth if auth is old
+- `require_step_up`: trigger MFA for sensitive routes
+- `headers_to_add`: signed identity context for upstream
+This lets you express “allow, but only if auth is recent” without embedding authentication logic into policy or vice versa.
+
+**4) Upstream identity propagation must be tamper-resistant.**  
+Once allowed, the proxy forwards:
+- mTLS to upstream with a stable proxy identity (and optionally per-tenant proxy identities).
+- A signed, short-lived “upstream assertion” (JWT) containing `sub`, `groups`, `device_id`, `decision_id`, `issued_at`, `expires_at`, `app_audience`.
+Apps verify signature and audience; they do not need to call the IdP or PDP. This gives apps a trustworthy user context while keeping the enforcement boundary at the proxy.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Fast, consistent enforcement at a single choke point | Some proxy complexity and operational criticality |
+| Real revocation via bounded posture/token staleness | Occasional “deny on stale signals” during outages |
+| Minimal app changes (mTLS + assertion verify) | Apps must adopt a standard identity propagation contract |
+
+## Failure Modes
+
+- **IdP outage or latency spike**
+  - **What happens:** New logins and step-up flows fail; existing sessions might continue until max age.
+  - **Detect:** Elevated OIDC error rates, auth callback timeouts, step-up failures.
+  - **Recover:** Use short grace windows for already-authenticated sessions (bounded by `max_session_age`), degrade to “no step-up allowed → deny sensitive routes,” and page quickly—this is a hard dependency by design.
+
+- **Posture service stale or unavailable**
+  - **What happens:** Proxy cannot refresh posture; risk of stale trust if you fail open.
+  - **Detect:** Posture fetch error rate, posture age histogram drifting beyond TTL.
+  - **Recover:** Default to **fail closed for high-risk apps**, fail to step-up or limited allow for low-risk apps only if posture age is within a tight emergency TTL. This is an explicit policy-mode switch (audited).
+
+- **Bad policy rollout**
+  - **What happens:** Accidental lockout or over-permissive access at scale.
+  - **Detect:** Canary policy metrics (deny rate shifts), admin-change alerts, sampled decision diffs between versions.
+  - **Recover:** Instant rollback to last known-good policy bundle; “break glass” admin path with strong controls and full audit.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Push PDP closer to proxies (regional PDPs) and add decision-result caching keyed by `(principal, device_posture_hash, route_id)` with millisecond-level invalidation on policy version bump.
+- **100x scale:** Make posture a streaming system (device events -> materialized posture state) and move to a multi-tenant policy distribution model with signed bundles and per-tenant isolation; audit becomes a dedicated pipeline with enforced schemas and tiered retention.
+
+## Operational Notes
+
+- Treat the proxy as a **tier-0** service: deploy multi-region, use fast health checks, and test “policy rollback” as a routine game day.
+- Monitor **posture freshness** as a first-class SLO; it’s the practical meaning of “continuous trust.”
+- Require mTLS on the internal side and ensure apps only accept traffic from the proxy identity; otherwise you’ve rebuilt a VPN with nicer login.
+- Make every decision explainable: log `policy_version`, `reason`, `inputs_hash`, and a stable `decision_id` to correlate proxy logs with app logs.
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Separating **identity proof** (OIDC, short-lived/audience-bound) from **access decisions** (policy + posture, evaluated per request with explicit staleness bounds) is the right “elegant core”—it makes revocation and consistency real without pushing auth into every app.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Access Proxy (Envoy/NGINX) | Single enforcement choke-point, consistent L7 normalization, and the only public entry. |
+| OIDC IdP | Best-in-class workforce identity, MFA, device/user directory integration. |
+| Policy Engine (OPA/Cedar) | Centralized, versioned, explainable authorization logic and constraints. |
+| Device Posture Service | Normalizes many vendor signals into one fast, cacheable “device truth.” |
+| mTLS/SPIFFE (or equivalent) | Proves “came through proxy” and blocks bypass paths on the internal network. |
+| Audit Log / Event Stream | Forensics + compliance require durable, queryable decision provenance at scale. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Per-request remote PDP call from proxy | Run OPA **in-proxy** (WASM) or as a **local sidecar**, distribute signed bundles | Loses “single live brain,” gains lower latency + fewer failure domains. |
+| Separate “Config Store” service | Start with **Postgres** as the config DB (routes/apps/policy metadata), optional LISTEN/NOTIFY for invalidation | Postgres becomes more critical; mitigated via HA + caching. |
+| Custom “append-only audit pipeline” implied | Use **Kafka/Kinesis/PubSub** (or managed log pipeline) with schema enforcement | Less custom code; commits you to operating/using a streaming platform. |
+| Posture fetched on-demand by proxies | Make posture **event-driven** (device events → materialized state), proxies read from Redis/DB cache | Extra pipeline, but reduces hot-path fanout and vendor API coupling. |
+| Signed headers *or* JWT assertion ambiguity | Pick one: **JWT assertion** with strict audience + expiry + key rotation | Slightly more work for apps, but cleaner contract and fewer header-injection pitfalls. |
+| “Emergency mode” as a switch | Make it a **policy capability** (break-glass policy bundle + approvals) | Less bespoke control-plane logic; requires careful policy review discipline. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **PDP unreachable / slow (network partition, overload)**
+   - Design’s answer: partially addressed via “caching,” but hot-path still implies dependency on PDP availability
+   - Recommendation: **Strengthen** — keep policy local to the proxy (bundle distribution) so authZ doesn’t fail on PDP liveness; reserve remote calls for rare “step-up”/exception flows.
+
+2. **Posture source is stale for 5 minutes (vendor API outage)**
+   - Design’s answer: addressed (bounded staleness, fail closed for high-risk; limited allow for low-risk with audited mode)
+   - Recommendation: **Acceptable** — but formalize per-app “staleness budgets,” and ensure posture freshness SLOs drive paging before widespread denies.
+
+3. **Identity/device binding confusion (user authenticates, but device_id is spoofed or not strongly proven)**
+   - Design’s answer: not addressed explicitly (device_id appears as an input, but proof mechanism is unclear, especially for browsers)
+   - Recommendation: **Strengthen** — require a cryptographic device factor (client cert, platform attestation, or managed agent token) and bind it to the proxy session; otherwise “user+device” collapses into “user says device.”
+
+4. **Policy/config rollback during incident (bad policy locks out everyone)**
+   - Design’s answer: addressed (canary + rollback + break glass)
+   - Recommendation: **Strengthen** — make rollback instantaneous and *proxy-local* (previous bundle retained); add “diff-based safety rails” (e.g., deny-rate spike thresholds that auto-halt rollout).
+
+5. **Audit pipeline backpressure (audit ingest down, peak 80k RPS)**
+   - Design’s answer: “log asynchronously without blocking,” but durability/backpressure behavior isn’t defined
+   - Recommendation: **Must clarify** — define local buffering limits and drop/overflow behavior; if you drop, decide what’s acceptable (sample? aggregate?) and how you alert, because audit gaps become a security incident too.
+
+## Recommendations
+
+### Must Fix
+- Make **device identity proof** explicit and strong, and bind it to sessions/tokens (browser and API flows differ).
+- Remove the hot-path dependency on a **remote PDP** (bundle-distributed local evaluation) or define a concrete degraded mode that doesn’t accidentally fail-open.
+- Specify **request normalization + route matching** rules (canonical path, encoded slashes, header canonicalization) to prevent policy bypass and header injection.
+- Define **audit durability/backpressure** semantics (buffering, retries, drop policy, and alerting).
+
+### Should Consider
+- Prefer a single, boring **Postgres-backed control plane** early (apps/routes/policy metadata), with signed policy bundle distribution to proxies.
+- Make posture **event-driven materialization** the default architecture; keep vendor polling out of the request path.
+- Decide on one upstream identity propagation contract (JWT assertion recommended) and publish a minimal verification library for apps.
+
+### Nice to Have
+- Bind upstream assertions to the connection/request more tightly for replay resistance (very short TTL, optional cnf/DPoP-style binding where needed).
+- Add automated “blast radius” controls: per-app canaries, staged rollout by proxy shard/region, and circuit breakers on deny spikes.
+
+## What's Working Well
+- The “bounded staleness” framing is clear, operationally measurable, and security-meaningful.
+- Treating the proxy as tier-0 with multi-region + rollback drills is the right operational posture.
+- Returning constraints (max_session_age, step-up) instead of only allow/deny keeps policy expressive without pushing auth logic into apps.
+- The insistence that apps only trust **mTLS from the proxy + a tamper-resistant assertion** prevents the common “pretty VPN” failure mode.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+Reconnecting... 1/5
+
+
+
+
+
+thinking
+**Evaluating posture service options**
+
+Posture per device changes slowly, so I think caching in proxy memory alongside a Postgres database for the last known state would be efficient. They mentioned no new components, but merging the Posture service into the proxy might work. The simplest solution is to keep the Posture Service off the hot path by pre-materializing the posture state. However, using a cache or DB might be necessary. I'll need to consider the trade-offs of fetching posture during authentication and using a short TTL versus continuous authZ.
+thinking
+**Managing posture storage options**
+
+I’m considering how to keep posture fetched efficiently from Postgres or memory. Pushing posture into the session token might be tricky because posture can change, and I’d need a revocation method. Embedding a posture version/hash is an option, but it still requires storage. The simplest setup might involve storing device posture in Postgres while using proxies to query it. Implementing an in-proxy cache with a TTL and background refresh from Postgres could help manage the load, especially with 80k devices. Plus, I’m thinking about using mTLS for secure identity proof.
+thinking
+**Addressing device identity and audit challenges**
+
+I’m thinking about how enterprises can prove device identity, possibly through a lightweight agent that creates a signed device token. Since I can’t add new components, I might require a “device certificate” as part of the requirements. This could validate during TLS client authentication. For browsers, using mTLS or a one-time device attestation is an option, but we can connect it to Device Posture. For the audit pipeline, it might be simplest to write audit events to a local buffer and batch them to Postgres, but given the volume, S3 could be an alternative.
+thinking
+**Streamlining audit and policy components**
+
+I’m considering simplifying our audit process by writing logs to a managed log sink like CloudWatch, but that feels like adding complexity. Since we already have an audit log component, we might want to keep it and define standards like an in-proxy async buffer and a drop policy for sampling. I’m thinking we should never drop auth decisions for high-risk scenarios. For request normalization and route matching, we can keep this in the proxy. Also, we could remove the PDP service by embedding policies into the proxy using OPA WASM. This could streamline our architecture to around six core components.
+thinking
+**Finalizing architecture documentation**
+
+I’m outlining the architecture with local policy evaluation at the proxy and bundles coming from the control plane. Device identity will be tied to client certificates, and we’ll maintain a posture materialized store with a proxy cache. The upstream contract will involve mTLS and JWT assertions. I’m thinking about condensing the Deep Dive section into a step-by-step request flow that includes caching rules and audit semantics. I also need to update the failure modes and take out certain components, replacing them as needed. Finally, I'll just format everything in plain markdown for clarity.
+codex
+```markdown
+---
+title: "Zero-Trust Access Proxy"
+category: "Security & Access Control"
+difficulty: "Hard"
+tags: ["zero-trust", "iap", "ztna", "oidc", "mTLS", "policy", "device-posture", "audit"]
+---
+
+## Overview
+
+This system is a Zero-Trust Access Proxy (ZTAP) that replaces a VPN by authenticating and authorizing **every request** to internal applications using **user identity + cryptographic device identity + device posture** and a single, versioned policy model. Users reach internal apps only through a gateway that enforces policy at L7, then forwards requests over mutually-authenticated transport to private services.
+
+Identity proof happens via OIDC, but access is decided at request time using posture with explicit staleness bounds. Policy evaluation runs **locally at the proxy** from signed, versioned bundles so traffic does not depend on a remote “live” policy service.
+
+## What Makes This Hard
+
+The hard part is preventing **stale trust** (device health changes after login) without turning authorization into a distributed, fragile dependency graph. The solution is bounded staleness (strict TTLs) and a single enforcement point with deterministic request normalization.
+
+## Requirements
+
+### Functional Requirements
+- Enforce access on **every request** using: user identity, device identity, device posture, app/resource, method/path, and policy version.
+- Support both **browser apps** (redirect/cookie) and **API clients** (non-interactive).
+- Provide **continuous access**: revocation within minutes, and within seconds for high-risk apps.
+- Strong auditability: record **inputs hash, policy version, decision result/reason, target**, and a stable `decision_id`.
+- Minimal app changes: internal apps verify **mTLS from proxy + a short-lived upstream assertion**.
+
+### Scale Targets
+- **Users/devices:** 50k / 80k.
+- **Traffic:** 20k RPS avg, 80k RPS peak; p95 proxy-added latency < 25ms.
+- **Posture freshness:** 60s normal, 5–10s high-risk.
+- **Audit:** up to hundreds of millions of events/day.
+
+## Key Design Decisions
+
+- **Decision 1: Proxy-local policy, centralized policy authoring**
+  - **Chose:** Proxies evaluate policy locally (OPA/Cedar embedded, e.g., OPA WASM) using signed, versioned bundles produced by the control plane.
+  - **Why:** Authorization remains available during partitions/overload; rollback is instant by switching bundles.
+
+- **Decision 2: Strong device identity bound to the session**
+  - **Chose:** Require a managed **device client certificate** at the proxy (mTLS on the public edge) and bind its `device_id` to the proxy session/token.
+  - **Why:** “User + device” is real only if the device factor is cryptographic and non-spoofable.
+
+- **Decision 3: One upstream contract**
+  - **Chose:** Proxy-to-app mTLS plus a short-lived **JWT upstream assertion** (audience-bound, signed, exp minutes/seconds, includes `decision_id`).
+  - **Why:** Apps get a tamper-resistant identity context without calling the IdP or policy system.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[User/Client] --> P[Access Proxy]
+  P --> I[OIDC IdP]
+  P --> CP[Control Plane]
+  CP --> DB[Postgres]
+  P --> A[Internal Apps]
+  P --> L[Audit Log]
+```
+
+### Components
+
+- `Access Proxy`: Only public entry. Terminates TLS and **requires client mTLS** for device identity, runs OIDC flows, normalizes requests, evaluates policy locally from the current bundle, enforces decisions, forwards to internal apps over mTLS, and emits audit events asynchronously.
+- `OIDC IdP`: Workforce identity and MFA authority (Okta/AzureAD/Google). Used for authentication and step-up; not used for fine-grained authorization.
+- `Control Plane`: Admin UI/API for apps/routes/policies, produces **signed policy bundles**, and serves the current materialized device posture state for proxies to cache.
+- `Postgres`: Single control-plane database for configuration, policy metadata, signing keys, rollout state, and materialized posture documents.
+- `Internal Apps`: Private services reachable only from the proxy. Validate proxy mTLS identity and verify the upstream assertion’s signature and audience.
+- `Audit Log`: Durable append-only sink for access/decision events; the proxy writes asynchronously with bounded buffering.
+
+## Deep Dive: Continuous AuthZ With Bounded Staleness
+
+**1) Request normalization happens before policy.**  
+The proxy canonicalizes: host, scheme, method, normalized path (no ambiguous encoded slashes/dots), query parsing, and header handling (drop/deny unsafe forwarded headers). Policy always sees the canonical form and the selected `app_id`/`route_id`.
+
+**2) Identity and device binding.**  
+- Device identity is the client certificate presented to the proxy; `device_id` is derived from cert subject/SAN and validated against the control plane.
+- User identity is established via OIDC (auth code + PKCE for browsers; OIDC token exchange or client mTLS-based client auth for APIs).
+- The proxy session/token binds `user_id` + `device_id` + `auth_time` + `mfa_level`.
+
+**3) Posture is materialized and cached with strict TTLs.**  
+The control plane maintains a normalized posture document per device (from MDM/EDR feeds): `compliance_state`, `edr_state`, `disk_encrypted`, `cert_status`, `risk_score`, `timestamp`.  
+Proxies keep an in-memory cache keyed by `device_id` with per-app TTL budgets:
+- Normal apps: 60s max posture age.
+- High-risk apps: 5–10s max posture age.
+If posture age exceeds the app’s budget, the decision is **deny or step-up** (policy-controlled), never “allow anyway.”
+
+**4) Policy evaluation is local and versioned.**  
+The proxy evaluates the current signed bundle against a compact input:
+- `principal` (user, groups, auth_time, mfa_level)
+- `device` (device_id, posture summary, posture_timestamp)
+- `request` (app_id, route_id, method, canonical_path, source attributes)
+- `context` (time, bundle_version)
+The output is: `allow/deny`, `reason_code`, optional `require_step_up`, and assertion claims.
+
+**5) Upstream enforcement and identity propagation.**  
+On allow, the proxy:
+- Connects to the app via mTLS (apps accept only the proxy identity).
+- Attaches a short-lived upstream assertion JWT with `sub`, `groups`, `device_id`, `decision_id`, `bundle_version`, `iat/exp`, and `aud` = app.
+
+**6) Audit durability and backpressure are explicit.**  
+The proxy emits an audit event per decision with `decision_id`, inputs hash, bundle version, result/reason, and target.
+- The proxy buffers audit events in memory up to a fixed limit.
+- When full, it **drops request-level “access” events** first (sampled) but **never drops decision-deny/decision-allow events for high-risk apps**; if that buffer cannot be maintained, the proxy **fails closed for high-risk apps** and continues sampling for low-risk with a visible alarm condition.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Fewer hot-path dependencies (policy local) | Bundle distribution becomes critical control-plane path |
+| Strong device binding (client cert required) | Enrollment/PKI operational overhead and stricter client requirements |
+| Simple app integration (mTLS + JWT verify) | Apps must implement assertion verification consistently |
+| Explicit bounded staleness | More denies/step-ups during posture feed issues |
+
+## Failure Modes
+
+- **IdP outage / latency spike**
+  - **What happens:** New logins and step-up fail; existing sessions continue until policy forces re-auth.
+  - **Recover:** Policy denies step-up-required routes; sensitive access fails closed while non-step-up routes continue within `max_session_age`.
+
+- **Policy bundle distribution broken**
+  - **What happens:** Proxies cannot fetch new bundles.
+  - **Recover:** Proxies continue with the last valid bundle and keep the previous bundle for instant rollback; admin rollouts halt until distribution recovers.
+
+- **Posture feed stale (e.g., 5 minutes)**
+  - **What happens:** Posture timestamps drift beyond budgets.
+  - **Recover:** High-risk routes fail closed; normal routes follow policy (deny or step-up). The proxy never extends staleness budgets silently.
+
+- **Audit sink degraded / down**
+  - **What happens:** Proxy buffers fill.
+  - **Recover:** Low-risk access events are sampled/dropped first; high-risk decision events are preserved or access fails closed when the high-risk audit guarantee cannot be met.
+
+## What We Removed
+
+- Remote per-request PDP dependency; policy evaluation is proxy-local from signed bundles.
+- Separate “Config Store” as a distinct system; configuration and policy metadata live in Postgres behind the control plane.
+- On-demand vendor posture calls in the request path; posture is materialized and served from the control plane for proxy caching.
+- Ambiguous “signed headers or JWT” propagation; upstream identity is a single JWT assertion contract.
+- Bespoke “emergency mode” control logic; break-glass is a signed policy bundle with the same rollout/rollback path.
+
+## Operational Notes
+
+- Treat the proxy as tier-0: multi-region, health checks, and routine rollback drills (bundle swap).
+- Monitor posture freshness per app tier; it is the operational definition of “continuous trust.”
+- Enforce bypass resistance: internal apps only accept mTLS from the proxy identity.
+- Lock down normalization and header rules centrally in the proxy; policy assumes canonical inputs only.
+- Make every decision explainable and correlatable via `decision_id`, `bundle_version`, and inputs hash.
+```
+tokens used
+9,772
+```markdown
+---
+title: "Zero-Trust Access Proxy"
+category: "Security & Access Control"
+difficulty: "Hard"
+tags: ["zero-trust", "iap", "ztna", "oidc", "mTLS", "policy", "device-posture", "audit"]
+---
+
+## Overview
+
+This system is a Zero-Trust Access Proxy (ZTAP) that replaces a VPN by authenticating and authorizing **every request** to internal applications using **user identity + cryptographic device identity + device posture** and a single, versioned policy model. Users reach internal apps only through a gateway that enforces policy at L7, then forwards requests over mutually-authenticated transport to private services.
+
+Identity proof happens via OIDC, but access is decided at request time using posture with explicit staleness bounds. Policy evaluation runs **locally at the proxy** from signed, versioned bundles so traffic does not depend on a remote “live” policy service.
+
+## What Makes This Hard
+
+The hard part is preventing **stale trust** (device health changes after login) without turning authorization into a distributed, fragile dependency graph. The solution is bounded staleness (strict TTLs) and a single enforcement point with deterministic request normalization.
+
+## Requirements
+
+### Functional Requirements
+- Enforce access on **every request** using: user identity, device identity, device posture, app/resource, method/path, and policy version.
+- Support both **browser apps** (redirect/cookie) and **API clients** (non-interactive).
+- Provide **continuous access**: revocation within minutes, and within seconds for high-risk apps.
+- Strong auditability: record **inputs hash, policy version, decision result/reason, target**, and a stable `decision_id`.
+- Minimal app changes: internal apps verify **mTLS from proxy + a short-lived upstream assertion**.
+
+### Scale Targets
+- **Users/devices:** 50k / 80k.
+- **Traffic:** 20k RPS avg, 80k RPS peak; p95 proxy-added latency < 25ms.
+- **Posture freshness:** 60s normal, 5–10s high-risk.
+- **Audit:** up to hundreds of millions of events/day.
+
+## Key Design Decisions
+
+- **Decision 1: Proxy-local policy, centralized policy authoring**
+  - **Chose:** Proxies evaluate policy locally (OPA/Cedar embedded, e.g., OPA WASM) using signed, versioned bundles produced by the control plane.
+  - **Why:** Authorization remains available during partitions/overload; rollback is instant by switching bundles.
+
+- **Decision 2: Strong device identity bound to the session**
+  - **Chose:** Require a managed **device client certificate** at the proxy (mTLS on the public edge) and bind its `device_id` to the proxy session/token.
+  - **Why:** “User + device” is real only if the device factor is cryptographic and non-spoofable.
+
+- **Decision 3: One upstream contract**
+  - **Chose:** Proxy-to-app mTLS plus a short-lived **JWT upstream assertion** (audience-bound, signed, exp minutes/seconds, includes `decision_id`).
+  - **Why:** Apps get a tamper-resistant identity context without calling the IdP or policy system.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[User/Client] --> P[Access Proxy]
+  P --> I[OIDC IdP]
+  P --> CP[Control Plane]
+  CP --> DB[Postgres]
+  P --> A[Internal Apps]
+  P --> L[Audit Log]
+```
+
+### Components
+
+- `Access Proxy`: Only public entry. Terminates TLS and **requires client mTLS** for device identity, runs OIDC flows, normalizes requests, evaluates policy locally from the current bundle, enforces decisions, forwards to internal apps over mTLS, and emits audit events asynchronously.
+- `OIDC IdP`: Workforce identity and MFA authority (Okta/AzureAD/Google). Used for authentication and step-up; not used for fine-grained authorization.
+- `Control Plane`: Admin UI/API for apps/routes/policies, produces **signed policy bundles**, and serves the current materialized device posture state for proxies to cache.
+- `Postgres`: Single control-plane database for configuration, policy metadata, signing keys, rollout state, and materialized posture documents.
+- `Internal Apps`: Private services reachable only from the proxy. Validate proxy mTLS identity and verify the upstream assertion’s signature and audience.
+- `Audit Log`: Durable append-only sink for access/decision events; the proxy writes asynchronously with bounded buffering.
+
+## Deep Dive: Continuous AuthZ With Bounded Staleness
+
+**1) Request normalization happens before policy.**  
+The proxy canonicalizes: host, scheme, method, normalized path (no ambiguous encoded slashes/dots), query parsing, and header handling (drop/deny unsafe forwarded headers). Policy always sees the canonical form and the selected `app_id`/`route_id`.
+
+**2) Identity and device binding.**  
+- Device identity is the client certificate presented to the proxy; `device_id` is derived from cert subject/SAN and validated against the control plane.
+- User identity is established via OIDC (auth code + PKCE for browsers; OIDC token exchange or client mTLS-based client auth for APIs).
+- The proxy session/token binds `user_id` + `device_id` + `auth_time` + `mfa_level`.
+
+**3) Posture is materialized and cached with strict TTLs.**  
+The control plane maintains a normalized posture document per device (from MDM/EDR feeds): `compliance_state`, `edr_state`, `disk_encrypted`, `cert_status`, `risk_score`, `timestamp`.  
+Proxies keep an in-memory cache keyed by `device_id` with per-app TTL budgets:
+- Normal apps: 60s max posture age.
+- High-risk apps: 5–10s max posture age.
+If posture age exceeds the app’s budget, the decision is **deny or step-up** (policy-controlled), never “allow anyway.”
+
+**4) Policy evaluation is local and versioned.**  
+The proxy evaluates the current signed bundle against a compact input:
+- `principal` (user, groups, auth_time, mfa_level)
+- `device` (device_id, posture summary, posture_timestamp)
+- `request` (app_id, route_id, method, canonical_path, source attributes)
+- `context` (time, bundle_version)
+The output is: `allow/deny`, `reason_code`, optional `require_step_up`, and assertion claims.
+
+**5) Upstream enforcement and identity propagation.**  
+On allow, the proxy:
+- Connects to the app via mTLS (apps accept only the proxy identity).
+- Attaches a short-lived upstream assertion JWT with `sub`, `groups`, `device_id`, `decision_id`, `bundle_version`, `iat/exp`, and `aud` = app.
+
+**6) Audit durability and backpressure are explicit.**  
+The proxy emits an audit event per decision with `decision_id`, inputs hash, bundle version, result/reason, and target.
+- The proxy buffers audit events in memory up to a fixed limit.
+- When full, it **drops request-level “access” events** first (sampled) but **never drops decision-deny/decision-allow events for high-risk apps**; if that buffer cannot be maintained, the proxy **fails closed for high-risk apps** and continues sampling for low-risk with a visible alarm condition.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Fewer hot-path dependencies (policy local) | Bundle distribution becomes critical control-plane path |
+| Strong device binding (client cert required) | Enrollment/PKI operational overhead and stricter client requirements |
+| Simple app integration (mTLS + JWT verify) | Apps must implement assertion verification consistently |
+| Explicit bounded staleness | More denies/step-ups during posture feed issues |
+
+## Failure Modes
+
+- **IdP outage / latency spike**
+  - **What happens:** New logins and step-up fail; existing sessions continue until policy forces re-auth.
+  - **Recover:** Policy denies step-up-required routes; sensitive access fails closed while non-step-up routes continue within `max_session_age`.
+
+- **Policy bundle distribution broken**
+  - **What happens:** Proxies cannot fetch new bundles.
+  - **Recover:** Proxies continue with the last valid bundle and keep the previous bundle for instant rollback; admin rollouts halt until distribution recovers.
+
+- **Posture feed stale (e.g., 5 minutes)**
+  - **What happens:** Posture timestamps drift beyond budgets.
+  - **Recover:** High-risk routes fail closed; normal routes follow policy (deny or step-up). The proxy never extends staleness budgets silently.
+
+- **Audit sink degraded / down**
+  - **What happens:** Proxy buffers fill.
+  - **Recover:** Low-risk access events are sampled/dropped first; high-risk decision events are preserved or access fails closed when the high-risk audit guarantee cannot be met.
+
+## What We Removed
+
+- Remote per-request PDP dependency; policy evaluation is proxy-local from signed bundles.
+- Separate “Config Store” as a distinct system; configuration and policy metadata live in Postgres behind the control plane.
+- On-demand vendor posture calls in the request path; posture is materialized and served from the control plane for proxy caching.
+- Ambiguous “signed headers or JWT” propagation; upstream identity is a single JWT assertion contract.
+- Bespoke “emergency mode” control logic; break-glass is a signed policy bundle with the same rollout/rollback path.
+
+## Operational Notes
+
+- Treat the proxy as tier-0: multi-region, health checks, and routine rollback drills (bundle swap).
+- Monitor posture freshness per app tier; it is the operational definition of “continuous trust.”
+- Enforce bypass resistance: internal apps only accept mTLS from the proxy identity.
+- Lock down normalization and header rules centrally in the proxy; policy assumes canonical inputs only.
+- Make every decision explainable and correlatable via `decision_id`, `bundle_version`, and inputs hash.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/08-security-access-control/zero-trust-access-proxy.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Zero-Trust Access Proxy
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/zero-trust-access-proxy.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/zero-trust-access-proxy.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/08-security-access-control/zero-trust-access-proxy.md

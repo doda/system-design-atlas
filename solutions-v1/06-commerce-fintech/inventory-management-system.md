@@ -1,0 +1,339 @@
+---
+title: "Inventory Management System"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["inventory", "reservations", "consistency", "flash-sales", "outbox", "idempotency"]
+---
+
+# Inventory Management System
+
+## Overview
+
+This system manages limited stock across `SKU + location` with a hard guarantee: **no oversells** during checkout, even under high concurrency and flash-sale hot keys. It serves extremely high read traffic for browse/search/PDP with low latency using short-lived caching, while keeping all reservation and allocation decisions strongly consistent in a single authoritative data store.
+
+The design is a single **Inventory Service** (modular monolith) with:
+- **Strongly consistent write path** for reserve/confirm/release and adjustments (authoritative).
+- **Fast read path** using cache with database fallback and explicit confidence signaling.
+- **Reliable event publishing** via a transactional outbox for downstream consumers.
+
+---
+
+## Requirements
+
+### Functional Requirements
+- Show available quantity per `SKU` and `location` for browse/search/PDP.
+- Create a reservation (hold) for `SKU/location/qty` with TTL (e.g., 15 minutes).
+- Confirm an active reservation into an allocation on successful checkout.
+- Release reservations on cancellation/payment failure/expiration (automatic and manual).
+- Prevent oversell under concurrency.
+- Support inventory adjustments with auditable reasons.
+- Provide fallback behaviors when inventory is unknown/unavailable.
+- Publish inventory and reservation events for downstream consumers (search, analytics, replenishment, notifications, ERP/WMS).
+
+### Non-Functional Requirements (SLO Targets)
+- Scale (peak): 100k QPS reads, 10k QPS writes, hot key up to 5k reserve attempts/sec.
+- Latency: reads P50 10ms/P99 50ms (cache hit), writes P50 40ms/P99 150ms.
+- Availability: read APIs 99.99%, reservation APIs 99.95%.
+- Consistency: strong for reserve/confirm/release per `sku_location`; eventual for downstream and cached reads.
+- Durability/DR: no lost confirmed allocations; multi-AZ, RPO ~0 within-region; cross-region async RPO ≤ 1 min, RTO ≤ 30 min.
+
+### Constraints & Assumptions
+- Inventory tracked per `SKU + location`; global inventory derived.
+- Order/Payment is external; confirmation happens after payment authorization.
+- Single-writer region per `location`, multi-AZ. DR is failover, not active-active for the same `location`.
+
+---
+
+## Simplified Architecture
+
+```mermaid
+graph TB
+  C[Client Apps] --> E[CDN/WAF]
+  E --> I[Inventory Service]
+
+  I --> R[(Redis Cache)]
+  I --> P[(Postgres)]
+
+  I --> B[(Event Bus)]
+  B --> S[Search]
+  B --> A[Analytics]
+  B --> W[ERP/WMS]
+  O[Order Service] --> I
+```
+
+### What the Inventory Service Contains
+- HTTP APIs (read + reservation + adjustments)
+- Reservation state machine and invariants
+- Idempotency handling
+- Expiration worker (scheduled job)
+- Outbox publisher (background loop)
+
+---
+
+## Core Data & Invariants
+
+### Authoritative Store: Postgres
+Postgres holds the source of truth and enforces correctness with transactions and row-level locking per `sku_location`.
+
+**Invariant (always true):**
+- `reserved + allocated <= on_hand`
+- `available_to_promise = on_hand - reserved - allocated` (optionally minus `safety_stock`)
+
+### Reservation State Machine
+
+```mermaid
+stateDiagram-v2
+  [*] --> ACTIVE: Reserve
+  ACTIVE --> CONFIRMED: Confirm
+  ACTIVE --> RELEASED: Release
+  ACTIVE --> EXPIRED: Expire
+  EXPIRED --> [*]
+  RELEASED --> [*]
+  CONFIRMED --> [*]
+```
+
+---
+
+## API Design
+
+### Conventions
+- All write endpoints require `Idempotency-Key`.
+- Server time defines `expires_at`; clients send `ttl_seconds`.
+- Responses include stable error `code` values.
+
+### Read API
+`GET /v1/availability?sku_id={sku_id}&location_id={location_id}`
+
+**Response**
+```json
+{
+  "sku_id": "SKU123",
+  "location_id": "WH1",
+  "available": 42,
+  "as_of": "2025-12-17T10:00:00Z",
+  "confidence": "fresh",
+  "version": 912381
+}
+```
+
+**Behavior**
+- Cache-first (`Redis`) with TTL 1–5s + jitter.
+- If cache miss: read from Postgres and populate cache.
+- If Postgres is unhealthy: return `confidence: "unknown"` with `available: null` (or conservative `0` via config).
+
+### Reservation APIs (Authoritative)
+
+#### Create reservation
+`POST /v1/reservations`  
+Headers: `Idempotency-Key: <uuid>`
+
+**Request**
+```json
+{
+  "sku_id": "SKU123",
+  "location_id": "WH1",
+  "qty": 2,
+  "ttl_seconds": 900,
+  "order_id": "ORD999"
+}
+```
+
+**Response (201)**
+```json
+{
+  "reservation_id": "01J...ULID",
+  "status": "ACTIVE",
+  "expires_at": "2025-12-17T10:15:00Z"
+}
+```
+
+**Errors**
+- `409 INSUFFICIENT_STOCK`
+- `400 INVALID_QTY` / `400 INVALID_TTL`
+- `404 UNKNOWN_SKU_LOCATION`
+- `429 HOT_KEY_THROTTLED`
+- `503 INVENTORY_UNAVAILABLE`
+
+#### Confirm reservation
+`POST /v1/reservations/{reservation_id}/confirm`  
+Headers: `Idempotency-Key: <uuid>`
+
+**Semantics**
+- `ACTIVE -> CONFIRMED`
+- Moves `qty` from `reserved` to `allocated` atomically.
+
+**Errors**
+- `410 EXPIRED`
+- `409 INVALID_STATE`
+- `404 NOT_FOUND`
+
+#### Release reservation
+`DELETE /v1/reservations/{reservation_id}`  
+Headers: `Idempotency-Key: <uuid>`
+
+**Semantics**
+- `ACTIVE -> RELEASED`
+- Decrements `reserved` by `qty` atomically.
+
+#### Adjustments (Internal/Admin)
+`POST /v1/inventory/adjustments`  
+Headers: `Idempotency-Key: <uuid>`
+
+**Request**
+```json
+{
+  "sku_id": "SKU123",
+  "location_id": "WH1",
+  "delta_on_hand": 50,
+  "reason": "RESTOCK",
+  "reference": "ASN-7781"
+}
+```
+
+**Rules**
+- Must not violate `reserved + allocated <= on_hand` after applying.
+- Emits an `ADJUSTED` event with audit context.
+
+---
+
+## Write-Path Correctness (How Oversells Are Prevented)
+
+All reserve/confirm/release operations run in a single Postgres transaction and lock the `inventory_balance` row for the target `sku_id + location_id`.
+
+### Reserve (single `sku_location`)
+1. Start transaction.
+2. Lock balance row: `SELECT ... FOR UPDATE` on `inventory_balance`.
+3. Check `on_hand - reserved - allocated >= qty`.
+4. Insert `reservation` with `status=ACTIVE` and `expires_at`.
+5. Update `inventory_balance.reserved += qty`, `version += 1`.
+6. Insert outbox event in the same transaction.
+7. Commit.
+
+### Confirm
+- Lock reservation row, validate `ACTIVE` and not expired.
+- Lock balance row for the same `sku_location`.
+- Update reservation to `CONFIRMED`.
+- Update balance: `reserved -= qty`, `allocated += qty`, `version += 1`.
+- Write outbox event; commit.
+
+### Release / Expire
+- Same pattern: transition reservation state and adjust `reserved`, with an outbox event in the same transaction.
+
+### Hot-Key Handling (Flash Sales)
+- Per-`sku_location` rate limiting using Redis (token bucket) to cap concurrency and protect tail latency.
+- Strict timeouts and bounded retries; client retries remain safe via idempotency.
+
+---
+
+## Expiration, Drift Control, and Idempotency
+
+### Expiration Worker (inside Inventory Service)
+- Runs every 30–60 seconds.
+- Queries `reservation` where `status='ACTIVE' AND expires_at <= now()` using an index.
+- For each batch, performs a transaction that:
+  - Moves `ACTIVE -> EXPIRED`
+  - Decrements `inventory_balance.reserved`
+  - Emits an `EXPIRED` outbox event
+
+### Drift Control
+- A periodic reconciler job (off-peak) samples `sku_location` keys and recomputes reserved from `ACTIVE` reservations to detect anomalies, alert, and repair within guardrails.
+
+### Idempotency
+- Write endpoints require `Idempotency-Key`.
+- Store idempotency results in Postgres with a unique constraint on `(idempotency_scope, idempotency_key)` and the canonical response payload, so retries return the same result without reapplying mutations.
+
+---
+
+## Data Model (Postgres)
+
+### `inventory_balance`
+- `location_id` (PK part)
+- `sku_id` (PK part)
+- `on_hand` (int, >= 0)
+- `reserved` (int, >= 0)
+- `allocated` (int, >= 0)
+- `version` (bigint, monotonic per `sku_location`)
+- `updated_at` (timestamptz)
+
+### `reservation`
+- `reservation_id` (PK, ULID/UUID)
+- `location_id`, `sku_id`
+- `qty` (int, > 0)
+- `status` (`ACTIVE|CONFIRMED|RELEASED|EXPIRED`)
+- `expires_at` (timestamptz)
+- `order_id` (nullable)
+- `created_at`, `updated_at`
+
+**Indexes**
+- `(status, expires_at)` for expiration scanning
+- `(location_id, sku_id, status)` for operational queries
+
+### `idempotency_record`
+- `idempotency_scope`
+- `idempotency_key`
+- `request_hash` (optional)
+- `response_code`, `response_body`
+- `created_at`, `expires_at`
+
+**Constraint**
+- Unique `(idempotency_scope, idempotency_key)`
+
+### `inventory_outbox`
+- `event_id` (PK)
+- `event_type` (`RESERVED|RELEASED|CONFIRMED|ADJUSTED|EXPIRED`)
+- `location_id`, `sku_id`
+- `new_version`
+- `payload` (jsonb)
+- `created_at`
+- `published_at` (nullable)
+
+---
+
+## Events and Downstream Consumers
+
+### Publishing
+- Inventory mutations and the outbox row are committed together in Postgres.
+- A background publisher reads unpublished outbox rows in small batches using `FOR UPDATE SKIP LOCKED`, publishes to the event bus, then marks `published_at`.
+
+### Consumer Contract
+Each event includes:
+- `event_id`, `event_type`, `occurred_at`
+- `location_id`, `sku_id`, `new_version`
+- `payload` containing deltas and/or the new balance snapshot
+
+Consumers process:
+- Idempotently by `event_id`
+- Monotonically per `sku_location` using `new_version`
+
+---
+
+## Failure Modes and Degraded Behavior (Minimum Set)
+
+- **Redis unavailable**: reads fall back to Postgres; `confidence` may be `stale` if timeouts occur.
+- **Postgres elevated latency/outage**: reservation APIs fail fast with `503`; read API returns `confidence: "unknown"` (or conservative `0`) without blocking UI.
+- **Publisher/event bus degradation**: outbox backlog grows; authoritative correctness unaffected; consumers catch up when healthy.
+- **Expiration lag**: alerts fire on count of `ACTIVE` past `expires_at` and job lag; worker scales horizontally via `SKIP LOCKED`.
+
+---
+
+## Operations and DR
+
+### SLIs/SLOs
+- Read: success rate, P99 latency, cache hit rate, `unknown` rate.
+- Write: success rate (excluding insufficient stock), P99 latency, lock wait time, throttling rate.
+- Correctness: invariant violations (must be zero), expired-but-active count.
+
+### DR
+- Multi-AZ Postgres with synchronous replication within region (RPO ~0).
+- Cross-region async replica and backups (RPO ≤ 1 minute).
+- Failover runbook: promote replica, route `location` traffic to DR, resume outbox publishing, run reconciliation.
+
+---
+
+## Simplification Notes
+
+- Removed: separate Read API and Reservation API; a single `Inventory Service` handles read/write with shared logic and deployment.
+- Removed: dedicated cache updater service; cache is updated by the Inventory Service on reads and writes, with short TTL convergence.
+- Removed: external authoritative and read-through “fallback” stores; Postgres is the single authoritative store for balances, reservations, idempotency, and outbox.
+- Merged: sweeper, reconciler, and outbox publisher into background workers within the Inventory Service for simpler operations.
+- Complexity kept: transactional outbox and consumer idempotency (required for durable, decoupled downstream publishing) and per-key throttling (required to keep flash-sale tail latency stable).

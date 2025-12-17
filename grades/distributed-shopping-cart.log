@@ -1,0 +1,415 @@
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2a95-8bf3-7a23-ba8e-fa6152a6929c
+--------
+user
+You are a senior systems architect reviewing a system design document.
+
+Grade this solution on three dimensions (1-10 scale):
+
+1. **Strength** (1-10): How technically sound, complete, and production-ready is the design?
+   - Does it address scalability, reliability, and failure modes?
+   - Are the trade-offs well-reasoned?
+   - Would this actually work at scale?
+
+2. **Interestingness** (1-10): How engaging and educational is the content?
+   - Does it teach useful concepts?
+   - Are there insights that aren't obvious?
+   - Would an engineer learn something valuable?
+
+3. **Novelty** (1-10): How unique or creative is the approach?
+   - Does it go beyond textbook solutions?
+   - Are there clever simplifications or unconventional choices?
+   - Does it challenge common assumptions?
+
+Also note any major issues or particularly strong aspects.
+
+Output ONLY valid JSON in this exact format:
+{
+  "slug": "distributed-shopping-cart",
+  "strength": <1-10>,
+  "interestingness": <1-10>,
+  "novelty": <1-10>,
+  "overall": <average of three scores, 1 decimal>,
+  "summary": "<2-3 sentence summary of the design>",
+  "strengths": ["<strength 1>", "<strength 2>"],
+  "weaknesses": ["<weakness 1>", "<weakness 2>"],
+  "verdict": "<one of: exceptional, strong, adequate, weak>"
+}
+
+---
+
+## Solution to Grade
+
+---
+title: "Distributed Shopping Cart"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["distributed-systems", "caching", "consistency", "idempotency", "multi-region"]
+---
+
+## Overview
+
+This design provides a fast, resilient shopping cart for browsing across devices, while keeping checkout as the strong-consistency boundary where pricing, promos, taxes, and inventory are validated authoritatively.
+
+Browsing prioritizes low-latency reads/writes and safe retries. Checkout always recalculates and reserves inventory before creating an order.
+
+---
+
+## Requirements
+
+### Functional Requirements
+
+- Create carts for **guest** and **authenticated** users.
+- Persist authenticated carts across sessions/devices; guest carts persist via cookie/device token.
+- Mutate cart contents:
+  - Add item, remove item, set quantity, update options.
+  - Apply/remove promo codes (best-effort validation in cart view).
+- Return a cart view including items, best-effort totals, and warnings (e.g., price changed, out of stock).
+- Support **idempotent** mutations (safe retries) and concurrent updates across devices.
+- Merge guest cart into user cart on login with deterministic rules.
+- Support cart expiration + cleanup without deleting active carts.
+- At checkout, produce a canonical snapshot and create an order with consistent final pricing/taxes/promos and inventory reservation.
+
+### Non-Functional Requirements (Targets)
+
+**Scale (example sizing)**
+- 20M DAU.
+- Peak: **50k read QPS**, **10k write QPS** (cart endpoints).
+- Average cart size: 10–30 items; **~2–10 KB** stored state typical, with a hard cap.
+
+**Latency (regional, not including client network)**
+- `GET cart`: P50 **15–30 ms**, P99 **80–150 ms** (cache-hit path).
+- Cart mutation: P50 **30–60 ms**, P99 **150–300 ms** (includes durable write).
+- Checkout validate+reserve+create order: P50 **200–400 ms**, P99 **800–1500 ms** (dependency-driven).
+
+**Availability**
+- Browsing cart read/write: **99.95–99.99%** (multi-AZ; multi-region failover).
+- Checkout confirm: **99.9–99.95%** (strong dependencies: inventory, pricing, order DB).
+
+**Consistency**
+- Browsing: eventual convergence across devices/regions; monotonic reads best-effort.
+- Checkout: strong consistency for inventory reservation and order creation; authoritative recalculation.
+
+**Durability**
+- No acknowledged mutation lost under **single-AZ failure** (multi-AZ durability).
+- Under **sudden full-region loss**, async replication implies small but non-zero RPO.
+
+### Constraints & Assumptions
+
+- Deployed in 2–3 regions; clients routed to nearest healthy region.
+- Pricing/promotions/catalog/inventory are owned by separate services; the cart must degrade gracefully.
+- Managed infrastructure is preferred.
+- Payment is out of scope; no PAN data in cart.
+
+---
+
+## Simplified Architecture
+
+```mermaid
+graph TD
+  C[Client Apps] --> E[CDN / WAF]
+  E --> A[Cart API]
+  A --> P[(Postgres)]
+  A --> R[(Redis Cache)]
+  A --> X[Product APIs]
+  A --> O[Checkout/Order APIs]
+```
+
+### Core Ideas
+
+- **One Cart API** owns browsing cart endpoints and checkout-intent endpoints.
+- **Postgres is the source of truth** for cart state, idempotency records, and lightweight background jobs.
+- **Redis is a cache for the rendered cart view** to keep `GET cart` fast and to reduce dependency fanout.
+- **Multi-region is handled via home-region routing + replicated storage**, keeping browsing writes strongly consistent within a region and resilient to regional failover.
+
+---
+
+## Components
+
+### CDN / WAF
+
+**Responsibilities**
+- TLS termination, basic WAF rules, bot protection.
+- Rate limiting per user/device and per cart.
+- Route requests to the cart’s **home region** (details below).
+
+### Cart API (stateless)
+
+**Responsibilities**
+- Cart reads/mutations, deterministic merge-on-login, and cart rendering.
+- Idempotency enforcement for all mutations and checkout confirms.
+- Best-effort totals and warnings using bounded calls to dependencies.
+- Cache management (read-through / write-through).
+
+**Hot-key protections**
+- Per-cart request coalescing for cache misses and expensive recomputations.
+- Per-cart throttling for mutation storms (flash sale behavior).
+
+### Postgres (durable source of truth)
+
+**Responsibilities**
+- Store cart state, items, promos, idempotency keys, and cleanup metadata.
+- Provide safe concurrency via transactions and row-level locking.
+
+**Deployment**
+- Multi-AZ primary in each region.
+- Cross-region async replica for failover (RPO measured in seconds; monitor replication lag).
+
+### Redis (cache)
+
+**Responsibilities**
+- Cache `CartView` payloads for fast reads.
+- Reduce load on Postgres and downstream dependency calls.
+
+**Practices**
+- TTL 5–30 minutes with jitter.
+- Write-through on successful mutations; embed cart `version` in cached value.
+
+### External Dependencies
+
+**Product APIs** (catalog, pricing, promotions)
+- Used to enrich the cart view and perform best-effort validation.
+- Always time-bounded; failures add warnings and fall back to last-known totals.
+
+**Checkout/Order APIs** (inventory, taxes, order creation)
+- Used only for checkout intent/confirm.
+- Confirm is idempotent and authoritative.
+
+---
+
+## Multi-Region Model
+
+### Home-Region Affinity
+
+Each cart has a `home_region` chosen on creation (typically the region closest to the user at that time).
+
+- **Writes** route to the home region to keep cart mutations strongly consistent and low-latency.
+- **Reads** prefer the home region for monotonic behavior; other regions may serve a stale view (optional) when the home region is unavailable.
+
+### Failover
+
+- If a home region is down, traffic shifts to the standby region.
+- The standby promotes its Postgres replica and becomes the new home region for affected carts.
+- The system exposes warnings/telemetry during failover (e.g., elevated staleness risk while promotion completes).
+
+---
+
+## Data Model (Postgres)
+
+### Identifiers
+
+- `cart_id`
+  - Authenticated: `user:{userId}`
+  - Guest: `guest:{guestId}` (stored in cookie/local storage; rotate carefully)
+- `item_key`: `hash(sku_id + normalized_options)`
+- `version`: monotonic integer per cart update (used for ETag / optimistic concurrency)
+
+### Tables
+
+**`carts`**
+- `cart_id` (PK)
+- `owner_type` (`USER|GUEST`)
+- `user_id` (nullable)
+- `home_region`
+- `currency`
+- `version` (int)
+- `last_computed_totals` (jsonb, non-authoritative)
+- `warnings` (jsonb)
+- `updated_at`
+- `expires_at`
+
+**`cart_items`**
+- `cart_id` (FK)
+- `item_key`
+- `sku_id`
+- `qty`
+- `options` (jsonb) or `options_hash`
+- `added_at`, `updated_at`
+- PK (`cart_id`, `item_key`)
+
+**`cart_promos`**
+- `cart_id` (FK)
+- `code`
+- PK (`cart_id`, `code`)
+
+**`idempotency_keys`**
+- `scope` (e.g., `CART_MUTATION`, `CHECKOUT_CONFIRM`)
+- `key` (Idempotency-Key)
+- `cart_id` (nullable for some scopes)
+- `request_hash`
+- `status` (`IN_PROGRESS|APPLIED|REJECTED`)
+- `response_snapshot` (jsonb, optional)
+- `created_at`
+- `expires_at`
+- Unique (`scope`, `key`, `cart_id`)
+
+### Retention & Expiration
+
+- Guest carts: 7–14 days since last update.
+- User carts: 30–90 days since last update.
+- Idempotency keys: 24–72 hours.
+
+Cleanup runs as a periodic job (e.g., every 10–30 minutes) deleting expired carts in bounded batches.
+
+---
+
+## Consistency and Concurrency
+
+### Writes (mutations)
+
+- Each mutation runs in a single Postgres transaction:
+  1. Insert/lock the idempotency record.
+  2. Lock the cart row (`SELECT ... FOR UPDATE`) to serialize concurrent device updates.
+  3. Apply changes, increment `version`, update derived fields.
+- Clients may supply `If-Match: "v{version}"`. If present and mismatched, return `412`.
+
+This keeps cart state strongly consistent per cart while still allowing high throughput across carts.
+
+### Reads
+
+- Cache hit returns immediately (includes `ETag: "v{version}"`).
+- Cache miss loads from Postgres and computes a best-effort view under strict dependency budgets.
+
+---
+
+## Data Flow
+
+### Mutation (idempotent, durable)
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant A as Cart API
+  participant P as Postgres
+  participant R as Redis
+
+  C->>A: POST /v1/carts/{cartId}/items (Idempotency-Key, If-Match optional)
+  A->>P: BEGIN
+  A->>P: Upsert idempotency_keys (scope+key+cartId)
+  alt Key exists, request_hash matches, status=APPLIED
+    A->>P: Load response_snapshot
+    A->>P: COMMIT
+    A-->>C: 200 (replay same response)
+  else New key (or IN_PROGRESS)
+    A->>P: Lock cart row (FOR UPDATE), apply mutation, bump version
+    A->>P: Store response_snapshot, mark APPLIED
+    A->>P: COMMIT
+    A->>R: Write-through CartView cache (cartId, version)
+    A-->>C: 200 CartView (ETag vN)
+  end
+```
+
+### Read (cache-aside)
+
+- `GET /v1/carts/{cartId}`
+  - Check Redis for `CartView`.
+  - On miss: load cart/items/promos from Postgres, call Product APIs within a fixed time budget, compute totals/warnings, cache the result, return.
+
+---
+
+## API Design
+
+### Authentication and Guest Identity
+
+- Authenticated requests use user auth (JWT/session).
+- Guest carts use a server-generated `guestId` stored in a secure cookie where possible.
+- Server enforces that callers may only access their own cart.
+
+### Get Cart
+
+- `GET /v1/carts/{cartId}`
+- Headers:
+  - `If-None-Match: "v{version}"` (optional)
+- Responses:
+  - `200` cart view + `ETag: "v{version}"`
+  - `304` not modified
+  - `200` empty cart (optional product choice) or `404`
+
+### Mutations (Idempotent)
+
+All mutation endpoints require:
+- `Idempotency-Key: <uuid>` (required)
+- `If-Match: "v{version}"` (optional but recommended)
+
+- `POST /v1/carts/{cartId}/items`
+- `PUT /v1/carts/{cartId}/items/{itemKey}`
+- `DELETE /v1/carts/{cartId}/items/{itemKey}`
+- `POST /v1/carts/{cartId}/promos`
+- `DELETE /v1/carts/{cartId}/promos/{code}`
+
+Common responses:
+- `200` updated cart view + new ETag
+- `412` precondition failed (If-Match mismatch)
+- `409` idempotency key reused with different payload (request_hash mismatch)
+- `422` invalid request
+
+### Merge Guest Cart on Login
+
+- `POST /v1/carts/user:{userId}/merge`
+- Body: `{ "fromCartId": "guest:abc" }`
+- Deterministic rules:
+  - Merge by `item_key`, sum quantities with a cap.
+  - Union promo codes, remove duplicates.
+  - Invalid items/options are dropped with warnings.
+- Idempotent with `Idempotency-Key`.
+
+### Checkout Intent (Strong Consistency Boundary)
+
+- `POST /v1/checkout/intents`
+  - Creates a server-side intent with TTL (10–30 minutes).
+  - Returns an order preview computed authoritatively via Checkout/Order APIs.
+
+- `POST /v1/checkout/intents/{checkoutIntentId}/confirm`
+  - Requires `Idempotency-Key`.
+  - Recomputes totals, validates promos, reserves inventory, creates the order.
+  - Returns `orderId` and final totals.
+
+---
+
+## Scaling & Operations
+
+### Performance Levers
+
+- Redis cache for `GET cart` keeps reads fast and stable under load.
+- Row-level locking per cart serializes only conflicting updates, not all writes.
+- Strict timeouts and circuit breakers on Product APIs prevent tail-latency amplification.
+- Compact cart representation and enforced limits (e.g., max items/cart, max payload size).
+
+### Observability (minimum set)
+
+- Endpoint p50/p95/p99 latency and error rate (reads vs writes vs checkout confirm).
+- Redis hit rate, evictions, and key size distribution.
+- Postgres replication lag (per region), lock wait time, and slow queries.
+- Idempotency conflict rate (`409`) and replay rate.
+- Dependency latency/error for Product APIs and Checkout/Order APIs.
+
+---
+
+## Failure Modes
+
+- **Redis unavailable**: fall back to Postgres; enable request coalescing and stricter rate limits to avoid thundering herd.
+- **Dependency slow/unavailable (pricing/promo/catalog)**: return items with last-known totals and warnings; checkout remains authoritative.
+- **Duplicate client retries**: idempotency table replays prior result deterministically.
+- **Concurrent device updates**: transaction serialization per cart produces deterministic ordering; optional `If-Match` enables optimistic client behavior.
+- **Region loss**: fail over to replica region, promote Postgres, update home-region routing.
+
+---
+
+## Simplification Notes
+
+- Removed: `Outbox / Durable Queue`, `Event Bus`, and downstream `Analytics/Recommendations/Messaging` consumers; cart correctness and checkout semantics are preserved without event delivery guarantees for non-critical consumers.
+- Removed: separate `Cart Store` technology matrix (DynamoDB/Spanner/Cassandra) in favor of a single managed `Postgres` source of truth with standard transactions and replication.
+- Merged: `Idempotency ledger` into the primary database as `idempotency_keys`, keeping retries safe without an extra datastore.
+- Merged: browsing cart and checkout-intent endpoints into one `Cart API` surface; checkout remains the strong-consistency boundary via `Checkout/Order APIs`.
+- Complexity that remains: multi-region failover and idempotency are necessary to meet availability targets and ensure retry-safe money/inventory flows at checkout.
+mcp startup: no servers
+ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Dec 17th, 2025 1:06 AM.
+Warning: no last agent message; wrote empty content to /Users/dominikdabrowski/pr/system-design-atlas/grades/distributed-shopping-cart.json

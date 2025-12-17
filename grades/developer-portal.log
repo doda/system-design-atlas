@@ -1,0 +1,392 @@
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2a95-a357-7ab0-b142-d82cc5e134a6
+--------
+user
+You are a senior systems architect reviewing a system design document.
+
+Grade this solution on three dimensions (1-10 scale):
+
+1. **Strength** (1-10): How technically sound, complete, and production-ready is the design?
+   - Does it address scalability, reliability, and failure modes?
+   - Are the trade-offs well-reasoned?
+   - Would this actually work at scale?
+
+2. **Interestingness** (1-10): How engaging and educational is the content?
+   - Does it teach useful concepts?
+   - Are there insights that aren't obvious?
+   - Would an engineer learn something valuable?
+
+3. **Novelty** (1-10): How unique or creative is the approach?
+   - Does it go beyond textbook solutions?
+   - Are there clever simplifications or unconventional choices?
+   - Does it challenge common assumptions?
+
+Also note any major issues or particularly strong aspects.
+
+Output ONLY valid JSON in this exact format:
+{
+  "slug": "developer-portal",
+  "strength": <1-10>,
+  "interestingness": <1-10>,
+  "novelty": <1-10>,
+  "overall": <average of three scores, 1 decimal>,
+  "summary": "<2-3 sentence summary of the design>",
+  "strengths": ["<strength 1>", "<strength 2>"],
+  "weaknesses": ["<weakness 1>", "<weakness 2>"],
+  "verdict": "<one of: exceptional, strong, adequate, weak>"
+}
+
+---
+
+## Solution to Grade
+
+---
+title: "Developer Portal (Service Catalog, Discovery, and Scorecards)"
+category: "IoT & Edge"
+difficulty: "Medium"
+tags: ["developer-portal", "service-catalog", "metadata-platform", "scorecards", "integrations", "governance"]
+---
+
+## Overview
+
+This developer portal is the internal **system of record for engineering metadata**: what services and edge workloads exist, who owns them, how to operate them, where they run, and whether they meet organizational expectations (SLOs, on-call readiness, runbooks, security posture, dependency hygiene).
+
+The portal treats metadata as two complementary classes:
+
+- **Declared (“spec”) fields**: strongly owned, manually curated, validated on write, and fully auditable (ownership, tier, lifecycle, ACL, docs/runbook refs).
+- **Observed (“status”) fields**: ingested signals with explicit freshness semantics (deployments, alerts, SLO burn, vulnerabilities, dependency edges).
+
+Key principle: **every observed signal has a source and staleness policy**. The UI always shows what is fresh, what is stale, and what is missing.
+
+### Goals
+- Make ownership and operational posture discoverable in seconds.
+- Keep metadata trustworthy via provenance, auditing, and freshness indicators.
+- Provide governance that drives action via scorecards with evidence and trend history.
+- Support both cloud services and edge fleets/workloads with environment- and region-scoped posture.
+
+### Non-goals
+- Replacing CI/CD, incident management, or observability systems.
+- Storing large documentation blobs as the primary docs store.
+- Real-time guarantees for dependency correctness across all sources.
+
+---
+
+## Requirements
+
+### Functional Requirements
+- Entity registration:
+  - Manual create/update/archive.
+  - “Register from repo” using a descriptor file (e.g., `portal.yaml`) and Git webhooks.
+- Ownership & governance:
+  - Team ownership, on-call refs, escalation policy refs.
+  - RBAC/ABAC controlled edits; restricted entities/namespaces supported.
+  - Audit history for critical fields.
+- Documentation hub:
+  - Link and optionally render versioned docs/runbooks/ADRs from Git (`repo:path@ref`) or URLs.
+- Operational scorecards:
+  - Configurable checks across environments (SLOs, alerting, security scans, backups, dependency hygiene).
+  - Evidence attached to each check (links, queries, metric snapshots, scan IDs).
+  - History/trends and org-level rollups.
+- Discovery & navigation:
+  - Full-text + faceted search (kind, owner, tags, domain, runtime, environment, region/fleet).
+  - Browse by taxonomy (domain, platform, lifecycle, tier).
+- Dependency mapping:
+  - Service-to-service and service-to-edge relationships.
+  - Confidence scoring and multiple sources (tracing/mesh/manual).
+  - Blast-radius queries and graph visualization.
+- Integrations:
+  - Git provider, CI/CD, Kubernetes, edge orchestrator/registry, vulnerability scanner, observability, incident management.
+  - Support both webhooks (push) and scheduled syncs (pull).
+- Freshness & staleness:
+  - Per-source last-success, per-signal observed timestamps, expiry policies, and UI staleness banners.
+
+### Non-Functional Requirements (Targets)
+- Scale (initial):
+  - ~10,000 entities (services + edge workloads + libraries + pipelines)
+  - ~2,000 teams, ~50,000 engineers
+  - Portal traffic: 500–2,000 QPS reads peak; 5–50 QPS writes peak
+  - Ingestion: 1,000–10,000 events/min sustained; bursts during deploy windows
+- Latency (user-facing):
+  - Entity page: P50 < 50 ms, P99 < 200 ms
+  - Search: P50 < 150 ms, P99 < 500 ms
+  - Scorecard page render: P99 < 800 ms (partial results allowed)
+- Availability:
+  - 99.9% monthly for core catalog read/write
+- Consistency:
+  - Strong consistency for declared fields via the catalog database
+  - Asynchronous updates for observed signals, scorecards, and derived search fields
+- Data protection:
+  - No silent loss of manual edits; audit log for sensitive changes
+  - RPO ≤ 15 minutes, RTO ≤ 1 hour for the catalog DB
+
+### Constraints & Assumptions
+- Enterprise SSO via OIDC/SAML; teams and groups managed in the IdP.
+- Integrations are incremental, resilient, and observable.
+- Vendor APIs may be rate-limited; ingestion backs off and checkpoints.
+- Multi-environment (dev/stage/prod) plus edge fleets/regions; posture is environment-scoped.
+
+---
+
+## Simplified Architecture
+
+### High-Level Diagram
+
+```mermaid
+flowchart TB
+  U[Engineer] --> UI[Portal UI]
+  UI --> API[Portal API]
+
+  API --> PG[(Postgres)]
+  W[Background Workers] --> PG
+
+  API <--> EXT[Git/CI/K8s/Edge/Obs/Incidents]
+  W <--> EXT
+```
+
+### Core Idea
+The portal is delivered as a **single deployable service** (UI + API) backed by **Postgres as the system of record**. A small set of **background workers** (same codebase, separate runtime mode) handles ingestion, recomputations, and maintenance tasks using a Postgres-backed job queue.
+
+This keeps declared data strongly consistent and auditable, while allowing observed signals and scorecards to update asynchronously without impacting UI latency.
+
+---
+
+## Components
+
+### Portal UI
+**Responsibilities**
+- Entity pages, search/browse, docs view, dependency view, scorecards, admin/config.
+
+**Key behaviors**
+- Fetch entity, latest scorecards, and dependencies in parallel.
+- Render partial results with clear “stale/unavailable” states and timestamps.
+- Prefer links to source systems; rendering is best-effort.
+
+---
+
+### Portal API (Single Service)
+**Responsibilities**
+- Authn, authz, entity CRUD, search, docs fetch/render endpoints, scorecard endpoints, dependency queries.
+- Request shaping for UI (BFF-style endpoints where useful).
+- Centralized validation, auditing, and optimistic concurrency.
+
+**Key decisions**
+- **Optimistic concurrency** via `version` and `If-Match`.
+- **Idempotency** via `Idempotency-Key` for mutation endpoints.
+- **Authorization** enforced in one place with a consistent permission model.
+
+---
+
+### Background Workers (Same Codebase)
+**Responsibilities**
+- Connector syncs (webhook-triggered and scheduled).
+- Normalize and upsert observations with freshness metadata.
+- Recompute scorecards for affected entities/environments.
+- Refresh derived search fields and lightweight aggregates.
+- Optional docs prefetch/render caching.
+
+**Execution model**
+- Postgres-backed job queue using a `jobs` table and `SELECT ... FOR UPDATE SKIP LOCKED`.
+- Bounded concurrency per connector/source to protect upstreams and the portal DB.
+- Checkpointing per connector to support incremental sync and safe retries.
+
+---
+
+### Postgres (System of Record)
+**Responsibilities**
+- Declared metadata, audit log, latest observations, dependencies, scorecards (latest + history), connector health, and job queue.
+- Full-text and faceted search using Postgres indexing.
+
+---
+
+## Data Model (Postgres)
+
+### Entity identity
+- `entity_id`: UUID (immutable)
+- `entity_ref`: `kind:namespace/name` (unique, used in links and APIs)
+
+### Recommended minimum tables
+- `entities`
+  - Declared fields (`spec` JSONB), ownership, lifecycle/tier, ACL, docs refs, `version`, timestamps, soft delete.
+  - Search support fields (e.g., normalized tags, plus a `tsvector` column for full-text).
+- `teams`
+  - Team identity mapped to IdP groups; on-call refs.
+- `observations_latest`
+  - One row per `(entity_id, source, environment)` with `observed_at`, `expires_at`, and normalized `data` JSONB.
+- `dependencies`
+  - Edges with `type`, `source`, `confidence`, `updated_at`.
+- `scorecard_definitions`
+  - Versioned definitions and scope.
+- `scorecard_results_latest`
+  - Latest per `(entity_id, environment, scorecard_id)` with `computed_at` and `details` (per-check evidence).
+- `scorecard_results_history`
+  - Append-only trend points; stored on status/score change and/or daily snapshots per entity/env.
+- `audit_log`
+  - Append-only, immutable audit entries for sensitive changes.
+- `connector_health`
+  - Per `(connector, scope)` last success, last error, backoff-until, checkpoint cursor.
+- `jobs`
+  - Background work items (sync source, recompute scorecards, refresh docs cache), with retries and dedupe keys.
+- `idempotency_keys`
+  - Request dedupe for mutation endpoints (key, actor, request hash, response summary, expiry).
+
+### Indexing (high level)
+- Entity lookup: unique on `entity_ref`, plus indexes on `owner_team_id`, `updated_at`, `lifecycle`, `tier`.
+- Observations: unique on `(entity_id, source, environment)`, plus `(expires_at)` for stale detection.
+- Search: GIN index on `entities.search_tsv`, plus supporting btree indexes for facets (kind/owner/tier/lifecycle).
+- Dependencies: btree indexes for `from_entity_id` and `to_entity_id` to support blast radius queries.
+
+---
+
+## Data Flow
+
+### Declared edits (manual or “register from repo”)
+
+```mermaid
+sequenceDiagram
+  participant UI as Portal UI
+  participant API as Portal API
+  participant DB as Postgres
+  participant W as Workers
+
+  UI->>API: PUT /v1/entities/{id} (If-Match: version)
+  API->>DB: Validate + write entity + audit (tx)
+  API->>DB: Enqueue jobs (tx)
+  API-->>UI: 200 (new version)
+
+  W->>DB: Claim jobs (SKIP LOCKED)
+  W->>DB: Refresh derived fields (search/aggregates)
+```
+
+### Ingestion → observations → scorecards
+- Webhooks enqueue targeted sync jobs (repo changed, deployment event, scan completed).
+- Scheduled sync fills gaps and corrects drift using connector checkpoints.
+- Workers upsert `observations_latest` with `observed_at` and `expires_at`.
+- Workers recompute scorecards for the affected `(entity, environment)` and store latest + history.
+
+---
+
+## Freshness & Staleness
+
+- Each observation includes `observed_at` and `expires_at`.
+- The UI shows:
+  - “Last observed” per source/environment.
+  - Staleness warnings when critical sources exceed thresholds.
+- Scorecards treat missing/stale evidence distinctly:
+  - **Fail**: evidence indicates non-compliance.
+  - **Warn**: evidence missing or stale.
+  - **Pass**: fresh evidence indicates compliance.
+
+Connector health is first-class: per source, the portal tracks last success, current backoff state, and sync lag.
+
+---
+
+## API Design
+
+### Authn/Authz
+- **Authn**: OIDC at the API; JWT carries identity and group claims.
+- **Authz**: RBAC/ABAC driven by `acl.view` and `acl.edit` (group-based) with default-deny for restricted namespaces.
+- **Admin**: gated by `portal-admin` group; actions are audited.
+
+### Conventions
+- Pagination: `limit` + `cursor` (opaque).
+- Concurrency: `If-Match` with entity `version`.
+- Errors: RFC7807 `application/problem+json` including `traceId`.
+- Idempotency: `Idempotency-Key` for mutations (24h retention window).
+
+### Representative endpoints
+- Entities:
+  - `GET /v1/entities?kind=&ownerTeamId=&tag=&q=&limit=&cursor=`
+  - `POST /v1/entities`
+  - `GET /v1/entities/{entityId}`
+  - `PUT /v1/entities/{entityId}`
+  - `POST /v1/entities/{entityId}:archive`
+- Search:
+  - `GET /v1/search/entities?q=&filters=&limit=&cursor=`
+- Docs:
+  - `GET /v1/entities/{entityId}/docs` (rendered when available + source metadata)
+- Dependencies:
+  - `GET /v1/entities/{entityId}/dependencies?direction=up|down&depth=1&minConfidence=60`
+  - `GET /v1/blast-radius?entityId=&depth=2`
+- Scorecards:
+  - `GET /v1/entities/{entityId}/scorecards?environment=prod`
+  - `POST /v1/scorecards:recompute` → `202 Accepted`
+- Integration health:
+  - `GET /v1/integrations/health` (admin)
+
+---
+
+## Scaling & Performance
+
+### Hot paths
+- **Entity page**: single API request that joins entity + latest observations + latest scorecards + deps (bounded depth), with careful indexing and parallel internal queries.
+- **Search**: Postgres full-text via `tsvector` + facets via indexed columns; cursor pagination for consistent paging.
+
+### Data volume control
+- `observations_latest` keeps the portal fast and bounded.
+- Optional raw observation history is retained selectively (critical sources) and/or with time-based retention.
+- Scorecard history is stored as trend points (on change and/or daily snapshots) to keep charts accurate without recording every recompute.
+
+### Availability
+- Stateless API/worker instances across multiple zones.
+- Managed Postgres with automated failover and continuous backups.
+
+---
+
+## Failure Modes & Mitigations
+
+- **Upstream outage / rate limiting**
+  - Impact: observed data becomes stale; scorecards may shift to warn.
+  - Mitigation: adaptive backoff, checkpointed sync, health dashboards, explicit staleness UI.
+- **Worker lag**
+  - Impact: slower propagation of observations and scorecards.
+  - Mitigation: job queue depth alerts, bounded retries, priority by tier/environment.
+- **Postgres incident**
+  - Impact: core read/write impaired.
+  - Mitigation: multi-AZ failover, read-only mode for brief periods, idempotent writes for safe retries, restore drills to meet RPO/RTO.
+
+---
+
+## Operations
+
+- Monitoring:
+  - API golden signals (RPS, errors, latency, saturation).
+  - Postgres health (connections, replication lag, slow queries).
+  - Job queue metrics (depth, oldest job age, retries).
+  - Per-connector health (last success age, backoff state, lag).
+- Deployment:
+  - Blue/green or canary for stateless services.
+  - Expand/contract DB migrations; backfills executed via jobs.
+- Runbooks:
+  - Connector disablement, job drain/retry procedures, recompute backfills, restore and validation steps.
+
+---
+
+## Security & Compliance
+
+- Restricted namespaces via explicit `acl.view` grants and default-deny.
+- TLS everywhere; service credentials scoped per connector and per environment.
+- Docs rendering:
+  - Allowlisted fetch domains, tight timeouts, and HTML sanitization to prevent SSRF/content injection.
+- Auditability:
+  - Immutable audit events for ownership, tier, lifecycle, ACL, and scorecard definition changes.
+
+---
+
+## Simplification Notes
+
+- Removed: `Kafka` and the outbox publisher; acceptable because a Postgres-backed `jobs` queue provides transactional enqueue, retries, and controlled backpressure for indexing/recompute workflows.
+- Removed: `OpenSearch`; acceptable because Postgres full-text search + indexed facets supports the initial scale and keeps discovery strongly tied to the source of truth.
+- Removed: Separate `API Gateway/BFF`, `Search API`, and `Scorecard Service`; merged into a single `Portal API` with clear internal modules and shared authz/audit logic.
+- Merged: Connector workers, indexing, and scorecard recompute into one worker fleet (same codebase) operating on a single job model with per-connector checkpoints and health tracking.
+- Complexity retained: strong auditability + ACL enforcement (required for restricted metadata), freshness semantics (required for trustworthy governance), and background ingestion/recompute (required to absorb upstream variability and bursts without impacting UI latency).
+mcp startup: no servers
+ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Dec 17th, 2025 1:06 AM.
+Warning: no last agent message; wrote empty content to /Users/dominikdabrowski/pr/system-design-atlas/grades/developer-portal.json

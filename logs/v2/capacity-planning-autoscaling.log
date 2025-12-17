@@ -1,0 +1,1994 @@
+==========================================
+Generating (v2): Capacity Planning & Autoscaling
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-28dd-7700-8f81-2f1c603ce260
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Capacity Planning & Autoscaling
+**Category**: Observability & Reliability
+
+**Problem Statement**:
+Design a predictive autoscaler that uses historical signals and safety margins to provision compute resources ahead of demand.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+thinking
+**Generating markdown document**
+
+I'm looking to create a markdown document focused on key components without using tools. I need to emphasize prediction under uncertainty and safe actuation. I see the importance of integrating a metrics store like Prometheus or Thanos and possibly a feature store using Postgres or BigQuery. I will outline the predictive autoscaler that forecasts demand, translating that into resources while ensuring safety. I should consider failure modes like under-provisioning and use robust statistics for accuracy, ultimately highlighting the challenge of forecasting and converting to capacity while maintaining service level objectives.
+thinking
+**Creating documentation for predictive scaling**
+
+I need to generate a mermaid diagram with no more than eight nodes. The plan is to use Kubernetes with HPA and Cluster Autoscaler, allowing a predictive layer to set desired replicas in advance. For long-term metrics, Thanos will be employed, while Postgres can manage configuration. I’m thinking about keeping the system simple with a controller loop running every minute. I’ll also write an overview, emphasizing predictive scaling as a “setpoint,” ensuring there's a bounded risk, and using quantile-based margins to handle residual errors. Implementing guardrails for maximum steps and anomaly freezes is crucial, along with notes on backtesting and shadow mode for rollouts.
+codex
+```markdown
+---
+title: "Capacity Planning & Autoscaling"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["autoscaling", "forecasting", "kubernetes", "sre", "capacity-planning"]
+---
+
+## Overview
+
+This system is a predictive autoscaler that provisions compute *ahead* of demand using historical signals plus explicit safety margins. It targets the gap that reactive autoscaling can’t close: fast ramps (marketing blasts, cron-driven traffic, timezone peaks) where “scale after you’re hot” is already too late.
+
+The key insight is to separate **prediction** from **actuation** and make the handoff mathematically explicit: predict a near-future demand distribution (not a single number), convert it into required capacity via a learned “cost per unit demand,” then add a safety margin that is tied to an error budget (coverage), not gut feel. Reactive autoscaling still exists—but as the seatbelt, not the engine.
+
+A small team can build and run this by leaning on boring primitives: Prometheus/Thanos for metrics, Postgres for config and audit, and a Kubernetes controller that writes desired replica counts (or ASG desired capacity). The “smart” part is narrow: uncertainty-aware forecasting + guardrailed scaling decisions.
+
+## What Makes This Hard
+
+Naive predictive autoscalers fail because they treat forecasting as the whole problem. The trap is that **forecast error becomes an outage** unless you translate it into a safety policy with guardrails and clear fallbacks.
+
+The second trap is **feedback loops**: autoscaling changes CPU/utilization, which changes the very signals you’re using to learn “how much capacity you need.” If you don’t disentangle “demand” from “resource saturation,” the model learns nonsense during incidents and then repeats it during the next peak.
+
+## Requirements
+
+### Functional Requirements
+
+- Produce per-workload capacity plans for a fixed horizon (e.g., 5–30 minutes ahead) and apply them continuously.
+- Encode safety explicitly: “scale to meet P95 demand with 99% coverage over the last 14 days” (or an equivalent SLO-driven rule).
+- Support overrides and guardrails per workload (max step, max spend, minimum headroom, freeze conditions).
+- Provide explainability: every scaling action is attributable to inputs, forecast, margin, and constraints.
+- Fail safe: on bad data or model degradation, revert to reactive autoscaling without operator heroics.
+
+### Scale Targets
+
+- **Workloads:** 500 deployments across 10 clusters (typical mid-size platform team).
+- **Decision cadence:** every 60s; **horizon:** 15 minutes (enough to cover node provisioning + pod warmup).
+- **Signals:** 1-minute aggregates of demand proxy (RPS/queue depth) + resource usage (CPU/mem) + saturation (latency, 5xx).
+- **Action volume:** worst case 500 workloads × 60 decisions/hour = 30k decisions/hour; only a small fraction should cause changes due to hysteresis.
+
+These numbers matter because they force the design to be cheap, incremental, and robust to partial failures; you can’t run heavyweight retraining per decision, and you must keep metric cardinality under control.
+
+## Key Design Decisions
+
+- **Decision 1: Predict demand, not utilization**
+  - **Chose:** forecast *demand proxies* (RPS, queue depth, scheduled jobs) and map to required resources via a learned cost model.
+  - **Rejected:** forecasting CPU%/utilization directly.
+  - **Why:** utilization is a controlled variable influenced by scaling; demand is closer to exogenous reality and is stable through incidents.
+
+- **Decision 2: Safety margin via coverage, not fixed headroom**
+  - **Chose:** quantile/coverage-based capacity (e.g., conformal prediction interval or empirical error quantiles) with explicit target coverage.
+  - **Rejected:** “+30% buffer” everywhere.
+  - **Why:** fixed buffers are wrong in both directions—wasteful for stable workloads, insufficient for spiky ones. Coverage ties cost directly to outage risk.
+
+- **Decision 3: Predictive sets the baseline; reactive handles residual**
+  - **Chose:** predictive scaler writes a *floor* (minimum replicas / desired capacity) while HPA (or target-tracking) still reacts to surprises.
+  - **Rejected:** replacing reactive autoscaling.
+  - **Why:** reactive is the last line of defense and a proven incident tool; predictive reduces the frequency and severity of “late scaling,” not all variance.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  M[Metrics (Prom/Thanos)] --> F[Feature Builder]
+  C[Config (Postgres)] --> P[Policy Engine]
+  F --> R[Forecaster]
+  R --> P
+  P --> A[Scaling Controller]
+  A --> K[K8s API / ASG]
+  K --> M
+  P --> L[Audit Log]
+```
+
+### Components
+
+- **Metrics (Prometheus + Thanos):** short-term + long-term signals with consistent 1-minute downsampling; Thanos gives you “last 90 days” without inventing a custom store.
+- **Feature Builder:** transforms raw metrics into stable demand features (time-of-week seasonality, recent trend, known batch schedules) and filters out saturated periods.
+- **Forecaster:** outputs a demand distribution for each workload and horizon; optimized for fast incremental updates, not fancy research.
+- **Config (Postgres):** per-workload policies, constraints, rollout state, and “what is the demand proxy for this service?” in one transactionally consistent place.
+- **Policy Engine:** converts predicted demand into required replicas/nodes with coverage-based margin and guardrails (max step, cooldown, budget caps).
+- **Scaling Controller:** applies decisions via Kubernetes (patch HPA minReplicas / scale subresource) and/or ASG desired capacity; owns backoff, retries, and idempotency.
+- **Audit Log:** immutable record of every decision with inputs and outputs; required for debugging, postmortems, and trust.
+
+## Deep Dive: Uncertainty-Aware Scaling (The Hardest Part)
+
+The hardest part is turning “a forecast” into “an action” without turning forecast error into pager fatigue. The system does this in three explicit steps:
+
+1) **Forecast a near-future demand distribution.** For each workload, predict demand for each minute in the next 15 minutes. Use a model that captures seasonality cheaply (time-of-week buckets + exponential smoothing on residuals). The output is not a point estimate; it’s an interval (or quantiles) per horizon step.
+
+2) **Map demand to capacity using an efficiency model learned from healthy periods.** Convert demand to required CPU (and optionally memory) using robust regression over windows where saturation is low (e.g., latency below SLO and CPU < 70%). This avoids “incident learning,” where throttling makes CPU look flat while demand is actually rising. The output is a capacity requirement in millicores (or replicas given per-pod requests).
+
+3) **Add safety margin using empirical coverage guarantees.** Maintain a rolling history of forecast errors per workload and time-of-week. Choose a target coverage (e.g., 99% of the time, capacity >= realized demand). Implement this as a conformal-style adjustment: widen the prediction interval by the (1-coverage) quantile of recent absolute errors. This is the crucial move: the margin automatically grows for spiky workloads and shrinks for stable ones, and it is measurable in production (coverage drift is an alertable metric).
+
+Finally, the Policy Engine turns “required capacity” into a bounded action with guardrails:
+- **Hysteresis:** don’t scale down unless you’ve been overprovisioned for N minutes.
+- **Max step:** cap increases/decreases per minute to avoid runaway and to respect warmup.
+- **Freeze on anomalies:** if data quality drops or coverage collapses, stop predictive writes and let reactive autoscaling run alone.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Fast ramps without latency spikes | Some steady-state efficiency |
+| Explicit, measurable risk (coverage) | Model simplicity over maximum accuracy |
+| Operational safety and reversibility | Per-workload tuning still required |
+| Small-team operability | Less “one size fits all” automation |
+
+## Failure Modes
+
+- **Bad metrics / gaps**
+  - **What happens:** forecaster underestimates demand or cannot compute features; scaling actions become noisy or absent.
+  - **Detect:** data freshness SLOs (scrape lag), missing-series rate, sudden drops to zero, feature build error rate.
+  - **Recover:** freeze predictive actions for affected workloads, fall back to reactive autoscaling, page only if fallbacks also fail.
+
+- **Model drift / coverage collapse**
+  - **What happens:** forecasts systematically miss (new traffic pattern, product launch), causing underprovisioning.
+  - **Detect:** online coverage metric (fraction of intervals where realized demand exceeded predicted-with-margin), plus SLO burn correlation.
+  - **Recover:** automatically widen margin (increase error quantile window), trigger shadow backtest, require human approval to reduce margin again.
+
+- **Actuation failure (K8s/ASG throttling, controller bugs)**
+  - **What happens:** decisions are computed but not applied; capacity lags behind demand.
+  - **Detect:** reconcile errors, API rate-limit metrics, “desired vs applied” diff, and time-to-effect histograms.
+  - **Recover:** exponential backoff + idempotent patches, reduce write frequency under throttling, and surface a single “predictive autoscaler degraded” alert.
+
+## What I'd Do Differently At...
+
+- **10x scale:** shard by cluster and move feature computation closer to metrics (per-cluster builders); add a lightweight stream (Kafka) only if metric polling becomes cost-dominant.
+- **100x scale:** split forecasting into offline + online: offline learns per-service demand/capacity models and priors; online only does residual updates and conformal margins. Also, stop using raw Prometheus queries as the feature substrate—emit curated “autoscaling signals” as a first-class product.
+
+## Operational Notes
+
+- Run in **shadow mode** first: compute decisions and margins, but don’t apply; publish coverage and “would-have-scaled” deltas to earn trust.
+- Treat **coverage** as the primary KPI; cost is a secondary KPI you optimize only after coverage is stable.
+- Maintain an explicit **blocklist**: workloads with unstable demand proxies (batchy, multi-tenant) shouldn’t use predictive until they expose a better signal.
+- Every applied change must be traceable in `Audit Log` with a stable decision ID and the exact inputs/constraints used.
+```
+tokens used
+3,419
+```markdown
+---
+title: "Capacity Planning & Autoscaling"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["autoscaling", "forecasting", "kubernetes", "sre", "capacity-planning"]
+---
+
+## Overview
+
+This system is a predictive autoscaler that provisions compute *ahead* of demand using historical signals plus explicit safety margins. It targets the gap that reactive autoscaling can’t close: fast ramps (marketing blasts, cron-driven traffic, timezone peaks) where “scale after you’re hot” is already too late.
+
+The key insight is to separate **prediction** from **actuation** and make the handoff mathematically explicit: predict a near-future demand distribution (not a single number), convert it into required capacity via a learned “cost per unit demand,” then add a safety margin that is tied to an error budget (coverage), not gut feel. Reactive autoscaling still exists—but as the seatbelt, not the engine.
+
+A small team can build and run this by leaning on boring primitives: Prometheus/Thanos for metrics, Postgres for config and audit, and a Kubernetes controller that writes desired replica counts (or ASG desired capacity). The “smart” part is narrow: uncertainty-aware forecasting + guardrailed scaling decisions.
+
+## What Makes This Hard
+
+Naive predictive autoscalers fail because they treat forecasting as the whole problem. The trap is that **forecast error becomes an outage** unless you translate it into a safety policy with guardrails and clear fallbacks.
+
+The second trap is **feedback loops**: autoscaling changes CPU/utilization, which changes the very signals you’re using to learn “how much capacity you need.” If you don’t disentangle “demand” from “resource saturation,” the model learns nonsense during incidents and then repeats it during the next peak.
+
+## Requirements
+
+### Functional Requirements
+
+- Produce per-workload capacity plans for a fixed horizon (e.g., 5–30 minutes ahead) and apply them continuously.
+- Encode safety explicitly: “scale to meet P95 demand with 99% coverage over the last 14 days” (or an equivalent SLO-driven rule).
+- Support overrides and guardrails per workload (max step, max spend, minimum headroom, freeze conditions).
+- Provide explainability: every scaling action is attributable to inputs, forecast, margin, and constraints.
+- Fail safe: on bad data or model degradation, revert to reactive autoscaling without operator heroics.
+
+### Scale Targets
+
+- **Workloads:** 500 deployments across 10 clusters (typical mid-size platform team).
+- **Decision cadence:** every 60s; **horizon:** 15 minutes (enough to cover node provisioning + pod warmup).
+- **Signals:** 1-minute aggregates of demand proxy (RPS/queue depth) + resource usage (CPU/mem) + saturation (latency, 5xx).
+- **Action volume:** worst case 500 workloads × 60 decisions/hour = 30k decisions/hour; only a small fraction should cause changes due to hysteresis.
+
+These numbers matter because they force the design to be cheap, incremental, and robust to partial failures; you can’t run heavyweight retraining per decision, and you must keep metric cardinality under control.
+
+## Key Design Decisions
+
+- **Decision 1: Predict demand, not utilization**
+  - **Chose:** forecast *demand proxies* (RPS, queue depth, scheduled jobs) and map to required resources via a learned cost model.
+  - **Rejected:** forecasting CPU%/utilization directly.
+  - **Why:** utilization is a controlled variable influenced by scaling; demand is closer to exogenous reality and is stable through incidents.
+
+- **Decision 2: Safety margin via coverage, not fixed headroom**
+  - **Chose:** quantile/coverage-based capacity (e.g., conformal prediction interval or empirical error quantiles) with explicit target coverage.
+  - **Rejected:** “+30% buffer” everywhere.
+  - **Why:** fixed buffers are wrong in both directions—wasteful for stable workloads, insufficient for spiky ones. Coverage ties cost directly to outage risk.
+
+- **Decision 3: Predictive sets the baseline; reactive handles residual**
+  - **Chose:** predictive scaler writes a *floor* (minimum replicas / desired capacity) while HPA (or target-tracking) still reacts to surprises.
+  - **Rejected:** replacing reactive autoscaling.
+  - **Why:** reactive is the last line of defense and a proven incident tool; predictive reduces the frequency and severity of “late scaling,” not all variance.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  M[Metrics (Prom/Thanos)] --> F[Feature Builder]
+  C[Config (Postgres)] --> P[Policy Engine]
+  F --> R[Forecaster]
+  R --> P
+  P --> A[Scaling Controller]
+  A --> K[K8s API / ASG]
+  K --> M
+  P --> L[Audit Log]
+```
+
+### Components
+
+- **Metrics (Prometheus + Thanos):** short-term + long-term signals with consistent 1-minute downsampling; Thanos gives you “last 90 days” without inventing a custom store.
+- **Feature Builder:** transforms raw metrics into stable demand features (time-of-week seasonality, recent trend, known batch schedules) and filters out saturated periods.
+- **Forecaster:** outputs a demand distribution for each workload and horizon; optimized for fast incremental updates, not fancy research.
+- **Config (Postgres):** per-workload policies, constraints, rollout state, and “what is the demand proxy for this service?” in one transactionally consistent place.
+- **Policy Engine:** converts predicted demand into required replicas/nodes with coverage-based margin and guardrails (max step, cooldown, budget caps).
+- **Scaling Controller:** applies decisions via Kubernetes (patch HPA minReplicas / scale subresource) and/or ASG desired capacity; owns backoff, retries, and idempotency.
+- **Audit Log:** immutable record of every decision with inputs and outputs; required for debugging, postmortems, and trust.
+
+## Deep Dive: Uncertainty-Aware Scaling (The Hardest Part)
+
+The hardest part is turning “a forecast” into “an action” without turning forecast error into pager fatigue. The system does this in three explicit steps:
+
+1) **Forecast a near-future demand distribution.** For each workload, predict demand for each minute in the next 15 minutes. Use a model that captures seasonality cheaply (time-of-week buckets + exponential smoothing on residuals). The output is not a point estimate; it’s an interval (or quantiles) per horizon step.
+
+2) **Map demand to capacity using an efficiency model learned from healthy periods.** Convert demand to required CPU (and optionally memory) using robust regression over windows where saturation is low (e.g., latency below SLO and CPU < 70%). This avoids “incident learning,” where throttling makes CPU look flat while demand is actually rising. The output is a capacity requirement in millicores (or replicas given per-pod requests).
+
+3) **Add safety margin using empirical coverage guarantees.** Maintain a rolling history of forecast errors per workload and time-of-week. Choose a target coverage (e.g., 99% of the time, capacity >= realized demand). Implement this as a conformal-style adjustment: widen the prediction interval by the (1-coverage) quantile of recent absolute errors. This is the crucial move: the margin automatically grows for spiky workloads and shrinks for stable ones, and it is measurable in production (coverage drift is an alertable metric).
+
+Finally, the Policy Engine turns “required capacity” into a bounded action with guardrails:
+- **Hysteresis:** don’t scale down unless you’ve been overprovisioned for N minutes.
+- **Max step:** cap increases/decreases per minute to avoid runaway and to respect warmup.
+- **Freeze on anomalies:** if data quality drops or coverage collapses, stop predictive writes and let reactive autoscaling run alone.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Fast ramps without latency spikes | Some steady-state efficiency |
+| Explicit, measurable risk (coverage) | Model simplicity over maximum accuracy |
+| Operational safety and reversibility | Per-workload tuning still required |
+| Small-team operability | Less “one size fits all” automation |
+
+## Failure Modes
+
+- **Bad metrics / gaps**
+  - **What happens:** forecaster underestimates demand or cannot compute features; scaling actions become noisy or absent.
+  - **Detect:** data freshness SLOs (scrape lag), missing-series rate, sudden drops to zero, feature build error rate.
+  - **Recover:** freeze predictive actions for affected workloads, fall back to reactive autoscaling, page only if fallbacks also fail.
+
+- **Model drift / coverage collapse**
+  - **What happens:** forecasts systematically miss (new traffic pattern, product launch), causing underprovisioning.
+  - **Detect:** online coverage metric (fraction of intervals where realized demand exceeded predicted-with-margin), plus SLO burn correlation.
+  - **Recover:** automatically widen margin (increase error quantile window), trigger shadow backtest, require human approval to reduce margin again.
+
+- **Actuation failure (K8s/ASG throttling, controller bugs)**
+  - **What happens:** decisions are computed but not applied; capacity lags behind demand.
+  - **Detect:** reconcile errors, API rate-limit metrics, “desired vs applied” diff, and time-to-effect histograms.
+  - **Recover:** exponential backoff + idempotent patches, reduce write frequency under throttling, and surface a single “predictive autoscaler degraded” alert.
+
+## What I'd Do Differently At...
+
+- **10x scale:** shard by cluster and move feature computation closer to metrics (per-cluster builders); add a lightweight stream (Kafka) only if metric polling becomes cost-dominant.
+- **100x scale:** split forecasting into offline + online: offline learns per-service demand/capacity models and priors; online only does residual updates and conformal margins. Also, stop using raw Prometheus queries as the feature substrate—emit curated “autoscaling signals” as a first-class product.
+
+## Operational Notes
+
+- Run in **shadow mode** first: compute decisions and margins, but don’t apply; publish coverage and “would-have-scaled” deltas to earn trust.
+- Treat **coverage** as the primary KPI; cost is a secondary KPI you optimize only after coverage is stable.
+- Maintain an explicit **blocklist**: workloads with unstable demand proxies (batchy, multi-tenant) shouldn’t use predictive until they expose a better signal.
+- Every applied change must be traceable in `Audit Log` with a stable decision ID and the exact inputs/constraints used.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/capacity-planning-autoscaling.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-ca0d-7bf3-a83d-1cdb7a63ad3c
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Capacity Planning & Autoscaling"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["autoscaling", "forecasting", "kubernetes", "sre", "capacity-planning"]
+---
+
+## Overview
+
+This system is a predictive autoscaler that provisions compute *ahead* of demand using historical signals plus explicit safety margins. It targets the gap that reactive autoscaling can’t close: fast ramps (marketing blasts, cron-driven traffic, timezone peaks) where “scale after you’re hot” is already too late.
+
+The key insight is to separate **prediction** from **actuation** and make the handoff mathematically explicit: predict a near-future demand distribution (not a single number), convert it into required capacity via a learned “cost per unit demand,” then add a safety margin that is tied to an error budget (coverage), not gut feel. Reactive autoscaling still exists—but as the seatbelt, not the engine.
+
+A small team can build and run this by leaning on boring primitives: Prometheus/Thanos for metrics, Postgres for config and audit, and a Kubernetes controller that writes desired replica counts (or ASG desired capacity). The “smart” part is narrow: uncertainty-aware forecasting + guardrailed scaling decisions.
+
+## What Makes This Hard
+
+Naive predictive autoscalers fail because they treat forecasting as the whole problem. The trap is that **forecast error becomes an outage** unless you translate it into a safety policy with guardrails and clear fallbacks.
+
+The second trap is **feedback loops**: autoscaling changes CPU/utilization, which changes the very signals you’re using to learn “how much capacity you need.” If you don’t disentangle “demand” from “resource saturation,” the model learns nonsense during incidents and then repeats it during the next peak.
+
+## Requirements
+
+### Functional Requirements
+
+- Produce per-workload capacity plans for a fixed horizon (e.g., 5–30 minutes ahead) and apply them continuously.
+- Encode safety explicitly: “scale to meet P95 demand with 99% coverage over the last 14 days” (or an equivalent SLO-driven rule).
+- Support overrides and guardrails per workload (max step, max spend, minimum headroom, freeze conditions).
+- Provide explainability: every scaling action is attributable to inputs, forecast, margin, and constraints.
+- Fail safe: on bad data or model degradation, revert to reactive autoscaling without operator heroics.
+
+### Scale Targets
+
+- **Workloads:** 500 deployments across 10 clusters (typical mid-size platform team).
+- **Decision cadence:** every 60s; **horizon:** 15 minutes (enough to cover node provisioning + pod warmup).
+- **Signals:** 1-minute aggregates of demand proxy (RPS/queue depth) + resource usage (CPU/mem) + saturation (latency, 5xx).
+- **Action volume:** worst case 500 workloads × 60 decisions/hour = 30k decisions/hour; only a small fraction should cause changes due to hysteresis.
+
+These numbers matter because they force the design to be cheap, incremental, and robust to partial failures; you can’t run heavyweight retraining per decision, and you must keep metric cardinality under control.
+
+## Key Design Decisions
+
+- **Decision 1: Predict demand, not utilization**
+  - **Chose:** forecast *demand proxies* (RPS, queue depth, scheduled jobs) and map to required resources via a learned cost model.
+  - **Rejected:** forecasting CPU%/utilization directly.
+  - **Why:** utilization is a controlled variable influenced by scaling; demand is closer to exogenous reality and is stable through incidents.
+
+- **Decision 2: Safety margin via coverage, not fixed headroom**
+  - **Chose:** quantile/coverage-based capacity (e.g., conformal prediction interval or empirical error quantiles) with explicit target coverage.
+  - **Rejected:** “+30% buffer” everywhere.
+  - **Why:** fixed buffers are wrong in both directions—wasteful for stable workloads, insufficient for spiky ones. Coverage ties cost directly to outage risk.
+
+- **Decision 3: Predictive sets the baseline; reactive handles residual**
+  - **Chose:** predictive scaler writes a *floor* (minimum replicas / desired capacity) while HPA (or target-tracking) still reacts to surprises.
+  - **Rejected:** replacing reactive autoscaling.
+  - **Why:** reactive is the last line of defense and a proven incident tool; predictive reduces the frequency and severity of “late scaling,” not all variance.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  M[Metrics (Prom/Thanos)] --> F[Feature Builder]
+  C[Config (Postgres)] --> P[Policy Engine]
+  F --> R[Forecaster]
+  R --> P
+  P --> A[Scaling Controller]
+  A --> K[K8s API / ASG]
+  K --> M
+  P --> L[Audit Log]
+```
+
+### Components
+
+- **Metrics (Prometheus + Thanos):** short-term + long-term signals with consistent 1-minute downsampling; Thanos gives you “last 90 days” without inventing a custom store.
+- **Feature Builder:** transforms raw metrics into stable demand features (time-of-week seasonality, recent trend, known batch schedules) and filters out saturated periods.
+- **Forecaster:** outputs a demand distribution for each workload and horizon; optimized for fast incremental updates, not fancy research.
+- **Config (Postgres):** per-workload policies, constraints, rollout state, and “what is the demand proxy for this service?” in one transactionally consistent place.
+- **Policy Engine:** converts predicted demand into required replicas/nodes with coverage-based margin and guardrails (max step, cooldown, budget caps).
+- **Scaling Controller:** applies decisions via Kubernetes (patch HPA minReplicas / scale subresource) and/or ASG desired capacity; owns backoff, retries, and idempotency.
+- **Audit Log:** immutable record of every decision with inputs and outputs; required for debugging, postmortems, and trust.
+
+## Deep Dive: Uncertainty-Aware Scaling (The Hardest Part)
+
+The hardest part is turning “a forecast” into “an action” without turning forecast error into pager fatigue. The system does this in three explicit steps:
+
+1) **Forecast a near-future demand distribution.** For each workload, predict demand for each minute in the next 15 minutes. Use a model that captures seasonality cheaply (time-of-week buckets + exponential smoothing on residuals). The output is not a point estimate; it’s an interval (or quantiles) per horizon step.
+
+2) **Map demand to capacity using an efficiency model learned from healthy periods.** Convert demand to required CPU (and optionally memory) using robust regression over windows where saturation is low (e.g., latency below SLO and CPU < 70%). This avoids “incident learning,” where throttling makes CPU look flat while demand is actually rising. The output is a capacity requirement in millicores (or replicas given per-pod requests).
+
+3) **Add safety margin using empirical coverage guarantees.** Maintain a rolling history of forecast errors per workload and time-of-week. Choose a target coverage (e.g., 99% of the time, capacity >= realized demand). Implement this as a conformal-style adjustment: widen the prediction interval by the (1-coverage) quantile of recent absolute errors. This is the crucial move: the margin automatically grows for spiky workloads and shrinks for stable ones, and it is measurable in production (coverage drift is an alertable metric).
+
+Finally, the Policy Engine turns “required capacity” into a bounded action with guardrails:
+- **Hysteresis:** don’t scale down unless you’ve been overprovisioned for N minutes.
+- **Max step:** cap increases/decreases per minute to avoid runaway and to respect warmup.
+- **Freeze on anomalies:** if data quality drops or coverage collapses, stop predictive writes and let reactive autoscaling run alone.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Fast ramps without latency spikes | Some steady-state efficiency |
+| Explicit, measurable risk (coverage) | Model simplicity over maximum accuracy |
+| Operational safety and reversibility | Per-workload tuning still required |
+| Small-team operability | Less “one size fits all” automation |
+
+## Failure Modes
+
+- **Bad metrics / gaps**
+  - **What happens:** forecaster underestimates demand or cannot compute features; scaling actions become noisy or absent.
+  - **Detect:** data freshness SLOs (scrape lag), missing-series rate, sudden drops to zero, feature build error rate.
+  - **Recover:** freeze predictive actions for affected workloads, fall back to reactive autoscaling, page only if fallbacks also fail.
+
+- **Model drift / coverage collapse**
+  - **What happens:** forecasts systematically miss (new traffic pattern, product launch), causing underprovisioning.
+  - **Detect:** online coverage metric (fraction of intervals where realized demand exceeded predicted-with-margin), plus SLO burn correlation.
+  - **Recover:** automatically widen margin (increase error quantile window), trigger shadow backtest, require human approval to reduce margin again.
+
+- **Actuation failure (K8s/ASG throttling, controller bugs)**
+  - **What happens:** decisions are computed but not applied; capacity lags behind demand.
+  - **Detect:** reconcile errors, API rate-limit metrics, “desired vs applied” diff, and time-to-effect histograms.
+  - **Recover:** exponential backoff + idempotent patches, reduce write frequency under throttling, and surface a single “predictive autoscaler degraded” alert.
+
+## What I'd Do Differently At...
+
+- **10x scale:** shard by cluster and move feature computation closer to metrics (per-cluster builders); add a lightweight stream (Kafka) only if metric polling becomes cost-dominant.
+- **100x scale:** split forecasting into offline + online: offline learns per-service demand/capacity models and priors; online only does residual updates and conformal margins. Also, stop using raw Prometheus queries as the feature substrate—emit curated “autoscaling signals” as a first-class product.
+
+## Operational Notes
+
+- Run in **shadow mode** first: compute decisions and margins, but don’t apply; publish coverage and “would-have-scaled” deltas to earn trust.
+- Treat **coverage** as the primary KPI; cost is a secondary KPI you optimize only after coverage is stable.
+- Maintain an explicit **blocklist**: workloads with unstable demand proxies (batchy, multi-tenant) shouldn’t use predictive until they expose a better signal.
+- Every applied change must be traceable in `Audit Log` with a stable decision ID and the exact inputs/constraints used.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+thinking
+**Evaluating operational models**
+
+I need to consider mapping demand to capacity using per-pod requests, but if those requests change, the model becomes invalid. I have to handle deploy changes, vertical scaling, and performance. The efficiency model should include version labels and change detection.
+
+Operational complexity arises with multiple components, so I'm thinking about having a single service called "autoscaler" with submodules for various functions. Using Postgres for the data store, I should keep an audit log with a partitioned table or consider alternatives like S3.
+thinking
+**Considering predictive autoscalers**
+
+The predictive autoscaler might need to collaborate with the node autoscaler, or I could just set a floor. But if nodes can't provision quickly enough, that won't help. I should think about integrating with the cluster autoscaler to pre-scale nodes, although that can be tricky.
+
+For simplification, I could use existing forecasting libraries like Prophet or Holt-Winters with conformal methods. I need to keep the model simple per workload with ETS and quantiles, and I’m contemplating using Kubernetes leases for decision scheduling and monitoring deployments.
+thinking
+**Evaluating autoscaling strategy**
+
+I’m considering whether the autoscaler should continue running with a cached configuration, which might lead to issues like not persisting audit logs. I could plan for a local ring buffer and asynchronous audit during a database outage, ensuring the last configuration remains read-only to avoid blocking scaling decisions. For metrics downtime, decisions could freeze for five minutes, using the last forecast to widen margins. If there's a bad config deployment, I might need guardrails like staged rollouts and dry-runs.
+thinking
+**Addressing scaling challenges**
+
+I need to consider the choice of demand proxies like RPS and queue depth, but with many services and changing request mixes, I should implement per-endpoint weights, though this can create issues. There's also a risk with forecast error quantiles, especially if the sample size is small—this could lead to instability and overfitting, so fallback smoothing is necessary. 
+
+I’m thinking I should define a "scaling SLO" that includes time to ready pods and warmup time distributions for each workload. Also, I should align "coverage" with an SLO burn metric to ensure capacity remains adequate.
+codex
+## Elegance Check
+
+### The Core Insight
+You made “forecast error” an explicit, measurable policy (coverage) and kept reactive autoscaling as the safety net. That’s the right framing: prediction is optional; safe actuation isn’t.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Metrics (Prom/Thanos) | Leverages existing operational truth; avoids building a time-series store. |
+| Policy Engine | Where safety lives: guardrails, hysteresis, budget caps, freeze logic. |
+| Scaling Controller | Idempotent, rate-limited actuation + “desired vs applied” observability is non-negotiable. |
+| Config store | Centralized overrides/rollouts and consistent policies per workload. |
+
+### Simplification Opportunities
+| Current | Simper Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Separate Feature Builder + Forecaster services | Single “autoscaler” controller process with modules (feature → forecast → policy → actuation) | Less independent scaling, but dramatically simpler ops for a small team. |
+| Postgres + separate “Audit Log” component | One partitioned Postgres table for decisions + optional async export to S3 later | Postgres retention/size management becomes your responsibility. |
+| Polling lots of PromQL at 60s cadence | Prometheus recording rules to emit curated per-workload “autoscaling signals” (demand, saturation, freshness) | Requires upfront metrics product work, but reduces query cost and cardinality risk. |
+| Writing HPA `minReplicas` as the “floor” | Prefer one authority per workload: either (a) predictive controller writes `scale` and disables HPA, or (b) HPA consumes a predictive external metric | Your current “floor + HPA” can work, but it needs explicit conflict rules to avoid fight/oscillation. |
+| Custom coordination implied | Kubernetes leader election via `Lease` + per-workload sharding | Slightly more controller plumbing, but no new infra (no etcd/ZK/Kafka). |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres is down for 5 minutes**
+   - Design’s answer: partially addressed (fallback to reactive), but Postgres is also config + audit.
+   - Recommendation: Strengthen — autoscaling decisions must not block on audit writes; cache config in-memory with TTL and run “read-only” until DB returns; queue audit asynchronously with bounded memory and lossy fallback.
+
+2. **Prometheus/Thanos query lag or partial metric gaps**
+   - Design’s answer: addressed (freeze on bad data).
+   - Recommendation: Strengthen — freezing is safe but can be costly; add “last-known-good forecast with widened margin” mode for short gaps, and make metric freshness a first-class signal in policy (not just a global kill switch).
+
+3. **Kubernetes API throttling / controller restart mid-rollout**
+   - Design’s answer: addressed (backoff, idempotency, desired vs applied).
+   - Recommendation: Acceptable if you also add per-cluster write rate limits + per-workload reconcile deadlines (skip stale decisions) to prevent a slow cluster from consuming the whole control loop.
+
+4. **Bad config or a wrong demand proxy at 3am**
+   - Design’s answer: partly addressed (overrides, guardrails).
+   - Recommendation: Strengthen — add “two-phase rollout” for policy changes (shadow → apply), a per-workload “safe mode” template, and a global kill switch that reverts any predictive-written fields back to their prior value (not just “stop writing”).
+
+5. **10x traffic spike + slow node provisioning**
+   - Design’s answer: implicitly assumes the 15-minute horizon covers provisioning.
+   - Recommendation: Strengthen — explicitly model *time-to-capacity* per workload/cluster (pod readiness + node scale latency). If you can’t pull nodes forward (Karpenter/Cluster Autoscaler/ASG), predictive pod scaling alone may not help on cold clusters.
+
+## Recommendations
+
+### Must Fix
+- Define the control authority model with HPA/target-tracking to prevent “fighting” (who owns `replicas` / `minReplicas`, how conflicts resolve, and how you detect oscillation).
+- Make the system non-blocking on dependencies: decisions should degrade gracefully when Postgres or metrics are impaired (bounded caching + last-known-good behavior).
+- Handle change points: new app version, changed CPU requests/limits, perf regressions — your “demand→capacity” regression must be version-aware or at least reset/relearn on deployment changes.
+
+### Should Consider
+- Convert “Feature Builder” into Prometheus recording rules + a small in-controller join step; it’s simpler and cheaper than repeated heavy queries.
+- Store full decision payloads only when an action changes (or sample); keep aggregates for coverage/cost. At your scale, “log every minute for every workload forever” becomes the hidden system.
+- Make coverage tie to an outcome metric (latency/SLO burn) in addition to demand proxy exceedance; otherwise you can hit coverage but still violate SLO due to tail latency, dependency slowness, or queueing effects.
+
+### Nice to Have
+- Explicit “freeze reasons” taxonomy and runbook-grade explainability (data stale, coverage collapsed, actuation failing, budget cap hit).
+- Automated backtests for new policies/models in CI-like pipelines (even lightweight) before enabling apply mode.
+
+## What's Working Well
+- Clear separation of prediction vs actuation, with safety as a first-class contract.
+- The “learn only from healthy periods” constraint is a pragmatic guardrail that many autoscalers miss.
+- Shadow mode + auditability + measurable coverage KPI is exactly how you earn trust and avoid pager-driven rollbacks.
+tokens used
+5,445
+## Elegance Check
+
+### The Core Insight
+You made “forecast error” an explicit, measurable policy (coverage) and kept reactive autoscaling as the safety net. That’s the right framing: prediction is optional; safe actuation isn’t.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Metrics (Prom/Thanos) | Leverages existing operational truth; avoids building a time-series store. |
+| Policy Engine | Where safety lives: guardrails, hysteresis, budget caps, freeze logic. |
+| Scaling Controller | Idempotent, rate-limited actuation + “desired vs applied” observability is non-negotiable. |
+| Config store | Centralized overrides/rollouts and consistent policies per workload. |
+
+### Simplification Opportunities
+| Current | Simper Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Separate Feature Builder + Forecaster services | Single “autoscaler” controller process with modules (feature → forecast → policy → actuation) | Less independent scaling, but dramatically simpler ops for a small team. |
+| Postgres + separate “Audit Log” component | One partitioned Postgres table for decisions + optional async export to S3 later | Postgres retention/size management becomes your responsibility. |
+| Polling lots of PromQL at 60s cadence | Prometheus recording rules to emit curated per-workload “autoscaling signals” (demand, saturation, freshness) | Requires upfront metrics product work, but reduces query cost and cardinality risk. |
+| Writing HPA `minReplicas` as the “floor” | Prefer one authority per workload: either (a) predictive controller writes `scale` and disables HPA, or (b) HPA consumes a predictive external metric | Your current “floor + HPA” can work, but it needs explicit conflict rules to avoid fight/oscillation. |
+| Custom coordination implied | Kubernetes leader election via `Lease` + per-workload sharding | Slightly more controller plumbing, but no new infra (no etcd/ZK/Kafka). |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres is down for 5 minutes**
+   - Design’s answer: partially addressed (fallback to reactive), but Postgres is also config + audit.
+   - Recommendation: Strengthen — autoscaling decisions must not block on audit writes; cache config in-memory with TTL and run “read-only” until DB returns; queue audit asynchronously with bounded memory and lossy fallback.
+
+2. **Prometheus/Thanos query lag or partial metric gaps**
+   - Design’s answer: addressed (freeze on bad data).
+   - Recommendation: Strengthen — freezing is safe but can be costly; add “last-known-good forecast with widened margin” mode for short gaps, and make metric freshness a first-class signal in policy (not just a global kill switch).
+
+3. **Kubernetes API throttling / controller restart mid-rollout**
+   - Design’s answer: addressed (backoff, idempotency, desired vs applied).
+   - Recommendation: Acceptable if you also add per-cluster write rate limits + per-workload reconcile deadlines (skip stale decisions) to prevent a slow cluster from consuming the whole control loop.
+
+4. **Bad config or a wrong demand proxy at 3am**
+   - Design’s answer: partly addressed (overrides, guardrails).
+   - Recommendation: Strengthen — add “two-phase rollout” for policy changes (shadow → apply), a per-workload “safe mode” template, and a global kill switch that reverts any predictive-written fields back to their prior value (not just “stop writing”).
+
+5. **10x traffic spike + slow node provisioning**
+   - Design’s answer: implicitly assumes the 15-minute horizon covers provisioning.
+   - Recommendation: Strengthen — explicitly model *time-to-capacity* per workload/cluster (pod readiness + node scale latency). If you can’t pull nodes forward (Karpenter/Cluster Autoscaler/ASG), predictive pod scaling alone may not help on cold clusters.
+
+## Recommendations
+
+### Must Fix
+- Define the control authority model with HPA/target-tracking to prevent “fighting” (who owns `replicas` / `minReplicas`, how conflicts resolve, and how you detect oscillation).
+- Make the system non-blocking on dependencies: decisions should degrade gracefully when Postgres or metrics are impaired (bounded caching + last-known-good behavior).
+- Handle change points: new app version, changed CPU requests/limits, perf regressions — your “demand→capacity” regression must be version-aware or at least reset/relearn on deployment changes.
+
+### Should Consider
+- Convert “Feature Builder” into Prometheus recording rules + a small in-controller join step; it’s simpler and cheaper than repeated heavy queries.
+- Store full decision payloads only when an action changes (or sample); keep aggregates for coverage/cost. At your scale, “log every minute for every workload forever” becomes the hidden system.
+- Make coverage tie to an outcome metric (latency/SLO burn) in addition to demand proxy exceedance; otherwise you can hit coverage but still violate SLO due to tail latency, dependency slowness, or queueing effects.
+
+### Nice to Have
+- Explicit “freeze reasons” taxonomy and runbook-grade explainability (data stale, coverage collapsed, actuation failing, budget cap hit).
+- Automated backtests for new policies/models in CI-like pipelines (even lightweight) before enabling apply mode.
+
+## What's Working Well
+- Clear separation of prediction vs actuation, with safety as a first-class contract.
+- The “learn only from healthy periods” constraint is a pragmatic guardrail that many autoscalers miss.
+- Shadow mode + auditability + measurable coverage KPI is exactly how you earn trust and avoid pager-driven rollbacks.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/capacity-planning-autoscaling.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afc-cff6-7950-847f-c5c2c9b3c907
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Capacity Planning & Autoscaling"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["autoscaling", "forecasting", "kubernetes", "sre", "capacity-planning"]
+---
+
+## Overview
+
+This system is a predictive autoscaler that provisions compute *ahead* of demand using historical signals plus explicit safety margins. It targets the gap that reactive autoscaling can’t close: fast ramps (marketing blasts, cron-driven traffic, timezone peaks) where “scale after you’re hot” is already too late.
+
+The key insight is to separate **prediction** from **actuation** and make the handoff mathematically explicit: predict a near-future demand distribution (not a single number), convert it into required capacity via a learned “cost per unit demand,” then add a safety margin that is tied to an error budget (coverage), not gut feel. Reactive autoscaling still exists—but as the seatbelt, not the engine.
+
+A small team can build and run this by leaning on boring primitives: Prometheus/Thanos for metrics, Postgres for config and audit, and a Kubernetes controller that writes desired replica counts (or ASG desired capacity). The “smart” part is narrow: uncertainty-aware forecasting + guardrailed scaling decisions.
+
+## What Makes This Hard
+
+Naive predictive autoscalers fail because they treat forecasting as the whole problem. The trap is that **forecast error becomes an outage** unless you translate it into a safety policy with guardrails and clear fallbacks.
+
+The second trap is **feedback loops**: autoscaling changes CPU/utilization, which changes the very signals you’re using to learn “how much capacity you need.” If you don’t disentangle “demand” from “resource saturation,” the model learns nonsense during incidents and then repeats it during the next peak.
+
+## Requirements
+
+### Functional Requirements
+
+- Produce per-workload capacity plans for a fixed horizon (e.g., 5–30 minutes ahead) and apply them continuously.
+- Encode safety explicitly: “scale to meet P95 demand with 99% coverage over the last 14 days” (or an equivalent SLO-driven rule).
+- Support overrides and guardrails per workload (max step, max spend, minimum headroom, freeze conditions).
+- Provide explainability: every scaling action is attributable to inputs, forecast, margin, and constraints.
+- Fail safe: on bad data or model degradation, revert to reactive autoscaling without operator heroics.
+
+### Scale Targets
+
+- **Workloads:** 500 deployments across 10 clusters (typical mid-size platform team).
+- **Decision cadence:** every 60s; **horizon:** 15 minutes (enough to cover node provisioning + pod warmup).
+- **Signals:** 1-minute aggregates of demand proxy (RPS/queue depth) + resource usage (CPU/mem) + saturation (latency, 5xx).
+- **Action volume:** worst case 500 workloads × 60 decisions/hour = 30k decisions/hour; only a small fraction should cause changes due to hysteresis.
+
+These numbers matter because they force the design to be cheap, incremental, and robust to partial failures; you can’t run heavyweight retraining per decision, and you must keep metric cardinality under control.
+
+## Key Design Decisions
+
+- **Decision 1: Predict demand, not utilization**
+  - **Chose:** forecast *demand proxies* (RPS, queue depth, scheduled jobs) and map to required resources via a learned cost model.
+  - **Rejected:** forecasting CPU%/utilization directly.
+  - **Why:** utilization is a controlled variable influenced by scaling; demand is closer to exogenous reality and is stable through incidents.
+
+- **Decision 2: Safety margin via coverage, not fixed headroom**
+  - **Chose:** quantile/coverage-based capacity (e.g., conformal prediction interval or empirical error quantiles) with explicit target coverage.
+  - **Rejected:** “+30% buffer” everywhere.
+  - **Why:** fixed buffers are wrong in both directions—wasteful for stable workloads, insufficient for spiky ones. Coverage ties cost directly to outage risk.
+
+- **Decision 3: Predictive sets the baseline; reactive handles residual**
+  - **Chose:** predictive scaler writes a *floor* (minimum replicas / desired capacity) while HPA (or target-tracking) still reacts to surprises.
+  - **Rejected:** replacing reactive autoscaling.
+  - **Why:** reactive is the last line of defense and a proven incident tool; predictive reduces the frequency and severity of “late scaling,” not all variance.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  M[Metrics (Prom/Thanos)] --> F[Feature Builder]
+  C[Config (Postgres)] --> P[Policy Engine]
+  F --> R[Forecaster]
+  R --> P
+  P --> A[Scaling Controller]
+  A --> K[K8s API / ASG]
+  K --> M
+  P --> L[Audit Log]
+```
+
+### Components
+
+- **Metrics (Prometheus + Thanos):** short-term + long-term signals with consistent 1-minute downsampling; Thanos gives you “last 90 days” without inventing a custom store.
+- **Feature Builder:** transforms raw metrics into stable demand features (time-of-week seasonality, recent trend, known batch schedules) and filters out saturated periods.
+- **Forecaster:** outputs a demand distribution for each workload and horizon; optimized for fast incremental updates, not fancy research.
+- **Config (Postgres):** per-workload policies, constraints, rollout state, and “what is the demand proxy for this service?” in one transactionally consistent place.
+- **Policy Engine:** converts predicted demand into required replicas/nodes with coverage-based margin and guardrails (max step, cooldown, budget caps).
+- **Scaling Controller:** applies decisions via Kubernetes (patch HPA minReplicas / scale subresource) and/or ASG desired capacity; owns backoff, retries, and idempotency.
+- **Audit Log:** immutable record of every decision with inputs and outputs; required for debugging, postmortems, and trust.
+
+## Deep Dive: Uncertainty-Aware Scaling (The Hardest Part)
+
+The hardest part is turning “a forecast” into “an action” without turning forecast error into pager fatigue. The system does this in three explicit steps:
+
+1) **Forecast a near-future demand distribution.** For each workload, predict demand for each minute in the next 15 minutes. Use a model that captures seasonality cheaply (time-of-week buckets + exponential smoothing on residuals). The output is not a point estimate; it’s an interval (or quantiles) per horizon step.
+
+2) **Map demand to capacity using an efficiency model learned from healthy periods.** Convert demand to required CPU (and optionally memory) using robust regression over windows where saturation is low (e.g., latency below SLO and CPU < 70%). This avoids “incident learning,” where throttling makes CPU look flat while demand is actually rising. The output is a capacity requirement in millicores (or replicas given per-pod requests).
+
+3) **Add safety margin using empirical coverage guarantees.** Maintain a rolling history of forecast errors per workload and time-of-week. Choose a target coverage (e.g., 99% of the time, capacity >= realized demand). Implement this as a conformal-style adjustment: widen the prediction interval by the (1-coverage) quantile of recent absolute errors. This is the crucial move: the margin automatically grows for spiky workloads and shrinks for stable ones, and it is measurable in production (coverage drift is an alertable metric).
+
+Finally, the Policy Engine turns “required capacity” into a bounded action with guardrails:
+- **Hysteresis:** don’t scale down unless you’ve been overprovisioned for N minutes.
+- **Max step:** cap increases/decreases per minute to avoid runaway and to respect warmup.
+- **Freeze on anomalies:** if data quality drops or coverage collapses, stop predictive writes and let reactive autoscaling run alone.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Fast ramps without latency spikes | Some steady-state efficiency |
+| Explicit, measurable risk (coverage) | Model simplicity over maximum accuracy |
+| Operational safety and reversibility | Per-workload tuning still required |
+| Small-team operability | Less “one size fits all” automation |
+
+## Failure Modes
+
+- **Bad metrics / gaps**
+  - **What happens:** forecaster underestimates demand or cannot compute features; scaling actions become noisy or absent.
+  - **Detect:** data freshness SLOs (scrape lag), missing-series rate, sudden drops to zero, feature build error rate.
+  - **Recover:** freeze predictive actions for affected workloads, fall back to reactive autoscaling, page only if fallbacks also fail.
+
+- **Model drift / coverage collapse**
+  - **What happens:** forecasts systematically miss (new traffic pattern, product launch), causing underprovisioning.
+  - **Detect:** online coverage metric (fraction of intervals where realized demand exceeded predicted-with-margin), plus SLO burn correlation.
+  - **Recover:** automatically widen margin (increase error quantile window), trigger shadow backtest, require human approval to reduce margin again.
+
+- **Actuation failure (K8s/ASG throttling, controller bugs)**
+  - **What happens:** decisions are computed but not applied; capacity lags behind demand.
+  - **Detect:** reconcile errors, API rate-limit metrics, “desired vs applied” diff, and time-to-effect histograms.
+  - **Recover:** exponential backoff + idempotent patches, reduce write frequency under throttling, and surface a single “predictive autoscaler degraded” alert.
+
+## What I'd Do Differently At...
+
+- **10x scale:** shard by cluster and move feature computation closer to metrics (per-cluster builders); add a lightweight stream (Kafka) only if metric polling becomes cost-dominant.
+- **100x scale:** split forecasting into offline + online: offline learns per-service demand/capacity models and priors; online only does residual updates and conformal margins. Also, stop using raw Prometheus queries as the feature substrate—emit curated “autoscaling signals” as a first-class product.
+
+## Operational Notes
+
+- Run in **shadow mode** first: compute decisions and margins, but don’t apply; publish coverage and “would-have-scaled” deltas to earn trust.
+- Treat **coverage** as the primary KPI; cost is a secondary KPI you optimize only after coverage is stable.
+- Maintain an explicit **blocklist**: workloads with unstable demand proxies (batchy, multi-tenant) shouldn’t use predictive until they expose a better signal.
+- Every applied change must be traceable in `Audit Log` with a stable decision ID and the exact inputs/constraints used.
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+You made “forecast error” an explicit, measurable policy (coverage) and kept reactive autoscaling as the safety net. That’s the right framing: prediction is optional; safe actuation isn’t.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Metrics (Prom/Thanos) | Leverages existing operational truth; avoids building a time-series store. |
+| Policy Engine | Where safety lives: guardrails, hysteresis, budget caps, freeze logic. |
+| Scaling Controller | Idempotent, rate-limited actuation + “desired vs applied” observability is non-negotiable. |
+| Config store | Centralized overrides/rollouts and consistent policies per workload. |
+
+### Simplification Opportunities
+| Current | Simper Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Separate Feature Builder + Forecaster services | Single “autoscaler” controller process with modules (feature → forecast → policy → actuation) | Less independent scaling, but dramatically simpler ops for a small team. |
+| Postgres + separate “Audit Log” component | One partitioned Postgres table for decisions + optional async export to S3 later | Postgres retention/size management becomes your responsibility. |
+| Polling lots of PromQL at 60s cadence | Prometheus recording rules to emit curated per-workload “autoscaling signals” (demand, saturation, freshness) | Requires upfront metrics product work, but reduces query cost and cardinality risk. |
+| Writing HPA `minReplicas` as the “floor” | Prefer one authority per workload: either (a) predictive controller writes `scale` and disables HPA, or (b) HPA consumes a predictive external metric | Your current “floor + HPA” can work, but it needs explicit conflict rules to avoid fight/oscillation. |
+| Custom coordination implied | Kubernetes leader election via `Lease` + per-workload sharding | Slightly more controller plumbing, but no new infra (no etcd/ZK/Kafka). |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres is down for 5 minutes**
+   - Design’s answer: partially addressed (fallback to reactive), but Postgres is also config + audit.
+   - Recommendation: Strengthen — autoscaling decisions must not block on audit writes; cache config in-memory with TTL and run “read-only” until DB returns; queue audit asynchronously with bounded memory and lossy fallback.
+
+2. **Prometheus/Thanos query lag or partial metric gaps**
+   - Design’s answer: addressed (freeze on bad data).
+   - Recommendation: Strengthen — freezing is safe but can be costly; add “last-known-good forecast with widened margin” mode for short gaps, and make metric freshness a first-class signal in policy (not just a global kill switch).
+
+3. **Kubernetes API throttling / controller restart mid-rollout**
+   - Design’s answer: addressed (backoff, idempotency, desired vs applied).
+   - Recommendation: Acceptable if you also add per-cluster write rate limits + per-workload reconcile deadlines (skip stale decisions) to prevent a slow cluster from consuming the whole control loop.
+
+4. **Bad config or a wrong demand proxy at 3am**
+   - Design’s answer: partly addressed (overrides, guardrails).
+   - Recommendation: Strengthen — add “two-phase rollout” for policy changes (shadow → apply), a per-workload “safe mode” template, and a global kill switch that reverts any predictive-written fields back to their prior value (not just “stop writing”).
+
+5. **10x traffic spike + slow node provisioning**
+   - Design’s answer: implicitly assumes the 15-minute horizon covers provisioning.
+   - Recommendation: Strengthen — explicitly model *time-to-capacity* per workload/cluster (pod readiness + node scale latency). If you can’t pull nodes forward (Karpenter/Cluster Autoscaler/ASG), predictive pod scaling alone may not help on cold clusters.
+
+## Recommendations
+
+### Must Fix
+- Define the control authority model with HPA/target-tracking to prevent “fighting” (who owns `replicas` / `minReplicas`, how conflicts resolve, and how you detect oscillation).
+- Make the system non-blocking on dependencies: decisions should degrade gracefully when Postgres or metrics are impaired (bounded caching + last-known-good behavior).
+- Handle change points: new app version, changed CPU requests/limits, perf regressions — your “demand→capacity” regression must be version-aware or at least reset/relearn on deployment changes.
+
+### Should Consider
+- Convert “Feature Builder” into Prometheus recording rules + a small in-controller join step; it’s simpler and cheaper than repeated heavy queries.
+- Store full decision payloads only when an action changes (or sample); keep aggregates for coverage/cost. At your scale, “log every minute for every workload forever” becomes the hidden system.
+- Make coverage tie to an outcome metric (latency/SLO burn) in addition to demand proxy exceedance; otherwise you can hit coverage but still violate SLO due to tail latency, dependency slowness, or queueing effects.
+
+### Nice to Have
+- Explicit “freeze reasons” taxonomy and runbook-grade explainability (data stale, coverage collapsed, actuation failing, budget cap hit).
+- Automated backtests for new policies/models in CI-like pipelines (even lightweight) before enabling apply mode.
+
+## What's Working Well
+- Clear separation of prediction vs actuation, with safety as a first-class contract.
+- The “learn only from healthy periods” constraint is a pragmatic guardrail that many autoscalers miss.
+- Shadow mode + auditability + measurable coverage KPI is exactly how you earn trust and avoid pager-driven rollbacks.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+thinking
+**Evaluating autoscaling strategy**
+
+I’m considering whether to disable HPA and rely solely on reactive scaling within the controller. But that would mean we’d have to implement our own autoscaling, which feels complex. Keeping HPA as is would mean feeding it predictive metrics, which isn’t allowed. So, I’ll stick with the existing HPA for reactive metrics and set the minimum replicas while monitoring the maximum. 
+
+I need to ensure that scaling policies prevent sudden drops and keep adjustments gradual. Also, merging several components into a single "Predictive Autoscaler" feels like a good architecture simplification.
+thinking
+**Updating architecture diagram**
+
+I can't add components, only merge, so it’s more about removal. I need to update the diagram to reflect that merging into the "Predictive Autoscaler," which combines features, forecasting, policy, and actuation—leading to the Kubernetes API. I’ll keep the metrics store, Postgres, controller, and audit log in a Postgres table.
+
+I'll simplify the deep dive, maintaining a three-step process but without getting into conformal details. I want to focus on the main failure modes: Postgres downtime, metrics gaps, and actuation issues. The scaling targets can stay but may not need to change. Now, I’ll produce the final markdown document.
+thinking
+**Rewriting document**
+
+I'm in the Codex environment and the user wants a document rewrite without making any changes to the repository. They didn't specify to write to a file—just to output the complete markdown, which I’ll provide.
+
+Maintaining the frontmatter exactly as it is, I’ll keep the titles and headings the same while condensing the content without adding new sections. I can note the removed items in bold labels within sections like "Architecture," "Components," or "Trade-offs." The "Minimal architecture" section can be included under "Architecture." 
+
+I’ll also follow the guidance to keep things straightforward, aiming for a clean presentation without extra complexity.
+thinking
+**Simplifying metrics storage**
+
+I’m considering using Prometheus with remote write to a managed store. However, I can’t add components like Thanos. I could keep Prometheus and Thanos since they’re already there, but maybe it’s simpler to remove Thanos if we're relying on the existing metrics stack.
+
+To streamline, I think I’ll say “Metrics: Prometheus” and outline the history as "14 days via existing retention/remote storage." Since the requirements mention a last 90-day history, I’m fine with shrinking that to a 14-day coverage window for simplicity! So, I’ll remove any mention of Thanos.
+thinking
+**Finalizing K8s autoscaling design**
+
+I’m deciding to keep only Prometheus and remove explicit mentions of ASG since scaling nodes is complex. The focus will be on patching HPA's minReplicas for scaling deployments within K8s workloads. The cluster autoscaler will handle nodes, but we can incorporate time-to-capacity by pre-scaling minReplicas. 
+
+The design will forecast demand distribution based on historical data, using a straightforward mapping of demand to replicas. I’ll also document failure scenarios and what’s removed. The markdown will note these changes without arguing for their necessity, presenting everything clearly. Let’s get started on that!
+codex
+```markdown
+---
+title: "Capacity Planning & Autoscaling"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["autoscaling", "forecasting", "kubernetes", "sre", "capacity-planning"]
+---
+
+## Overview
+
+This is a predictive autoscaler that raises baseline capacity *before* demand hits, while Kubernetes HPA remains the safety net for surprises. Every decision is: forecast near-future demand, translate demand into replicas using a learned “safe throughput per replica,” then add a safety margin with an explicit coverage target. When inputs degrade, it stops writing and HPA runs alone.
+
+The system is intentionally small: one controller process, existing metrics, and one database table for policy + audit.
+
+## What Makes This Hard
+
+Forecasting isn’t the hard part; safe actuation is. Forecast error becomes an outage unless it’s translated into a measurable safety policy with guardrails and reliable fallbacks.
+
+The other failure mode is feedback: scaling changes utilization and can corrupt learning. This design learns only from “healthy” windows and uses demand-per-replica (not CPU%) as the primary mapping, so incidents don’t rewrite capacity assumptions.
+
+## Requirements
+
+### Functional Requirements
+
+- Produce per-workload capacity floors for a fixed horizon (e.g., 5–30 minutes ahead) and apply them continuously.
+- Encode safety explicitly: “scale to P95 demand with 99% coverage over the last 14 days” (or equivalent).
+- Support per-workload overrides and guardrails (max step, max spend, minimum headroom, freeze conditions).
+- Provide explainability: every applied change is attributable to inputs, forecast, margin, and constraints.
+- Fail safe: on bad data, degraded coverage, or dependency outages, stop predictive writes and rely on HPA.
+
+### Scale Targets
+
+- **Workloads:** 500 deployments across 10 clusters.
+- **Decision cadence:** every 60s; **horizon:** 15 minutes.
+- **Signals:** 1-minute aggregates of demand proxy (RPS/queue depth) + saturation (latency, 5xx) + current replicas + data freshness.
+- **Action volume:** up to 30k decisions/hour; only a small fraction should change floors due to hysteresis.
+
+## Key Design Decisions
+
+- **Decision 1: Predict demand, not utilization**
+  - Forecast a demand proxy and keep saturation as a veto signal.
+  - Capacity mapping is “demand per replica in healthy windows,” not “CPU% predicts replicas.”
+
+- **Decision 2: Safety margin via coverage**
+  - Maintain a rolling forecast error history per workload and set margin from the error quantile needed to hit target coverage.
+  - Coverage is measured online and is the primary health signal for the predictive path.
+
+- **Decision 3: One control authority**
+  - The predictive controller only writes `HPA.spec.minReplicas` (the floor).
+  - HPA remains the only writer of `replicas` and handles residual variance.
+  - Floors decrease slowly (hysteresis + max-down-step) to avoid “floor drops” creating sudden downscales.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  M[Metrics (Prometheus)] --> S[Predictive Autoscaler Controller]
+  D[Postgres (policy + audit table)] --> S
+  S --> K[Kubernetes API (patch HPA minReplicas)]
+  K --> M
+```
+
+**What We Removed:** separate Feature Builder service, separate Forecaster service, separate Policy Engine service, separate Audit Log component, direct ASG/node actuation path, heavyweight model/retraining per decision.
+
+### Components
+
+- **Metrics (Prometheus):** provides 1-minute demand + saturation + freshness signals.
+  - Justification: it’s the system’s source of operational truth; the autoscaler only reads what already exists.
+
+- **Postgres (policy + audit table):** stores per-workload constraints, rollout state, and an immutable decision record.
+  - Justification: one transactional store for “what is allowed” and “what happened,” without introducing another logging system.
+
+- **Predictive Autoscaler Controller:** one process that does feature extraction, forecasting, margining, mapping demand→replicas, and K8s actuation.
+  - Justification: the only custom component; it concentrates safety logic, fallbacks, rate limits, and idempotent writes.
+
+- **Kubernetes HPA:** reactive autoscaling based on existing signals.
+  - Justification: proven incident tooling and the default fallback when prediction is unsafe.
+
+## Deep Dive: Uncertainty-Aware Scaling (The Hardest Part)
+
+Each minute, per workload:
+
+1) **Forecast near-future demand.** Use a cheap seasonal baseline (time-of-week buckets) plus short-term residual smoothing to produce a demand quantile for the next 15 minutes.
+
+2) **Map demand to replicas from healthy periods.** Maintain a “safe throughput per replica” estimate computed only from windows where saturation is low (latency under SLO, low 5xx) and the workload is stable. Convert forecast demand to replicas via `ceil(demand / safe_throughput_per_replica)`.
+
+3) **Add margin to hit target coverage.** Track recent forecast errors by time-of-week. Inflate the forecast by the error quantile needed for target coverage (e.g., 99%). Coverage is measured online; if it collapses, predictive writes stop.
+
+Guardrails applied before writing a floor:
+- **Hysteresis:** floors only drop after sustained overprovisioning.
+- **Max step:** caps per-minute floor changes up and down.
+- **Freeze reasons:** stale metrics, missing series, coverage collapse, actuation throttling, or policy violations.
+- **Staleness cutoff:** never apply a decision older than the current loop.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Simple, safe operation for a small team | Maximum forecast accuracy |
+| Predictive pre-scaling without fighting HPA | Direct control of nodes/ASGs |
+| Measurable risk via coverage | Some steady-state efficiency |
+| Dependency outages don’t page immediately | Less complete audit during outages |
+
+## Failure Modes
+
+- **Postgres is down**
+  - **What happens:** policy reads and audit writes can’t complete.
+  - **Detect:** DB health and write failures.
+  - **Recover:** controller runs on cached config (TTL) and continues computing decisions; audit writes are best-effort with a bounded in-memory buffer (drop-oldest). If config expires or safety constraints can’t be validated, freeze predictive writes and rely on HPA.
+
+- **Prometheus gaps / query lag**
+  - **What happens:** forecasts are wrong or impossible.
+  - **Detect:** freshness signal, missing-series rate, sudden drops to zero.
+  - **Recover:** for short gaps, reuse last-known-good forecast and widen margin; for sustained gaps, freeze predictive writes and rely on HPA.
+
+- **Kubernetes API throttling / controller restarts**
+  - **What happens:** decisions aren’t applied promptly; floors lag.
+  - **Detect:** reconcile error rate, rate-limit signals, desired-vs-applied drift.
+  - **Recover:** idempotent patches with exponential backoff, per-cluster write rate limits, skip stale decisions, and freeze predictive writes on repeated actuation failure (HPA continues).
+
+- **Bad config / wrong demand proxy**
+  - **What happens:** floors push the wrong direction.
+  - **Detect:** coverage collapse and saturation rising after floor changes.
+  - **Recover:** per-workload safe template (tight max step + high margin) and a global kill switch that stops predictive writes; rollback is simply “stop writing floors” (HPA remains).
+
+- **Change points (new version, requests/limits, perf regression)**
+  - **What happens:** “safe throughput per replica” becomes invalid.
+  - **Detect:** abrupt shift in achieved demand-per-replica during healthy windows, correlated with rollout.
+  - **Recover:** reset mapping on rollout and run shadow-only for a short warmup window before writing floors again.
+
+## What I'd Do Differently At...
+
+- **10x scale:** use Prometheus recording rules to emit curated per-workload signals (demand, saturation, freshness) so the controller does cheap reads; shard controllers by cluster with leader election.
+- **100x scale:** keep the same controller shape, but move most computation into recording rules and reduce audit volume (store full payload only on change; keep aggregates for coverage/cost).
+
+## Operational Notes
+
+- Start in **shadow mode**: compute floors and coverage, don’t write.
+- Coverage is the primary KPI; cost is tuned only after coverage is stable.
+- Maintain a **blocklist** for workloads without a stable demand proxy.
+- Every applied change writes one decision row with a stable decision ID, inputs, constraints, and the exact floor written (or a freeze reason when it refuses to write).
+```
+tokens used
+8,611
+```markdown
+---
+title: "Capacity Planning & Autoscaling"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["autoscaling", "forecasting", "kubernetes", "sre", "capacity-planning"]
+---
+
+## Overview
+
+This is a predictive autoscaler that raises baseline capacity *before* demand hits, while Kubernetes HPA remains the safety net for surprises. Every decision is: forecast near-future demand, translate demand into replicas using a learned “safe throughput per replica,” then add a safety margin with an explicit coverage target. When inputs degrade, it stops writing and HPA runs alone.
+
+The system is intentionally small: one controller process, existing metrics, and one database table for policy + audit.
+
+## What Makes This Hard
+
+Forecasting isn’t the hard part; safe actuation is. Forecast error becomes an outage unless it’s translated into a measurable safety policy with guardrails and reliable fallbacks.
+
+The other failure mode is feedback: scaling changes utilization and can corrupt learning. This design learns only from “healthy” windows and uses demand-per-replica (not CPU%) as the primary mapping, so incidents don’t rewrite capacity assumptions.
+
+## Requirements
+
+### Functional Requirements
+
+- Produce per-workload capacity floors for a fixed horizon (e.g., 5–30 minutes ahead) and apply them continuously.
+- Encode safety explicitly: “scale to P95 demand with 99% coverage over the last 14 days” (or equivalent).
+- Support per-workload overrides and guardrails (max step, max spend, minimum headroom, freeze conditions).
+- Provide explainability: every applied change is attributable to inputs, forecast, margin, and constraints.
+- Fail safe: on bad data, degraded coverage, or dependency outages, stop predictive writes and rely on HPA.
+
+### Scale Targets
+
+- **Workloads:** 500 deployments across 10 clusters.
+- **Decision cadence:** every 60s; **horizon:** 15 minutes.
+- **Signals:** 1-minute aggregates of demand proxy (RPS/queue depth) + saturation (latency, 5xx) + current replicas + data freshness.
+- **Action volume:** up to 30k decisions/hour; only a small fraction should change floors due to hysteresis.
+
+## Key Design Decisions
+
+- **Decision 1: Predict demand, not utilization**
+  - Forecast a demand proxy and keep saturation as a veto signal.
+  - Capacity mapping is “demand per replica in healthy windows,” not “CPU% predicts replicas.”
+
+- **Decision 2: Safety margin via coverage**
+  - Maintain a rolling forecast error history per workload and set margin from the error quantile needed to hit target coverage.
+  - Coverage is measured online and is the primary health signal for the predictive path.
+
+- **Decision 3: One control authority**
+  - The predictive controller only writes `HPA.spec.minReplicas` (the floor).
+  - HPA remains the only writer of `replicas` and handles residual variance.
+  - Floors decrease slowly (hysteresis + max-down-step) to avoid “floor drops” creating sudden downscales.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  M[Metrics (Prometheus)] --> S[Predictive Autoscaler Controller]
+  D[Postgres (policy + audit table)] --> S
+  S --> K[Kubernetes API (patch HPA minReplicas)]
+  K --> M
+```
+
+**What We Removed:** separate Feature Builder service, separate Forecaster service, separate Policy Engine service, separate Audit Log component, direct ASG/node actuation path, heavyweight model/retraining per decision.
+
+### Components
+
+- **Metrics (Prometheus):** provides 1-minute demand + saturation + freshness signals.
+  - Justification: it’s the system’s source of operational truth; the autoscaler only reads what already exists.
+
+- **Postgres (policy + audit table):** stores per-workload constraints, rollout state, and an immutable decision record.
+  - Justification: one transactional store for “what is allowed” and “what happened,” without introducing another logging system.
+
+- **Predictive Autoscaler Controller:** one process that does feature extraction, forecasting, margining, mapping demand→replicas, and K8s actuation.
+  - Justification: the only custom component; it concentrates safety logic, fallbacks, rate limits, and idempotent writes.
+
+- **Kubernetes HPA:** reactive autoscaling based on existing signals.
+  - Justification: proven incident tooling and the default fallback when prediction is unsafe.
+
+## Deep Dive: Uncertainty-Aware Scaling (The Hardest Part)
+
+Each minute, per workload:
+
+1) **Forecast near-future demand.** Use a cheap seasonal baseline (time-of-week buckets) plus short-term residual smoothing to produce a demand quantile for the next 15 minutes.
+
+2) **Map demand to replicas from healthy periods.** Maintain a “safe throughput per replica” estimate computed only from windows where saturation is low (latency under SLO, low 5xx) and the workload is stable. Convert forecast demand to replicas via `ceil(demand / safe_throughput_per_replica)`.
+
+3) **Add margin to hit target coverage.** Track recent forecast errors by time-of-week. Inflate the forecast by the error quantile needed for target coverage (e.g., 99%). Coverage is measured online; if it collapses, predictive writes stop.
+
+Guardrails applied before writing a floor:
+- **Hysteresis:** floors only drop after sustained overprovisioning.
+- **Max step:** caps per-minute floor changes up and down.
+- **Freeze reasons:** stale metrics, missing series, coverage collapse, actuation throttling, or policy violations.
+- **Staleness cutoff:** never apply a decision older than the current loop.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Simple, safe operation for a small team | Maximum forecast accuracy |
+| Predictive pre-scaling without fighting HPA | Direct control of nodes/ASGs |
+| Measurable risk via coverage | Some steady-state efficiency |
+| Dependency outages don’t page immediately | Less complete audit during outages |
+
+## Failure Modes
+
+- **Postgres is down**
+  - **What happens:** policy reads and audit writes can’t complete.
+  - **Detect:** DB health and write failures.
+  - **Recover:** controller runs on cached config (TTL) and continues computing decisions; audit writes are best-effort with a bounded in-memory buffer (drop-oldest). If config expires or safety constraints can’t be validated, freeze predictive writes and rely on HPA.
+
+- **Prometheus gaps / query lag**
+  - **What happens:** forecasts are wrong or impossible.
+  - **Detect:** freshness signal, missing-series rate, sudden drops to zero.
+  - **Recover:** for short gaps, reuse last-known-good forecast and widen margin; for sustained gaps, freeze predictive writes and rely on HPA.
+
+- **Kubernetes API throttling / controller restarts**
+  - **What happens:** decisions aren’t applied promptly; floors lag.
+  - **Detect:** reconcile error rate, rate-limit signals, desired-vs-applied drift.
+  - **Recover:** idempotent patches with exponential backoff, per-cluster write rate limits, skip stale decisions, and freeze predictive writes on repeated actuation failure (HPA continues).
+
+- **Bad config / wrong demand proxy**
+  - **What happens:** floors push the wrong direction.
+  - **Detect:** coverage collapse and saturation rising after floor changes.
+  - **Recover:** per-workload safe template (tight max step + high margin) and a global kill switch that stops predictive writes; rollback is simply “stop writing floors” (HPA remains).
+
+- **Change points (new version, requests/limits, perf regression)**
+  - **What happens:** “safe throughput per replica” becomes invalid.
+  - **Detect:** abrupt shift in achieved demand-per-replica during healthy windows, correlated with rollout.
+  - **Recover:** reset mapping on rollout and run shadow-only for a short warmup window before writing floors again.
+
+## What I'd Do Differently At...
+
+- **10x scale:** use Prometheus recording rules to emit curated per-workload signals (demand, saturation, freshness) so the controller does cheap reads; shard controllers by cluster with leader election.
+- **100x scale:** keep the same controller shape, but move most computation into recording rules and reduce audit volume (store full payload only on change; keep aggregates for coverage/cost).
+
+## Operational Notes
+
+- Start in **shadow mode**: compute floors and coverage, don’t write.
+- Coverage is the primary KPI; cost is tuned only after coverage is stable.
+- Maintain a **blocklist** for workloads without a stable demand proxy.
+- Every applied change writes one decision row with a stable decision ID, inputs, constraints, and the exact floor written (or a freeze reason when it refuses to write).
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/03-observability-reliability/capacity-planning-autoscaling.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+Found invalid Mermaid diagrams, fixing...
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afe-34c1-7c60-998f-0d7cd8377c72
+--------
+user
+Fix these Mermaid syntax errors:
+
+
+--- Block 1 ---
+flowchart LR
+  M[Metrics (Prometheus)] --> S[Predictive Autoscaler Controller]
+  D[Postgres (policy + audit table)] --> S
+  S --> K[Kubernetes API (patch HPA minReplicas)]
+  K --> M
+--- Error ---
+Generating single mermaid chart
+
+Error: Parse error on line 2:
+
+
+Common fixes:
+- Quote labels with special characters: A["Label (with parens)"]
+- Use short labels (2-4 words max)
+- Remove HTML tags
+- Keep diagrams simple (max 8 nodes)
+
+Output the complete fixed document.
+
+---
+
+```markdown
+---
+title: "Capacity Planning & Autoscaling"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["autoscaling", "forecasting", "kubernetes", "sre", "capacity-planning"]
+---
+
+## Overview
+
+This is a predictive autoscaler that raises baseline capacity *before* demand hits, while Kubernetes HPA remains the safety net for surprises. Every decision is: forecast near-future demand, translate demand into replicas using a learned “safe throughput per replica,” then add a safety margin with an explicit coverage target. When inputs degrade, it stops writing and HPA runs alone.
+
+The system is intentionally small: one controller process, existing metrics, and one database table for policy + audit.
+
+## What Makes This Hard
+
+Forecasting isn’t the hard part; safe actuation is. Forecast error becomes an outage unless it’s translated into a measurable safety policy with guardrails and reliable fallbacks.
+
+The other failure mode is feedback: scaling changes utilization and can corrupt learning. This design learns only from “healthy” windows and uses demand-per-replica (not CPU%) as the primary mapping, so incidents don’t rewrite capacity assumptions.
+
+## Requirements
+
+### Functional Requirements
+
+- Produce per-workload capacity floors for a fixed horizon (e.g., 5–30 minutes ahead) and apply them continuously.
+- Encode safety explicitly: “scale to P95 demand with 99% coverage over the last 14 days” (or equivalent).
+- Support per-workload overrides and guardrails (max step, max spend, minimum headroom, freeze conditions).
+- Provide explainability: every applied change is attributable to inputs, forecast, margin, and constraints.
+- Fail safe: on bad data, degraded coverage, or dependency outages, stop predictive writes and rely on HPA.
+
+### Scale Targets
+
+- **Workloads:** 500 deployments across 10 clusters.
+- **Decision cadence:** every 60s; **horizon:** 15 minutes.
+- **Signals:** 1-minute aggregates of demand proxy (RPS/queue depth) + saturation (latency, 5xx) + current replicas + data freshness.
+- **Action volume:** up to 30k decisions/hour; only a small fraction should change floors due to hysteresis.
+
+## Key Design Decisions
+
+- **Decision 1: Predict demand, not utilization**
+  - Forecast a demand proxy and keep saturation as a veto signal.
+  - Capacity mapping is “demand per replica in healthy windows,” not “CPU% predicts replicas.”
+
+- **Decision 2: Safety margin via coverage**
+  - Maintain a rolling forecast error history per workload and set margin from the error quantile needed to hit target coverage.
+  - Coverage is measured online and is the primary health signal for the predictive path.
+
+- **Decision 3: One control authority**
+  - The predictive controller only writes `HPA.spec.minReplicas` (the floor).
+  - HPA remains the only writer of `replicas` and handles residual variance.
+  - Floors decrease slowly (hysteresis + max-down-step) to avoid “floor drops” creating sudden downscales.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  M[Metrics (Prometheus)] --> S[Predictive Autoscaler Controller]
+  D[Postgres (policy + audit table)] --> S
+  S --> K[Kubernetes API (patch HPA minReplicas)]
+  K --> M
+```
+
+**What We Removed:** separate Feature Builder service, separate Forecaster service, separate Policy Engine service, separate Audit Log component, direct ASG/node actuation path, heavyweight model/retraining per decision.
+
+### Components
+
+- **Metrics (Prometheus):** provides 1-minute demand + saturation + freshness signals.
+  - Justification: it’s the system’s source of operational truth; the autoscaler only reads what already exists.
+
+- **Postgres (policy + audit table):** stores per-workload constraints, rollout state, and an immutable decision record.
+  - Justification: one transactional store for “what is allowed” and “what happened,” without introducing another logging system.
+
+- **Predictive Autoscaler Controller:** one process that does feature extraction, forecasting, margining, mapping demand→replicas, and K8s actuation.
+  - Justification: the only custom component; it concentrates safety logic, fallbacks, rate limits, and idempotent writes.
+
+- **Kubernetes HPA:** reactive autoscaling based on existing signals.
+  - Justification: proven incident tooling and the default fallback when prediction is unsafe.
+
+## Deep Dive: Uncertainty-Aware Scaling (The Hardest Part)
+
+Each minute, per workload:
+
+1) **Forecast near-future demand.** Use a cheap seasonal baseline (time-of-week buckets) plus short-term residual smoothing to produce a demand quantile for the next 15 minutes.
+
+2) **Map demand to replicas from healthy periods.** Maintain a “safe throughput per replica” estimate computed only from windows where saturation is low (latency under SLO, low 5xx) and the workload is stable. Convert forecast demand to replicas via `ceil(demand / safe_throughput_per_replica)`.
+
+3) **Add margin to hit target coverage.** Track recent forecast errors by time-of-week. Inflate the forecast by the error quantile needed for target coverage (e.g., 99%). Coverage is measured online; if it collapses, predictive writes stop.
+
+Guardrails applied before writing a floor:
+- **Hysteresis:** floors only drop after sustained overprovisioning.
+- **Max step:** caps per-minute floor changes up and down.
+- **Freeze reasons:** stale metrics, missing series, coverage collapse, actuation throttling, or policy violations.
+- **Staleness cutoff:** never apply a decision older than the current loop.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Simple, safe operation for a small team | Maximum forecast accuracy |
+| Predictive pre-scaling without fighting HPA | Direct control of nodes/ASGs |
+| Measurable risk via coverage | Some steady-state efficiency |
+| Dependency outages don’t page immediately | Less complete audit during outages |
+
+## Failure Modes
+
+- **Postgres is down**
+  - **What happens:** policy reads and audit writes can’t complete.
+  - **Detect:** DB health and write failures.
+  - **Recover:** controller runs on cached config (TTL) and continues computing decisions; audit writes are best-effort with a bounded in-memory buffer (drop-oldest). If config expires or safety constraints can’t be validated, freeze predictive writes and rely on HPA.
+
+- **Prometheus gaps / query lag**
+  - **What happens:** forecasts are wrong or impossible.
+  - **Detect:** freshness signal, missing-series rate, sudden drops to zero.
+  - **Recover:** for short gaps, reuse last-known-good forecast and widen margin; for sustained gaps, freeze predictive writes and rely on HPA.
+
+- **Kubernetes API throttling / controller restarts**
+  - **What happens:** decisions aren’t applied promptly; floors lag.
+  - **Detect:** reconcile error rate, rate-limit signals, desired-vs-applied drift.
+  - **Recover:** idempotent patches with exponential backoff, per-cluster write rate limits, skip stale decisions, and freeze predictive writes on repeated actuation failure (HPA continues).
+
+- **Bad config / wrong demand proxy**
+  - **What happens:** floors push the wrong direction.
+  - **Detect:** coverage collapse and saturation rising after floor changes.
+  - **Recover:** per-workload safe template (tight max step + high margin) and a global kill switch that stops predictive writes; rollback is simply “stop writing floors” (HPA remains).
+
+- **Change points (new version, requests/limits, perf regression)**
+  - **What happens:** “safe throughput per replica” becomes invalid.
+  - **Detect:** abrupt shift in achieved demand-per-replica during healthy windows, correlated with rollout.
+  - **Recover:** reset mapping on rollout and run shadow-only for a short warmup window before writing floors again.
+
+## What I'd Do Differently At...
+
+- **10x scale:** use Prometheus recording rules to emit curated per-workload signals (demand, saturation, freshness) so the controller does cheap reads; shard controllers by cluster with leader election.
+- **100x scale:** keep the same controller shape, but move most computation into recording rules and reduce audit volume (store full payload only on change; keep aggregates for coverage/cost).
+
+## Operational Notes
+
+- Start in **shadow mode**: compute floors and coverage, don’t write.
+- Coverage is the primary KPI; cost is tuned only after coverage is stable.
+- Maintain a **blocklist** for workloads without a stable demand proxy.
+- Every applied change writes one decision row with a stable decision ID, inputs, constraints, and the exact floor written (or a freeze reason when it refuses to write).
+```
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+codex
+```markdown
+---
+title: "Capacity Planning & Autoscaling"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["autoscaling", "forecasting", "kubernetes", "sre", "capacity-planning"]
+---
+
+## Overview
+
+This is a predictive autoscaler that raises baseline capacity *before* demand hits, while Kubernetes HPA remains the safety net for surprises. Every decision is: forecast near-future demand, translate demand into replicas using a learned “safe throughput per replica,” then add a safety margin with an explicit coverage target. When inputs degrade, it stops writing and HPA runs alone.
+
+The system is intentionally small: one controller process, existing metrics, and one database table for policy + audit.
+
+## What Makes This Hard
+
+Forecasting isn’t the hard part; safe actuation is. Forecast error becomes an outage unless it’s translated into a measurable safety policy with guardrails and reliable fallbacks.
+
+The other failure mode is feedback: scaling changes utilization and can corrupt learning. This design learns only from “healthy” windows and uses demand-per-replica (not CPU%) as the primary mapping, so incidents don’t rewrite capacity assumptions.
+
+## Requirements
+
+### Functional Requirements
+
+- Produce per-workload capacity floors for a fixed horizon (e.g., 5–30 minutes ahead) and apply them continuously.
+- Encode safety explicitly: “scale to P95 demand with 99% coverage over the last 14 days” (or equivalent).
+- Support per-workload overrides and guardrails (max step, max spend, minimum headroom, freeze conditions).
+- Provide explainability: every applied change is attributable to inputs, forecast, margin, and constraints.
+- Fail safe: on bad data, degraded coverage, or dependency outages, stop predictive writes and rely on HPA.
+
+### Scale Targets
+
+- **Workloads:** 500 deployments across 10 clusters.
+- **Decision cadence:** every 60s; **horizon:** 15 minutes.
+- **Signals:** 1-minute aggregates of demand proxy (RPS/queue depth) + saturation (latency, 5xx) + current replicas + data freshness.
+- **Action volume:** up to 30k decisions/hour; only a small fraction should change floors due to hysteresis.
+
+## Key Design Decisions
+
+- **Decision 1: Predict demand, not utilization**
+  - Forecast a demand proxy and keep saturation as a veto signal.
+  - Capacity mapping is “demand per replica in healthy windows,” not “CPU% predicts replicas.”
+
+- **Decision 2: Safety margin via coverage**
+  - Maintain a rolling forecast error history per workload and set margin from the error quantile needed to hit target coverage.
+  - Coverage is measured online and is the primary health signal for the predictive path.
+
+- **Decision 3: One control authority**
+  - The predictive controller only writes `HPA.spec.minReplicas` (the floor).
+  - HPA remains the only writer of `replicas` and handles residual variance.
+  - Floors decrease slowly (hysteresis + max-down-step) to avoid “floor drops” creating sudden downscales.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  M["Metrics (Prometheus)"] --> S["Predictive Autoscaler Controller"]
+  D["Postgres (policy + audit table)"] --> S
+  S --> K["Kubernetes API (patch HPA minReplicas)"]
+  K --> M
+```
+
+**What We Removed:** separate Feature Builder service, separate Forecaster service, separate Policy Engine service, separate Audit Log component, direct ASG/node actuation path, heavyweight model/retraining per decision.
+
+### Components
+
+- **Metrics (Prometheus):** provides 1-minute demand + saturation + freshness signals.
+  - Justification: it’s the system’s source of operational truth; the autoscaler only reads what already exists.
+
+- **Postgres (policy + audit table):** stores per-workload constraints, rollout state, and an immutable decision record.
+  - Justification: one transactional store for “what is allowed” and “what happened,” without introducing another logging system.
+
+- **Predictive Autoscaler Controller:** one process that does feature extraction, forecasting, margining, mapping demand→replicas, and K8s actuation.
+  - Justification: the only custom component; it concentrates safety logic, fallbacks, rate limits, and idempotent writes.
+
+- **Kubernetes HPA:** reactive autoscaling based on existing signals.
+  - Justification: proven incident tooling and the default fallback when prediction is unsafe.
+
+## Deep Dive: Uncertainty-Aware Scaling (The Hardest Part)
+
+Each minute, per workload:
+
+1) **Forecast near-future demand.** Use a cheap seasonal baseline (time-of-week buckets) plus short-term residual smoothing to produce a demand quantile for the next 15 minutes.
+
+2) **Map demand to replicas from healthy periods.** Maintain a “safe throughput per replica” estimate computed only from windows where saturation is low (latency under SLO, low 5xx) and the workload is stable. Convert forecast demand to replicas via `ceil(demand / safe_throughput_per_replica)`.
+
+3) **Add margin to hit target coverage.** Track recent forecast errors by time-of-week. Inflate the forecast by the error quantile needed for target coverage (e.g., 99%). Coverage is measured online; if it collapses, predictive writes stop.
+
+Guardrails applied before writing a floor:
+- **Hysteresis:** floors only drop after sustained overprovisioning.
+- **Max step:** caps per-minute floor changes up and down.
+- **Freeze reasons:** stale metrics, missing series, coverage collapse, actuation throttling, or policy violations.
+- **Staleness cutoff:** never apply a decision older than the current loop.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Simple, safe operation for a small team | Maximum forecast accuracy |
+| Predictive pre-scaling without fighting HPA | Direct control of nodes/ASGs |
+| Measurable risk via coverage | Some steady-state efficiency |
+| Dependency outages don’t page immediately | Less complete audit during outages |
+
+## Failure Modes
+
+- **Postgres is down**
+  - **What happens:** policy reads and audit writes can’t complete.
+  - **Detect:** DB health and write failures.
+  - **Recover:** controller runs on cached config (TTL) and continues computing decisions; audit writes are best-effort with a bounded in-memory buffer (drop-oldest). If config expires or safety constraints can’t be validated, freeze predictive writes and rely on HPA.
+
+- **Prometheus gaps / query lag**
+  - **What happens:** forecasts are wrong or impossible.
+  - **Detect:** freshness signal, missing-series rate, sudden drops to zero.
+  - **Recover:** for short gaps, reuse last-known-good forecast and widen margin; for sustained gaps, freeze predictive writes and rely on HPA.
+
+- **Kubernetes API throttling / controller restarts**
+  - **What happens:** decisions aren’t applied promptly; floors lag.
+  - **Detect:** reconcile error rate, rate-limit signals, desired-vs-applied drift.
+  - **Recover:** idempotent patches with exponential backoff, per-cluster write rate limits, skip stale decisions, and freeze predictive writes on repeated actuation failure (HPA continues).
+
+- **Bad config / wrong demand proxy**
+  - **What happens:** floors push the wrong direction.
+  - **Detect:** coverage collapse and saturation rising after floor changes.
+  - **Recover:** per-workload safe template (tight max step + high margin) and a global kill switch that stops predictive writes; rollback is simply “stop writing floors” (HPA remains).
+
+- **Change points (new version, requests/limits, perf regression)**
+  - **What happens:** “safe throughput per replica” becomes invalid.
+  - **Detect:** abrupt shift in achieved demand-per-replica during healthy windows, correlated with rollout.
+  - **Recover:** reset mapping on rollout and run shadow-only for a short warmup window before writing floors again.
+
+## What I'd Do Differently At...
+
+- **10x scale:** use Prometheus recording rules to emit curated per-workload signals (demand, saturation, freshness) so the controller does cheap reads; shard controllers by cluster with leader election.
+- **100x scale:** keep the same controller shape, but move most computation into recording rules and reduce audit volume (store full payload only on change; keep aggregates for coverage/cost).
+
+## Operational Notes
+
+- Start in **shadow mode**: compute floors and coverage, don’t write.
+- Coverage is the primary KPI; cost is tuned only after coverage is stable.
+- Maintain a **blocklist** for workloads without a stable demand proxy.
+- Every applied change writes one decision row with a stable decision ID, inputs, constraints, and the exact floor written (or a freeze reason when it refuses to write).
+```
+tokens used
+4,168
+```markdown
+---
+title: "Capacity Planning & Autoscaling"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["autoscaling", "forecasting", "kubernetes", "sre", "capacity-planning"]
+---
+
+## Overview
+
+This is a predictive autoscaler that raises baseline capacity *before* demand hits, while Kubernetes HPA remains the safety net for surprises. Every decision is: forecast near-future demand, translate demand into replicas using a learned “safe throughput per replica,” then add a safety margin with an explicit coverage target. When inputs degrade, it stops writing and HPA runs alone.
+
+The system is intentionally small: one controller process, existing metrics, and one database table for policy + audit.
+
+## What Makes This Hard
+
+Forecasting isn’t the hard part; safe actuation is. Forecast error becomes an outage unless it’s translated into a measurable safety policy with guardrails and reliable fallbacks.
+
+The other failure mode is feedback: scaling changes utilization and can corrupt learning. This design learns only from “healthy” windows and uses demand-per-replica (not CPU%) as the primary mapping, so incidents don’t rewrite capacity assumptions.
+
+## Requirements
+
+### Functional Requirements
+
+- Produce per-workload capacity floors for a fixed horizon (e.g., 5–30 minutes ahead) and apply them continuously.
+- Encode safety explicitly: “scale to P95 demand with 99% coverage over the last 14 days” (or equivalent).
+- Support per-workload overrides and guardrails (max step, max spend, minimum headroom, freeze conditions).
+- Provide explainability: every applied change is attributable to inputs, forecast, margin, and constraints.
+- Fail safe: on bad data, degraded coverage, or dependency outages, stop predictive writes and rely on HPA.
+
+### Scale Targets
+
+- **Workloads:** 500 deployments across 10 clusters.
+- **Decision cadence:** every 60s; **horizon:** 15 minutes.
+- **Signals:** 1-minute aggregates of demand proxy (RPS/queue depth) + saturation (latency, 5xx) + current replicas + data freshness.
+- **Action volume:** up to 30k decisions/hour; only a small fraction should change floors due to hysteresis.
+
+## Key Design Decisions
+
+- **Decision 1: Predict demand, not utilization**
+  - Forecast a demand proxy and keep saturation as a veto signal.
+  - Capacity mapping is “demand per replica in healthy windows,” not “CPU% predicts replicas.”
+
+- **Decision 2: Safety margin via coverage**
+  - Maintain a rolling forecast error history per workload and set margin from the error quantile needed to hit target coverage.
+  - Coverage is measured online and is the primary health signal for the predictive path.
+
+- **Decision 3: One control authority**
+  - The predictive controller only writes `HPA.spec.minReplicas` (the floor).
+  - HPA remains the only writer of `replicas` and handles residual variance.
+  - Floors decrease slowly (hysteresis + max-down-step) to avoid “floor drops” creating sudden downscales.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  M["Metrics (Prometheus)"] --> S["Predictive Autoscaler Controller"]
+  D["Postgres (policy + audit table)"] --> S
+  S --> K["Kubernetes API (patch HPA minReplicas)"]
+  K --> M
+```
+
+**What We Removed:** separate Feature Builder service, separate Forecaster service, separate Policy Engine service, separate Audit Log component, direct ASG/node actuation path, heavyweight model/retraining per decision.
+
+### Components
+
+- **Metrics (Prometheus):** provides 1-minute demand + saturation + freshness signals.
+  - Justification: it’s the system’s source of operational truth; the autoscaler only reads what already exists.
+
+- **Postgres (policy + audit table):** stores per-workload constraints, rollout state, and an immutable decision record.
+  - Justification: one transactional store for “what is allowed” and “what happened,” without introducing another logging system.
+
+- **Predictive Autoscaler Controller:** one process that does feature extraction, forecasting, margining, mapping demand→replicas, and K8s actuation.
+  - Justification: the only custom component; it concentrates safety logic, fallbacks, rate limits, and idempotent writes.
+
+- **Kubernetes HPA:** reactive autoscaling based on existing signals.
+  - Justification: proven incident tooling and the default fallback when prediction is unsafe.
+
+## Deep Dive: Uncertainty-Aware Scaling (The Hardest Part)
+
+Each minute, per workload:
+
+1) **Forecast near-future demand.** Use a cheap seasonal baseline (time-of-week buckets) plus short-term residual smoothing to produce a demand quantile for the next 15 minutes.
+
+2) **Map demand to replicas from healthy periods.** Maintain a “safe throughput per replica” estimate computed only from windows where saturation is low (latency under SLO, low 5xx) and the workload is stable. Convert forecast demand to replicas via `ceil(demand / safe_throughput_per_replica)`.
+
+3) **Add margin to hit target coverage.** Track recent forecast errors by time-of-week. Inflate the forecast by the error quantile needed for target coverage (e.g., 99%). Coverage is measured online; if it collapses, predictive writes stop.
+
+Guardrails applied before writing a floor:
+- **Hysteresis:** floors only drop after sustained overprovisioning.
+- **Max step:** caps per-minute floor changes up and down.
+- **Freeze reasons:** stale metrics, missing series, coverage collapse, actuation throttling, or policy violations.
+- **Staleness cutoff:** never apply a decision older than the current loop.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Simple, safe operation for a small team | Maximum forecast accuracy |
+| Predictive pre-scaling without fighting HPA | Direct control of nodes/ASGs |
+| Measurable risk via coverage | Some steady-state efficiency |
+| Dependency outages don’t page immediately | Less complete audit during outages |
+
+## Failure Modes
+
+- **Postgres is down**
+  - **What happens:** policy reads and audit writes can’t complete.
+  - **Detect:** DB health and write failures.
+  - **Recover:** controller runs on cached config (TTL) and continues computing decisions; audit writes are best-effort with a bounded in-memory buffer (drop-oldest). If config expires or safety constraints can’t be validated, freeze predictive writes and rely on HPA.
+
+- **Prometheus gaps / query lag**
+  - **What happens:** forecasts are wrong or impossible.
+  - **Detect:** freshness signal, missing-series rate, sudden drops to zero.
+  - **Recover:** for short gaps, reuse last-known-good forecast and widen margin; for sustained gaps, freeze predictive writes and rely on HPA.
+
+- **Kubernetes API throttling / controller restarts**
+  - **What happens:** decisions aren’t applied promptly; floors lag.
+  - **Detect:** reconcile error rate, rate-limit signals, desired-vs-applied drift.
+  - **Recover:** idempotent patches with exponential backoff, per-cluster write rate limits, skip stale decisions, and freeze predictive writes on repeated actuation failure (HPA continues).
+
+- **Bad config / wrong demand proxy**
+  - **What happens:** floors push the wrong direction.
+  - **Detect:** coverage collapse and saturation rising after floor changes.
+  - **Recover:** per-workload safe template (tight max step + high margin) and a global kill switch that stops predictive writes; rollback is simply “stop writing floors” (HPA remains).
+
+- **Change points (new version, requests/limits, perf regression)**
+  - **What happens:** “safe throughput per replica” becomes invalid.
+  - **Detect:** abrupt shift in achieved demand-per-replica during healthy windows, correlated with rollout.
+  - **Recover:** reset mapping on rollout and run shadow-only for a short warmup window before writing floors again.
+
+## What I'd Do Differently At...
+
+- **10x scale:** use Prometheus recording rules to emit curated per-workload signals (demand, saturation, freshness) so the controller does cheap reads; shard controllers by cluster with leader election.
+- **100x scale:** keep the same controller shape, but move most computation into recording rules and reduce audit volume (store full payload only on change; keep aggregates for coverage/cost).
+
+## Operational Notes
+
+- Start in **shadow mode**: compute floors and coverage, don’t write.
+- Coverage is the primary KPI; cost is tuned only after coverage is stable.
+- Maintain a **blocklist** for workloads without a stable demand proxy.
+- Every applied change writes one decision row with a stable decision ID, inputs, constraints, and the exact floor written (or a freeze reason when it refuses to write).
+```
+[Pass 4/4] Mermaid diagrams fixed
+
+==========================================
+Completed (v2): Capacity Planning & Autoscaling
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/capacity-planning-autoscaling.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/capacity-planning-autoscaling.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/03-observability-reliability/capacity-planning-autoscaling.md

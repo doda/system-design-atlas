@@ -1,0 +1,1766 @@
+==========================================
+Generating (v2): Workflow Orchestration Engine
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-19f8-7dc2-a114-9ac0fefb2749
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Workflow Orchestration Engine
+**Category**: Foundational Infrastructure
+
+**Problem Statement**:
+Design a system (like Airflow/Temporal) capable of managing long-running processes with durable state and exactly-once step execution.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+Reconnecting... 1/5
+Reconnecting... 2/5
+
+
+thinking
+**Planning architectural changes**
+
+I need to consider significant changes: moving from Postgres to Cassandra, creating a separate history store, implementing partitioning, having a stronger queue, and ensuring a multi-region setup. The YAML front matter is necessary, and I want to avoid hedge words while being thorough. Strong opinions form here, like using Postgres with partitioning and possibly Kafka or NATS JetStream for queuing. I'll also detail a design for components like the frontend API and task queue to ensure everything connects well.
+thinking
+**Simplifying architecture design**
+
+I'm thinking of keeping the architecture straightforward with components like an API, orchestrator, history database, task queue, workers, visibility database, and admin/metrics—seven in total. I need to clearly explain each part and key decisions like using event-sourced history and sharding for single-threaded workflows with optimistic concurrency. I'll ensure exactly-once delivery with activity IDs and idempotency keys. Additionally, I'll address long-running tasks, durability across restarts, scalability targets, and operational considerations such as versioning and dead letter queues. Markdown formatting will be used for clarity.
+codex
+```markdown
+---
+title: "Workflow Orchestration Engine"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: [workflow, orchestration, temporal, durable-state, event-sourcing, exactly-once, distributed-systems]
+---
+
+## Overview
+
+This system is a Temporal-like workflow engine for coordinating long-running business processes (minutes to months) with durable state, retries, timers, and *exactly-once* step effects. The core idea is to treat each workflow as a tiny, single-threaded state machine whose state is derived from an append-only history log. That makes crash recovery trivial: replay the history to reconstruct state, then continue.
+
+The “elegance” comes from separating *orchestration* from *execution*. The engine never performs business side effects; it only records decisions (schedule activity X, start timer Y). Side effects happen in external workers, and the engine uses durable deduplication + fencing tokens to make step effects occur exactly once even though messages and workers are only at-least-once.
+
+## What Makes This Hard
+
+Naive implementations conflate orchestration with execution and store “current state” as mutable rows. That fails under retries, crashes, and partitions: you get double execution, lost progress, and impossible debugging (“why is this stuck?”).
+
+The trap: “exactly-once” is not a queue setting—it’s an end-to-end property. You must assume duplicate delivery, duplicate worker attempts, and coordinator failover mid-decision, then still guarantee that *each step’s externally visible effect* happens once (or is provably equivalent to once).
+
+## Requirements
+
+### Functional Requirements
+- Durable workflows: progress survives process crashes and restarts without manual recovery.
+- Exactly-once step effects: each step’s side effect is applied once even with retries/duplicates.
+- Timers and delays: schedule future steps reliably across outages.
+- Retries with backoff, timeouts, heartbeats, and cancellation.
+- Deterministic workflow logic: replay produces identical decisions (or fails loudly).
+- Observability: inspect workflow history, current state, and “why it’s stuck”.
+
+### Scale Targets
+- 10M total workflows/day, 1M concurrently open (long-running).
+- 50k workflow task decisions/sec peak (orchestrator evaluations).
+- 200k activity dispatches/sec peak to workers.
+- P95 decision latency < 200ms under normal load (excluding activity runtime).
+- History retention 30 days; average history 200 events, p99 10k events.
+Why these matter: they force sharding, bounded per-workflow contention, and history storage that stays append-only and cheap.
+
+## Key Design Decisions
+
+- **Event-sourced workflow history as the source of truth**
+  - Chose: append-only history + replay-derived state.
+  - Rejected: mutable “current state” rows with ad-hoc transitions.
+  - Why: append-only enables deterministic recovery, auditability, and safe retries.
+
+- **Single-writer per workflow via optimistic concurrency (no distributed locks)**
+  - Chose: one “workflow task” at a time; commit decisions with a version check.
+  - Rejected: global locks/leases, multi-writer merges.
+  - Why: removes an entire class of races; contention is localized to a workflow ID.
+
+- **Exactly-once step effects via durable dedupe + fencing tokens**
+  - Chose: activity attempts are at-least-once delivered, but completions are fenced and deduped by `(workflow_id, activity_id)`.
+  - Rejected: “exactly-once messaging” promises from brokers.
+  - Why: the only reliable place to enforce exactly-once is the durable state machine that owns the step.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C["Client SDK"] --> A["API Frontend"]
+  A --> O["Orchestrator"]
+  O <--> H["History Store (Postgres)"]
+  O --> Q["Task Queue (Kafka)"]
+  Q --> W["Workers"]
+  W --> A
+  O --> V["Visibility Index"]
+```
+
+### Components
+
+- **Client SDK**
+  - Ensures deterministic workflow code (no wall-clock, random, IO during replay) by routing nondeterminism through engine APIs (timers, activities, signals).
+
+- **API Frontend**
+  - Auth, rate limits, idempotent request handling (e.g., `StartWorkflow(workflow_id)` is naturally idempotent).
+  - Serves worker polling and completion APIs to keep the worker surface area small and stable.
+
+- **Orchestrator**
+  - The “workflow CPU”: takes one workflow at a time, replays history, produces the next set of decisions, and commits them atomically.
+  - Sharded by `workflow_id` to scale horizontally; each shard is stateless beyond in-flight caches.
+
+- **History Store (Postgres)**
+  - Append-only `history_events` + compact `workflow_execution` row with `next_event_id`, status, and a version for optimistic concurrency.
+  - Partition tables by shard (or by time + shard) to keep indexes small and vacuum predictable.
+
+- **Task Queue (Kafka)**
+  - Delivers workflow tasks (to orchestrators) and activity tasks (to workers) with at-least-once semantics.
+  - Keyed by `workflow_id` (workflow tasks) and `task_queue` (activity routing) to preserve order where it matters.
+
+- **Workers**
+  - Execute activities (side effects) and report completion/heartbeat.
+  - Must treat `activity_id` as an idempotency key for downstream effects (the engine enforces fencing; downstream idempotency makes failures non-catastrophic).
+
+- **Visibility Index**
+  - Read-optimized view for “list workflows”, search by attributes, and operational dashboards.
+  - Built asynchronously from history/outbox so it never blocks correctness.
+
+## Deep Dive: Exactly-Once Step Execution
+
+The engine guarantees exactly-once *effects* by making “a step happened” a durable fact that can be checked and fenced—*before* accepting or applying a completion.
+
+### 1) Model every step as a named, immutable decision
+When workflow code says “do step S”, the orchestrator emits a decision:
+- `ScheduleActivity(activity_id=S, input=..., retry_policy=...)`
+
+That decision is appended to history. Importantly, “scheduled” is not “started” and not “completed”; it is the single durable intent.
+
+### 2) Dispatch is derived, not authoritative (transactional outbox)
+After committing history, the orchestrator writes an outbox record in the same database transaction:
+- `outbox(activity_task, workflow_id, activity_id, attempt, task_queue, payload, fence_token)`
+
+A separate dispatcher publishes outbox rows to Kafka and marks them sent. If the orchestrator crashes after committing history but before enqueueing, the outbox row still exists; if it crashes after enqueueing, re-sending creates duplicates that are safe.
+
+### 3) Fencing tokens prevent “late completions” from winning
+Each scheduled attempt has a monotonically increasing `fence_token` (e.g., the history event id or an explicit attempt token). The worker receives that token with the task.
+
+On completion, the worker calls:
+- `CompleteActivity(workflow_id, activity_id, fence_token, result)`
+
+The API Frontend performs a single, decisive check in the History Store transaction:
+- If `(workflow_id, activity_id)` is already completed → return the recorded result (idempotent completion).
+- Else if `fence_token` != `current_expected_token` → reject as stale (a retry already superseded it).
+- Else → append `ActivityCompleted` to history and mark the activity completed.
+
+This is the key: duplicates are common; *accepting* a completion is rare and strictly fenced by durable state.
+
+### 4) Workflow progress is exactly-once because decisions are versioned
+The orchestrator runs with optimistic concurrency:
+- Reads `workflow_execution.version = v`
+- Replays history, produces decisions
+- Writes new events and updates `version = v+1` with `WHERE version = v`
+
+If two orchestrators race, one wins; the loser retries by replaying the now-longer history. This turns “split brain” into “extra work” without incorrectness.
+
+### 5) The real-world side effect is exactly-once via idempotency keys
+Even with engine-level fencing, a worker can crash after applying a side effect but before reporting completion. The retry will re-run the activity. The practical solution is explicit:
+- Every activity integrates with downstream systems using an idempotency key = `activity_id` (or `workflow_id:activity_id`).
+- Downstream systems store that key and return the original result on duplicates.
+
+The engine provides the fencing boundary; idempotency keys make the boundary meaningful in the real world.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness under retries/partitions | Some extra compute from replay |
+| Simple concurrency model (per-workflow single writer) | Hot workflow IDs can bottleneck |
+| Operational debuggability (history is truth) | Storage growth without retention/compaction |
+| Small-team operability (Postgres + Kafka) | Ultimate scale vs purpose-built storage |
+
+## Failure Modes
+
+- **Kafka outage / queue delay**
+  - What happens: activity dispatch and workflow tasks stall; no state is lost.
+  - Detect: queue consumer lag, outbox backlog growth.
+  - Recover: dispatcher resumes; backlog drains; workflows continue from durable history.
+
+- **Orchestrator crash mid-decision**
+  - What happens: at worst, duplicate tasks are emitted; no double effects due to fencing.
+  - Detect: spike in workflow-task retries, shard health alerts.
+  - Recover: another orchestrator replays history and commits with version checks.
+
+- **Worker applies side effect then crashes before completion**
+  - What happens: activity retries; without downstream idempotency you risk double effects.
+  - Detect: repeated attempts for same `(workflow_id, activity_id)`, long-running “in-progress” heartbeats missing.
+  - Recover: rely on downstream idempotency; if absent, quarantine that activity type and require manual reconciliation.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Move Postgres to sharded Postgres (Citus-style) or split history by shard into multiple Postgres clusters.
+  - Add history compaction/snapshots to reduce replay cost for very long histories.
+
+- **100x scale:**
+  - Replace Postgres history with a log-structured, horizontally scalable store (Cassandra/Scylla) and store large payloads in object storage.
+  - Introduce multi-region active/active only for read/visibility; keep workflow state single-region per shard unless you accept complex consensus costs.
+
+## Operational Notes
+
+- Determinism is a product feature: non-deterministic workflow code must fail fast with a clear “non-determinism detected” error and history pointer.
+- “Stuck” workflows are usually one of three things: missing worker pollers for a task queue, poisoned activity retries, or runaway history size causing replay latency—instrument each explicitly.
+- Keep payloads out of history: store large inputs/outputs in object storage and reference them; history is for decisions and pointers.
+- Make retention enforceable: TTL/archival is not cleanup—without it, your history store becomes your outage.
+```
+tokens used
+3,121
+```markdown
+---
+title: "Workflow Orchestration Engine"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: [workflow, orchestration, temporal, durable-state, event-sourcing, exactly-once, distributed-systems]
+---
+
+## Overview
+
+This system is a Temporal-like workflow engine for coordinating long-running business processes (minutes to months) with durable state, retries, timers, and *exactly-once* step effects. The core idea is to treat each workflow as a tiny, single-threaded state machine whose state is derived from an append-only history log. That makes crash recovery trivial: replay the history to reconstruct state, then continue.
+
+The “elegance” comes from separating *orchestration* from *execution*. The engine never performs business side effects; it only records decisions (schedule activity X, start timer Y). Side effects happen in external workers, and the engine uses durable deduplication + fencing tokens to make step effects occur exactly once even though messages and workers are only at-least-once.
+
+## What Makes This Hard
+
+Naive implementations conflate orchestration with execution and store “current state” as mutable rows. That fails under retries, crashes, and partitions: you get double execution, lost progress, and impossible debugging (“why is this stuck?”).
+
+The trap: “exactly-once” is not a queue setting—it’s an end-to-end property. You must assume duplicate delivery, duplicate worker attempts, and coordinator failover mid-decision, then still guarantee that *each step’s externally visible effect* happens once (or is provably equivalent to once).
+
+## Requirements
+
+### Functional Requirements
+- Durable workflows: progress survives process crashes and restarts without manual recovery.
+- Exactly-once step effects: each step’s side effect is applied once even with retries/duplicates.
+- Timers and delays: schedule future steps reliably across outages.
+- Retries with backoff, timeouts, heartbeats, and cancellation.
+- Deterministic workflow logic: replay produces identical decisions (or fails loudly).
+- Observability: inspect workflow history, current state, and “why it’s stuck”.
+
+### Scale Targets
+- 10M total workflows/day, 1M concurrently open (long-running).
+- 50k workflow task decisions/sec peak (orchestrator evaluations).
+- 200k activity dispatches/sec peak to workers.
+- P95 decision latency < 200ms under normal load (excluding activity runtime).
+- History retention 30 days; average history 200 events, p99 10k events.
+Why these matter: they force sharding, bounded per-workflow contention, and history storage that stays append-only and cheap.
+
+## Key Design Decisions
+
+- **Event-sourced workflow history as the source of truth**
+  - Chose: append-only history + replay-derived state.
+  - Rejected: mutable “current state” rows with ad-hoc transitions.
+  - Why: append-only enables deterministic recovery, auditability, and safe retries.
+
+- **Single-writer per workflow via optimistic concurrency (no distributed locks)**
+  - Chose: one “workflow task” at a time; commit decisions with a version check.
+  - Rejected: global locks/leases, multi-writer merges.
+  - Why: removes an entire class of races; contention is localized to a workflow ID.
+
+- **Exactly-once step effects via durable dedupe + fencing tokens**
+  - Chose: activity attempts are at-least-once delivered, but completions are fenced and deduped by `(workflow_id, activity_id)`.
+  - Rejected: “exactly-once messaging” promises from brokers.
+  - Why: the only reliable place to enforce exactly-once is the durable state machine that owns the step.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C["Client SDK"] --> A["API Frontend"]
+  A --> O["Orchestrator"]
+  O <--> H["History Store (Postgres)"]
+  O --> Q["Task Queue (Kafka)"]
+  Q --> W["Workers"]
+  W --> A
+  O --> V["Visibility Index"]
+```
+
+### Components
+
+- **Client SDK**
+  - Ensures deterministic workflow code (no wall-clock, random, IO during replay) by routing nondeterminism through engine APIs (timers, activities, signals).
+
+- **API Frontend**
+  - Auth, rate limits, idempotent request handling (e.g., `StartWorkflow(workflow_id)` is naturally idempotent).
+  - Serves worker polling and completion APIs to keep the worker surface area small and stable.
+
+- **Orchestrator**
+  - The “workflow CPU”: takes one workflow at a time, replays history, produces the next set of decisions, and commits them atomically.
+  - Sharded by `workflow_id` to scale horizontally; each shard is stateless beyond in-flight caches.
+
+- **History Store (Postgres)**
+  - Append-only `history_events` + compact `workflow_execution` row with `next_event_id`, status, and a version for optimistic concurrency.
+  - Partition tables by shard (or by time + shard) to keep indexes small and vacuum predictable.
+
+- **Task Queue (Kafka)**
+  - Delivers workflow tasks (to orchestrators) and activity tasks (to workers) with at-least-once semantics.
+  - Keyed by `workflow_id` (workflow tasks) and `task_queue` (activity routing) to preserve order where it matters.
+
+- **Workers**
+  - Execute activities (side effects) and report completion/heartbeat.
+  - Must treat `activity_id` as an idempotency key for downstream effects (the engine enforces fencing; downstream idempotency makes failures non-catastrophic).
+
+- **Visibility Index**
+  - Read-optimized view for “list workflows”, search by attributes, and operational dashboards.
+  - Built asynchronously from history/outbox so it never blocks correctness.
+
+## Deep Dive: Exactly-Once Step Execution
+
+The engine guarantees exactly-once *effects* by making “a step happened” a durable fact that can be checked and fenced—*before* accepting or applying a completion.
+
+### 1) Model every step as a named, immutable decision
+When workflow code says “do step S”, the orchestrator emits a decision:
+- `ScheduleActivity(activity_id=S, input=..., retry_policy=...)`
+
+That decision is appended to history. Importantly, “scheduled” is not “started” and not “completed”; it is the single durable intent.
+
+### 2) Dispatch is derived, not authoritative (transactional outbox)
+After committing history, the orchestrator writes an outbox record in the same database transaction:
+- `outbox(activity_task, workflow_id, activity_id, attempt, task_queue, payload, fence_token)`
+
+A separate dispatcher publishes outbox rows to Kafka and marks them sent. If the orchestrator crashes after committing history but before enqueueing, the outbox row still exists; if it crashes after enqueueing, re-sending creates duplicates that are safe.
+
+### 3) Fencing tokens prevent “late completions” from winning
+Each scheduled attempt has a monotonically increasing `fence_token` (e.g., the history event id or an explicit attempt token). The worker receives that token with the task.
+
+On completion, the worker calls:
+- `CompleteActivity(workflow_id, activity_id, fence_token, result)`
+
+The API Frontend performs a single, decisive check in the History Store transaction:
+- If `(workflow_id, activity_id)` is already completed → return the recorded result (idempotent completion).
+- Else if `fence_token` != `current_expected_token` → reject as stale (a retry already superseded it).
+- Else → append `ActivityCompleted` to history and mark the activity completed.
+
+This is the key: duplicates are common; *accepting* a completion is rare and strictly fenced by durable state.
+
+### 4) Workflow progress is exactly-once because decisions are versioned
+The orchestrator runs with optimistic concurrency:
+- Reads `workflow_execution.version = v`
+- Replays history, produces decisions
+- Writes new events and updates `version = v+1` with `WHERE version = v`
+
+If two orchestrators race, one wins; the loser retries by replaying the now-longer history. This turns “split brain” into “extra work” without incorrectness.
+
+### 5) The real-world side effect is exactly-once via idempotency keys
+Even with engine-level fencing, a worker can crash after applying a side effect but before reporting completion. The retry will re-run the activity. The practical solution is explicit:
+- Every activity integrates with downstream systems using an idempotency key = `activity_id` (or `workflow_id:activity_id`).
+- Downstream systems store that key and return the original result on duplicates.
+
+The engine provides the fencing boundary; idempotency keys make the boundary meaningful in the real world.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness under retries/partitions | Some extra compute from replay |
+| Simple concurrency model (per-workflow single writer) | Hot workflow IDs can bottleneck |
+| Operational debuggability (history is truth) | Storage growth without retention/compaction |
+| Small-team operability (Postgres + Kafka) | Ultimate scale vs purpose-built storage |
+
+## Failure Modes
+
+- **Kafka outage / queue delay**
+  - What happens: activity dispatch and workflow tasks stall; no state is lost.
+  - Detect: queue consumer lag, outbox backlog growth.
+  - Recover: dispatcher resumes; backlog drains; workflows continue from durable history.
+
+- **Orchestrator crash mid-decision**
+  - What happens: at worst, duplicate tasks are emitted; no double effects due to fencing.
+  - Detect: spike in workflow-task retries, shard health alerts.
+  - Recover: another orchestrator replays history and commits with version checks.
+
+- **Worker applies side effect then crashes before completion**
+  - What happens: activity retries; without downstream idempotency you risk double effects.
+  - Detect: repeated attempts for same `(workflow_id, activity_id)`, long-running “in-progress” heartbeats missing.
+  - Recover: rely on downstream idempotency; if absent, quarantine that activity type and require manual reconciliation.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Move Postgres to sharded Postgres (Citus-style) or split history by shard into multiple Postgres clusters.
+  - Add history compaction/snapshots to reduce replay cost for very long histories.
+
+- **100x scale:**
+  - Replace Postgres history with a log-structured, horizontally scalable store (Cassandra/Scylla) and store large payloads in object storage.
+  - Introduce multi-region active/active only for read/visibility; keep workflow state single-region per shard unless you accept complex consensus costs.
+
+## Operational Notes
+
+- Determinism is a product feature: non-deterministic workflow code must fail fast with a clear “non-determinism detected” error and history pointer.
+- “Stuck” workflows are usually one of three things: missing worker pollers for a task queue, poisoned activity retries, or runaway history size causing replay latency—instrument each explicitly.
+- Keep payloads out of history: store large inputs/outputs in object storage and reference them; history is for decisions and pointers.
+- Make retention enforceable: TTL/archival is not cleanup—without it, your history store becomes your outage.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/workflow-orchestration-engine.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afd-6706-7431-978a-541025377599
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Workflow Orchestration Engine"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: [workflow, orchestration, temporal, durable-state, event-sourcing, exactly-once, distributed-systems]
+---
+
+## Overview
+
+This system is a Temporal-like workflow engine for coordinating long-running business processes (minutes to months) with durable state, retries, timers, and *exactly-once* step effects. The core idea is to treat each workflow as a tiny, single-threaded state machine whose state is derived from an append-only history log. That makes crash recovery trivial: replay the history to reconstruct state, then continue.
+
+The “elegance” comes from separating *orchestration* from *execution*. The engine never performs business side effects; it only records decisions (schedule activity X, start timer Y). Side effects happen in external workers, and the engine uses durable deduplication + fencing tokens to make step effects occur exactly once even though messages and workers are only at-least-once.
+
+## What Makes This Hard
+
+Naive implementations conflate orchestration with execution and store “current state” as mutable rows. That fails under retries, crashes, and partitions: you get double execution, lost progress, and impossible debugging (“why is this stuck?”).
+
+The trap: “exactly-once” is not a queue setting—it’s an end-to-end property. You must assume duplicate delivery, duplicate worker attempts, and coordinator failover mid-decision, then still guarantee that *each step’s externally visible effect* happens once (or is provably equivalent to once).
+
+## Requirements
+
+### Functional Requirements
+- Durable workflows: progress survives process crashes and restarts without manual recovery.
+- Exactly-once step effects: each step’s side effect is applied once even with retries/duplicates.
+- Timers and delays: schedule future steps reliably across outages.
+- Retries with backoff, timeouts, heartbeats, and cancellation.
+- Deterministic workflow logic: replay produces identical decisions (or fails loudly).
+- Observability: inspect workflow history, current state, and “why it’s stuck”.
+
+### Scale Targets
+- 10M total workflows/day, 1M concurrently open (long-running).
+- 50k workflow task decisions/sec peak (orchestrator evaluations).
+- 200k activity dispatches/sec peak to workers.
+- P95 decision latency < 200ms under normal load (excluding activity runtime).
+- History retention 30 days; average history 200 events, p99 10k events.
+Why these matter: they force sharding, bounded per-workflow contention, and history storage that stays append-only and cheap.
+
+## Key Design Decisions
+
+- **Event-sourced workflow history as the source of truth**
+  - Chose: append-only history + replay-derived state.
+  - Rejected: mutable “current state” rows with ad-hoc transitions.
+  - Why: append-only enables deterministic recovery, auditability, and safe retries.
+
+- **Single-writer per workflow via optimistic concurrency (no distributed locks)**
+  - Chose: one “workflow task” at a time; commit decisions with a version check.
+  - Rejected: global locks/leases, multi-writer merges.
+  - Why: removes an entire class of races; contention is localized to a workflow ID.
+
+- **Exactly-once step effects via durable dedupe + fencing tokens**
+  - Chose: activity attempts are at-least-once delivered, but completions are fenced and deduped by `(workflow_id, activity_id)`.
+  - Rejected: “exactly-once messaging” promises from brokers.
+  - Why: the only reliable place to enforce exactly-once is the durable state machine that owns the step.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C["Client SDK"] --> A["API Frontend"]
+  A --> O["Orchestrator"]
+  O <--> H["History Store (Postgres)"]
+  O --> Q["Task Queue (Kafka)"]
+  Q --> W["Workers"]
+  W --> A
+  O --> V["Visibility Index"]
+```
+
+### Components
+
+- **Client SDK**
+  - Ensures deterministic workflow code (no wall-clock, random, IO during replay) by routing nondeterminism through engine APIs (timers, activities, signals).
+
+- **API Frontend**
+  - Auth, rate limits, idempotent request handling (e.g., `StartWorkflow(workflow_id)` is naturally idempotent).
+  - Serves worker polling and completion APIs to keep the worker surface area small and stable.
+
+- **Orchestrator**
+  - The “workflow CPU”: takes one workflow at a time, replays history, produces the next set of decisions, and commits them atomically.
+  - Sharded by `workflow_id` to scale horizontally; each shard is stateless beyond in-flight caches.
+
+- **History Store (Postgres)**
+  - Append-only `history_events` + compact `workflow_execution` row with `next_event_id`, status, and a version for optimistic concurrency.
+  - Partition tables by shard (or by time + shard) to keep indexes small and vacuum predictable.
+
+- **Task Queue (Kafka)**
+  - Delivers workflow tasks (to orchestrators) and activity tasks (to workers) with at-least-once semantics.
+  - Keyed by `workflow_id` (workflow tasks) and `task_queue` (activity routing) to preserve order where it matters.
+
+- **Workers**
+  - Execute activities (side effects) and report completion/heartbeat.
+  - Must treat `activity_id` as an idempotency key for downstream effects (the engine enforces fencing; downstream idempotency makes failures non-catastrophic).
+
+- **Visibility Index**
+  - Read-optimized view for “list workflows”, search by attributes, and operational dashboards.
+  - Built asynchronously from history/outbox so it never blocks correctness.
+
+## Deep Dive: Exactly-Once Step Execution
+
+The engine guarantees exactly-once *effects* by making “a step happened” a durable fact that can be checked and fenced—*before* accepting or applying a completion.
+
+### 1) Model every step as a named, immutable decision
+When workflow code says “do step S”, the orchestrator emits a decision:
+- `ScheduleActivity(activity_id=S, input=..., retry_policy=...)`
+
+That decision is appended to history. Importantly, “scheduled” is not “started” and not “completed”; it is the single durable intent.
+
+### 2) Dispatch is derived, not authoritative (transactional outbox)
+After committing history, the orchestrator writes an outbox record in the same database transaction:
+- `outbox(activity_task, workflow_id, activity_id, attempt, task_queue, payload, fence_token)`
+
+A separate dispatcher publishes outbox rows to Kafka and marks them sent. If the orchestrator crashes after committing history but before enqueueing, the outbox row still exists; if it crashes after enqueueing, re-sending creates duplicates that are safe.
+
+### 3) Fencing tokens prevent “late completions” from winning
+Each scheduled attempt has a monotonically increasing `fence_token` (e.g., the history event id or an explicit attempt token). The worker receives that token with the task.
+
+On completion, the worker calls:
+- `CompleteActivity(workflow_id, activity_id, fence_token, result)`
+
+The API Frontend performs a single, decisive check in the History Store transaction:
+- If `(workflow_id, activity_id)` is already completed → return the recorded result (idempotent completion).
+- Else if `fence_token` != `current_expected_token` → reject as stale (a retry already superseded it).
+- Else → append `ActivityCompleted` to history and mark the activity completed.
+
+This is the key: duplicates are common; *accepting* a completion is rare and strictly fenced by durable state.
+
+### 4) Workflow progress is exactly-once because decisions are versioned
+The orchestrator runs with optimistic concurrency:
+- Reads `workflow_execution.version = v`
+- Replays history, produces decisions
+- Writes new events and updates `version = v+1` with `WHERE version = v`
+
+If two orchestrators race, one wins; the loser retries by replaying the now-longer history. This turns “split brain” into “extra work” without incorrectness.
+
+### 5) The real-world side effect is exactly-once via idempotency keys
+Even with engine-level fencing, a worker can crash after applying a side effect but before reporting completion. The retry will re-run the activity. The practical solution is explicit:
+- Every activity integrates with downstream systems using an idempotency key = `activity_id` (or `workflow_id:activity_id`).
+- Downstream systems store that key and return the original result on duplicates.
+
+The engine provides the fencing boundary; idempotency keys make the boundary meaningful in the real world.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness under retries/partitions | Some extra compute from replay |
+| Simple concurrency model (per-workflow single writer) | Hot workflow IDs can bottleneck |
+| Operational debuggability (history is truth) | Storage growth without retention/compaction |
+| Small-team operability (Postgres + Kafka) | Ultimate scale vs purpose-built storage |
+
+## Failure Modes
+
+- **Kafka outage / queue delay**
+  - What happens: activity dispatch and workflow tasks stall; no state is lost.
+  - Detect: queue consumer lag, outbox backlog growth.
+  - Recover: dispatcher resumes; backlog drains; workflows continue from durable history.
+
+- **Orchestrator crash mid-decision**
+  - What happens: at worst, duplicate tasks are emitted; no double effects due to fencing.
+  - Detect: spike in workflow-task retries, shard health alerts.
+  - Recover: another orchestrator replays history and commits with version checks.
+
+- **Worker applies side effect then crashes before completion**
+  - What happens: activity retries; without downstream idempotency you risk double effects.
+  - Detect: repeated attempts for same `(workflow_id, activity_id)`, long-running “in-progress” heartbeats missing.
+  - Recover: rely on downstream idempotency; if absent, quarantine that activity type and require manual reconciliation.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Move Postgres to sharded Postgres (Citus-style) or split history by shard into multiple Postgres clusters.
+  - Add history compaction/snapshots to reduce replay cost for very long histories.
+
+- **100x scale:**
+  - Replace Postgres history with a log-structured, horizontally scalable store (Cassandra/Scylla) and store large payloads in object storage.
+  - Introduce multi-region active/active only for read/visibility; keep workflow state single-region per shard unless you accept complex consensus costs.
+
+## Operational Notes
+
+- Determinism is a product feature: non-deterministic workflow code must fail fast with a clear “non-determinism detected” error and history pointer.
+- “Stuck” workflows are usually one of three things: missing worker pollers for a task queue, poisoned activity retries, or runaway history size causing replay latency—instrument each explicitly.
+- Keep payloads out of history: store large inputs/outputs in object storage and reference them; history is for decisions and pointers.
+- Make retention enforceable: TTL/archival is not cleanup—without it, your history store becomes your outage.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+codex
+## Elegance Check
+
+### The Core Insight
+Treat each workflow as a single-writer, deterministic state machine whose *only durable truth* is an append-only history; everything else (dispatch, retries, visibility) is derived and therefore safely repeatable.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| History Store (append-only + version) | The only place you can enforce determinism, replay, and fencing/idempotent completion. |
+| Orchestrator (single-writer per workflow) | Converts concurrency/split-brain into “extra work” via optimistic commits; keeps correctness local to `workflow_id`. |
+| Transactional outbox + dispatcher | Bridges DB correctness to at-least-once messaging without coupling orchestration to Kafka availability. |
+| Workers (external side effects) | Keeps engine pure; isolates business IO and lets retries/heartbeats be standardized. |
+| Visibility Index (async) | Separates operational querying from correctness so search/load can’t wedge execution. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Kafka for both workflow tasks and activity tasks | Start with Postgres as the workflow-task queue (`SKIP LOCKED` + leases) and keep Kafka only for activity fanout | Less infra early; DB becomes hotter and you must design fair scheduling carefully. |
+| Custom dispatcher service | Use Debezium CDC from outbox table to Kafka | Adds CDC operational complexity; reduces bespoke code and “mark sent” race handling. |
+| Visibility Index as separate system | Postgres read model (materialized views / denormalized tables) fed from the same outbox | Simpler ops; may cap query flexibility/scale vs Elasticsearch/OpenSearch. |
+| “Exactly-once effects” framed at engine level | Reframe as “exactly-once *acceptance* + at-least-once *execution*” with required idempotency contracts per activity type | More honest; pushes design docs to specify what’s guaranteed vs required from integrators. |
+| Replay-only for state reconstruction | Add periodic snapshots (state + next_event_id) for long histories | More moving parts; dramatically improves p99 replay and reduces hot partitions. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres is down for 5 minutes**
+   - Design’s answer: partially addressed (Kafka outage covered; DB outage not explicitly).
+   - Recommendation: Strengthen. Define behavior for *all* APIs (start/signal/complete/poll), backpressure strategy, and recovery steps (replay storm control, dispatcher catch-up pacing).
+
+2. **Network partition: workers can reach Kafka but not API/DB (or vice versa)**
+   - Design’s answer: not addressed.
+   - Recommendation: Strengthen. Clarify that completion is authoritative only when committed to history; require workers to persist attempt state locally (or tolerate re-exec) and define retry/timeout semantics when completion can’t be reported.
+
+3. **A “slow” component: visibility indexing or dispatcher lags for hours**
+   - Design’s answer: addressed for Kafka lag/outbox backlog, but not the downstream effects (e.g., timer firing delays, user-facing “stuck” UX).
+   - Recommendation: Strengthen. Add explicit SLOs and alerts tied to *workflow correctness risk* (e.g., “timers delayed > X”, “outbox age > Y”), plus degradations (pause new starts, shed load, prioritize timer/outbox drains).
+
+4. **Bad deploy/config causes nondeterminism in workflow code**
+   - Design’s answer: addressed (“fail fast with pointer”).
+   - Recommendation: Strengthen. Add a versioning story: workflow code version markers, compatible change guidelines, and an operational playbook (rollback vs continue-as-new vs patch history).
+
+5. **Traffic spikes 10x unexpectedly**
+   - Design’s answer: partially addressed via sharding; replay cost and DB hotspots are implied.
+   - Recommendation: Strengthen. Add admission control: cap concurrent workflow evaluations per shard, prioritize timers/heartbeats, and define what gets dropped/429’d first (starts vs signals vs list/search).
+
+## Recommendations
+
+### Must Fix
+- Define the **timer subsystem** precisely: where timers live (DB rows?), how they wake orchestrators, how you prevent timer scans from becoming O(N), and what correctness means during outages (late is OK; early must be impossible).
+- Tighten the **completion transaction contract**: exactly which row(s) are locked/checked (activity state + expected token), what isolation level assumptions exist, and how you avoid races between retry scheduling and late completions.
+- Make the “exactly-once” claim explicit: guarantee **exactly-once state transitions/acceptance**, require **idempotency for side effects**, and document the failure mode when downstream lacks it (quarantine/manual reconcile is good—make it a first-class workflow state).
+
+### Should Consider
+- Start simpler by collapsing workflow-task scheduling into Postgres (at least initially) to reduce moving parts; keep Kafka focused on activity distribution if you need it.
+- Add **snapshots/compaction** earlier than “100x”: your own p99 history of 10k events makes replay a primary latency driver at the stated decision QPS.
+- Specify **hot workflow** handling: per-workflow rate limits, yielding/continuations, or splitting long workflows (continue-as-new) to avoid single-ID bottlenecks.
+
+### Nice to Have
+- Formalize **state machine invariants** (e.g., monotonic fence tokens, single completion) and add lightweight consistency checks/repair tooling.
+- Add an explicit **backfill/rebuild** story for Visibility Index (from history/outbox) with bounded impact on production.
+- Provide an operator “3am” runbook: “why stuck?” decision tree mapped to concrete metrics (outbox age, worker pollers, retry saturation, timer delay).
+
+## What’s Working Well
+- Clean separation of concerns: orchestration is pure/derivable; execution is external and fenced.
+- The outbox pattern is used in the right place: correctness anchored in the DB transaction, messaging made repeatable.
+- The single-writer-per-workflow model is the right elegance lever: it shrinks concurrency bugs into a single optimistic-commit boundary.
+- Honest operational notes (payloads out of history, retention as reliability, stuck taxonomy) are exactly what makes these systems supportable.
+tokens used
+4,691
+## Elegance Check
+
+### The Core Insight
+Treat each workflow as a single-writer, deterministic state machine whose *only durable truth* is an append-only history; everything else (dispatch, retries, visibility) is derived and therefore safely repeatable.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| History Store (append-only + version) | The only place you can enforce determinism, replay, and fencing/idempotent completion. |
+| Orchestrator (single-writer per workflow) | Converts concurrency/split-brain into “extra work” via optimistic commits; keeps correctness local to `workflow_id`. |
+| Transactional outbox + dispatcher | Bridges DB correctness to at-least-once messaging without coupling orchestration to Kafka availability. |
+| Workers (external side effects) | Keeps engine pure; isolates business IO and lets retries/heartbeats be standardized. |
+| Visibility Index (async) | Separates operational querying from correctness so search/load can’t wedge execution. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Kafka for both workflow tasks and activity tasks | Start with Postgres as the workflow-task queue (`SKIP LOCKED` + leases) and keep Kafka only for activity fanout | Less infra early; DB becomes hotter and you must design fair scheduling carefully. |
+| Custom dispatcher service | Use Debezium CDC from outbox table to Kafka | Adds CDC operational complexity; reduces bespoke code and “mark sent” race handling. |
+| Visibility Index as separate system | Postgres read model (materialized views / denormalized tables) fed from the same outbox | Simpler ops; may cap query flexibility/scale vs Elasticsearch/OpenSearch. |
+| “Exactly-once effects” framed at engine level | Reframe as “exactly-once *acceptance* + at-least-once *execution*” with required idempotency contracts per activity type | More honest; pushes design docs to specify what’s guaranteed vs required from integrators. |
+| Replay-only for state reconstruction | Add periodic snapshots (state + next_event_id) for long histories | More moving parts; dramatically improves p99 replay and reduces hot partitions. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres is down for 5 minutes**
+   - Design’s answer: partially addressed (Kafka outage covered; DB outage not explicitly).
+   - Recommendation: Strengthen. Define behavior for *all* APIs (start/signal/complete/poll), backpressure strategy, and recovery steps (replay storm control, dispatcher catch-up pacing).
+
+2. **Network partition: workers can reach Kafka but not API/DB (or vice versa)**
+   - Design’s answer: not addressed.
+   - Recommendation: Strengthen. Clarify that completion is authoritative only when committed to history; require workers to persist attempt state locally (or tolerate re-exec) and define retry/timeout semantics when completion can’t be reported.
+
+3. **A “slow” component: visibility indexing or dispatcher lags for hours**
+   - Design’s answer: addressed for Kafka lag/outbox backlog, but not the downstream effects (e.g., timer firing delays, user-facing “stuck” UX).
+   - Recommendation: Strengthen. Add explicit SLOs and alerts tied to *workflow correctness risk* (e.g., “timers delayed > X”, “outbox age > Y”), plus degradations (pause new starts, shed load, prioritize timer/outbox drains).
+
+4. **Bad deploy/config causes nondeterminism in workflow code**
+   - Design’s answer: addressed (“fail fast with pointer”).
+   - Recommendation: Strengthen. Add a versioning story: workflow code version markers, compatible change guidelines, and an operational playbook (rollback vs continue-as-new vs patch history).
+
+5. **Traffic spikes 10x unexpectedly**
+   - Design’s answer: partially addressed via sharding; replay cost and DB hotspots are implied.
+   - Recommendation: Strengthen. Add admission control: cap concurrent workflow evaluations per shard, prioritize timers/heartbeats, and define what gets dropped/429’d first (starts vs signals vs list/search).
+
+## Recommendations
+
+### Must Fix
+- Define the **timer subsystem** precisely: where timers live (DB rows?), how they wake orchestrators, how you prevent timer scans from becoming O(N), and what correctness means during outages (late is OK; early must be impossible).
+- Tighten the **completion transaction contract**: exactly which row(s) are locked/checked (activity state + expected token), what isolation level assumptions exist, and how you avoid races between retry scheduling and late completions.
+- Make the “exactly-once” claim explicit: guarantee **exactly-once state transitions/acceptance**, require **idempotency for side effects**, and document the failure mode when downstream lacks it (quarantine/manual reconcile is good—make it a first-class workflow state).
+
+### Should Consider
+- Start simpler by collapsing workflow-task scheduling into Postgres (at least initially) to reduce moving parts; keep Kafka focused on activity distribution if you need it.
+- Add **snapshots/compaction** earlier than “100x”: your own p99 history of 10k events makes replay a primary latency driver at the stated decision QPS.
+- Specify **hot workflow** handling: per-workflow rate limits, yielding/continuations, or splitting long workflows (continue-as-new) to avoid single-ID bottlenecks.
+
+### Nice to Have
+- Formalize **state machine invariants** (e.g., monotonic fence tokens, single completion) and add lightweight consistency checks/repair tooling.
+- Add an explicit **backfill/rebuild** story for Visibility Index (from history/outbox) with bounded impact on production.
+- Provide an operator “3am” runbook: “why stuck?” decision tree mapped to concrete metrics (outbox age, worker pollers, retry saturation, timer delay).
+
+## What’s Working Well
+- Clean separation of concerns: orchestration is pure/derivable; execution is external and fenced.
+- The outbox pattern is used in the right place: correctness anchored in the DB transaction, messaging made repeatable.
+- The single-writer-per-workflow model is the right elegance lever: it shrinks concurrency bugs into a single optimistic-commit boundary.
+- Honest operational notes (payloads out of history, retention as reliability, stuck taxonomy) are exactly what makes these systems supportable.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/workflow-orchestration-engine.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afd-e4cb-7f90-a489-29ab739ce167
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Workflow Orchestration Engine"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: [workflow, orchestration, temporal, durable-state, event-sourcing, exactly-once, distributed-systems]
+---
+
+## Overview
+
+This system is a Temporal-like workflow engine for coordinating long-running business processes (minutes to months) with durable state, retries, timers, and *exactly-once* step effects. The core idea is to treat each workflow as a tiny, single-threaded state machine whose state is derived from an append-only history log. That makes crash recovery trivial: replay the history to reconstruct state, then continue.
+
+The “elegance” comes from separating *orchestration* from *execution*. The engine never performs business side effects; it only records decisions (schedule activity X, start timer Y). Side effects happen in external workers, and the engine uses durable deduplication + fencing tokens to make step effects occur exactly once even though messages and workers are only at-least-once.
+
+## What Makes This Hard
+
+Naive implementations conflate orchestration with execution and store “current state” as mutable rows. That fails under retries, crashes, and partitions: you get double execution, lost progress, and impossible debugging (“why is this stuck?”).
+
+The trap: “exactly-once” is not a queue setting—it’s an end-to-end property. You must assume duplicate delivery, duplicate worker attempts, and coordinator failover mid-decision, then still guarantee that *each step’s externally visible effect* happens once (or is provably equivalent to once).
+
+## Requirements
+
+### Functional Requirements
+- Durable workflows: progress survives process crashes and restarts without manual recovery.
+- Exactly-once step effects: each step’s side effect is applied once even with retries/duplicates.
+- Timers and delays: schedule future steps reliably across outages.
+- Retries with backoff, timeouts, heartbeats, and cancellation.
+- Deterministic workflow logic: replay produces identical decisions (or fails loudly).
+- Observability: inspect workflow history, current state, and “why it’s stuck”.
+
+### Scale Targets
+- 10M total workflows/day, 1M concurrently open (long-running).
+- 50k workflow task decisions/sec peak (orchestrator evaluations).
+- 200k activity dispatches/sec peak to workers.
+- P95 decision latency < 200ms under normal load (excluding activity runtime).
+- History retention 30 days; average history 200 events, p99 10k events.
+Why these matter: they force sharding, bounded per-workflow contention, and history storage that stays append-only and cheap.
+
+## Key Design Decisions
+
+- **Event-sourced workflow history as the source of truth**
+  - Chose: append-only history + replay-derived state.
+  - Rejected: mutable “current state” rows with ad-hoc transitions.
+  - Why: append-only enables deterministic recovery, auditability, and safe retries.
+
+- **Single-writer per workflow via optimistic concurrency (no distributed locks)**
+  - Chose: one “workflow task” at a time; commit decisions with a version check.
+  - Rejected: global locks/leases, multi-writer merges.
+  - Why: removes an entire class of races; contention is localized to a workflow ID.
+
+- **Exactly-once step effects via durable dedupe + fencing tokens**
+  - Chose: activity attempts are at-least-once delivered, but completions are fenced and deduped by `(workflow_id, activity_id)`.
+  - Rejected: “exactly-once messaging” promises from brokers.
+  - Why: the only reliable place to enforce exactly-once is the durable state machine that owns the step.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C["Client SDK"] --> A["API Frontend"]
+  A --> O["Orchestrator"]
+  O <--> H["History Store (Postgres)"]
+  O --> Q["Task Queue (Kafka)"]
+  Q --> W["Workers"]
+  W --> A
+  O --> V["Visibility Index"]
+```
+
+### Components
+
+- **Client SDK**
+  - Ensures deterministic workflow code (no wall-clock, random, IO during replay) by routing nondeterminism through engine APIs (timers, activities, signals).
+
+- **API Frontend**
+  - Auth, rate limits, idempotent request handling (e.g., `StartWorkflow(workflow_id)` is naturally idempotent).
+  - Serves worker polling and completion APIs to keep the worker surface area small and stable.
+
+- **Orchestrator**
+  - The “workflow CPU”: takes one workflow at a time, replays history, produces the next set of decisions, and commits them atomically.
+  - Sharded by `workflow_id` to scale horizontally; each shard is stateless beyond in-flight caches.
+
+- **History Store (Postgres)**
+  - Append-only `history_events` + compact `workflow_execution` row with `next_event_id`, status, and a version for optimistic concurrency.
+  - Partition tables by shard (or by time + shard) to keep indexes small and vacuum predictable.
+
+- **Task Queue (Kafka)**
+  - Delivers workflow tasks (to orchestrators) and activity tasks (to workers) with at-least-once semantics.
+  - Keyed by `workflow_id` (workflow tasks) and `task_queue` (activity routing) to preserve order where it matters.
+
+- **Workers**
+  - Execute activities (side effects) and report completion/heartbeat.
+  - Must treat `activity_id` as an idempotency key for downstream effects (the engine enforces fencing; downstream idempotency makes failures non-catastrophic).
+
+- **Visibility Index**
+  - Read-optimized view for “list workflows”, search by attributes, and operational dashboards.
+  - Built asynchronously from history/outbox so it never blocks correctness.
+
+## Deep Dive: Exactly-Once Step Execution
+
+The engine guarantees exactly-once *effects* by making “a step happened” a durable fact that can be checked and fenced—*before* accepting or applying a completion.
+
+### 1) Model every step as a named, immutable decision
+When workflow code says “do step S”, the orchestrator emits a decision:
+- `ScheduleActivity(activity_id=S, input=..., retry_policy=...)`
+
+That decision is appended to history. Importantly, “scheduled” is not “started” and not “completed”; it is the single durable intent.
+
+### 2) Dispatch is derived, not authoritative (transactional outbox)
+After committing history, the orchestrator writes an outbox record in the same database transaction:
+- `outbox(activity_task, workflow_id, activity_id, attempt, task_queue, payload, fence_token)`
+
+A separate dispatcher publishes outbox rows to Kafka and marks them sent. If the orchestrator crashes after committing history but before enqueueing, the outbox row still exists; if it crashes after enqueueing, re-sending creates duplicates that are safe.
+
+### 3) Fencing tokens prevent “late completions” from winning
+Each scheduled attempt has a monotonically increasing `fence_token` (e.g., the history event id or an explicit attempt token). The worker receives that token with the task.
+
+On completion, the worker calls:
+- `CompleteActivity(workflow_id, activity_id, fence_token, result)`
+
+The API Frontend performs a single, decisive check in the History Store transaction:
+- If `(workflow_id, activity_id)` is already completed → return the recorded result (idempotent completion).
+- Else if `fence_token` != `current_expected_token` → reject as stale (a retry already superseded it).
+- Else → append `ActivityCompleted` to history and mark the activity completed.
+
+This is the key: duplicates are common; *accepting* a completion is rare and strictly fenced by durable state.
+
+### 4) Workflow progress is exactly-once because decisions are versioned
+The orchestrator runs with optimistic concurrency:
+- Reads `workflow_execution.version = v`
+- Replays history, produces decisions
+- Writes new events and updates `version = v+1` with `WHERE version = v`
+
+If two orchestrators race, one wins; the loser retries by replaying the now-longer history. This turns “split brain” into “extra work” without incorrectness.
+
+### 5) The real-world side effect is exactly-once via idempotency keys
+Even with engine-level fencing, a worker can crash after applying a side effect but before reporting completion. The retry will re-run the activity. The practical solution is explicit:
+- Every activity integrates with downstream systems using an idempotency key = `activity_id` (or `workflow_id:activity_id`).
+- Downstream systems store that key and return the original result on duplicates.
+
+The engine provides the fencing boundary; idempotency keys make the boundary meaningful in the real world.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness under retries/partitions | Some extra compute from replay |
+| Simple concurrency model (per-workflow single writer) | Hot workflow IDs can bottleneck |
+| Operational debuggability (history is truth) | Storage growth without retention/compaction |
+| Small-team operability (Postgres + Kafka) | Ultimate scale vs purpose-built storage |
+
+## Failure Modes
+
+- **Kafka outage / queue delay**
+  - What happens: activity dispatch and workflow tasks stall; no state is lost.
+  - Detect: queue consumer lag, outbox backlog growth.
+  - Recover: dispatcher resumes; backlog drains; workflows continue from durable history.
+
+- **Orchestrator crash mid-decision**
+  - What happens: at worst, duplicate tasks are emitted; no double effects due to fencing.
+  - Detect: spike in workflow-task retries, shard health alerts.
+  - Recover: another orchestrator replays history and commits with version checks.
+
+- **Worker applies side effect then crashes before completion**
+  - What happens: activity retries; without downstream idempotency you risk double effects.
+  - Detect: repeated attempts for same `(workflow_id, activity_id)`, long-running “in-progress” heartbeats missing.
+  - Recover: rely on downstream idempotency; if absent, quarantine that activity type and require manual reconciliation.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Move Postgres to sharded Postgres (Citus-style) or split history by shard into multiple Postgres clusters.
+  - Add history compaction/snapshots to reduce replay cost for very long histories.
+
+- **100x scale:**
+  - Replace Postgres history with a log-structured, horizontally scalable store (Cassandra/Scylla) and store large payloads in object storage.
+  - Introduce multi-region active/active only for read/visibility; keep workflow state single-region per shard unless you accept complex consensus costs.
+
+## Operational Notes
+
+- Determinism is a product feature: non-deterministic workflow code must fail fast with a clear “non-determinism detected” error and history pointer.
+- “Stuck” workflows are usually one of three things: missing worker pollers for a task queue, poisoned activity retries, or runaway history size causing replay latency—instrument each explicitly.
+- Keep payloads out of history: store large inputs/outputs in object storage and reference them; history is for decisions and pointers.
+- Make retention enforceable: TTL/archival is not cleanup—without it, your history store becomes your outage.
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Treat each workflow as a single-writer, deterministic state machine whose *only durable truth* is an append-only history; everything else (dispatch, retries, visibility) is derived and therefore safely repeatable.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| History Store (append-only + version) | The only place you can enforce determinism, replay, and fencing/idempotent completion. |
+| Orchestrator (single-writer per workflow) | Converts concurrency/split-brain into “extra work” via optimistic commits; keeps correctness local to `workflow_id`. |
+| Transactional outbox + dispatcher | Bridges DB correctness to at-least-once messaging without coupling orchestration to Kafka availability. |
+| Workers (external side effects) | Keeps engine pure; isolates business IO and lets retries/heartbeats be standardized. |
+| Visibility Index (async) | Separates operational querying from correctness so search/load can’t wedge execution. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Kafka for both workflow tasks and activity tasks | Start with Postgres as the workflow-task queue (`SKIP LOCKED` + leases) and keep Kafka only for activity fanout | Less infra early; DB becomes hotter and you must design fair scheduling carefully. |
+| Custom dispatcher service | Use Debezium CDC from outbox table to Kafka | Adds CDC operational complexity; reduces bespoke code and “mark sent” race handling. |
+| Visibility Index as separate system | Postgres read model (materialized views / denormalized tables) fed from the same outbox | Simpler ops; may cap query flexibility/scale vs Elasticsearch/OpenSearch. |
+| “Exactly-once effects” framed at engine level | Reframe as “exactly-once *acceptance* + at-least-once *execution*” with required idempotency contracts per activity type | More honest; pushes design docs to specify what’s guaranteed vs required from integrators. |
+| Replay-only for state reconstruction | Add periodic snapshots (state + next_event_id) for long histories | More moving parts; dramatically improves p99 replay and reduces hot partitions. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres is down for 5 minutes**
+   - Design’s answer: partially addressed (Kafka outage covered; DB outage not explicitly).
+   - Recommendation: Strengthen. Define behavior for *all* APIs (start/signal/complete/poll), backpressure strategy, and recovery steps (replay storm control, dispatcher catch-up pacing).
+
+2. **Network partition: workers can reach Kafka but not API/DB (or vice versa)**
+   - Design’s answer: not addressed.
+   - Recommendation: Strengthen. Clarify that completion is authoritative only when committed to history; require workers to persist attempt state locally (or tolerate re-exec) and define retry/timeout semantics when completion can’t be reported.
+
+3. **A “slow” component: visibility indexing or dispatcher lags for hours**
+   - Design’s answer: addressed for Kafka lag/outbox backlog, but not the downstream effects (e.g., timer firing delays, user-facing “stuck” UX).
+   - Recommendation: Strengthen. Add explicit SLOs and alerts tied to *workflow correctness risk* (e.g., “timers delayed > X”, “outbox age > Y”), plus degradations (pause new starts, shed load, prioritize timer/outbox drains).
+
+4. **Bad deploy/config causes nondeterminism in workflow code**
+   - Design’s answer: addressed (“fail fast with pointer”).
+   - Recommendation: Strengthen. Add a versioning story: workflow code version markers, compatible change guidelines, and an operational playbook (rollback vs continue-as-new vs patch history).
+
+5. **Traffic spikes 10x unexpectedly**
+   - Design’s answer: partially addressed via sharding; replay cost and DB hotspots are implied.
+   - Recommendation: Strengthen. Add admission control: cap concurrent workflow evaluations per shard, prioritize timers/heartbeats, and define what gets dropped/429’d first (starts vs signals vs list/search).
+
+## Recommendations
+
+### Must Fix
+- Define the **timer subsystem** precisely: where timers live (DB rows?), how they wake orchestrators, how you prevent timer scans from becoming O(N), and what correctness means during outages (late is OK; early must be impossible).
+- Tighten the **completion transaction contract**: exactly which row(s) are locked/checked (activity state + expected token), what isolation level assumptions exist, and how you avoid races between retry scheduling and late completions.
+- Make the “exactly-once” claim explicit: guarantee **exactly-once state transitions/acceptance**, require **idempotency for side effects**, and document the failure mode when downstream lacks it (quarantine/manual reconcile is good—make it a first-class workflow state).
+
+### Should Consider
+- Start simpler by collapsing workflow-task scheduling into Postgres (at least initially) to reduce moving parts; keep Kafka focused on activity distribution if you need it.
+- Add **snapshots/compaction** earlier than “100x”: your own p99 history of 10k events makes replay a primary latency driver at the stated decision QPS.
+- Specify **hot workflow** handling: per-workflow rate limits, yielding/continuations, or splitting long workflows (continue-as-new) to avoid single-ID bottlenecks.
+
+### Nice to Have
+- Formalize **state machine invariants** (e.g., monotonic fence tokens, single completion) and add lightweight consistency checks/repair tooling.
+- Add an explicit **backfill/rebuild** story for Visibility Index (from history/outbox) with bounded impact on production.
+- Provide an operator “3am” runbook: “why stuck?” decision tree mapped to concrete metrics (outbox age, worker pollers, retry saturation, timer delay).
+
+## What’s Working Well
+- Clean separation of concerns: orchestration is pure/derivable; execution is external and fenced.
+- The outbox pattern is used in the right place: correctness anchored in the DB transaction, messaging made repeatable.
+- The single-writer-per-workflow model is the right elegance lever: it shrinks concurrency bugs into a single optimistic-commit boundary.
+- Honest operational notes (payloads out of history, retention as reliability, stuck taxonomy) are exactly what makes these systems supportable.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+
+
+thinking
+**Figuring out user instructions**
+
+I'm trying to sort through the user's instructions. They clearly say not to add sections, yet they request specific outputs that imply the need for those sections. It's a bit contradictory! I think I can reinterpret this by reusing existing sections to meet the requirements without creating new ones. For example, I could modify "Architecture" to fit the minimal architecture description and combine "Key Design Decisions" with justification. As for "What We Removed," maybe I can rename an existing section to include that without technically adding anything new.
+thinking
+**Revising project structure**
+
+I’m working through some rules: I can’t modify the title, difficulty, or tags, and while renaming section headings seems okay, I can’t add new sections. I could change "What I'd Do Differently At..." into "What We Removed" and include scaling notes into operational notes/trade-offs. It’s necessary to address failure scenarios, perhaps expanding the "Failure Modes" section. I’m considering simplifying by using Postgres as a task queue and possibly removing Kafka, but I must ensure scalability. I can consolidate by using Postgres for both history and the task queue.
+thinking
+**Refining components layout**
+
+I’m focused on optimizing the architecture without adding components. I’ll keep the API Frontend, Orchestrator, Postgres, Workers, and possibly the SDK. I could merge the API Frontend with the Orchestrator into a single service while referring to them as modules. The goal is to create a small-team-friendly "Engine API" service for handling client requests and orchestrations. For minimal architecture, using Postgres as both history and queues seems viable. I can remove Kafka and the dispatcher by polling directly from workers and using the outbox as the task queue, eliminating the need for a broker.
+thinking
+**Addressing orchestrator scheduling**
+
+I’m thinking about scheduling in the orchestrator, where the `workflow_tasks` table could manage it. I’d propose a `timers` table with a due_at index to enqueue workflows. It's essential to avoid O(N) scans, so I’ll limit queries. The goal is to achieve exactly-once processing in Postgres with row locks and unique constraints, while recognizing that step effects are at-least-once and require idempotency keys. I also need to consider failure scenarios, such as handling Postgres downtime and network partitions, ensuring workers retry tasks appropriately and manage concurrency.
+thinking
+**Clarifying architecture decisions**
+
+I'm working on details for the architecture. I can keep using the API for database access and have workers retry completion if they can't reach it. For visibility, I’ll remove the separate index/dispatcher and just update the tables transactionally, avoiding complexity. While I don't want to add sections, I can merge components by renaming current ones. The "What I'd Do Differently At..." section can change to "What We Removed," and I’ll outline what’s removed, like Kafka and the separate visibility index. I’ll also define timers precisely and ensure the completion transaction contract is clear. Keeping the scale targets might be too ambitious, especially using just Postgres, so I might note the need to partition. I’ll keep in mind to keep the system minimal while addressing trade-offs.
+thinking
+**Documenting minimal architecture**
+
+I’m setting up our architecture guidelines. While I can’t add components, I’ll mention that simplifying might require a dedicated queue at extreme scales. I can keep Kafka for high-throughput activity distribution but still focus primarily on Postgres for workflow tasks. The components will include a thin optional Client SDK, an Engine API that combines the API frontend and orchestrator, Postgres for all state management, and Kafka for activities. Also, I’ll outline our failures and what we’ve removed to ensure clarity in the final markdown doc. I’ll condense sections to meet the requirements while maintaining necessary details and justifications.
+thinking
+**Generating final document**
+
+I’m creating the final simplified document, starting with an overview that includes 2-3 paragraphs. I need to clarify "exactly-once acceptance" in the Requirements section and condense the Key Design Decisions regarding event-sourced history and concurrency.
+
+In the Architecture section, the diagram will show components with their justifications. The Deep Dive section will include Exactly-Once Step Execution and define the timer subsystem. I’ll lay out the Trade-offs and Failure Modes clearly. I’ll repurpose the “What I’d Do Differently At” section to “What We Removed” without adding any new sections while providing the complete markdown document. Let’s do this!
+codex
+```markdown
+---
+title: "Workflow Orchestration Engine"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: [workflow, orchestration, temporal, durable-state, event-sourcing, exactly-once, distributed-systems]
+---
+
+## Overview
+
+This is a Temporal-like workflow engine for coordinating long-running business processes (minutes to months). Each workflow is a deterministic, single-writer state machine whose only durable truth is an append-only history log in Postgres. Crash recovery is replay: read history, rebuild in-memory state, continue.
+
+The engine guarantees exactly-once **acceptance** of workflow state transitions (decisions, completions, timers, signals). External side effects are at-least-once executed by workers and made practically safe via required idempotency keys.
+
+## What Makes This Hard
+
+You must assume duplicates, retries, worker crashes, and coordinator failover mid-decision. Correctness comes from one durable place enforcing ordering and fencing; everything else is derived and safely repeatable.
+
+## Requirements
+
+### Functional Requirements
+- Durable workflows: progress survives process crashes and restarts.
+- Exactly-once acceptance: each step completion is recorded once (idempotent API semantics).
+- Timers and delays: late is acceptable; early is impossible.
+- Retries with backoff, timeouts, heartbeats, and cancellation.
+- Deterministic workflow logic: replay produces identical decisions (or fails loudly).
+- Observability: inspect history, current state, and “why it’s stuck”.
+
+### Scale Targets
+- 10M total workflows/day, 1M concurrently open.
+- 50k workflow task decisions/sec peak.
+- 200k activity dispatches/sec peak to workers.
+- P95 decision latency < 200ms (excluding activity runtime).
+- History retention 30 days; average history 200 events, p99 10k events.
+
+## Key Design Decisions
+
+- **Append-only history is truth**
+  - State is derived by replay; debugging and recovery are built-in.
+- **Single-writer per workflow via optimistic concurrency**
+  - One committed decision stream per `workflow_id`; races become extra work, not corruption.
+- **Exactly-once acceptance via durable fencing**
+  - Completions are accepted only when their fence token matches durable expected state; duplicates return the recorded result.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C["Client SDK"] --> E["Engine API (Frontend + Orchestrator)"]
+  E <--> P["Postgres (history + state + timers + queues + visibility)"]
+  E --> K["Kafka (activity tasks)"]
+  K --> W["Workers"]
+  W --> E
+```
+
+### Components
+
+- **Client SDK**
+  - Runs deterministic workflow code and routes nondeterminism through engine APIs (timers, activities, signals).
+  - Exists to make determinism enforceable and developer-visible.
+
+- **Engine API (Frontend + Orchestrator)**
+  - One service boundary: client/worker APIs plus the orchestrator loop.
+  - Exists to enforce idempotency, fencing, and optimistic commits at a single durable boundary (Postgres).
+
+- **Postgres (history + state + timers + queues + visibility)**
+  - `history_events` (append-only), `workflow_execution` (status + `version` + pointers), `activity_state` (expected token + completion result), and a small read model for listing workflows.
+  - Exists because correctness needs one transactional source of truth.
+
+- **Kafka (activity tasks)**
+  - Activity distribution at high fanout/throughput with at-least-once delivery.
+  - Exists to keep worker scaling and dispatch throughput off the primary database write path.
+
+- **Workers**
+  - Execute side effects and report heartbeats/completions using idempotency keys.
+  - Exists because the engine must stay pure and repeatable; IO is external.
+
+## Deep Dive: Exactly-Once Step Execution
+
+### 1) Decisions are durable, dispatch is derived
+When workflow code requests an activity or timer, the orchestrator commits intent to history:
+- `ScheduleActivity(activity_id, input, retry_policy, fence_token)`
+- `StartTimer(timer_id, due_at)`
+
+The same transaction updates derived tables (`activity_state`, timers, visibility) so reads don’t require replay.
+
+### 2) Workflow-task scheduling (no workflow-task broker)
+All events that require evaluation (start, signal, activity completion, timer firing) enqueue a workflow task in Postgres:
+- `workflow_task_queue(workflow_id, run_id, available_at)`
+
+Orchestrator workers claim tasks with:
+- `SELECT ... FOR UPDATE SKIP LOCKED` + a short lease
+so crashes become re-claimable work, not stuck workflows.
+
+### 3) Timers live in Postgres and wake workflows
+Timers are rows keyed by `(workflow_id, timer_id)` with an index on `due_at`. A poller claims due timers with:
+- `WHERE due_at <= now() ORDER BY due_at LIMIT N FOR UPDATE SKIP LOCKED`
+and, in the same transaction, appends `TimerFired` to history and enqueues a workflow task. Early fire cannot happen because the DB condition is authoritative.
+
+### 4) Completion transaction contract (the only place “exactly-once” exists)
+Workers complete with:
+- `CompleteActivity(workflow_id, activity_id, fence_token, result)`
+
+The Engine API performs one transaction:
+- `SELECT ... FROM activity_state WHERE (workflow_id, activity_id) FOR UPDATE`
+- If already completed: return the recorded result (idempotent).
+- Else if `fence_token != expected_fence_token`: reject as stale.
+- Else: append `ActivityCompleted` to `history_events`, mark `activity_state` completed with stored result, and enqueue a workflow task.
+
+This makes “accepting a completion” rare and strictly fenced by durable state.
+
+### 5) Side effects are safe via required idempotency keys
+A worker may crash after applying an effect but before reporting completion. Retried execution must be equivalent:
+- Idempotency key = `workflow_id:activity_id` (or a stable activity key recorded in history).
+- Downstream must store/recognize that key and return the original result on duplicates.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness under retries/partitions | Extra compute from replay and retries |
+| Small-team operability (one service + Postgres + Kafka) | Less flexibility than many specialized subsystems |
+| Fast, authoritative timer semantics (DB truth) | Timer throughput tied to Postgres tuning |
+| Simple visibility (Postgres read model) | Limited search vs dedicated search engines |
+
+## Failure Modes
+
+- **Postgres down**
+  - What happens: all APIs that write state fail; no progress is recorded; workers can still run but completions won’t be accepted.
+  - Recover: clients/workers retry with backoff; on return, orchestrator drains `workflow_task_queue` with concurrency caps to avoid replay storms.
+
+- **Kafka outage / consumer lag**
+  - What happens: activity dispatch stalls; workflows wait on activities; state remains correct.
+  - Recover: when Kafka returns, workers catch up; retries remain safe due to idempotent completion + fencing.
+
+- **Network partition: workers can’t reach Engine API or Postgres**
+  - What happens: completions can’t be accepted; retries occur; side effects rely on downstream idempotency keys.
+  - Recover: once connectivity returns, the first accepted completion wins; stale attempts are fenced.
+
+- **Outbox/dispatch loop lags**
+  - What happens: activities are scheduled in history but arrive late to workers; timers and signals still enqueue workflow tasks.
+  - Recover: prioritize publishing oldest unsent activity tasks; throttle new starts before starving completions/timers.
+
+- **Bad deploy causes nondeterminism**
+  - What happens: replay diverges; the workflow fails loudly at the first mismatched decision with a history pointer.
+  - Recover: roll back, or gate incompatible logic behind a workflow-code version marker recorded in history.
+
+- **Traffic spikes 10x**
+  - What happens: queue depth grows; decision latency rises.
+  - Recover: admission control in Engine API (429 starts first), cap concurrent evaluations per shard/worker, prioritize timer firing and activity completions over new work.
+
+## What We Removed
+
+- **Workflow-task Kafka**
+  - Workflow evaluation scheduling is a Postgres queue (`SKIP LOCKED` + leases) because it’s already tied to durable state and needs simple fairness, not a separate broker.
+
+- **Separate Visibility Index**
+  - Visibility is a Postgres read model updated in the same transaction as history/state changes, so listing workflows cannot lag correctness.
+
+- **Standalone dispatcher service**
+  - Publishing activity tasks is a loop inside the Engine API reading durable rows and publishing to Kafka; there is no extra service boundary.
+
+- **“Exactly-once effects” claim**
+  - The engine guarantees exactly-once acceptance of transitions; effects are safe only with required idempotency contracts per activity type.
+
+## Operational Notes
+
+- Determinism is enforced: workflow code must fail fast on nondeterminism with a clear decision mismatch and history pointer.
+- “Stuck” usually means: missing worker pollers, retries saturated, Kafka lag, timer backlog, or replay cost; each maps to one queue/table/metric.
+- Keep payloads out of history: store large inputs/outputs externally and reference them; history is for decisions and pointers.
+- Retention is reliability: TTL/archival is mandatory; without it, the history store becomes the outage.
+```
+tokens used
+10,726
+```markdown
+---
+title: "Workflow Orchestration Engine"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: [workflow, orchestration, temporal, durable-state, event-sourcing, exactly-once, distributed-systems]
+---
+
+## Overview
+
+This is a Temporal-like workflow engine for coordinating long-running business processes (minutes to months). Each workflow is a deterministic, single-writer state machine whose only durable truth is an append-only history log in Postgres. Crash recovery is replay: read history, rebuild in-memory state, continue.
+
+The engine guarantees exactly-once **acceptance** of workflow state transitions (decisions, completions, timers, signals). External side effects are at-least-once executed by workers and made practically safe via required idempotency keys.
+
+## What Makes This Hard
+
+You must assume duplicates, retries, worker crashes, and coordinator failover mid-decision. Correctness comes from one durable place enforcing ordering and fencing; everything else is derived and safely repeatable.
+
+## Requirements
+
+### Functional Requirements
+- Durable workflows: progress survives process crashes and restarts.
+- Exactly-once acceptance: each step completion is recorded once (idempotent API semantics).
+- Timers and delays: late is acceptable; early is impossible.
+- Retries with backoff, timeouts, heartbeats, and cancellation.
+- Deterministic workflow logic: replay produces identical decisions (or fails loudly).
+- Observability: inspect history, current state, and “why it’s stuck”.
+
+### Scale Targets
+- 10M total workflows/day, 1M concurrently open.
+- 50k workflow task decisions/sec peak.
+- 200k activity dispatches/sec peak to workers.
+- P95 decision latency < 200ms (excluding activity runtime).
+- History retention 30 days; average history 200 events, p99 10k events.
+
+## Key Design Decisions
+
+- **Append-only history is truth**
+  - State is derived by replay; debugging and recovery are built-in.
+- **Single-writer per workflow via optimistic concurrency**
+  - One committed decision stream per `workflow_id`; races become extra work, not corruption.
+- **Exactly-once acceptance via durable fencing**
+  - Completions are accepted only when their fence token matches durable expected state; duplicates return the recorded result.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C["Client SDK"] --> E["Engine API (Frontend + Orchestrator)"]
+  E <--> P["Postgres (history + state + timers + queues + visibility)"]
+  E --> K["Kafka (activity tasks)"]
+  K --> W["Workers"]
+  W --> E
+```
+
+### Components
+
+- **Client SDK**
+  - Runs deterministic workflow code and routes nondeterminism through engine APIs (timers, activities, signals).
+  - Exists to make determinism enforceable and developer-visible.
+
+- **Engine API (Frontend + Orchestrator)**
+  - One service boundary: client/worker APIs plus the orchestrator loop.
+  - Exists to enforce idempotency, fencing, and optimistic commits at a single durable boundary (Postgres).
+
+- **Postgres (history + state + timers + queues + visibility)**
+  - `history_events` (append-only), `workflow_execution` (status + `version` + pointers), `activity_state` (expected token + completion result), and a small read model for listing workflows.
+  - Exists because correctness needs one transactional source of truth.
+
+- **Kafka (activity tasks)**
+  - Activity distribution at high fanout/throughput with at-least-once delivery.
+  - Exists to keep worker scaling and dispatch throughput off the primary database write path.
+
+- **Workers**
+  - Execute side effects and report heartbeats/completions using idempotency keys.
+  - Exists because the engine must stay pure and repeatable; IO is external.
+
+## Deep Dive: Exactly-Once Step Execution
+
+### 1) Decisions are durable, dispatch is derived
+When workflow code requests an activity or timer, the orchestrator commits intent to history:
+- `ScheduleActivity(activity_id, input, retry_policy, fence_token)`
+- `StartTimer(timer_id, due_at)`
+
+The same transaction updates derived tables (`activity_state`, timers, visibility) so reads don’t require replay.
+
+### 2) Workflow-task scheduling (no workflow-task broker)
+All events that require evaluation (start, signal, activity completion, timer firing) enqueue a workflow task in Postgres:
+- `workflow_task_queue(workflow_id, run_id, available_at)`
+
+Orchestrator workers claim tasks with:
+- `SELECT ... FOR UPDATE SKIP LOCKED` + a short lease
+so crashes become re-claimable work, not stuck workflows.
+
+### 3) Timers live in Postgres and wake workflows
+Timers are rows keyed by `(workflow_id, timer_id)` with an index on `due_at`. A poller claims due timers with:
+- `WHERE due_at <= now() ORDER BY due_at LIMIT N FOR UPDATE SKIP LOCKED`
+and, in the same transaction, appends `TimerFired` to history and enqueues a workflow task. Early fire cannot happen because the DB condition is authoritative.
+
+### 4) Completion transaction contract (the only place “exactly-once” exists)
+Workers complete with:
+- `CompleteActivity(workflow_id, activity_id, fence_token, result)`
+
+The Engine API performs one transaction:
+- `SELECT ... FROM activity_state WHERE (workflow_id, activity_id) FOR UPDATE`
+- If already completed: return the recorded result (idempotent).
+- Else if `fence_token != expected_fence_token`: reject as stale.
+- Else: append `ActivityCompleted` to `history_events`, mark `activity_state` completed with stored result, and enqueue a workflow task.
+
+This makes “accepting a completion” rare and strictly fenced by durable state.
+
+### 5) Side effects are safe via required idempotency keys
+A worker may crash after applying an effect but before reporting completion. Retried execution must be equivalent:
+- Idempotency key = `workflow_id:activity_id` (or a stable activity key recorded in history).
+- Downstream must store/recognize that key and return the original result on duplicates.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness under retries/partitions | Extra compute from replay and retries |
+| Small-team operability (one service + Postgres + Kafka) | Less flexibility than many specialized subsystems |
+| Fast, authoritative timer semantics (DB truth) | Timer throughput tied to Postgres tuning |
+| Simple visibility (Postgres read model) | Limited search vs dedicated search engines |
+
+## Failure Modes
+
+- **Postgres down**
+  - What happens: all APIs that write state fail; no progress is recorded; workers can still run but completions won’t be accepted.
+  - Recover: clients/workers retry with backoff; on return, orchestrator drains `workflow_task_queue` with concurrency caps to avoid replay storms.
+
+- **Kafka outage / consumer lag**
+  - What happens: activity dispatch stalls; workflows wait on activities; state remains correct.
+  - Recover: when Kafka returns, workers catch up; retries remain safe due to idempotent completion + fencing.
+
+- **Network partition: workers can’t reach Engine API or Postgres**
+  - What happens: completions can’t be accepted; retries occur; side effects rely on downstream idempotency keys.
+  - Recover: once connectivity returns, the first accepted completion wins; stale attempts are fenced.
+
+- **Outbox/dispatch loop lags**
+  - What happens: activities are scheduled in history but arrive late to workers; timers and signals still enqueue workflow tasks.
+  - Recover: prioritize publishing oldest unsent activity tasks; throttle new starts before starving completions/timers.
+
+- **Bad deploy causes nondeterminism**
+  - What happens: replay diverges; the workflow fails loudly at the first mismatched decision with a history pointer.
+  - Recover: roll back, or gate incompatible logic behind a workflow-code version marker recorded in history.
+
+- **Traffic spikes 10x**
+  - What happens: queue depth grows; decision latency rises.
+  - Recover: admission control in Engine API (429 starts first), cap concurrent evaluations per shard/worker, prioritize timer firing and activity completions over new work.
+
+## What We Removed
+
+- **Workflow-task Kafka**
+  - Workflow evaluation scheduling is a Postgres queue (`SKIP LOCKED` + leases) because it’s already tied to durable state and needs simple fairness, not a separate broker.
+
+- **Separate Visibility Index**
+  - Visibility is a Postgres read model updated in the same transaction as history/state changes, so listing workflows cannot lag correctness.
+
+- **Standalone dispatcher service**
+  - Publishing activity tasks is a loop inside the Engine API reading durable rows and publishing to Kafka; there is no extra service boundary.
+
+- **“Exactly-once effects” claim**
+  - The engine guarantees exactly-once acceptance of transitions; effects are safe only with required idempotency contracts per activity type.
+
+## Operational Notes
+
+- Determinism is enforced: workflow code must fail fast on nondeterminism with a clear decision mismatch and history pointer.
+- “Stuck” usually means: missing worker pollers, retries saturated, Kafka lag, timer backlog, or replay cost; each maps to one queue/table/metric.
+- Keep payloads out of history: store large inputs/outputs externally and reference them; history is for decisions and pointers.
+- Retention is reliability: TTL/archival is mandatory; without it, the history store becomes the outage.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/01-foundational-infrastructure/workflow-orchestration-engine.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Workflow Orchestration Engine
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/workflow-orchestration-engine.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/workflow-orchestration-engine.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/01-foundational-infrastructure/workflow-orchestration-engine.md

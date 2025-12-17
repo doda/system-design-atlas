@@ -1,0 +1,206 @@
+---
+title: "Web Application Firewall (WAF)"
+category: "Security & Access Control"
+difficulty: "Hard"
+tags: ["waf", "edge-security", "appsec", "ddos-mitigation", "rate-limiting", "observability"]
+---
+
+## Overview
+
+A Web Application Firewall (WAF) is an edge security layer that inspects inbound HTTP(S) traffic and mitigates common application-layer attacks (SQLi, XSS, SSRF, path traversal, protocol evasion, malformed requests) before requests reach origin services.
+
+This design uses:
+- A **fast, deterministic edge data plane** that evaluates requests under strict CPU/bytes limits.
+- A **central control plane** that authors, validates, versions, and safely rolls out policies as signed, immutable bundles.
+
+---
+
+## Requirements
+
+### Goals
+- Block, challenge, rate-limit, or log common web attacks with low added latency.
+- Multi-tenant isolation: per-tenant policies, per-hostname/per-route overrides, tenant-scoped visibility and retention.
+- Safe changes: validation, staged rollout, and instant rollback.
+- Operational visibility: metrics, searchable security events, and audited configuration history.
+
+### Non-Goals
+- L3/L4 volumetric DDoS scrubbing (integrates upstream).
+- Inline heavy ML inference at line rate.
+- Full inspection of arbitrarily large/streaming bodies (inspection remains bounded).
+
+### Functional Requirements
+- Detect SQLi, XSS, injection patterns, path traversal, SSRF, protocol evasion, malformed requests.
+- Policy per tenant: managed rules, custom rules, allow/deny lists, per-route overrides, per-route parsing and body inspection limits.
+- Actions: `allow`, `block`, `redirect`, `rate_limit`, `challenge`, `log_only`.
+- Canonicalization before inspection (bounded decoding, header normalization, content-type aware parsing).
+- Logging/forensics: decision, matched rule IDs, scoring, sampled/redacted snippets (optional), correlation IDs.
+- Safe rollout: dry-run/monitor mode, canaries, staged rollout steps, instant rollback, audited break-glass bypass.
+- Control plane APIs/UI: policy CRUD, simulation, rollouts, audit history.
+- Managed signatures updated without downtime (signed bundles, hot-swap at edge).
+
+### Non-Functional Requirements (Targets)
+- Scale: ~1,000 tenants; up to ~1,000,000 RPS global peak; 100–400 Gbps aggregate.
+- Added edge latency: P50 ≤ 0.5 ms, P99 ≤ 2 ms typical; heavy paths P99 ≤ 5 ms with explicit limits.
+- Availability: data plane 99.99%; control plane 99.9% (edge continues on last known good).
+- Consistency: strong consistency for policy versioning/audit; edge propagation eventual with target <60s.
+- Durability: policy/audit RPO ~0; security events best-effort under overload with bounded loss.
+- Security: encryption in transit, encryption at rest, redaction/minimization, tenant retention (e.g., 7–90 days), audited access.
+
+---
+
+## Simplified Architecture
+
+```mermaid
+flowchart TB
+  C[Client] --> R[Anycast Routing] --> E[Edge PoP<br/>Proxy + WAF]
+  E --> O[Origin Services]
+
+  A[Admin API/UI] --> P[Control Plane]
+  P --> DB[(Postgres<br/>Policy + Audit)]
+  P --> B[(Object Storage<br/>Signed Bundles)]
+  B -->|HTTPS pull| E
+
+  E --> T[Telemetry Ingest]
+  T --> ES[(Event Store)]
+```
+
+---
+
+## Components
+
+### Edge PoP (Proxy + WAF)
+**Responsibilities**
+- TLS termination and strict HTTP parsing (HTTP/2/3 as supported by the proxy).
+- Coarse pre-WAF limits: header/body size caps, connection limits, basic per-IP request caps.
+- Deterministic WAF evaluation: normalization, rule evaluation, action execution, and correlation IDs.
+- Local rate limiting and challenge decisions on the request path.
+- Emit metrics and sampled security events asynchronously.
+
+**Request Evaluation (bounded and short-circuiting)**
+1. Parse and extract features (method, host, path, query, headers, content-type, sizes).
+2. Canonicalize (bounded): path normalization, percent-decoding with recursion limits, header/cookie normalization with strict duplicate policies.
+3. Fast gates: allow/deny lists and per-route limits.
+4. Signature matching: deterministic multi-pattern scanning and safe regex (RE2-class) with caps on inspected bytes and match work.
+5. Optional structured parsing (bounded): JSON/form/XML tokenization only for configured routes.
+6. Decision: `allow`, `block`, `challenge`, `rate_limit`, `redirect`, `log_only`.
+7. Async telemetry: enqueue a compact event; under backpressure, drop optional fields/snippets first and keep counters/metrics.
+
+**Posture**
+- Default `fail_open` for availability with a high-severity signal on evaluation failure.
+- `fail_closed` supported per tenant/route with guarded rollout.
+
+### Control Plane (single service)
+**Responsibilities**
+- Policy authoring, simulation, versioning, audit logging.
+- Validation and compilation into an internal representation with strict limits (reject unsafe constructs, enforce byte/time budgets).
+- Bundle assembly and signing; key rotation support.
+- Rollout orchestration: canary percentage, step progression, auto-halt thresholds, and instant rollback.
+- Managed rules updates: periodically ingest curated rule sets and publish as new bundle versions.
+
+**Persistence**
+- Postgres as the single source of truth for tenants, policies, versions, rollouts, and audits (multi-AZ + WAL archival).
+
+**Bundle Distribution**
+- Signed, immutable bundles stored in object storage.
+- Edge PoPs pull by version (ETag), verify signature, load into memory, and swap atomically.
+- PoPs retain the last N versions (e.g., 5) plus “last known good” for immediate rollback and offline operation.
+
+### Telemetry (ingest + searchable store)
+**Responsibilities**
+- Collect edge events via an HTTP ingestion endpoint (batch-friendly, tenant-authenticated).
+- Store:
+  - **Metrics** (counters/histograms) for SLOs and rollout safety.
+  - **Sampled security events** for search and forensics with tenant isolation and retention.
+- Apply data minimization by default (hash/redact sensitive fields; snippets disabled unless tenant-enabled, size-capped, and sampled).
+
+**Overload Behavior**
+- Telemetry never blocks requests.
+- Ingestion applies backpressure and drops lowest-value fields first; maintains core counters for safety automation.
+
+---
+
+## Data Model (Logical)
+
+### Postgres (Policy + Audit)
+- `tenants(id, name, plan, created_at)`
+- `users(id, tenant_id, email, role, created_at)` (or external IdP mapping)
+- `policies(id, tenant_id, name, created_at)`
+- `policy_versions(id, policy_id, version, mode, status, created_at, created_by, changelog, compiled_cost_json)`
+- `policy_bindings(id, tenant_id, hostname, path_prefix, policy_version_id, priority, created_at)`
+- `rollouts(id, tenant_id, policy_version_id, state, canary_percent, steps_json, step_minutes, auto_halt_json, started_at, finished_at)`
+- `audit_log(id, tenant_id, actor, action, target_type, target_id, diff_json, created_at)`
+
+### Object Storage (Bundles)
+- `bundles/{tenant_id}/{policy_id}/{version}.tar.zst`
+  - `manifest.json` (limits, routes, rule IDs, compiled metadata)
+  - `matchers.bin`
+  - `responses.json`
+  - `signature.sig` + `checksums.txt`
+
+### Event Store (Security Events)
+- `waf_events(tenant_id, ts, request_id, pop, host, path, route_id, action, status_code, matched_rule_ids, score, client_ip_hash, user_agent_hash, sampling_rate, redaction_level, body_truncated)`
+- Partition by `(tenant_id, date)`; retain by policy (e.g., 7–90 days).
+
+---
+
+## API (Minimal)
+
+### Authn/Authz
+- OIDC for users (JWT).
+- Tenant-scoped RBAC (`viewer`, `editor`, `admin`); all mutations audited.
+- Break-glass bypass requires elevated role and produces an audit entry.
+
+### Policy & Rollouts (REST)
+- `POST /v1/tenants/{tenantId}/policies`
+- `POST /v1/policies/{policyId}/versions` (creates an immutable version; triggers validation/compile)
+- `POST /v1/policy-versions/{versionId}/rollouts` (canary + steps + auto-halt)
+- `POST /v1/rollouts/{rolloutId}/rollback`
+- `POST /v1/policies/{policyId}/simulate` (evaluate a sample request against a version)
+
+### Event Query (Read API)
+- `GET /v1/tenants/{tenantId}/events?from=...&to=...&action=block&ruleId=...`
+- Cursor pagination; tenant rate limits; sensitive fields redacted by default.
+
+---
+
+## Scaling & Performance
+
+- Edge processing is **linear over bounded inputs** (strict caps on header bytes, inspected body bytes, decoding recursion, regex match work, and token counts).
+- PoPs scale horizontally and remain operational on cached bundles.
+- Control plane is stateless around Postgres; bundle build is done inline as part of version validation and can be scaled by adding instances.
+- Telemetry scales independently via batch ingestion and partitioned event storage; sampling is the primary lever at peak load.
+
+---
+
+## Failure Modes
+
+- **Bad rule update**: canary auto-halt on block/challenge spike or latency regression; instant rollback to last known good.
+- **Adversarial payloads (CPU bombs, encoding tricks)**: strict parsing, bounded decoding, RE2-class regex only, per-route inspection limits, early exits.
+- **Control plane outage**: PoPs continue serving with cached bundles; rollouts pause; visibility continues via telemetry.
+- **Bundle integrity failure**: PoP rejects bundle and keeps prior version; alert surfaced in rollout status and ops metrics.
+- **Telemetry backpressure/outage**: edge continues; events sampled/dropped; counters remain accurate for safety signals.
+
+---
+
+## Operations
+
+- SLOs: edge added latency (p99), edge availability, decision error rate, rollout safety metrics, bundle skew age.
+- Deployments:
+  - Edge: PoP canary and staged rollout; backward-compatible bundle format.
+  - Control plane: rolling deploy; Postgres HA.
+- Security ops:
+  - Signed bundles with key rotation.
+  - Tenant-configurable retention and redaction.
+  - Audited break-glass controls and access logging for sensitive event fields.
+
+---
+
+## Simplification Notes
+
+- Removed: standalone rate-limiter service by enforcing per-PoP limits inside the edge WAF (keeps latency low and eliminates a critical dependency on the request path).
+- Removed: event stream bus (Kafka/PubSub) by sending batched events directly to a telemetry ingest service (fewer moving parts while preserving searchable events and metrics).
+- Removed: separate telemetry agent by emitting directly from the edge component (fewer deployables per PoP).
+- Merged: policy service, validation/build workers, and managed-rules ingest into a single control plane service (one deployment unit with a single Postgres source of truth).
+- Merged: hot store + archive into one event store with retention policies (keeps forensics searchable without maintaining multiple storage pipelines).
+- Complexity retained: signed, immutable bundles with atomic edge hot-swap (required for safe rollouts and instant rollback at global scale).
+- Complexity retained: bounded normalization and deterministic matching (required for adversarial inputs and predictable latency).

@@ -1,0 +1,1684 @@
+==========================================
+Generating (v2): Global Rate Limiter
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-16bf-7982-b5e7-af9ea89410d8
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Global Rate Limiter
+**Category**: Foundational Infrastructure
+
+**Problem Statement**:
+Design a rate limiter (per user/IP/API key) that works across extensive geographic regions with low coordination overhead and latency.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+thinking
+**Designing a system document**
+
+I need to output a system design document in markdown format, sticking to the template sections without being overly verbose. It should provide key insights, especially on the challenging topic of "global enforcement with low coordination." 
+
+I’m considering using a token bucket system with local leaky buckets and periodic syncs to balance global consistency and latency. Implementing hierarchical region limiters with local decision-making using bounded staleness and CRDT counters could be a solid approach, along with a central allocator that leases tokens to regions. Using Redis/Envoy for local enforcement seems essential.
+thinking
+**Optimizing rate limiting strategy**
+
+When a bucket starts running low, I’ll call the regional Rate Limit Service (RLS) to replenish from a local Redis cache holding the leased quota for low latency. If the regional lease empties, the RLS will request a new lease from the global quota allocator (GQA) using Spanner/etcd, decrementing atomic values from the global budget.
+
+Sharding the GQA by key hash can help reduce contention. I'll have to manage the lease size carefully to ensure minimal overshoot and avoid overwhelming the allocator while balancing efficiency. The decision-making around lease sizing is tricky!
+thinking
+**Considering security strategies**
+
+I have to think about security and potential abuse in the system design. For expensive endpoints, I’m leaning toward a fail-closed approach, while for free endpoints, a fail-open strategy might be appropriate. I should default to fail-closed with a small emergency budget per region.
+
+It's crucial to keep the policy simple while addressing requirements like huge key cardinality and the need for eviction with TTL. For scalability, I’ll have to think about sharding and how to manage load effectively while aiming for high performance targets.
+thinking
+**Addressing lease allocation challenges**
+
+The toughest challenge I’m facing is designing the lease allocation algorithm. I'll need to prevent issues like thundering herd problems, reclaim on region failure, and manage consistent hashing with potential hotspots. It’ll also involve using Envoy for the Global Rate Limit Service or possibly custom gRPC, which feels like a lot of “boring tech” like Envoy, Redis, Spanner, and protobuf.
+
+I should set up YAML front matter for the document including title, category, difficulty—maybe “Hard”—and relevant tags like rate-limiting and distributed systems. The overview will highlight the importance of separating the data plane from the control plane using leased quotas. I’ll need to emphasize the complex requirements around global coordination, strict correctness versus latency, and user migration between regions. This is going to be quite the task!
+thinking
+**Defining system components**
+
+I’m outlining the necessary components for the system: an Edge Gateway, Local limiter, Regional Rate Limit Service (RLS), Regional Redis, Global allocator, and perhaps a Config service. If the node count gets too high, I might consider merging the config into the Global DB and using a config cache at the RLS.
+
+I’ll confidently state the lease size should be based on the per-key rate with a formula of `lease = clamp(rate*2s, 50, 5000)`, and I’ll ensure to set an overshoot bound of `lease_size_per_region * active_regions`. It’s important to manage multi-dimensional limits and to use approximate LRU for large cardinality handling. Alright, let's generate this!
+codex
+```markdown
+---
+title: "Global Rate Limiter"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: [rate-limiting, edge, distributed-systems, quota-leasing, reliability]
+---
+
+## Overview
+
+This system enforces per user/IP/API key rate limits globally across many regions without putting a round-trip to a central coordinator on the critical path. The key insight is to split the design into a **fast local data plane** (decide in-region, in-memory) and a **slow global control plane** (allocate quota occasionally, strongly consistent), connected by **time-bounded quota leases**.
+
+Most “global” limiters fail because they chase perfect global synchronization and accidentally build a distributed lock in front of every request. This design accepts a *bounded* amount of global inaccuracy (strictly limited overshoot) to achieve consistently low latency and low coordination overhead.
+
+## What Makes This Hard
+
+Naive designs either (a) centralize the counter (correct, but high latency + single bottleneck) or (b) replicate counters asynchronously (fast, but easy to exceed limits massively during bursts or regional failover). The trap is that “low coordination” and “global correctness” are in tension: you don’t get both without carefully bounding the error.
+
+The other trap is hot keys. A single abused API key can drive contention at the storage layer even if your average case looks fine. The design must make “one key at 50k RPS” boring.
+
+## Requirements
+
+### Functional Requirements
+- Enforce **global** limits per identity (API key/user/IP) with **bounded overshoot**, not “best effort”.
+- Support **hierarchical limits** (e.g., per API key AND per IP AND per endpoint class); decision is the minimum remaining budget across applicable policies.
+- Keep request-path overhead low: **no cross-region dependency** for the common case.
+- Provide deterministic operator controls: per-key overrides, emergency blocks, and “shadow mode” rollout (measure-only).
+- Produce audit-grade telemetry: allow/deny counts, remaining quota, lease refill rates, and top offenders.
+
+### Scale Targets
+- Global traffic: **1M RPS** sustained, **5M RPS** peak (why: edge systems must absorb product launches and abuse spikes).
+- Regions: **30–60** active regions (why: any design that assumes “a few” breaks when expansion happens).
+- Identities: **10M** provisioned, **200k** active/minute (why: memory + eviction dominates).
+- Added latency budget: **p99 < 2ms** at the gateway (why: rate limiting must not become the tail).
+- Global coordination budget: **< 0.5%** of requests cause a control-plane call (why: keeps the global allocator small and stable).
+
+## Key Design Decisions
+
+- **We chose:** Quota leasing per identity from a strongly consistent global allocator to regions  
+  **We rejected:** A single global counter hit on every request  
+  **Why:** Leasing keeps the request path local while bounding global overshoot by construction.
+
+- **We chose:** Enforce at the edge with in-memory token buckets backed by a regional quota cache (Redis)  
+  **We rejected:** Enforce only in a regional service hop for every request  
+  **Why:** The gateway already touches every request; doing the last micro-decision there removes an entire network hop.
+
+- **We chose:** Shard the global allocator by identity hash in a strongly consistent store (Spanner/CockroachDB)  
+  **We rejected:** “Eventually consistent” multi-master counters  
+  **Why:** The allocator is the only place that must be correct; making that one component strongly consistent simplifies everything else.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> D[Anycast DNS]
+  D --> G[Edge Gateway]
+  G --> L[Local Token Bucket]
+  L -->|refill| R[Regional RLS]
+  R --> X[Regional Redis]
+  R --> A[Global Quota Allocator]
+  A --> S[(Global Strong DB)]
+```
+
+### Components
+
+- **Edge Gateway**
+  - Owns the request decision point (allow/deny) and attaches rate-limit headers.
+  - Keeps per-identity in-memory buckets for hot paths; avoids network for the common case.
+
+- **Local Token Bucket**
+  - Implements token bucket per identity (and per policy dimension if needed).
+  - Decrements locally; when low, asks for more tokens (a refill), not permission per request.
+
+- **Regional RLS (Rate Limit Service)**
+  - The “regional brain”: hands out tokens to gateways from a regional pool and absorbs bursts.
+  - Aggregates multiple gateways, smoothing refill storms and centralizing policy evaluation.
+
+- **Regional Redis**
+  - Stores regional leased balances and short-lived coordination state (per-identity regional remaining).
+  - Keeps refill cheap and local; Redis latency is predictable within a region.
+
+- **Global Quota Allocator**
+  - Grants time-bounded leases by atomically decrementing global remaining budget for an identity.
+  - Sharded by `hash(identity)` to scale horizontally and avoid hot partitions.
+
+- **Global Strong DB**
+  - Stores authoritative per-identity rate policies and the allocator’s global “remaining” state for the current refill period.
+  - Strong consistency is used here to make overshoot bounds defensible.
+
+## Deep Dive: Quota Leasing (The Hardest Part)
+
+The allocator doesn’t answer “is this request allowed?” It answers “how many tokens may this region spend locally before asking again?” That one reframing removes the need for per-request global coordination.
+
+**Lease mechanics**
+- Each identity has a token bucket defined by `(rate, burst)`.
+- The allocator maintains the global bucket state and hands out **leases**: `(tokens, expiry)`.
+- A region spends from its lease locally (Redis + gateway memory). When the regional lease drops below a threshold, it requests another lease.
+
+**Bounding overshoot**
+Overshoot happens when multiple regions hold unspent leases and the identity suddenly concentrates traffic in one region. We bound it explicitly:
+
+- Let `L` be the maximum lease size the allocator grants for an identity.
+- Let `R` be the number of regions that can hold an active lease concurrently.
+- Worst-case global overshoot is bounded by `R * L` (plus a small in-flight margin).
+
+So we pick `L` with intent:
+- Default: `L = clamp(rate * 2s, 50, 5000)` tokens
+- Refill when remaining < 20% of `L`
+- Add ±10% jitter to refill timing to avoid synchronized thundering herds
+
+This keeps coordination low (leases cover seconds of traffic) while limiting abuse blast radius (a leaked key cannot exceed the global limit by more than a known bound).
+
+**Handling hot keys without melting the allocator**
+Hot identities refill frequently. Two tactics keep it boring:
+1. **Adaptive leases:** increase `L` for identities that refill repeatedly from the same region (reduces allocator QPS), but cap `L` so overshoot stays bounded.
+2. **Single-flight per identity per region:** the regional RLS deduplicates concurrent refill requests so 1,000 gateways don’t stampede the allocator.
+
+**Failover and expiry**
+Leases have expiries. If a region dies holding tokens, those tokens are “lost” until expiry; this intentionally biases toward *under-utilization* over *over-limit*. In practice, it’s the right trade: users prefer occasional extra throttling during outages over letting abuse through.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Low latency (local decisions) | Perfect global precision at millisecond granularity |
+| Predictable, bounded error | Some quota under-utilization on regional failure |
+| Simple request path | More complexity in control-plane lease logic |
+
+## Failure Modes
+
+- **Global allocator outage**
+  - **What happens:** Regions cannot obtain new leases; local buckets drain.
+  - **Detect:** Lease refill failures spike; regional remaining trends to zero.
+  - **Recover:** Gateways continue using remaining leased tokens; once exhausted, enforce throttling (deny) rather than unbounded allow. Restore allocator; leases resume.
+
+- **Regional Redis degradation**
+  - **What happens:** Regional pooling becomes slow; gateways fall back to in-memory only and refill less efficiently.
+  - **Detect:** Redis latency/timeout alarms; RLS refill latency increases.
+  - **Recover:** Gateways use a small in-memory “emergency budget” per identity (e.g., 1–2 seconds worth) to smooth transient failures; sustained issues trigger stricter throttling until Redis recovers.
+
+- **Identity hotspot / abuse spike**
+  - **What happens:** A single key drives high refill rates and pressure on one shard.
+  - **Detect:** Top-identity dashboards show refill QPS and denies; allocator shard skew metrics.
+  - **Recover:** Automatic lease size adaptation + per-identity circuit breaker (hard cap) and operator kill switch; shard by identity hash prevents broader impact.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move more decision logic into the gateway (WASM/Lua filter), keep RLS as a lightweight refill/coordinator, and aggressively tune lease sizing to keep allocator QPS flat.
+- **100x scale:** Add a second-level hierarchy: allocate leases to *regional clusters* (not individual regions) and subdivide locally. This reduces `R` in the overshoot bound and keeps global allocator state smaller and less contended.
+
+## Operational Notes
+
+- Tune `L` (lease size) per policy tier; overshoot bounds are only real if lease caps are real.
+- Track “refill rate per identity” as an early abuse signal; it’s more actionable than raw RPS.
+- Roll out new policies in **shadow mode** first; compare predicted denies vs actual traffic before enforcing.
+- Keep TTL-based eviction on gateway buckets; cardinality spikes otherwise become a memory incident, not a rate-limit incident.
+```
+tokens used
+4,258
+```markdown
+---
+title: "Global Rate Limiter"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: [rate-limiting, edge, distributed-systems, quota-leasing, reliability]
+---
+
+## Overview
+
+This system enforces per user/IP/API key rate limits globally across many regions without putting a round-trip to a central coordinator on the critical path. The key insight is to split the design into a **fast local data plane** (decide in-region, in-memory) and a **slow global control plane** (allocate quota occasionally, strongly consistent), connected by **time-bounded quota leases**.
+
+Most “global” limiters fail because they chase perfect global synchronization and accidentally build a distributed lock in front of every request. This design accepts a *bounded* amount of global inaccuracy (strictly limited overshoot) to achieve consistently low latency and low coordination overhead.
+
+## What Makes This Hard
+
+Naive designs either (a) centralize the counter (correct, but high latency + single bottleneck) or (b) replicate counters asynchronously (fast, but easy to exceed limits massively during bursts or regional failover). The trap is that “low coordination” and “global correctness” are in tension: you don’t get both without carefully bounding the error.
+
+The other trap is hot keys. A single abused API key can drive contention at the storage layer even if your average case looks fine. The design must make “one key at 50k RPS” boring.
+
+## Requirements
+
+### Functional Requirements
+- Enforce **global** limits per identity (API key/user/IP) with **bounded overshoot**, not “best effort”.
+- Support **hierarchical limits** (e.g., per API key AND per IP AND per endpoint class); decision is the minimum remaining budget across applicable policies.
+- Keep request-path overhead low: **no cross-region dependency** for the common case.
+- Provide deterministic operator controls: per-key overrides, emergency blocks, and “shadow mode” rollout (measure-only).
+- Produce audit-grade telemetry: allow/deny counts, remaining quota, lease refill rates, and top offenders.
+
+### Scale Targets
+- Global traffic: **1M RPS** sustained, **5M RPS** peak (why: edge systems must absorb product launches and abuse spikes).
+- Regions: **30–60** active regions (why: any design that assumes “a few” breaks when expansion happens).
+- Identities: **10M** provisioned, **200k** active/minute (why: memory + eviction dominates).
+- Added latency budget: **p99 < 2ms** at the gateway (why: rate limiting must not become the tail).
+- Global coordination budget: **< 0.5%** of requests cause a control-plane call (why: keeps the global allocator small and stable).
+
+## Key Design Decisions
+
+- **We chose:** Quota leasing per identity from a strongly consistent global allocator to regions  
+  **We rejected:** A single global counter hit on every request  
+  **Why:** Leasing keeps the request path local while bounding global overshoot by construction.
+
+- **We chose:** Enforce at the edge with in-memory token buckets backed by a regional quota cache (Redis)  
+  **We rejected:** Enforce only in a regional service hop for every request  
+  **Why:** The gateway already touches every request; doing the last micro-decision there removes an entire network hop.
+
+- **We chose:** Shard the global allocator by identity hash in a strongly consistent store (Spanner/CockroachDB)  
+  **We rejected:** “Eventually consistent” multi-master counters  
+  **Why:** The allocator is the only place that must be correct; making that one component strongly consistent simplifies everything else.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> D[Anycast DNS]
+  D --> G[Edge Gateway]
+  G --> L[Local Token Bucket]
+  L -->|refill| R[Regional RLS]
+  R --> X[Regional Redis]
+  R --> A[Global Quota Allocator]
+  A --> S[(Global Strong DB)]
+```
+
+### Components
+
+- **Edge Gateway**
+  - Owns the request decision point (allow/deny) and attaches rate-limit headers.
+  - Keeps per-identity in-memory buckets for hot paths; avoids network for the common case.
+
+- **Local Token Bucket**
+  - Implements token bucket per identity (and per policy dimension if needed).
+  - Decrements locally; when low, asks for more tokens (a refill), not permission per request.
+
+- **Regional RLS (Rate Limit Service)**
+  - The “regional brain”: hands out tokens to gateways from a regional pool and absorbs bursts.
+  - Aggregates multiple gateways, smoothing refill storms and centralizing policy evaluation.
+
+- **Regional Redis**
+  - Stores regional leased balances and short-lived coordination state (per-identity regional remaining).
+  - Keeps refill cheap and local; Redis latency is predictable within a region.
+
+- **Global Quota Allocator**
+  - Grants time-bounded leases by atomically decrementing global remaining budget for an identity.
+  - Sharded by `hash(identity)` to scale horizontally and avoid hot partitions.
+
+- **Global Strong DB**
+  - Stores authoritative per-identity rate policies and the allocator’s global “remaining” state for the current refill period.
+  - Strong consistency is used here to make overshoot bounds defensible.
+
+## Deep Dive: Quota Leasing (The Hardest Part)
+
+The allocator doesn’t answer “is this request allowed?” It answers “how many tokens may this region spend locally before asking again?” That one reframing removes the need for per-request global coordination.
+
+**Lease mechanics**
+- Each identity has a token bucket defined by `(rate, burst)`.
+- The allocator maintains the global bucket state and hands out **leases**: `(tokens, expiry)`.
+- A region spends from its lease locally (Redis + gateway memory). When the regional lease drops below a threshold, it requests another lease.
+
+**Bounding overshoot**
+Overshoot happens when multiple regions hold unspent leases and the identity suddenly concentrates traffic in one region. We bound it explicitly:
+
+- Let `L` be the maximum lease size the allocator grants for an identity.
+- Let `R` be the number of regions that can hold an active lease concurrently.
+- Worst-case global overshoot is bounded by `R * L` (plus a small in-flight margin).
+
+So we pick `L` with intent:
+- Default: `L = clamp(rate * 2s, 50, 5000)` tokens
+- Refill when remaining < 20% of `L`
+- Add ±10% jitter to refill timing to avoid synchronized thundering herds
+
+This keeps coordination low (leases cover seconds of traffic) while limiting abuse blast radius (a leaked key cannot exceed the global limit by more than a known bound).
+
+**Handling hot keys without melting the allocator**
+Hot identities refill frequently. Two tactics keep it boring:
+1. **Adaptive leases:** increase `L` for identities that refill repeatedly from the same region (reduces allocator QPS), but cap `L` so overshoot stays bounded.
+2. **Single-flight per identity per region:** the regional RLS deduplicates concurrent refill requests so 1,000 gateways don’t stampede the allocator.
+
+**Failover and expiry**
+Leases have expiries. If a region dies holding tokens, those tokens are “lost” until expiry; this intentionally biases toward *under-utilization* over *over-limit*. In practice, it’s the right trade: users prefer occasional extra throttling during outages over letting abuse through.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Low latency (local decisions) | Perfect global precision at millisecond granularity |
+| Predictable, bounded error | Some quota under-utilization on regional failure |
+| Simple request path | More complexity in control-plane lease logic |
+
+## Failure Modes
+
+- **Global allocator outage**
+  - **What happens:** Regions cannot obtain new leases; local buckets drain.
+  - **Detect:** Lease refill failures spike; regional remaining trends to zero.
+  - **Recover:** Gateways continue using remaining leased tokens; once exhausted, enforce throttling (deny) rather than unbounded allow. Restore allocator; leases resume.
+
+- **Regional Redis degradation**
+  - **What happens:** Regional pooling becomes slow; gateways fall back to in-memory only and refill less efficiently.
+  - **Detect:** Redis latency/timeout alarms; RLS refill latency increases.
+  - **Recover:** Gateways use a small in-memory “emergency budget” per identity (e.g., 1–2 seconds worth) to smooth transient failures; sustained issues trigger stricter throttling until Redis recovers.
+
+- **Identity hotspot / abuse spike**
+  - **What happens:** A single key drives high refill rates and pressure on one shard.
+  - **Detect:** Top-identity dashboards show refill QPS and denies; allocator shard skew metrics.
+  - **Recover:** Automatic lease size adaptation + per-identity circuit breaker (hard cap) and operator kill switch; shard by identity hash prevents broader impact.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move more decision logic into the gateway (WASM/Lua filter), keep RLS as a lightweight refill/coordinator, and aggressively tune lease sizing to keep allocator QPS flat.
+- **100x scale:** Add a second-level hierarchy: allocate leases to *regional clusters* (not individual regions) and subdivide locally. This reduces `R` in the overshoot bound and keeps global allocator state smaller and less contended.
+
+## Operational Notes
+
+- Tune `L` (lease size) per policy tier; overshoot bounds are only real if lease caps are real.
+- Track “refill rate per identity” as an early abuse signal; it’s more actionable than raw RPS.
+- Roll out new policies in **shadow mode** first; compare predicted denies vs actual traffic before enforcing.
+- Keep TTL-based eviction on gateway buckets; cardinality spikes otherwise become a memory incident, not a rate-limit incident.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/global-rate-limiter.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-e666-7b71-bb3f-4b3c742f73cb
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Global Rate Limiter"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: [rate-limiting, edge, distributed-systems, quota-leasing, reliability]
+---
+
+## Overview
+
+This system enforces per user/IP/API key rate limits globally across many regions without putting a round-trip to a central coordinator on the critical path. The key insight is to split the design into a **fast local data plane** (decide in-region, in-memory) and a **slow global control plane** (allocate quota occasionally, strongly consistent), connected by **time-bounded quota leases**.
+
+Most “global” limiters fail because they chase perfect global synchronization and accidentally build a distributed lock in front of every request. This design accepts a *bounded* amount of global inaccuracy (strictly limited overshoot) to achieve consistently low latency and low coordination overhead.
+
+## What Makes This Hard
+
+Naive designs either (a) centralize the counter (correct, but high latency + single bottleneck) or (b) replicate counters asynchronously (fast, but easy to exceed limits massively during bursts or regional failover). The trap is that “low coordination” and “global correctness” are in tension: you don’t get both without carefully bounding the error.
+
+The other trap is hot keys. A single abused API key can drive contention at the storage layer even if your average case looks fine. The design must make “one key at 50k RPS” boring.
+
+## Requirements
+
+### Functional Requirements
+- Enforce **global** limits per identity (API key/user/IP) with **bounded overshoot**, not “best effort”.
+- Support **hierarchical limits** (e.g., per API key AND per IP AND per endpoint class); decision is the minimum remaining budget across applicable policies.
+- Keep request-path overhead low: **no cross-region dependency** for the common case.
+- Provide deterministic operator controls: per-key overrides, emergency blocks, and “shadow mode” rollout (measure-only).
+- Produce audit-grade telemetry: allow/deny counts, remaining quota, lease refill rates, and top offenders.
+
+### Scale Targets
+- Global traffic: **1M RPS** sustained, **5M RPS** peak (why: edge systems must absorb product launches and abuse spikes).
+- Regions: **30–60** active regions (why: any design that assumes “a few” breaks when expansion happens).
+- Identities: **10M** provisioned, **200k** active/minute (why: memory + eviction dominates).
+- Added latency budget: **p99 < 2ms** at the gateway (why: rate limiting must not become the tail).
+- Global coordination budget: **< 0.5%** of requests cause a control-plane call (why: keeps the global allocator small and stable).
+
+## Key Design Decisions
+
+- **We chose:** Quota leasing per identity from a strongly consistent global allocator to regions  
+  **We rejected:** A single global counter hit on every request  
+  **Why:** Leasing keeps the request path local while bounding global overshoot by construction.
+
+- **We chose:** Enforce at the edge with in-memory token buckets backed by a regional quota cache (Redis)  
+  **We rejected:** Enforce only in a regional service hop for every request  
+  **Why:** The gateway already touches every request; doing the last micro-decision there removes an entire network hop.
+
+- **We chose:** Shard the global allocator by identity hash in a strongly consistent store (Spanner/CockroachDB)  
+  **We rejected:** “Eventually consistent” multi-master counters  
+  **Why:** The allocator is the only place that must be correct; making that one component strongly consistent simplifies everything else.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> D[Anycast DNS]
+  D --> G[Edge Gateway]
+  G --> L[Local Token Bucket]
+  L -->|refill| R[Regional RLS]
+  R --> X[Regional Redis]
+  R --> A[Global Quota Allocator]
+  A --> S[(Global Strong DB)]
+```
+
+### Components
+
+- **Edge Gateway**
+  - Owns the request decision point (allow/deny) and attaches rate-limit headers.
+  - Keeps per-identity in-memory buckets for hot paths; avoids network for the common case.
+
+- **Local Token Bucket**
+  - Implements token bucket per identity (and per policy dimension if needed).
+  - Decrements locally; when low, asks for more tokens (a refill), not permission per request.
+
+- **Regional RLS (Rate Limit Service)**
+  - The “regional brain”: hands out tokens to gateways from a regional pool and absorbs bursts.
+  - Aggregates multiple gateways, smoothing refill storms and centralizing policy evaluation.
+
+- **Regional Redis**
+  - Stores regional leased balances and short-lived coordination state (per-identity regional remaining).
+  - Keeps refill cheap and local; Redis latency is predictable within a region.
+
+- **Global Quota Allocator**
+  - Grants time-bounded leases by atomically decrementing global remaining budget for an identity.
+  - Sharded by `hash(identity)` to scale horizontally and avoid hot partitions.
+
+- **Global Strong DB**
+  - Stores authoritative per-identity rate policies and the allocator’s global “remaining” state for the current refill period.
+  - Strong consistency is used here to make overshoot bounds defensible.
+
+## Deep Dive: Quota Leasing (The Hardest Part)
+
+The allocator doesn’t answer “is this request allowed?” It answers “how many tokens may this region spend locally before asking again?” That one reframing removes the need for per-request global coordination.
+
+**Lease mechanics**
+- Each identity has a token bucket defined by `(rate, burst)`.
+- The allocator maintains the global bucket state and hands out **leases**: `(tokens, expiry)`.
+- A region spends from its lease locally (Redis + gateway memory). When the regional lease drops below a threshold, it requests another lease.
+
+**Bounding overshoot**
+Overshoot happens when multiple regions hold unspent leases and the identity suddenly concentrates traffic in one region. We bound it explicitly:
+
+- Let `L` be the maximum lease size the allocator grants for an identity.
+- Let `R` be the number of regions that can hold an active lease concurrently.
+- Worst-case global overshoot is bounded by `R * L` (plus a small in-flight margin).
+
+So we pick `L` with intent:
+- Default: `L = clamp(rate * 2s, 50, 5000)` tokens
+- Refill when remaining < 20% of `L`
+- Add ±10% jitter to refill timing to avoid synchronized thundering herds
+
+This keeps coordination low (leases cover seconds of traffic) while limiting abuse blast radius (a leaked key cannot exceed the global limit by more than a known bound).
+
+**Handling hot keys without melting the allocator**
+Hot identities refill frequently. Two tactics keep it boring:
+1. **Adaptive leases:** increase `L` for identities that refill repeatedly from the same region (reduces allocator QPS), but cap `L` so overshoot stays bounded.
+2. **Single-flight per identity per region:** the regional RLS deduplicates concurrent refill requests so 1,000 gateways don’t stampede the allocator.
+
+**Failover and expiry**
+Leases have expiries. If a region dies holding tokens, those tokens are “lost” until expiry; this intentionally biases toward *under-utilization* over *over-limit*. In practice, it’s the right trade: users prefer occasional extra throttling during outages over letting abuse through.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Low latency (local decisions) | Perfect global precision at millisecond granularity |
+| Predictable, bounded error | Some quota under-utilization on regional failure |
+| Simple request path | More complexity in control-plane lease logic |
+
+## Failure Modes
+
+- **Global allocator outage**
+  - **What happens:** Regions cannot obtain new leases; local buckets drain.
+  - **Detect:** Lease refill failures spike; regional remaining trends to zero.
+  - **Recover:** Gateways continue using remaining leased tokens; once exhausted, enforce throttling (deny) rather than unbounded allow. Restore allocator; leases resume.
+
+- **Regional Redis degradation**
+  - **What happens:** Regional pooling becomes slow; gateways fall back to in-memory only and refill less efficiently.
+  - **Detect:** Redis latency/timeout alarms; RLS refill latency increases.
+  - **Recover:** Gateways use a small in-memory “emergency budget” per identity (e.g., 1–2 seconds worth) to smooth transient failures; sustained issues trigger stricter throttling until Redis recovers.
+
+- **Identity hotspot / abuse spike**
+  - **What happens:** A single key drives high refill rates and pressure on one shard.
+  - **Detect:** Top-identity dashboards show refill QPS and denies; allocator shard skew metrics.
+  - **Recover:** Automatic lease size adaptation + per-identity circuit breaker (hard cap) and operator kill switch; shard by identity hash prevents broader impact.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move more decision logic into the gateway (WASM/Lua filter), keep RLS as a lightweight refill/coordinator, and aggressively tune lease sizing to keep allocator QPS flat.
+- **100x scale:** Add a second-level hierarchy: allocate leases to *regional clusters* (not individual regions) and subdivide locally. This reduces `R` in the overshoot bound and keeps global allocator state smaller and less contended.
+
+## Operational Notes
+
+- Tune `L` (lease size) per policy tier; overshoot bounds are only real if lease caps are real.
+- Track “refill rate per identity” as an early abuse signal; it’s more actionable than raw RPS.
+- Roll out new policies in **shadow mode** first; compare predicted denies vs actual traffic before enforcing.
+- Keep TTL-based eviction on gateway buckets; cardinality spikes otherwise become a memory incident, not a rate-limit incident.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+thinking
+**Crafting a Structured Critique**
+
+I need to focus on providing a structured critique. No coding is necessary, but I should follow a markdown format. The critique must be constructive, emphasizing elegance, simplifications, and stress tests. I’ll use tables to present information clearly and suggest alternatives like Postgres or Redis.
+
+I can outline stress test scenarios, including DB outage and network partitions. Key areas to fix include overshooting formula assumptions and managing identity memory. Also, I should highlight the need for specifying timekeeping in algorithms related to token bucket design. I'll keep everything concise.
+thinking
+**Reflecting on Key Insights**
+
+I’ve identified a core insight about separating the data plane with a leased quota while treating the global component as an allocator. Potential components include a gateway, RLS, global allocator, and possibly Redis. 
+
+In terms of simplification, I could replace regional Redis with RLS holding the state, sharding it to avoid central Redis. Alternatively, I could let gateways communicate directly with Redis for the token bucket, but I'd need to consider the overhead. I'll need to evaluate the trade-offs carefully to optimize the design.
+thinking
+**Exploring Coordination and Allocation**
+
+The gateway can utilize local in-memory storage for consultations, but it requires regional coordination. I might consider using a global rate limit filter like Envoy or existing projects such as Uber's ratelimit. 
+
+For the allocator, Cockroach could work with stored procedures, or I could look into etcd, although not at scale. Combining a strong DB with Spanner for atomic row updates could eliminate the need for a separate allocator. Also, instead of allocating leases per region, I could explore using hierarchical leasing and consistent hashing for better identity management, though latency might complicate that.
+thinking
+**Evaluating Stress Tests**
+
+I'm laying out stress tests to address several potential issues. First, for an allocator outage, I’ll need a specific SLO and options for fail-open or fail-close per tier, especially for logins. 
+
+Next, in a strong DB partial failure, I need to consider how to maintain transactionality and manage lease tokens. For network partitions, overshooting bounds may hold, but the region can’t get new leases, leading to underutilization.
+
+Regarding clock skew, if there are discrepancies across regions, it could lead to overspending or early lease expiration. To mitigate this, I should use a monotonic time and a TTL-based approach to manage expiry effectively. Lastly, I’ll need to ensure that fallback emergency budgets don’t disrupt the overshoot bounds.
+thinking
+**Evaluating Overshoot and Configuration Challenges**
+
+I need to clarify the implications of overshoot exceeding the allowed bound. When dealing with hot keys across regions, it's essential to ensure there's only one lease per region and that unspent tokens are capped. I’ll need to reinforce idempotency for lease requests to avoid double allocations, using request IDs for deduplication.
+
+For bad config rollouts, I must consider versioning and whether to revoke old leases. Implementing a global blocklist via config is an option too.
+
+Lastly, regarding telemetry, consistent aggregation and effective bucket management are key. I'll ensure the design includes recommendations and highlights strengths across various scenarios.
+codex
+## Elegance Check
+
+### The Core Insight
+Turn “global rate limiting” into “occasional global quota allocation”: local decisions stay fast, and global correctness is concentrated into a single strongly-consistent lease issuer with an explicit overshoot bound.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Edge Gateway | Only place that can guarantee <2ms p99 by making the final allow/deny decision locally. |
+| Global Quota Allocator | The one correctness-critical component that makes the “bounded overshoot” claim defensible. |
+| Global Strong DB | Provides atomicity/durability for leases and policies; prevents “double spend” under retries/failures. |
+| Regional RLS | Useful as a shock absorber (single-flight, policy evaluation, smoothing refill storms) so gateways stay simple. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Regional RLS + Regional Redis | Remove Redis: keep regional lease state in RLS memory + shard RLS (consistent hash) | Loses Redis durability; requires careful RLS failover (or accept faster drain/stricter throttling on RLS restarts). |
+| Regional RLS + Regional Redis | Remove RLS: gateways refill directly from Redis (Lua/Redis-Cell style) and only call allocator when Redis low | Simpler service topology, but pushes more logic/coordination to gateways and increases Redis hot-key pressure. |
+| Custom RLS implementation | Use Envoy’s global rate limit patterns (gateway filter + external RLS) as the “regional brain” | Less custom code, but you inherit Envoy integration constraints and may still need bespoke global leasing. |
+| Allocator as separate service | Push allocator logic into the strong DB access layer (stored proc / transactional function) | Fewer moving parts; harder to evolve logic and observability; DB becomes more “application-aware”. |
+| Global limits on highly-cardinal identities (e.g., IP) | Make only API keys global; keep IP limits regional + coarse global abuse controls | You lose strict global IP fairness, but you likely reduce 10M→massive cardinality pain and allocator/DB load. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Allocator request retries + timeouts (duplicate lease grants)**
+   - Design’s answer: not addressed
+   - Recommendation: Strengthen (this is the #1 way “bounded overshoot” silently becomes unbounded). Require idempotency keys per lease request stored transactionally in `Global Strong DB`, and define whether a “refill” is additive vs “set-to/max” to prevent accumulation.
+
+2. **Bad policy rollout / emergency block**
+   - Design’s answer: partial (shadow mode + operator kill switch mentioned)
+   - Recommendation: Strengthen. Define policy versioning and how outstanding leases behave on policy change (honor until expiry vs revoke). For emergency blocks, don’t rely on allocator reachability—ship a fast path denylist/config to gateways (or regional RLS) that takes effect immediately.
+
+3. **Clock skew / timekeeping bugs affecting lease expiry**
+   - Design’s answer: not addressed
+   - Recommendation: Strengthen. Make expiry based on monotonic “lease TTL remaining since receipt” rather than absolute wall-clock, or have gateways/RLS treat allocator-stamped `expires_at` conservatively (min with local). Otherwise skew can cause early expiration (over-throttling) or late expiration (overshoot).
+
+4. **Regional Redis brownout (slow, not down)**
+   - Design’s answer: addressed (fallback to in-memory emergency budget)
+   - Recommendation: Strengthen. Ensure “emergency budget” is strictly carved out of already-leased tokens (not extra), or you break the overshoot bound exactly when you’re degraded. Also define backpressure: when Redis p99 rises, reduce refill concurrency and tighten local admission to keep the region stable.
+
+5. **Hot key hits many regions at once (burst + anycast shifts)**
+   - Design’s answer: addressed conceptually (`R * L` bound, adaptive leases, single-flight)
+   - Recommendation: Acceptable with one clarification: explicitly guarantee “at most one active lease per (identity, region)” and prevent overlapping leases on retries. Also consider lowering `R` earlier via “super-region” leasing (your 100x idea is valuable at 10x too if you truly have 30–60 regions).
+
+## Recommendations
+
+### Must Fix
+- Define the allocator’s exact state machine for token buckets (e.g., store `(tokens, last_refill)` or use a GCRA-style “theoretical arrival time”); “remaining for current refill period” reads like fixed-window semantics and will surprise reviewers/operators.
+- Add end-to-end idempotency for lease grants (request IDs + transactional dedupe) and specify retry behavior; without this, overshoot bounds won’t hold under real failure.
+- Specify policy change semantics (versioning, lease revocation rules, emergency block propagation) so operators aren’t stuck waiting for lease expiry during incidents.
+
+### Should Consider
+- Re-evaluate whether you need both `Regional RLS` and `Regional Redis`; pick one as the coordination point to reduce operational surface area.
+- Treat global-IP limits as an explicit, justified choice (cardinality + churn); if you keep them, describe eviction/TTL strategy and how you avoid allocator hot partitions on NATed IPs.
+- Make “fail closed vs fail open” a per-endpoint/per-tier knob (auth vs telemetry ingestion), not a single global behavior.
+
+### Nice to Have
+- Document the invariant behind the overshoot bound (one lease per region, no accumulation, conservative expiry) as a short “safety proof” section.
+- Add a clear on-call runbook trigger: “allocator unreachable + leases draining” → what knobs to turn (tighten L, raise refill threshold, enable stricter local mode).
+
+## What's Working Well
+- The lease framing cleanly separates latency-sensitive data plane from correctness-sensitive control plane.
+- The design is honest about trade-offs (bounded inaccuracy, under-utilization on failures) and picks sensible defaults (jitter, single-flight).
+- You explicitly call out hot-key behavior and design for it, instead of assuming averages—this is where most global limiters die.
+- Shadow mode + audit-grade telemetry requirements are pragmatic and make rollout safer.
+tokens used
+5,911
+## Elegance Check
+
+### The Core Insight
+Turn “global rate limiting” into “occasional global quota allocation”: local decisions stay fast, and global correctness is concentrated into a single strongly-consistent lease issuer with an explicit overshoot bound.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Edge Gateway | Only place that can guarantee <2ms p99 by making the final allow/deny decision locally. |
+| Global Quota Allocator | The one correctness-critical component that makes the “bounded overshoot” claim defensible. |
+| Global Strong DB | Provides atomicity/durability for leases and policies; prevents “double spend” under retries/failures. |
+| Regional RLS | Useful as a shock absorber (single-flight, policy evaluation, smoothing refill storms) so gateways stay simple. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Regional RLS + Regional Redis | Remove Redis: keep regional lease state in RLS memory + shard RLS (consistent hash) | Loses Redis durability; requires careful RLS failover (or accept faster drain/stricter throttling on RLS restarts). |
+| Regional RLS + Regional Redis | Remove RLS: gateways refill directly from Redis (Lua/Redis-Cell style) and only call allocator when Redis low | Simpler service topology, but pushes more logic/coordination to gateways and increases Redis hot-key pressure. |
+| Custom RLS implementation | Use Envoy’s global rate limit patterns (gateway filter + external RLS) as the “regional brain” | Less custom code, but you inherit Envoy integration constraints and may still need bespoke global leasing. |
+| Allocator as separate service | Push allocator logic into the strong DB access layer (stored proc / transactional function) | Fewer moving parts; harder to evolve logic and observability; DB becomes more “application-aware”. |
+| Global limits on highly-cardinal identities (e.g., IP) | Make only API keys global; keep IP limits regional + coarse global abuse controls | You lose strict global IP fairness, but you likely reduce 10M→massive cardinality pain and allocator/DB load. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Allocator request retries + timeouts (duplicate lease grants)**
+   - Design’s answer: not addressed
+   - Recommendation: Strengthen (this is the #1 way “bounded overshoot” silently becomes unbounded). Require idempotency keys per lease request stored transactionally in `Global Strong DB`, and define whether a “refill” is additive vs “set-to/max” to prevent accumulation.
+
+2. **Bad policy rollout / emergency block**
+   - Design’s answer: partial (shadow mode + operator kill switch mentioned)
+   - Recommendation: Strengthen. Define policy versioning and how outstanding leases behave on policy change (honor until expiry vs revoke). For emergency blocks, don’t rely on allocator reachability—ship a fast path denylist/config to gateways (or regional RLS) that takes effect immediately.
+
+3. **Clock skew / timekeeping bugs affecting lease expiry**
+   - Design’s answer: not addressed
+   - Recommendation: Strengthen. Make expiry based on monotonic “lease TTL remaining since receipt” rather than absolute wall-clock, or have gateways/RLS treat allocator-stamped `expires_at` conservatively (min with local). Otherwise skew can cause early expiration (over-throttling) or late expiration (overshoot).
+
+4. **Regional Redis brownout (slow, not down)**
+   - Design’s answer: addressed (fallback to in-memory emergency budget)
+   - Recommendation: Strengthen. Ensure “emergency budget” is strictly carved out of already-leased tokens (not extra), or you break the overshoot bound exactly when you’re degraded. Also define backpressure: when Redis p99 rises, reduce refill concurrency and tighten local admission to keep the region stable.
+
+5. **Hot key hits many regions at once (burst + anycast shifts)**
+   - Design’s answer: addressed conceptually (`R * L` bound, adaptive leases, single-flight)
+   - Recommendation: Acceptable with one clarification: explicitly guarantee “at most one active lease per (identity, region)” and prevent overlapping leases on retries. Also consider lowering `R` earlier via “super-region” leasing (your 100x idea is valuable at 10x too if you truly have 30–60 regions).
+
+## Recommendations
+
+### Must Fix
+- Define the allocator’s exact state machine for token buckets (e.g., store `(tokens, last_refill)` or use a GCRA-style “theoretical arrival time”); “remaining for current refill period” reads like fixed-window semantics and will surprise reviewers/operators.
+- Add end-to-end idempotency for lease grants (request IDs + transactional dedupe) and specify retry behavior; without this, overshoot bounds won’t hold under real failure.
+- Specify policy change semantics (versioning, lease revocation rules, emergency block propagation) so operators aren’t stuck waiting for lease expiry during incidents.
+
+### Should Consider
+- Re-evaluate whether you need both `Regional RLS` and `Regional Redis`; pick one as the coordination point to reduce operational surface area.
+- Treat global-IP limits as an explicit, justified choice (cardinality + churn); if you keep them, describe eviction/TTL strategy and how you avoid allocator hot partitions on NATed IPs.
+- Make “fail closed vs fail open” a per-endpoint/per-tier knob (auth vs telemetry ingestion), not a single global behavior.
+
+### Nice to Have
+- Document the invariant behind the overshoot bound (one lease per region, no accumulation, conservative expiry) as a short “safety proof” section.
+- Add a clear on-call runbook trigger: “allocator unreachable + leases draining” → what knobs to turn (tighten L, raise refill threshold, enable stricter local mode).
+
+## What's Working Well
+- The lease framing cleanly separates latency-sensitive data plane from correctness-sensitive control plane.
+- The design is honest about trade-offs (bounded inaccuracy, under-utilization on failures) and picks sensible defaults (jitter, single-flight).
+- You explicitly call out hot-key behavior and design for it, instead of assuming averages—this is where most global limiters die.
+- Shadow mode + audit-grade telemetry requirements are pragmatic and make rollout safer.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/global-rate-limiter.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afc-baff-7e42-91a5-ca5299fd82c8
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Global Rate Limiter"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: [rate-limiting, edge, distributed-systems, quota-leasing, reliability]
+---
+
+## Overview
+
+This system enforces per user/IP/API key rate limits globally across many regions without putting a round-trip to a central coordinator on the critical path. The key insight is to split the design into a **fast local data plane** (decide in-region, in-memory) and a **slow global control plane** (allocate quota occasionally, strongly consistent), connected by **time-bounded quota leases**.
+
+Most “global” limiters fail because they chase perfect global synchronization and accidentally build a distributed lock in front of every request. This design accepts a *bounded* amount of global inaccuracy (strictly limited overshoot) to achieve consistently low latency and low coordination overhead.
+
+## What Makes This Hard
+
+Naive designs either (a) centralize the counter (correct, but high latency + single bottleneck) or (b) replicate counters asynchronously (fast, but easy to exceed limits massively during bursts or regional failover). The trap is that “low coordination” and “global correctness” are in tension: you don’t get both without carefully bounding the error.
+
+The other trap is hot keys. A single abused API key can drive contention at the storage layer even if your average case looks fine. The design must make “one key at 50k RPS” boring.
+
+## Requirements
+
+### Functional Requirements
+- Enforce **global** limits per identity (API key/user/IP) with **bounded overshoot**, not “best effort”.
+- Support **hierarchical limits** (e.g., per API key AND per IP AND per endpoint class); decision is the minimum remaining budget across applicable policies.
+- Keep request-path overhead low: **no cross-region dependency** for the common case.
+- Provide deterministic operator controls: per-key overrides, emergency blocks, and “shadow mode” rollout (measure-only).
+- Produce audit-grade telemetry: allow/deny counts, remaining quota, lease refill rates, and top offenders.
+
+### Scale Targets
+- Global traffic: **1M RPS** sustained, **5M RPS** peak (why: edge systems must absorb product launches and abuse spikes).
+- Regions: **30–60** active regions (why: any design that assumes “a few” breaks when expansion happens).
+- Identities: **10M** provisioned, **200k** active/minute (why: memory + eviction dominates).
+- Added latency budget: **p99 < 2ms** at the gateway (why: rate limiting must not become the tail).
+- Global coordination budget: **< 0.5%** of requests cause a control-plane call (why: keeps the global allocator small and stable).
+
+## Key Design Decisions
+
+- **We chose:** Quota leasing per identity from a strongly consistent global allocator to regions  
+  **We rejected:** A single global counter hit on every request  
+  **Why:** Leasing keeps the request path local while bounding global overshoot by construction.
+
+- **We chose:** Enforce at the edge with in-memory token buckets backed by a regional quota cache (Redis)  
+  **We rejected:** Enforce only in a regional service hop for every request  
+  **Why:** The gateway already touches every request; doing the last micro-decision there removes an entire network hop.
+
+- **We chose:** Shard the global allocator by identity hash in a strongly consistent store (Spanner/CockroachDB)  
+  **We rejected:** “Eventually consistent” multi-master counters  
+  **Why:** The allocator is the only place that must be correct; making that one component strongly consistent simplifies everything else.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> D[Anycast DNS]
+  D --> G[Edge Gateway]
+  G --> L[Local Token Bucket]
+  L -->|refill| R[Regional RLS]
+  R --> X[Regional Redis]
+  R --> A[Global Quota Allocator]
+  A --> S[(Global Strong DB)]
+```
+
+### Components
+
+- **Edge Gateway**
+  - Owns the request decision point (allow/deny) and attaches rate-limit headers.
+  - Keeps per-identity in-memory buckets for hot paths; avoids network for the common case.
+
+- **Local Token Bucket**
+  - Implements token bucket per identity (and per policy dimension if needed).
+  - Decrements locally; when low, asks for more tokens (a refill), not permission per request.
+
+- **Regional RLS (Rate Limit Service)**
+  - The “regional brain”: hands out tokens to gateways from a regional pool and absorbs bursts.
+  - Aggregates multiple gateways, smoothing refill storms and centralizing policy evaluation.
+
+- **Regional Redis**
+  - Stores regional leased balances and short-lived coordination state (per-identity regional remaining).
+  - Keeps refill cheap and local; Redis latency is predictable within a region.
+
+- **Global Quota Allocator**
+  - Grants time-bounded leases by atomically decrementing global remaining budget for an identity.
+  - Sharded by `hash(identity)` to scale horizontally and avoid hot partitions.
+
+- **Global Strong DB**
+  - Stores authoritative per-identity rate policies and the allocator’s global “remaining” state for the current refill period.
+  - Strong consistency is used here to make overshoot bounds defensible.
+
+## Deep Dive: Quota Leasing (The Hardest Part)
+
+The allocator doesn’t answer “is this request allowed?” It answers “how many tokens may this region spend locally before asking again?” That one reframing removes the need for per-request global coordination.
+
+**Lease mechanics**
+- Each identity has a token bucket defined by `(rate, burst)`.
+- The allocator maintains the global bucket state and hands out **leases**: `(tokens, expiry)`.
+- A region spends from its lease locally (Redis + gateway memory). When the regional lease drops below a threshold, it requests another lease.
+
+**Bounding overshoot**
+Overshoot happens when multiple regions hold unspent leases and the identity suddenly concentrates traffic in one region. We bound it explicitly:
+
+- Let `L` be the maximum lease size the allocator grants for an identity.
+- Let `R` be the number of regions that can hold an active lease concurrently.
+- Worst-case global overshoot is bounded by `R * L` (plus a small in-flight margin).
+
+So we pick `L` with intent:
+- Default: `L = clamp(rate * 2s, 50, 5000)` tokens
+- Refill when remaining < 20% of `L`
+- Add ±10% jitter to refill timing to avoid synchronized thundering herds
+
+This keeps coordination low (leases cover seconds of traffic) while limiting abuse blast radius (a leaked key cannot exceed the global limit by more than a known bound).
+
+**Handling hot keys without melting the allocator**
+Hot identities refill frequently. Two tactics keep it boring:
+1. **Adaptive leases:** increase `L` for identities that refill repeatedly from the same region (reduces allocator QPS), but cap `L` so overshoot stays bounded.
+2. **Single-flight per identity per region:** the regional RLS deduplicates concurrent refill requests so 1,000 gateways don’t stampede the allocator.
+
+**Failover and expiry**
+Leases have expiries. If a region dies holding tokens, those tokens are “lost” until expiry; this intentionally biases toward *under-utilization* over *over-limit*. In practice, it’s the right trade: users prefer occasional extra throttling during outages over letting abuse through.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Low latency (local decisions) | Perfect global precision at millisecond granularity |
+| Predictable, bounded error | Some quota under-utilization on regional failure |
+| Simple request path | More complexity in control-plane lease logic |
+
+## Failure Modes
+
+- **Global allocator outage**
+  - **What happens:** Regions cannot obtain new leases; local buckets drain.
+  - **Detect:** Lease refill failures spike; regional remaining trends to zero.
+  - **Recover:** Gateways continue using remaining leased tokens; once exhausted, enforce throttling (deny) rather than unbounded allow. Restore allocator; leases resume.
+
+- **Regional Redis degradation**
+  - **What happens:** Regional pooling becomes slow; gateways fall back to in-memory only and refill less efficiently.
+  - **Detect:** Redis latency/timeout alarms; RLS refill latency increases.
+  - **Recover:** Gateways use a small in-memory “emergency budget” per identity (e.g., 1–2 seconds worth) to smooth transient failures; sustained issues trigger stricter throttling until Redis recovers.
+
+- **Identity hotspot / abuse spike**
+  - **What happens:** A single key drives high refill rates and pressure on one shard.
+  - **Detect:** Top-identity dashboards show refill QPS and denies; allocator shard skew metrics.
+  - **Recover:** Automatic lease size adaptation + per-identity circuit breaker (hard cap) and operator kill switch; shard by identity hash prevents broader impact.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move more decision logic into the gateway (WASM/Lua filter), keep RLS as a lightweight refill/coordinator, and aggressively tune lease sizing to keep allocator QPS flat.
+- **100x scale:** Add a second-level hierarchy: allocate leases to *regional clusters* (not individual regions) and subdivide locally. This reduces `R` in the overshoot bound and keeps global allocator state smaller and less contended.
+
+## Operational Notes
+
+- Tune `L` (lease size) per policy tier; overshoot bounds are only real if lease caps are real.
+- Track “refill rate per identity” as an early abuse signal; it’s more actionable than raw RPS.
+- Roll out new policies in **shadow mode** first; compare predicted denies vs actual traffic before enforcing.
+- Keep TTL-based eviction on gateway buckets; cardinality spikes otherwise become a memory incident, not a rate-limit incident.
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Turn “global rate limiting” into “occasional global quota allocation”: local decisions stay fast, and global correctness is concentrated into a single strongly-consistent lease issuer with an explicit overshoot bound.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Edge Gateway | Only place that can guarantee <2ms p99 by making the final allow/deny decision locally. |
+| Global Quota Allocator | The one correctness-critical component that makes the “bounded overshoot” claim defensible. |
+| Global Strong DB | Provides atomicity/durability for leases and policies; prevents “double spend” under retries/failures. |
+| Regional RLS | Useful as a shock absorber (single-flight, policy evaluation, smoothing refill storms) so gateways stay simple. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Regional RLS + Regional Redis | Remove Redis: keep regional lease state in RLS memory + shard RLS (consistent hash) | Loses Redis durability; requires careful RLS failover (or accept faster drain/stricter throttling on RLS restarts). |
+| Regional RLS + Regional Redis | Remove RLS: gateways refill directly from Redis (Lua/Redis-Cell style) and only call allocator when Redis low | Simpler service topology, but pushes more logic/coordination to gateways and increases Redis hot-key pressure. |
+| Custom RLS implementation | Use Envoy’s global rate limit patterns (gateway filter + external RLS) as the “regional brain” | Less custom code, but you inherit Envoy integration constraints and may still need bespoke global leasing. |
+| Allocator as separate service | Push allocator logic into the strong DB access layer (stored proc / transactional function) | Fewer moving parts; harder to evolve logic and observability; DB becomes more “application-aware”. |
+| Global limits on highly-cardinal identities (e.g., IP) | Make only API keys global; keep IP limits regional + coarse global abuse controls | You lose strict global IP fairness, but you likely reduce 10M→massive cardinality pain and allocator/DB load. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Allocator request retries + timeouts (duplicate lease grants)**
+   - Design’s answer: not addressed
+   - Recommendation: Strengthen (this is the #1 way “bounded overshoot” silently becomes unbounded). Require idempotency keys per lease request stored transactionally in `Global Strong DB`, and define whether a “refill” is additive vs “set-to/max” to prevent accumulation.
+
+2. **Bad policy rollout / emergency block**
+   - Design’s answer: partial (shadow mode + operator kill switch mentioned)
+   - Recommendation: Strengthen. Define policy versioning and how outstanding leases behave on policy change (honor until expiry vs revoke). For emergency blocks, don’t rely on allocator reachability—ship a fast path denylist/config to gateways (or regional RLS) that takes effect immediately.
+
+3. **Clock skew / timekeeping bugs affecting lease expiry**
+   - Design’s answer: not addressed
+   - Recommendation: Strengthen. Make expiry based on monotonic “lease TTL remaining since receipt” rather than absolute wall-clock, or have gateways/RLS treat allocator-stamped `expires_at` conservatively (min with local). Otherwise skew can cause early expiration (over-throttling) or late expiration (overshoot).
+
+4. **Regional Redis brownout (slow, not down)**
+   - Design’s answer: addressed (fallback to in-memory emergency budget)
+   - Recommendation: Strengthen. Ensure “emergency budget” is strictly carved out of already-leased tokens (not extra), or you break the overshoot bound exactly when you’re degraded. Also define backpressure: when Redis p99 rises, reduce refill concurrency and tighten local admission to keep the region stable.
+
+5. **Hot key hits many regions at once (burst + anycast shifts)**
+   - Design’s answer: addressed conceptually (`R * L` bound, adaptive leases, single-flight)
+   - Recommendation: Acceptable with one clarification: explicitly guarantee “at most one active lease per (identity, region)” and prevent overlapping leases on retries. Also consider lowering `R` earlier via “super-region” leasing (your 100x idea is valuable at 10x too if you truly have 30–60 regions).
+
+## Recommendations
+
+### Must Fix
+- Define the allocator’s exact state machine for token buckets (e.g., store `(tokens, last_refill)` or use a GCRA-style “theoretical arrival time”); “remaining for current refill period” reads like fixed-window semantics and will surprise reviewers/operators.
+- Add end-to-end idempotency for lease grants (request IDs + transactional dedupe) and specify retry behavior; without this, overshoot bounds won’t hold under real failure.
+- Specify policy change semantics (versioning, lease revocation rules, emergency block propagation) so operators aren’t stuck waiting for lease expiry during incidents.
+
+### Should Consider
+- Re-evaluate whether you need both `Regional RLS` and `Regional Redis`; pick one as the coordination point to reduce operational surface area.
+- Treat global-IP limits as an explicit, justified choice (cardinality + churn); if you keep them, describe eviction/TTL strategy and how you avoid allocator hot partitions on NATed IPs.
+- Make “fail closed vs fail open” a per-endpoint/per-tier knob (auth vs telemetry ingestion), not a single global behavior.
+
+### Nice to Have
+- Document the invariant behind the overshoot bound (one lease per region, no accumulation, conservative expiry) as a short “safety proof” section.
+- Add a clear on-call runbook trigger: “allocator unreachable + leases draining” → what knobs to turn (tighten L, raise refill threshold, enable stricter local mode).
+
+## What's Working Well
+- The lease framing cleanly separates latency-sensitive data plane from correctness-sensitive control plane.
+- The design is honest about trade-offs (bounded inaccuracy, under-utilization on failures) and picks sensible defaults (jitter, single-flight).
+- You explicitly call out hot-key behavior and design for it, instead of assuming averages—this is where most global limiters die.
+- Shadow mode + audit-grade telemetry requirements are pragmatic and make rollout safer.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+
+
+thinking
+**Simplifying design documentation**
+
+I'm facing some guidelines about presenting designs clearly and without argumentative tones. It’s emphasized that I need to remove criticisms while clarifying what was taken out. For example, instead of saying "we don’t need X," I should simply state “Removed: ...” It seems I should exclude critique sections completely and include only straightforward simplifications, like idempotency keys and policy versioning. I think it’s best to focus on minimal components like Edge Gateway and Global Allocator to make things simple.
+thinking
+**Evaluating gateway complexity**
+
+I’m considering how to centralize complexity in the gateway while minimizing components. I worry about many gateways calling the allocator, especially with a small coordination budget. We need a single flight per identity per region, which could be managed in the gateway. However, multiple gateways could lead to a stampede effect without a regional coordinator. I think adding a regional token cache via Redis might help, but it introduces an extra component. Keeping Regional Redis could coordinate identity leases efficiently.
+thinking
+**Optimizing components and setup**
+
+I'm evaluating the components we have: Edge Gateway, Regional Redis, Global Allocator, and Global Strong DB. That gives me four components, but only the allocator is custom. I wonder if I could use a managed global DB like Spanner to integrate the allocator logic, potentially reducing components down to three. I could implement lease granting as a stored procedure in the DB. However, cross-region DB calls are slow, and I need to consider access from the nearest DB replica.
+thinking
+**Deciding on architecture components**
+
+I'm reconsidering the architecture, specifically about having gateways directly call the DB since it introduces risks like connection management and security concerns. It seems wiser to keep the allocator as a service. If I remove Regional RLS but keep Regional Redis, it seems justified since it coordinates among gateways. Without it, each gateway would manage its own leases, raising the overshoot significantly. I realize a regional coordinator like Redis with a Lua script could effectively manage this, though it adds some latency.
+thinking
+**Streamlining the leasing architecture**
+
+I'm navigating how to optimize the leasing architecture without adding components. I’m contemplating keeping local in-memory token buckets per gateway and using Redis for refills while enforcing one lease per region. The idea of sharing leases via a regional pool is tricky. Instead, I could allow per-gateway leases, then cap them based on the number of gateways. Also, I should ensure idempotency and manage failure scenarios like duplicate lease grants and policy changes. Keeping everything streamlined means relying on established components, like Redis for quick updates and managing emergency blocks efficiently.
+thinking
+**Refining architecture and documentation**
+
+I’m refining the architecture requirements while ensuring I don’t add any new sections. I can condense information by renaming "Key Design Decisions" to "What We Removed" and justifying existing components like the Edge Gateway and Regional Redis. I’ll integrate the local token bucket into the gateway to streamline components. The state of leases will be managed to avoid double spending, and I’ll use idempotency with request IDs to ensure redundant requests don’t issue overlapping leases. This keeps everything efficient while addressing operational challenges and failure modes.
+thinking
+**Simplifying the design and documentation**
+
+I'm working on refining the design by ensuring that the allocator manages leases effectively without tracking token usage. To prevent overlapping leases, I’ll enforce idempotency and ensure there's at most one active lease per identity and region. With a global DB managing state on policies, tokens, and leases, I can simplify sections of the documentation, such as removing unnecessary details, while retaining critical components like the Edge Gateway and Regional Redis. Ultimately, the goal is to provide a clear yet comprehensive markdown document that maintains existing titles and sections.
+codex
+```markdown
+---
+title: "Global Rate Limiter"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: [rate-limiting, edge, distributed-systems, quota-leasing, reliability]
+---
+
+## Overview
+
+Enforce global per-identity limits without putting a global round-trip on every request.
+
+The gateway makes the allow/deny decision locally using short-lived tokens. A single global allocator occasionally grants **time-bounded quota leases** from a strongly consistent store. This keeps the request path fast while making global overshoot explicitly bounded.
+
+## What Makes This Hard
+
+- Global correctness and low latency fight each other; per-request global counters don’t scale.
+- Failure retries can silently turn “bounded overshoot” into unbounded overshoot if leases aren’t idempotent.
+- Hot identities must be boring: one abused key shouldn’t melt shared state.
+
+## Requirements
+
+### Functional Requirements
+- Global limits per identity (API key/user/IP) with a **bounded** overshoot.
+- Hierarchical limits; the decision is the minimum remaining budget across applicable policies.
+- Common case: no cross-region dependency.
+- Operator controls: per-key overrides, emergency blocks, shadow mode.
+- Audit-grade telemetry: allow/deny counts, lease grants, top offenders.
+
+### Scale Targets
+- ~1M RPS sustained, peaks higher.
+- 30–60 regions.
+- High identity cardinality with churn; eviction must be first-class.
+- Gateway added latency p99 < 2ms.
+- Global allocator touched by a small fraction of requests.
+
+## Key Design Decisions
+
+- Lease quota globally; spend locally.
+- Keep exactly one active lease per `(identity, region)` and make lease grants idempotent.
+- Use a strongly consistent global DB for the allocator’s state so “double spend” is impossible under retries.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> D[Anycast DNS]
+  D --> G[Edge Gateway]
+  G -->|refill/local sync| X[Regional Redis]
+  X --> A[Global Quota Allocator]
+  A --> S[(Global Strong DB)]
+```
+
+### Components
+
+- **Edge Gateway**
+  - Does the allow/deny decision and emits rate-limit headers.
+  - Holds a tiny in-memory token bucket per identity for the hot path.
+  - Justification: the only place that can reliably stay under the latency budget.
+
+- **Regional Redis**
+  - Stores the *regional* leased pool per identity and deduplicates refills (single-flight).
+  - Gateways periodically “top up” their in-memory buckets from this pool in chunks.
+  - Justification: one shared regional coordination point without running a regional service.
+
+- **Global Quota Allocator**
+  - Issues time-bounded leases to regions and enforces “one active lease per `(identity, region)`”.
+  - Implements strict idempotency so retries never grant extra tokens.
+  - Justification: the only correctness-critical component besides the DB.
+
+- **Global Strong DB**
+  - Stores policies (versioned), global bucket state, and lease/idempotency records.
+  - Justification: makes bounded overshoot defensible under failures and retries.
+
+## Deep Dive: Quota Leasing (The Hardest Part)
+
+The allocator never answers “is this request allowed?” It only answers “how much may this region spend locally until expiry?”
+
+**State model (token bucket)**
+- Policy defines `(rate, burst)` and has a monotonically increasing `policy_version`.
+- Global state per identity is stored as token-bucket fields: `(tokens, last_refill_time)`.
+
+**Lease grant contract**
+- A region requests a lease for `(identity, region, policy_version, request_id, prior_lease_id?)`.
+- The allocator transactionally:
+  - Enforces **idempotency**: if `request_id` already exists, return the stored response.
+  - Enforces **single active lease**: if an unexpired lease exists for `(identity, region)` and `prior_lease_id` doesn’t match, return “lease still active” (no new tokens).
+  - Refill global tokens by elapsed time, then decrement by `granted_tokens`.
+  - Write the new lease record `(lease_id, granted_tokens, expires_at, policy_version)` and the idempotency record keyed by `request_id`.
+
+**Regional spending**
+- Redis holds `(lease_id, remaining_tokens, expires_in, policy_version)` per `(identity, region)`.
+- Gateways obtain small chunks from Redis (single-flight + atomic decrement) and spend locally in-memory.
+- If Redis is unavailable, gateways do not mint new tokens; they only spend what they already hold and then throttle.
+
+**Bounding overshoot**
+- Let `L` be the max lease size per identity and `R` the number of regions that can hold a lease.
+- Worst-case overshoot is bounded by `R * L` (plus in-flight requests already admitted).
+- The bound holds because:
+  - At most one active lease per `(identity, region)`.
+  - Lease grants are idempotent.
+  - Gateways never create tokens during degraded modes.
+
+**Policy changes and emergency blocks**
+- Policies are versioned. A lease carries `policy_version`.
+- If a gateway/Redis sees a newer `policy_version`, it treats old leased state as expired and refills (biasing toward under-utilization).
+- Emergency blocks are enforced at the gateway from a cached “blocklist” fetched via the allocator’s control API; the gateway applies it immediately on the request path.
+
+**Timekeeping**
+- Leases are enforced using “time since receipt” (monotonic TTL countdown), not wall-clock `expires_at`.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| <2ms request path (local decisions) | Perfect global precision at sub-second granularity |
+| Defensible bounded overshoot | Some under-utilization during failures and policy changes |
+| Small operational surface area | Redis becomes a key regional dependency (but not on every request) |
+
+## Failure Modes
+
+- **Allocator outage**
+  - Regions can’t obtain new leases; Redis pools drain; gateways eventually throttle.
+  - Safe behavior: fail closed when tokens are exhausted.
+
+- **Allocator retries/timeouts**
+  - Safe behavior: idempotent `request_id` returns the same lease; no extra tokens can be granted.
+
+- **Bad policy rollout / emergency block**
+  - Safe behavior: policy version bump causes fast convergence (old leases treated as expired); emergency block is enforced at the gateway from cached control data, independent of allocator reachability at request time.
+
+- **Clock skew**
+  - Safe behavior: TTL is monotonic from receipt; skew cannot extend a lease.
+
+- **Regional Redis brownout**
+  - Safe behavior: gateways reduce refill concurrency, spend only already-held tokens, then throttle; no “extra emergency budget” is minted.
+
+- **Hot identity bursts across many regions**
+  - Safe behavior: `R * L` bound applies; single-flight in Redis prevents refill stampedes.
+
+## What We Removed
+
+- **Regional RLS service**
+  - Merged into gateways + Redis (Redis is the single regional coordination point).
+
+- **Separate “Local Token Bucket” component**
+  - Folded into the gateway as an implementation detail.
+
+- **Lease adaptation complexity**
+  - Fixed, capped lease sizing is the default; correctness invariants stay simple and auditable.
+
+## Operational Notes
+
+- Pick `L` (max lease size) to match your overshoot tolerance; the bound is only real if the cap is real.
+- Require `request_id` on every lease call and persist the response transactionally.
+- Monitor: lease grant QPS, idempotency hit rate, per-identity refill rate, top denies, Redis latency, allocator latency.
+- Keep gateway bucket TTL eviction aggressive; cardinality spikes should shed cleanly.
+```
+tokens used
+10,331
+```markdown
+---
+title: "Global Rate Limiter"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: [rate-limiting, edge, distributed-systems, quota-leasing, reliability]
+---
+
+## Overview
+
+Enforce global per-identity limits without putting a global round-trip on every request.
+
+The gateway makes the allow/deny decision locally using short-lived tokens. A single global allocator occasionally grants **time-bounded quota leases** from a strongly consistent store. This keeps the request path fast while making global overshoot explicitly bounded.
+
+## What Makes This Hard
+
+- Global correctness and low latency fight each other; per-request global counters don’t scale.
+- Failure retries can silently turn “bounded overshoot” into unbounded overshoot if leases aren’t idempotent.
+- Hot identities must be boring: one abused key shouldn’t melt shared state.
+
+## Requirements
+
+### Functional Requirements
+- Global limits per identity (API key/user/IP) with a **bounded** overshoot.
+- Hierarchical limits; the decision is the minimum remaining budget across applicable policies.
+- Common case: no cross-region dependency.
+- Operator controls: per-key overrides, emergency blocks, shadow mode.
+- Audit-grade telemetry: allow/deny counts, lease grants, top offenders.
+
+### Scale Targets
+- ~1M RPS sustained, peaks higher.
+- 30–60 regions.
+- High identity cardinality with churn; eviction must be first-class.
+- Gateway added latency p99 < 2ms.
+- Global allocator touched by a small fraction of requests.
+
+## Key Design Decisions
+
+- Lease quota globally; spend locally.
+- Keep exactly one active lease per `(identity, region)` and make lease grants idempotent.
+- Use a strongly consistent global DB for the allocator’s state so “double spend” is impossible under retries.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> D[Anycast DNS]
+  D --> G[Edge Gateway]
+  G -->|refill/local sync| X[Regional Redis]
+  X --> A[Global Quota Allocator]
+  A --> S[(Global Strong DB)]
+```
+
+### Components
+
+- **Edge Gateway**
+  - Does the allow/deny decision and emits rate-limit headers.
+  - Holds a tiny in-memory token bucket per identity for the hot path.
+  - Justification: the only place that can reliably stay under the latency budget.
+
+- **Regional Redis**
+  - Stores the *regional* leased pool per identity and deduplicates refills (single-flight).
+  - Gateways periodically “top up” their in-memory buckets from this pool in chunks.
+  - Justification: one shared regional coordination point without running a regional service.
+
+- **Global Quota Allocator**
+  - Issues time-bounded leases to regions and enforces “one active lease per `(identity, region)`”.
+  - Implements strict idempotency so retries never grant extra tokens.
+  - Justification: the only correctness-critical component besides the DB.
+
+- **Global Strong DB**
+  - Stores policies (versioned), global bucket state, and lease/idempotency records.
+  - Justification: makes bounded overshoot defensible under failures and retries.
+
+## Deep Dive: Quota Leasing (The Hardest Part)
+
+The allocator never answers “is this request allowed?” It only answers “how much may this region spend locally until expiry?”
+
+**State model (token bucket)**
+- Policy defines `(rate, burst)` and has a monotonically increasing `policy_version`.
+- Global state per identity is stored as token-bucket fields: `(tokens, last_refill_time)`.
+
+**Lease grant contract**
+- A region requests a lease for `(identity, region, policy_version, request_id, prior_lease_id?)`.
+- The allocator transactionally:
+  - Enforces **idempotency**: if `request_id` already exists, return the stored response.
+  - Enforces **single active lease**: if an unexpired lease exists for `(identity, region)` and `prior_lease_id` doesn’t match, return “lease still active” (no new tokens).
+  - Refill global tokens by elapsed time, then decrement by `granted_tokens`.
+  - Write the new lease record `(lease_id, granted_tokens, expires_at, policy_version)` and the idempotency record keyed by `request_id`.
+
+**Regional spending**
+- Redis holds `(lease_id, remaining_tokens, expires_in, policy_version)` per `(identity, region)`.
+- Gateways obtain small chunks from Redis (single-flight + atomic decrement) and spend locally in-memory.
+- If Redis is unavailable, gateways do not mint new tokens; they only spend what they already hold and then throttle.
+
+**Bounding overshoot**
+- Let `L` be the max lease size per identity and `R` the number of regions that can hold a lease.
+- Worst-case overshoot is bounded by `R * L` (plus in-flight requests already admitted).
+- The bound holds because:
+  - At most one active lease per `(identity, region)`.
+  - Lease grants are idempotent.
+  - Gateways never create tokens during degraded modes.
+
+**Policy changes and emergency blocks**
+- Policies are versioned. A lease carries `policy_version`.
+- If a gateway/Redis sees a newer `policy_version`, it treats old leased state as expired and refills (biasing toward under-utilization).
+- Emergency blocks are enforced at the gateway from a cached “blocklist” fetched via the allocator’s control API; the gateway applies it immediately on the request path.
+
+**Timekeeping**
+- Leases are enforced using “time since receipt” (monotonic TTL countdown), not wall-clock `expires_at`.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| <2ms request path (local decisions) | Perfect global precision at sub-second granularity |
+| Defensible bounded overshoot | Some under-utilization during failures and policy changes |
+| Small operational surface area | Redis becomes a key regional dependency (but not on every request) |
+
+## Failure Modes
+
+- **Allocator outage**
+  - Regions can’t obtain new leases; Redis pools drain; gateways eventually throttle.
+  - Safe behavior: fail closed when tokens are exhausted.
+
+- **Allocator retries/timeouts**
+  - Safe behavior: idempotent `request_id` returns the same lease; no extra tokens can be granted.
+
+- **Bad policy rollout / emergency block**
+  - Safe behavior: policy version bump causes fast convergence (old leases treated as expired); emergency block is enforced at the gateway from cached control data, independent of allocator reachability at request time.
+
+- **Clock skew**
+  - Safe behavior: TTL is monotonic from receipt; skew cannot extend a lease.
+
+- **Regional Redis brownout**
+  - Safe behavior: gateways reduce refill concurrency, spend only already-held tokens, then throttle; no “extra emergency budget” is minted.
+
+- **Hot identity bursts across many regions**
+  - Safe behavior: `R * L` bound applies; single-flight in Redis prevents refill stampedes.
+
+## What We Removed
+
+- **Regional RLS service**
+  - Merged into gateways + Redis (Redis is the single regional coordination point).
+
+- **Separate “Local Token Bucket” component**
+  - Folded into the gateway as an implementation detail.
+
+- **Lease adaptation complexity**
+  - Fixed, capped lease sizing is the default; correctness invariants stay simple and auditable.
+
+## Operational Notes
+
+- Pick `L` (max lease size) to match your overshoot tolerance; the bound is only real if the cap is real.
+- Require `request_id` on every lease call and persist the response transactionally.
+- Monitor: lease grant QPS, idempotency hit rate, per-identity refill rate, top denies, Redis latency, allocator latency.
+- Keep gateway bucket TTL eviction aggressive; cardinality spikes should shed cleanly.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/01-foundational-infrastructure/global-rate-limiter.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Global Rate Limiter
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/global-rate-limiter.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/global-rate-limiter.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/01-foundational-infrastructure/global-rate-limiter.md

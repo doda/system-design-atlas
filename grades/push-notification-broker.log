@@ -1,0 +1,349 @@
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2a95-5f3f-78c3-9318-4ad799a27d35
+--------
+user
+You are a senior systems architect reviewing a system design document.
+
+Grade this solution on three dimensions (1-10 scale):
+
+1. **Strength** (1-10): How technically sound, complete, and production-ready is the design?
+   - Does it address scalability, reliability, and failure modes?
+   - Are the trade-offs well-reasoned?
+   - Would this actually work at scale?
+
+2. **Interestingness** (1-10): How engaging and educational is the content?
+   - Does it teach useful concepts?
+   - Are there insights that aren't obvious?
+   - Would an engineer learn something valuable?
+
+3. **Novelty** (1-10): How unique or creative is the approach?
+   - Does it go beyond textbook solutions?
+   - Are there clever simplifications or unconventional choices?
+   - Does it challenge common assumptions?
+
+Also note any major issues or particularly strong aspects.
+
+Output ONLY valid JSON in this exact format:
+{
+  "slug": "push-notification-broker",
+  "strength": <1-10>,
+  "interestingness": <1-10>,
+  "novelty": <1-10>,
+  "overall": <average of three scores, 1 decimal>,
+  "summary": "<2-3 sentence summary of the design>",
+  "strengths": ["<strength 1>", "<strength 2>"],
+  "weaknesses": ["<weakness 1>", "<weakness 2>"],
+  "verdict": "<one of: exceptional, strong, adequate, weak>"
+}
+
+---
+
+## Solution to Grade
+
+---
+title: "Push Notification Broker"
+category: "Real-Time & Media"
+difficulty: "Hard"
+tags: ["push-notifications", "realtime", "streaming", "multi-tenant", "kafka", "rate-limiting", "multi-region", "retries", "webhooks"]
+---
+
+## Overview
+
+A **push notification broker** provides a single API to send notifications across APNs, FCM, and Web Push. It ensures reliable acceptance, multi-tenant isolation, provider-aware delivery, retries, token hygiene, receipts, and a durable audit trail.
+
+The system is organized around one durable backbone (a log) and one primary data store:
+- A **durable event log** buffers spikes, decouples ingestion from delivery, and supports replay.
+- A **distributed key-value store** holds tenant config, idempotency records, device tokens, and status materializations.
+
+---
+
+## Requirements
+
+### Functional Requirements
+- Accept notification requests via API (single + batch) with `priority`, `ttl`, optional `schedule_at`, optional collapse/dedupe semantics, and per-channel options.
+- Target audiences:
+  - device tokens
+  - user IDs (resolve to tokens)
+  - topic/segment fanout (can be large; handled asynchronously)
+- Enforce multi-tenant isolation:
+  - quotas/rate limits across tenant/app/priority/provider
+  - predictable fairness under load
+- Prioritize critical traffic (P0 > P1 > P2).
+- Deliver to APNs (HTTP/2), FCM (HTTP v1), Web Push (HTTP) with provider-specific error handling and token invalidation.
+- Provide receipts and status:
+  - query API for current status and summary counts
+  - optional per-recipient receipts by tier
+  - webhook delivery of receipts
+- Retries with exponential backoff + jitter, retry budgets, dead-lettering and diagnostics for permanent failures.
+- Token hygiene: register/rotate/invalidate/suppress known-invalid tokens.
+- Auditing: immutable event trail for sends and outcomes.
+
+### Non-Functional Requirements (Targets)
+- Ingest acknowledgement (durably accepted): **P99 ≤ 50 ms**
+- P0 enqueue → first provider attempt: **P99 ≤ 1 s**
+- First receipt availability: **P99 ≤ 5 s**
+- Status freshness: **P99 ≤ 2 s**
+- Availability: ingest enqueue **99.99%** per region, first attempt **99.9%** (provider permitting)
+- No loss for accepted notifications within a region; cross-region asynchronous replication
+- Retention: status 7–30 days, immutable events 30–90 days hot, longer archived
+
+---
+
+## Simplified Architecture
+
+### High-Level Component Diagram
+
+```mermaid
+graph TB
+  C["Client Apps"] --> E["API Edge"]
+  E --> B["Broker API"]
+  B --> K["Kafka"]
+  B --> S[("KV Store")]
+  W["Workers"] <--> K
+  W <--> S
+  W --> P["Push Providers"]
+  W --> H["Customer Webhooks"]
+  W --> O[("Object Storage")]
+```
+
+**Core idea**
+- The Broker API durably records “what to send” quickly.
+- Workers asynchronously expand audiences, apply fairness/rate limits, call providers, write receipts, and update status.
+
+---
+
+## Core Flows
+
+### Request Acceptance (Idempotent)
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as Client
+  participant E as Edge
+  participant B as Broker API
+  participant S as KV Store
+  participant K as Kafka
+
+  C->>E: POST /v1/notifications (Idempotency-Key)
+  E->>B: Authenticated request
+  B->>B: Validate, policy checks
+  B->>S: PutIfAbsent(tenant, idem_key) -> notification_id
+  alt existing key (same payload)
+    S-->>B: existing notification_id
+    B-->>C: 202 Accepted (notification_id)
+  else conflict (payload mismatch)
+    S-->>B: conflict
+    B-->>C: 409 Conflict
+  else new
+    S-->>B: created notification_id
+    B->>K: Append NotificationAccepted event
+    B-->>C: 202 Accepted (notification_id)
+  end
+```
+
+### Fanout, Delivery, Receipts (Asynchronous)
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant K as Kafka
+  participant W as Workers
+  participant S as KV Store
+  participant P as Provider
+  participant H as Webhook
+
+  K->>W: Consume NotificationAccepted / WorkItem
+  W->>S: Resolve audience -> tokens (paged)
+  W->>W: Apply fairness + quotas + TTL
+  W->>P: Send (pooled connections)
+  P-->>W: Response (ack/throttle/error)
+  W->>K: Append ReceiptEvent
+  W->>S: Update status materialization
+  W->>H: Deliver webhook (signed)
+```
+
+---
+
+## Components
+
+### API Edge
+- TLS termination, WAF/rate limits, request size enforcement.
+- Authentication/authorization and basic schema validation.
+
+### Broker API (Single Service)
+- Endpoints:
+  - create notifications (single + batch)
+  - register/rotate tokens
+  - query status
+  - tenant configuration (quotas, priorities, provider credentials metadata)
+- Enforces:
+  - payload validation, TTL/priority rules, allowed channels
+  - **strong idempotency** per `(tenant_id, idempotency_key)`
+  - admission control under overload
+- Writes:
+  - `NotificationAccepted` to Kafka
+  - idempotency record + initial status to the KV store
+
+**Merged components**
+- Tenant config, quotas, and policy management are served from the same API surface and stored in the same KV store (with strongly-versioned config records).
+
+### Kafka (Durable Event Backbone)
+- Minimal topic set (example):
+  - `notifications.p0/p1/p2` (accepted notifications by priority)
+  - `receipts` (immutable delivery outcomes)
+  - `work` (fanout pages, retries, webhook redelivery)
+- Partitioning:
+  - key by `(tenant_id, priority)` to support isolation and predictable consumer scaling.
+
+### KV Store (Primary Data Store)
+A distributed key-value store that supports high write throughput, TTL, and atomic conditional writes (for idempotency and counters).
+
+Stores:
+- `idempotency_keys`: `(tenant_id, idempotency_key) -> notification_id + request_hash + ttl`
+- `tenant_config`: quotas, priorities, webhook settings, provider credential references
+- `device_tokens`: `(tenant_id, user_id/device_id/provider) -> token (encrypted) + state`
+- `notification_status`: summary state + counts + timestamps (TTL 7–30d)
+- `delivery_status` (optional tier): per-recipient state (shorter TTL)
+- `retry_schedule` (delay buckets): due-time buckets pointing to retry work items
+- `webhook_state`: per-endpoint cursor and idempotency keys for deliveries
+
+### Workers (One Worker Fleet, Multiple Roles)
+All asynchronous processing runs as a single deployable worker codebase with separate consumer groups and concurrency limits per role.
+
+Responsibilities:
+- Audience resolution:
+  - user ID → tokens
+  - segment/topic fanout via paged membership iteration
+- Delivery orchestration:
+  - weighted fairness across tenants per priority lane
+  - hierarchical rate limits (tenant → priority → provider)
+  - provider-specific connection pooling and request shaping
+- Retries:
+  - exponential backoff + jitter
+  - retry budgets (attempt caps and per-tenant/provider retry rate caps)
+  - TTL enforcement
+  - dead-lettering to a diagnostic work stream/table
+- Receipts:
+  - append immutable receipt events
+  - update status materializations
+  - trigger webhook delivery (with replay protection)
+
+### Provider Connectors
+- APNs (HTTP/2), FCM (HTTP v1), Web Push (HTTP).
+- Normalize responses into a canonical receipt taxonomy:
+  - `provider_ack`, `throttled`, `transient_failure`, `permanent_failure`, `invalid_token`, `expired`
+- Emit token invalidations and suppress future sends to invalid tokens.
+
+### Customer Webhooks
+- Signed (HMAC) deliveries with timestamp + nonce replay protection.
+- Webhook retry policy managed as work items with backoff and dead-lettering.
+
+### Object Storage (Archive)
+- Append-only receipt/event archive partitioned by day/tenant/provider.
+- Long retention and cheap audit replay outside the hot path.
+
+---
+
+## Data Model (Conceptual)
+
+### Identifiers
+- `notification_id`: ULID/UUIDv7
+- `delivery_id`: optional, for per-recipient tracking tiers
+- `attempt`: integer attempt number per delivery
+
+### Records
+- **Idempotency**
+  - key: `(tenant_id, idempotency_key)`
+  - value: `notification_id`, `request_hash`, `created_at`, TTL
+- **Device tokens**
+  - key: `(tenant_id, user_id, device_id, provider)`
+  - value: `token_ciphertext`, `platform`, `state`, `updated_at`
+- **Notification status (summary)**
+  - key: `(tenant_id, notification_id)`
+  - value: `state`, `counts_by_outcome`, `counts_by_provider`, `attempts_total`, `timestamps`, TTL
+- **Receipt event (immutable)**
+  - stored in Kafka and archived to object storage:
+    - `event_id`, `tenant_id`, `notification_id`, optional `delivery_id`, `provider`, `type`, `attempt`, `ts`, small metadata
+
+### Privacy
+- Encrypt tokens at rest; never log raw tokens.
+- Support deletion workflows for user-linked identifiers (token mappings and status records per policy).
+
+---
+
+## API Design
+
+### Create Notification
+`POST /v1/notifications` with `Idempotency-Key`
+
+- Returns `202 Accepted` with `notification_id`.
+- Enforces tenant policy and admission control.
+- Large fanouts are accepted quickly and processed asynchronously.
+
+### Batch Create
+`POST /v1/notifications:batch`
+- Per-item idempotency keys.
+- Bounded max items and max total bytes.
+
+### Query Status
+`GET /v1/notifications/{notification_id}`
+- Summary by default (counts, last update, high-level state).
+- Optional per-recipient detail gated by tier.
+
+### Device Token Registration
+`PUT /v1/users/{user_id}/devices/{device_id}/tokens`
+- Handles rotation and invalidation state transitions.
+
+### Receipts Webhook
+- Tenant-configured endpoint, signed payloads, replay protection.
+- Summary events by default; per-recipient events by tier.
+
+---
+
+## Multi-Region Architecture
+
+- Active-active ingestion via global routing (Geo DNS/Anycast).
+- Tenant “home region” routing in normal operation for simpler idempotency behavior and debugging.
+- Kafka and the KV store are deployed per-region with multi-AZ durability.
+- Cross-region replication is asynchronous for:
+  - tenant configuration
+  - receipts archive
+  - optional status replication for read locality
+
+**Semantics during failover**
+- Acceptance is at-least-once across regions; duplicates are possible during retries/failover.
+- Provider-level collapse keys and broker idempotency reduce practical impact.
+
+---
+
+## Reliability, Backpressure, and Operations
+
+- **Admission control** in Broker API based on Kafka producer health and worker lag.
+- **Priority lanes** (`p0/p1/p2`) for predictable SLO isolation.
+- **Fairness**: weighted scheduling per tenant within each priority lane.
+- **Rate limits**: local fast-path + shared counters in the KV store for regional enforcement.
+- **Provider protection**: circuit breakers and adaptive concurrency per provider/region.
+- **Observability**
+  - ingest latency/QPS/errors, Kafka lag by priority, provider error taxonomy, retry rate, webhook success/DLQ depth, time-to-first-attempt and time-to-first-receipt.
+
+---
+
+## Simplification Notes
+
+- Removed: separate control-plane services (config/quotas/segments/credentials) by consolidating into `Broker API` backed by versioned config records in the KV store; operational levers remain centralized and auditable.
+- Removed: multiple intent logs and specialized status stores by using a small Kafka topic set plus a single KV store for hot materializations; immutable receipts remain in Kafka and object storage for audit and replay.
+- Removed: dedicated caches by serving hot reads directly from the KV store (with short TTL records where needed); correctness remains anchored on the KV store and Kafka.
+- Merged: fanout, dispatch, receipt processing, webhook delivery, and retry handling into one `Workers` fleet with distinct consumer groups and per-role concurrency limits.
+- Complexity retained: Kafka (burst absorption + replay), multi-tenant fairness/rate limiting (required for isolation), provider-aware adapters (required for correctness), multi-region active-active ingestion with at-least-once semantics (required for availability goals).
+mcp startup: no servers
+ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Dec 17th, 2025 1:06 AM.
+Warning: no last agent message; wrote empty content to /Users/dominikdabrowski/pr/system-design-atlas/grades/push-notification-broker.json

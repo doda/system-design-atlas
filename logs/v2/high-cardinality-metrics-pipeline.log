@@ -1,0 +1,2831 @@
+==========================================
+Generating (v2): High-Cardinality Metrics Pipeline
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2879-75e0-8f2b-db8c3020ea14
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: High-Cardinality Metrics Pipeline
+**Category**: Observability & Reliability
+
+**Problem Statement**:
+Design a system (like Prometheus/Cortex) to ingest and query metrics at scale, handling cardinality explosions and long-term storage.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+thinking
+**Exploring management strategies**
+
+I'm looking into managing cardinality by limiting the number of active series per tenant and considering methods like active series tracking and bloom filters. I want to address both write-time validation and query-time protection through query sharding and setting maximum series. Additionally, I’ll focus on using TSDB blocks for storage. My targets are to ingest 10 million samples per second and handle up to 1 million active series per tenant with a retention period of one year. There are also various failure modes I need to account for, like ingester crashes and object storage outages. I should also include operational notes regarding rollouts and backpressure. Lastly, I’ll remember that YAML front matter needs titles and tags. Let's get to writing!
+codex
+```markdown
+---
+title: "High-Cardinality Metrics Pipeline"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["metrics", "tsdb", "prometheus", "cortex", "multitenancy", "object-storage", "cardinality", "indexing", "query-engine"]
+---
+
+## Overview
+
+This system ingests Prometheus-style metrics at very high volume, survives sudden cardinality explosions, and supports fast queries over long retention. The key insight is to **treat “high-cardinality” as a product constraint, not a scaling surprise**: you enforce strict, explicit budgets at the edge and at ingest, then design storage/query around immutable TSDB blocks in cheap object storage.
+
+Elegance comes from a hard separation of concerns: **ingesters are only responsible for the hot, mutable window** (fast writes, recent reads, durability via WAL), while **long-term data is immutable blocks** in object storage queried through cacheable, horizontally scalable gateways. Everything else is boring glue: consistent hashing, rate limits, object storage, and a small number of background jobs.
+
+## What Makes This Hard
+
+Naive designs die in two ways:
+
+1. **Cardinality explosion masquerades as “just more traffic.”** But it’s not. It blows up *memory* (active series), *index size*, and *query fanout* nonlinearly. If you don’t enforce budgets early, you end up with a cluster-wide brownout where even “healthy” tenants can’t query.
+
+2. **Long-term queries tempt you into a centralized index/database.** A single “series index DB” becomes your scaling ceiling and your pager magnet. The trap is coupling queryability to a monolith that must be strongly consistent under write load.
+
+## Requirements
+
+### Functional Requirements
+- **Prometheus remote_write-compatible ingest** with per-tenant isolation.
+- **Cardinality controls**: per-tenant series limits, label allow/deny lists, and hard rejection with clear reasons.
+- **Fast queries for recent data** and acceptable latency for long-range queries (hours–months).
+- **Long-term retention** (months to years) on inexpensive storage.
+- **Safe multi-tenant query execution**: no query can destabilize the cluster.
+
+### Scale Targets
+- Ingest: **10M samples/sec** sustained, **50M samples/sec** bursts (flash release + autoscaling lag).
+- Active series: **200M global**, with **hard per-tenant caps** (e.g., 1–10M depending on plan).
+- Retention: **13 months** raw at 10–15s resolution for “gold” tenants; **downsampled** for cheaper tiers.
+- Queries: **p95 < 2s** for last 15m; **p95 < 8s** for 30d; concurrency in the low thousands.
+
+These numbers matter because the bottleneck shifts: *writes* are bandwidth + memory (active series), while *queries* are CPU + index scan + object GET amplification.
+
+## Key Design Decisions
+
+- **Decision 1: Immutable TSDB blocks in object storage as the source of truth**
+  - Chose: Periodic cutover from ingester head to **TSDB blocks** uploaded to **S3/GCS**.
+  - Rejected: Keeping long-term data in a distributed database (Cassandra/Bigtable) as the primary store.
+  - Why: Object storage gives cheap durability and scaling; immutable blocks make caching and compaction tractable and operationally calm.
+
+- **Decision 2: Enforce cardinality budgets at ingest, not “best-effort”**
+  - Chose: **Per-tenant limits** (active series, label lengths, sample rate) + **write-time validation** + edge relabeling guidance.
+  - Rejected: Let everything in, “deal with it later” via compaction/downsampling.
+  - Why: Once high-cardinality hits memory and index, it’s already an outage. Rejecting early is kinder than failing later.
+
+- **Decision 3: Query protection via sharding + bounded execution**
+  - Chose: Query frontend that **splits by time/range**, enforces **max series / max bytes / max execution time**, and uses results caching.
+  - Rejected: A single stateless query API that forwards raw PromQL to backends.
+  - Why: PromQL is expressive enough to become a denial-of-service vector; the system must make “expensive” queries safe by construction.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[Prometheus / Agents] --> B["Ingest Gateway"]
+  B --> C["Ingester Ring"]
+  C --> D["Object Storage"]
+  D --> E["Store Gateway"]
+  F["Query Frontend"] --> E
+  F --> C
+  D --> G["Compactor"]
+```
+
+### Components
+
+- `Prometheus / Agents`
+  - Scrape locally; use remote_write with backoff. This keeps scrape failures local and makes the central system purely “receive + serve”.
+
+- `Ingest Gateway`
+  - Auth, tenant routing, rate limiting, and *first line* cardinality guardrails. It rejects obviously bad writes before they allocate ingester memory.
+
+- `Ingester Ring`
+  - Consistent-hash sharding by tenant+series fingerprint; replicates to N ingesters; WAL-backed. Serves recent reads without touching object storage.
+
+- `Object Storage`
+  - Durable home for immutable TSDB blocks. The only “database” you truly trust long-term.
+
+- `Store Gateway`
+  - Index-aware reader over object storage; aggressively caches index and hot chunk ranges. Horizontally scalable and restart-friendly.
+
+- `Query Frontend`
+  - Splits/shards queries, enforces budgets, caches results, and merges partials. This is where you keep PromQL powerful without letting it be dangerous.
+
+- `Compactor`
+  - Compacts small blocks into larger ones, applies retention, and optionally downsampling. Without it, object storage costs and query fanout spiral.
+
+## Deep Dive: Cardinality Explosions (and How to Survive Them)
+
+The hardest part is that cardinality is a *memory and index* problem before it’s a throughput problem. If a tenant suddenly starts emitting `user_id` as a label, you don’t just get “more samples”—you get an unbounded number of new series, each requiring head state, postings, and query fanout.
+
+**1) Make cardinality a budgeted resource (per tenant, per metric family).**  
+Track *active series* per tenant in ingesters (in-memory set keyed by series fingerprint, with TTL based on recent samples). Enforce hard caps:
+- `max_active_series_per_tenant`
+- `max_series_per_metric_name` (stops one metric from consuming the whole budget)
+- label count/length limits and reject known-bad label keys
+
+When a new series would exceed budget, reject with a precise error that includes the offending labelset hash and the metric name. This converts “mysterious outage” into “actionable contract violation”.
+
+**2) Reject cheaply, before allocating expensive structures.**  
+Do not accept-and-then-evict. The ingestion pipeline should parse, validate, and fingerprint first; only then touch head state. Use a small, bounded “new series admission” structure per tenant (e.g., token-bucket for new series/sec) so explosions are throttled even below the hard cap. This prevents churn from turning into CPU death.
+
+**3) Protect reads too: expensive queries are just another cardinality vector.**  
+Even with perfect ingest controls, queries like `sum by (pod) (rate(http_requests_total[30d]))` can fan out disastrously. The query frontend enforces:
+- max time range (or mandatory step increases)
+- max series scanned (estimated from index/postings cardinality)
+- max bytes fetched from store gateways
+- query splitting (e.g., 30d => 30x 1d subqueries), with caching per shard
+
+The non-obvious benefit: once queries are sharded and cached, the system becomes stable under load because repeated dashboards stop recomputing the world.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Predictable cluster stability under cardinality spikes | “Accept all data” convenience |
+| Cheap, durable long-term storage | Slightly higher query complexity (block + gateway) |
+| Horizontal scalability of both write and read paths | More moving parts than single-node Prometheus |
+
+## Failure Modes
+
+- **Ingester crashes / rolling restarts**
+  - What happens: recent samples risk loss; queries for the last minutes can become partial.
+  - Detect: WAL replay time, replication quorum misses, increased remote_write retries.
+  - Recover: WAL replay + replication (N=3) so one node loss is survivable; query frontend tolerates partials only for explicitly-configured tenants.
+
+- **Object storage degradation (slow or erroring GET/LIST)**
+  - What happens: long-range queries slow; compaction backlog grows.
+  - Detect: store gateway GET latency, 5xx rates, compactor queue age.
+  - Recover: serve recent queries from ingesters; cache index/chunks; apply query budgets and shed long-range load first.
+
+- **Cardinality incident from a tenant**
+  - What happens: without controls, global memory pressure and cascading failures.
+  - Detect: surge in “new series admitted/sec”, tenant active series approaching cap, query fanout anomalies.
+  - Recover: hard reject new series for that tenant; keep existing series serving; provide top offending metrics/labels to remediate quickly.
+
+## What I'd Do Differently At...
+
+- **10x scale:** move to dedicated **query scheduler + worker pool** to smooth query bursts, increase store-gateway caching tiers (RAM + SSD), and tighten per-tenant SLAs with separate rings for “noisy” tenants.
+- **100x scale:** introduce **hierarchical storage** (tiered blocks, aggressive downsampling), global index acceleration (e.g., per-block bloom filters / partitioned postings caches), and potentially regionalize ingest + query with federation to avoid cross-region object-store hot spots.
+
+## Operational Notes
+
+- Cardinality limits are your primary “circuit breaker”; keep them visible, versioned, and tied to tenant plans.
+- Watch **WAL replay time** like a hawk; it defines recovery time and dictates safe ingester memory sizing.
+- Compaction lag is silent debt: measure “oldest un-compacted block age” and page before dashboards get slow.
+- Treat query budgets as SLO enforcement, not annoyance; without them, one bad dashboard becomes an incident.
+```
+tokens used
+3,714
+```markdown
+---
+title: "High-Cardinality Metrics Pipeline"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["metrics", "tsdb", "prometheus", "cortex", "multitenancy", "object-storage", "cardinality", "indexing", "query-engine"]
+---
+
+## Overview
+
+This system ingests Prometheus-style metrics at very high volume, survives sudden cardinality explosions, and supports fast queries over long retention. The key insight is to **treat “high-cardinality” as a product constraint, not a scaling surprise**: you enforce strict, explicit budgets at the edge and at ingest, then design storage/query around immutable TSDB blocks in cheap object storage.
+
+Elegance comes from a hard separation of concerns: **ingesters are only responsible for the hot, mutable window** (fast writes, recent reads, durability via WAL), while **long-term data is immutable blocks** in object storage queried through cacheable, horizontally scalable gateways. Everything else is boring glue: consistent hashing, rate limits, object storage, and a small number of background jobs.
+
+## What Makes This Hard
+
+Naive designs die in two ways:
+
+1. **Cardinality explosion masquerades as “just more traffic.”** But it’s not. It blows up *memory* (active series), *index size*, and *query fanout* nonlinearly. If you don’t enforce budgets early, you end up with a cluster-wide brownout where even “healthy” tenants can’t query.
+
+2. **Long-term queries tempt you into a centralized index/database.** A single “series index DB” becomes your scaling ceiling and your pager magnet. The trap is coupling queryability to a monolith that must be strongly consistent under write load.
+
+## Requirements
+
+### Functional Requirements
+- **Prometheus remote_write-compatible ingest** with per-tenant isolation.
+- **Cardinality controls**: per-tenant series limits, label allow/deny lists, and hard rejection with clear reasons.
+- **Fast queries for recent data** and acceptable latency for long-range queries (hours–months).
+- **Long-term retention** (months to years) on inexpensive storage.
+- **Safe multi-tenant query execution**: no query can destabilize the cluster.
+
+### Scale Targets
+- Ingest: **10M samples/sec** sustained, **50M samples/sec** bursts (flash release + autoscaling lag).
+- Active series: **200M global**, with **hard per-tenant caps** (e.g., 1–10M depending on plan).
+- Retention: **13 months** raw at 10–15s resolution for “gold” tenants; **downsampled** for cheaper tiers.
+- Queries: **p95 < 2s** for last 15m; **p95 < 8s** for 30d; concurrency in the low thousands.
+
+These numbers matter because the bottleneck shifts: *writes* are bandwidth + memory (active series), while *queries* are CPU + index scan + object GET amplification.
+
+## Key Design Decisions
+
+- **Decision 1: Immutable TSDB blocks in object storage as the source of truth**
+  - Chose: Periodic cutover from ingester head to **TSDB blocks** uploaded to **S3/GCS**.
+  - Rejected: Keeping long-term data in a distributed database (Cassandra/Bigtable) as the primary store.
+  - Why: Object storage gives cheap durability and scaling; immutable blocks make caching and compaction tractable and operationally calm.
+
+- **Decision 2: Enforce cardinality budgets at ingest, not “best-effort”**
+  - Chose: **Per-tenant limits** (active series, label lengths, sample rate) + **write-time validation** + edge relabeling guidance.
+  - Rejected: Let everything in, “deal with it later” via compaction/downsampling.
+  - Why: Once high-cardinality hits memory and index, it’s already an outage. Rejecting early is kinder than failing later.
+
+- **Decision 3: Query protection via sharding + bounded execution**
+  - Chose: Query frontend that **splits by time/range**, enforces **max series / max bytes / max execution time**, and uses results caching.
+  - Rejected: A single stateless query API that forwards raw PromQL to backends.
+  - Why: PromQL is expressive enough to become a denial-of-service vector; the system must make “expensive” queries safe by construction.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[Prometheus / Agents] --> B["Ingest Gateway"]
+  B --> C["Ingester Ring"]
+  C --> D["Object Storage"]
+  D --> E["Store Gateway"]
+  F["Query Frontend"] --> E
+  F --> C
+  D --> G["Compactor"]
+```
+
+### Components
+
+- `Prometheus / Agents`
+  - Scrape locally; use remote_write with backoff. This keeps scrape failures local and makes the central system purely “receive + serve”.
+
+- `Ingest Gateway`
+  - Auth, tenant routing, rate limiting, and *first line* cardinality guardrails. It rejects obviously bad writes before they allocate ingester memory.
+
+- `Ingester Ring`
+  - Consistent-hash sharding by tenant+series fingerprint; replicates to N ingesters; WAL-backed. Serves recent reads without touching object storage.
+
+- `Object Storage`
+  - Durable home for immutable TSDB blocks. The only “database” you truly trust long-term.
+
+- `Store Gateway`
+  - Index-aware reader over object storage; aggressively caches index and hot chunk ranges. Horizontally scalable and restart-friendly.
+
+- `Query Frontend`
+  - Splits/shards queries, enforces budgets, caches results, and merges partials. This is where you keep PromQL powerful without letting it be dangerous.
+
+- `Compactor`
+  - Compacts small blocks into larger ones, applies retention, and optionally downsampling. Without it, object storage costs and query fanout spiral.
+
+## Deep Dive: Cardinality Explosions (and How to Survive Them)
+
+The hardest part is that cardinality is a *memory and index* problem before it’s a throughput problem. If a tenant suddenly starts emitting `user_id` as a label, you don’t just get “more samples”—you get an unbounded number of new series, each requiring head state, postings, and query fanout.
+
+**1) Make cardinality a budgeted resource (per tenant, per metric family).**  
+Track *active series* per tenant in ingesters (in-memory set keyed by series fingerprint, with TTL based on recent samples). Enforce hard caps:
+- `max_active_series_per_tenant`
+- `max_series_per_metric_name` (stops one metric from consuming the whole budget)
+- label count/length limits and reject known-bad label keys
+
+When a new series would exceed budget, reject with a precise error that includes the offending labelset hash and the metric name. This converts “mysterious outage” into “actionable contract violation”.
+
+**2) Reject cheaply, before allocating expensive structures.**  
+Do not accept-and-then-evict. The ingestion pipeline should parse, validate, and fingerprint first; only then touch head state. Use a small, bounded “new series admission” structure per tenant (e.g., token-bucket for new series/sec) so explosions are throttled even below the hard cap. This prevents churn from turning into CPU death.
+
+**3) Protect reads too: expensive queries are just another cardinality vector.**  
+Even with perfect ingest controls, queries like `sum by (pod) (rate(http_requests_total[30d]))` can fan out disastrously. The query frontend enforces:
+- max time range (or mandatory step increases)
+- max series scanned (estimated from index/postings cardinality)
+- max bytes fetched from store gateways
+- query splitting (e.g., 30d => 30x 1d subqueries), with caching per shard
+
+The non-obvious benefit: once queries are sharded and cached, the system becomes stable under load because repeated dashboards stop recomputing the world.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Predictable cluster stability under cardinality spikes | “Accept all data” convenience |
+| Cheap, durable long-term storage | Slightly higher query complexity (block + gateway) |
+| Horizontal scalability of both write and read paths | More moving parts than single-node Prometheus |
+
+## Failure Modes
+
+- **Ingester crashes / rolling restarts**
+  - What happens: recent samples risk loss; queries for the last minutes can become partial.
+  - Detect: WAL replay time, replication quorum misses, increased remote_write retries.
+  - Recover: WAL replay + replication (N=3) so one node loss is survivable; query frontend tolerates partials only for explicitly-configured tenants.
+
+- **Object storage degradation (slow or erroring GET/LIST)**
+  - What happens: long-range queries slow; compaction backlog grows.
+  - Detect: store gateway GET latency, 5xx rates, compactor queue age.
+  - Recover: serve recent queries from ingesters; cache index/chunks; apply query budgets and shed long-range load first.
+
+- **Cardinality incident from a tenant**
+  - What happens: without controls, global memory pressure and cascading failures.
+  - Detect: surge in “new series admitted/sec”, tenant active series approaching cap, query fanout anomalies.
+  - Recover: hard reject new series for that tenant; keep existing series serving; provide top offending metrics/labels to remediate quickly.
+
+## What I'd Do Differently At...
+
+- **10x scale:** move to dedicated **query scheduler + worker pool** to smooth query bursts, increase store-gateway caching tiers (RAM + SSD), and tighten per-tenant SLAs with separate rings for “noisy” tenants.
+- **100x scale:** introduce **hierarchical storage** (tiered blocks, aggressive downsampling), global index acceleration (e.g., per-block bloom filters / partitioned postings caches), and potentially regionalize ingest + query with federation to avoid cross-region object-store hot spots.
+
+## Operational Notes
+
+- Cardinality limits are your primary “circuit breaker”; keep them visible, versioned, and tied to tenant plans.
+- Watch **WAL replay time** like a hawk; it defines recovery time and dictates safe ingester memory sizing.
+- Compaction lag is silent debt: measure “oldest un-compacted block age” and page before dashboards get slow.
+- Treat query budgets as SLO enforcement, not annoyance; without them, one bad dashboard becomes an incident.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/high-cardinality-metrics-pipeline.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-3411-75e0-ad03-9eaffbf472be
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "High-Cardinality Metrics Pipeline"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["metrics", "tsdb", "prometheus", "cortex", "multitenancy", "object-storage", "cardinality", "indexing", "query-engine"]
+---
+
+## Overview
+
+This system ingests Prometheus-style metrics at very high volume, survives sudden cardinality explosions, and supports fast queries over long retention. The key insight is to **treat “high-cardinality” as a product constraint, not a scaling surprise**: you enforce strict, explicit budgets at the edge and at ingest, then design storage/query around immutable TSDB blocks in cheap object storage.
+
+Elegance comes from a hard separation of concerns: **ingesters are only responsible for the hot, mutable window** (fast writes, recent reads, durability via WAL), while **long-term data is immutable blocks** in object storage queried through cacheable, horizontally scalable gateways. Everything else is boring glue: consistent hashing, rate limits, object storage, and a small number of background jobs.
+
+## What Makes This Hard
+
+Naive designs die in two ways:
+
+1. **Cardinality explosion masquerades as “just more traffic.”** But it’s not. It blows up *memory* (active series), *index size*, and *query fanout* nonlinearly. If you don’t enforce budgets early, you end up with a cluster-wide brownout where even “healthy” tenants can’t query.
+
+2. **Long-term queries tempt you into a centralized index/database.** A single “series index DB” becomes your scaling ceiling and your pager magnet. The trap is coupling queryability to a monolith that must be strongly consistent under write load.
+
+## Requirements
+
+### Functional Requirements
+- **Prometheus remote_write-compatible ingest** with per-tenant isolation.
+- **Cardinality controls**: per-tenant series limits, label allow/deny lists, and hard rejection with clear reasons.
+- **Fast queries for recent data** and acceptable latency for long-range queries (hours–months).
+- **Long-term retention** (months to years) on inexpensive storage.
+- **Safe multi-tenant query execution**: no query can destabilize the cluster.
+
+### Scale Targets
+- Ingest: **10M samples/sec** sustained, **50M samples/sec** bursts (flash release + autoscaling lag).
+- Active series: **200M global**, with **hard per-tenant caps** (e.g., 1–10M depending on plan).
+- Retention: **13 months** raw at 10–15s resolution for “gold” tenants; **downsampled** for cheaper tiers.
+- Queries: **p95 < 2s** for last 15m; **p95 < 8s** for 30d; concurrency in the low thousands.
+
+These numbers matter because the bottleneck shifts: *writes* are bandwidth + memory (active series), while *queries* are CPU + index scan + object GET amplification.
+
+## Key Design Decisions
+
+- **Decision 1: Immutable TSDB blocks in object storage as the source of truth**
+  - Chose: Periodic cutover from ingester head to **TSDB blocks** uploaded to **S3/GCS**.
+  - Rejected: Keeping long-term data in a distributed database (Cassandra/Bigtable) as the primary store.
+  - Why: Object storage gives cheap durability and scaling; immutable blocks make caching and compaction tractable and operationally calm.
+
+- **Decision 2: Enforce cardinality budgets at ingest, not “best-effort”**
+  - Chose: **Per-tenant limits** (active series, label lengths, sample rate) + **write-time validation** + edge relabeling guidance.
+  - Rejected: Let everything in, “deal with it later” via compaction/downsampling.
+  - Why: Once high-cardinality hits memory and index, it’s already an outage. Rejecting early is kinder than failing later.
+
+- **Decision 3: Query protection via sharding + bounded execution**
+  - Chose: Query frontend that **splits by time/range**, enforces **max series / max bytes / max execution time**, and uses results caching.
+  - Rejected: A single stateless query API that forwards raw PromQL to backends.
+  - Why: PromQL is expressive enough to become a denial-of-service vector; the system must make “expensive” queries safe by construction.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[Prometheus / Agents] --> B["Ingest Gateway"]
+  B --> C["Ingester Ring"]
+  C --> D["Object Storage"]
+  D --> E["Store Gateway"]
+  F["Query Frontend"] --> E
+  F --> C
+  D --> G["Compactor"]
+```
+
+### Components
+
+- `Prometheus / Agents`
+  - Scrape locally; use remote_write with backoff. This keeps scrape failures local and makes the central system purely “receive + serve”.
+
+- `Ingest Gateway`
+  - Auth, tenant routing, rate limiting, and *first line* cardinality guardrails. It rejects obviously bad writes before they allocate ingester memory.
+
+- `Ingester Ring`
+  - Consistent-hash sharding by tenant+series fingerprint; replicates to N ingesters; WAL-backed. Serves recent reads without touching object storage.
+
+- `Object Storage`
+  - Durable home for immutable TSDB blocks. The only “database” you truly trust long-term.
+
+- `Store Gateway`
+  - Index-aware reader over object storage; aggressively caches index and hot chunk ranges. Horizontally scalable and restart-friendly.
+
+- `Query Frontend`
+  - Splits/shards queries, enforces budgets, caches results, and merges partials. This is where you keep PromQL powerful without letting it be dangerous.
+
+- `Compactor`
+  - Compacts small blocks into larger ones, applies retention, and optionally downsampling. Without it, object storage costs and query fanout spiral.
+
+## Deep Dive: Cardinality Explosions (and How to Survive Them)
+
+The hardest part is that cardinality is a *memory and index* problem before it’s a throughput problem. If a tenant suddenly starts emitting `user_id` as a label, you don’t just get “more samples”—you get an unbounded number of new series, each requiring head state, postings, and query fanout.
+
+**1) Make cardinality a budgeted resource (per tenant, per metric family).**  
+Track *active series* per tenant in ingesters (in-memory set keyed by series fingerprint, with TTL based on recent samples). Enforce hard caps:
+- `max_active_series_per_tenant`
+- `max_series_per_metric_name` (stops one metric from consuming the whole budget)
+- label count/length limits and reject known-bad label keys
+
+When a new series would exceed budget, reject with a precise error that includes the offending labelset hash and the metric name. This converts “mysterious outage” into “actionable contract violation”.
+
+**2) Reject cheaply, before allocating expensive structures.**  
+Do not accept-and-then-evict. The ingestion pipeline should parse, validate, and fingerprint first; only then touch head state. Use a small, bounded “new series admission” structure per tenant (e.g., token-bucket for new series/sec) so explosions are throttled even below the hard cap. This prevents churn from turning into CPU death.
+
+**3) Protect reads too: expensive queries are just another cardinality vector.**  
+Even with perfect ingest controls, queries like `sum by (pod) (rate(http_requests_total[30d]))` can fan out disastrously. The query frontend enforces:
+- max time range (or mandatory step increases)
+- max series scanned (estimated from index/postings cardinality)
+- max bytes fetched from store gateways
+- query splitting (e.g., 30d => 30x 1d subqueries), with caching per shard
+
+The non-obvious benefit: once queries are sharded and cached, the system becomes stable under load because repeated dashboards stop recomputing the world.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Predictable cluster stability under cardinality spikes | “Accept all data” convenience |
+| Cheap, durable long-term storage | Slightly higher query complexity (block + gateway) |
+| Horizontal scalability of both write and read paths | More moving parts than single-node Prometheus |
+
+## Failure Modes
+
+- **Ingester crashes / rolling restarts**
+  - What happens: recent samples risk loss; queries for the last minutes can become partial.
+  - Detect: WAL replay time, replication quorum misses, increased remote_write retries.
+  - Recover: WAL replay + replication (N=3) so one node loss is survivable; query frontend tolerates partials only for explicitly-configured tenants.
+
+- **Object storage degradation (slow or erroring GET/LIST)**
+  - What happens: long-range queries slow; compaction backlog grows.
+  - Detect: store gateway GET latency, 5xx rates, compactor queue age.
+  - Recover: serve recent queries from ingesters; cache index/chunks; apply query budgets and shed long-range load first.
+
+- **Cardinality incident from a tenant**
+  - What happens: without controls, global memory pressure and cascading failures.
+  - Detect: surge in “new series admitted/sec”, tenant active series approaching cap, query fanout anomalies.
+  - Recover: hard reject new series for that tenant; keep existing series serving; provide top offending metrics/labels to remediate quickly.
+
+## What I'd Do Differently At...
+
+- **10x scale:** move to dedicated **query scheduler + worker pool** to smooth query bursts, increase store-gateway caching tiers (RAM + SSD), and tighten per-tenant SLAs with separate rings for “noisy” tenants.
+- **100x scale:** introduce **hierarchical storage** (tiered blocks, aggressive downsampling), global index acceleration (e.g., per-block bloom filters / partitioned postings caches), and potentially regionalize ingest + query with federation to avoid cross-region object-store hot spots.
+
+## Operational Notes
+
+- Cardinality limits are your primary “circuit breaker”; keep them visible, versioned, and tied to tenant plans.
+- Watch **WAL replay time** like a hawk; it defines recovery time and dictates safe ingester memory sizing.
+- Compaction lag is silent debt: measure “oldest un-compacted block age” and page before dashboards get slow.
+- Treat query budgets as SLO enforcement, not annoyance; without them, one bad dashboard becomes an incident.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+codex
+## Elegance Check
+
+### The Core Insight
+Treating cardinality as an explicit, enforceable budget (not an emergent scaling property), combined with “mutable hot window + immutable blocks in object storage,” is the right conceptual split for stability and long retention.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Ingest Gateway | The only place you can cheaply reject/shape writes before they allocate TSDB head memory and trigger cluster-wide blast radius. |
+| Ingester Ring | Owns the hot window, WAL durability, and low-latency recent reads; isolates object storage from write path. |
+| Object Storage | Cost-effective, durable source of truth for long retention; immutable blocks enable caching and compaction. |
+| Store Gateway | Turns object storage into a scalable read backend via index/chunk caching and restart-friendly behavior. |
+| Query Frontend | The safety valve for PromQL (budgeting, splitting, caching, fairness) so “one bad query” doesn’t become an incident. |
+| Compactor | Prevents long-term cost/query fanout from spiraling; centralizes retention/downsampling semantics. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| “Build this pipeline” as a bespoke system | Adopt an existing battle-tested stack: Grafana Mimir/Cortex (ingest+querier+compactor) + Thanos patterns (index-header, store gateway) | Less design freedom; you inherit project constraints, but you also inherit years of operational edge-case handling. |
+| Custom ring + membership implied | Use memberlist (gossip) or Consul/etcd for ring state (like Cortex/Mimir) | Adds a dependency, but makes failure behavior explicit and reduces “mysterious sharding” bugs. |
+| Hard per-tenant cardinality enforced “in ingesters” | Use shuffle sharding (per-tenant ingester subset) + per-ingester limits, with optional central limit service | True global “hard cap” is tricky without coordination; shuffle sharding gives strong isolation with simpler mechanics. |
+| Custom query cost estimation (“max series scanned”) | Reuse proven query-frontend/querier implementations (Mimir/Cortex) or keep initial guardrails coarse (range/step/concurrency) | Fine-grained estimators are complex and can be wrong; coarse controls are safer early but less user-friendly. |
+| “New series admission structure” local only | Redis-backed token bucket for “new series/sec” (per tenant), or accept per-ingester buckets with shuffle sharding | Redis adds ops; per-ingester buckets are simpler but can be bypassed by fanout unless sharding is tenant-sticky. |
+| “Boring glue” underspecified | Explicit control-plane: tenant configs, limit versions, rollout, audit | More formalism up front, but it’s what prevents 3am “who changed limits?” events. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Ring KV store (etcd/Consul) down for 5 minutes**
+   - Design’s answer: not addressed (ring exists conceptually, but membership/state store isn’t specified)
+   - Recommendation: Strengthen (define whether you use memberlist gossip, a KV store, or both; define read/write behavior during outages and how tokens/ownership changes are gated).
+
+2. **Network partition: ingesters split-brain (two sides accept writes)**
+   - Design’s answer: not addressed (replication mentioned, but quorum/ownership fencing isn’t)
+   - Recommendation: Strengthen (define write quorum rules, how a tenant/series maps to replica set, and how you prevent “dual leaders” from diverging; consider “ingest only if ring is stable” or fencing via KV epochs).
+
+3. **Object storage slow/erroring for hours (not minutes)**
+   - Design’s answer: partially addressed (serve recent from ingesters; cache; shed long-range)
+   - Recommendation: Strengthen (explicitly define: cache warmup strategy, how LIST storms are avoided, whether you rely on periodic metadata sync, and how compactor behaves—pause vs build backlog—and when you page).
+
+4. **Bad limits/config rollout rejects healthy tenants globally**
+   - Design’s answer: not addressed (limits “visible/versioned” is noted, but no rollout mechanics)
+   - Recommendation: Strengthen (add staged rollout + per-tenant overrides + fast revert; require “dry run” mode in gateway that reports would-reject without enforcing).
+
+5. **Traffic 10x + cardinality 10x during an incident (agents retry + deploy bug)**
+   - Design’s answer: partially addressed (reject early; token bucket for new series; query budgets)
+   - Recommendation: Acceptable if you add explicit backpressure contracts: remote_write retry guidance, per-tenant ingest concurrency caps, and a global “protect the cluster” mode that tightens limits automatically.
+
+## Recommendations
+
+### Must Fix
+- Make “hard per-tenant caps” mechanically true: either define coordination for global cardinality or adopt shuffle sharding + per-ingester caps (and be honest that it’s “hard within the shard,” not globally absolute).
+- Specify ring/membership and fencing: what stores ring state, how ingesters join/leave, what happens during partitions, and what guarantees writes rely on.
+- Define multi-tenant safety boundaries end-to-end: authn/z, tenant-aware caches (no cross-tenant leakage), and per-tenant query fairness (not just max limits).
+- Clarify partial results policy: when queries may be partial, how it’s surfaced, and how dashboards/alerts should behave.
+
+### Should Consider
+- Prefer an existing implementation (Mimir/Cortex/Thanos patterns) unless there’s a clear differentiator; your design already matches those primitives, so “compose” may beat “build.”
+- Add an explicit control plane for limits (schema, versioning, rollout, audit, emergency overrides) since limits are now a core product contract.
+- Make object-store read amplification a first-class design point: index-header caching, minimizing LIST calls, and a clear cache hierarchy (RAM vs SSD) for store gateways.
+
+### Nice to Have
+- Tenant isolation upgrades: shuffle sharding everywhere (ingest + query), “noisy neighbor” containment by default.
+- Operator ergonomics: top-N offending label keys/metrics surfaced automatically with runbooks and suggested relabel configs.
+- Clear SLO-driven load shedding: deterministic rules for tightening query windows/steps and disabling expensive features per tenant during incidents.
+
+## What's Working Well
+- The separation of mutable hot path (WAL + ingesters) from immutable long-term blocks is operationally calm and scales naturally.
+- You correctly treat cardinality as a budgeted resource with explicit rejection, which is the difference between “degraded” and “outage” at this scale.
+- Query frontend as a safety layer (splitting, caching, bounded execution) is the right place to make PromQL safe without neutering it.
+- Failure modes are discussed in the right order (cardinality → memory/index → query fanout), and the operational notes focus on the real pager metrics (WAL replay, compaction lag, query budgets).
+tokens used
+5,469
+## Elegance Check
+
+### The Core Insight
+Treating cardinality as an explicit, enforceable budget (not an emergent scaling property), combined with “mutable hot window + immutable blocks in object storage,” is the right conceptual split for stability and long retention.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Ingest Gateway | The only place you can cheaply reject/shape writes before they allocate TSDB head memory and trigger cluster-wide blast radius. |
+| Ingester Ring | Owns the hot window, WAL durability, and low-latency recent reads; isolates object storage from write path. |
+| Object Storage | Cost-effective, durable source of truth for long retention; immutable blocks enable caching and compaction. |
+| Store Gateway | Turns object storage into a scalable read backend via index/chunk caching and restart-friendly behavior. |
+| Query Frontend | The safety valve for PromQL (budgeting, splitting, caching, fairness) so “one bad query” doesn’t become an incident. |
+| Compactor | Prevents long-term cost/query fanout from spiraling; centralizes retention/downsampling semantics. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| “Build this pipeline” as a bespoke system | Adopt an existing battle-tested stack: Grafana Mimir/Cortex (ingest+querier+compactor) + Thanos patterns (index-header, store gateway) | Less design freedom; you inherit project constraints, but you also inherit years of operational edge-case handling. |
+| Custom ring + membership implied | Use memberlist (gossip) or Consul/etcd for ring state (like Cortex/Mimir) | Adds a dependency, but makes failure behavior explicit and reduces “mysterious sharding” bugs. |
+| Hard per-tenant cardinality enforced “in ingesters” | Use shuffle sharding (per-tenant ingester subset) + per-ingester limits, with optional central limit service | True global “hard cap” is tricky without coordination; shuffle sharding gives strong isolation with simpler mechanics. |
+| Custom query cost estimation (“max series scanned”) | Reuse proven query-frontend/querier implementations (Mimir/Cortex) or keep initial guardrails coarse (range/step/concurrency) | Fine-grained estimators are complex and can be wrong; coarse controls are safer early but less user-friendly. |
+| “New series admission structure” local only | Redis-backed token bucket for “new series/sec” (per tenant), or accept per-ingester buckets with shuffle sharding | Redis adds ops; per-ingester buckets are simpler but can be bypassed by fanout unless sharding is tenant-sticky. |
+| “Boring glue” underspecified | Explicit control-plane: tenant configs, limit versions, rollout, audit | More formalism up front, but it’s what prevents 3am “who changed limits?” events. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Ring KV store (etcd/Consul) down for 5 minutes**
+   - Design’s answer: not addressed (ring exists conceptually, but membership/state store isn’t specified)
+   - Recommendation: Strengthen (define whether you use memberlist gossip, a KV store, or both; define read/write behavior during outages and how tokens/ownership changes are gated).
+
+2. **Network partition: ingesters split-brain (two sides accept writes)**
+   - Design’s answer: not addressed (replication mentioned, but quorum/ownership fencing isn’t)
+   - Recommendation: Strengthen (define write quorum rules, how a tenant/series maps to replica set, and how you prevent “dual leaders” from diverging; consider “ingest only if ring is stable” or fencing via KV epochs).
+
+3. **Object storage slow/erroring for hours (not minutes)**
+   - Design’s answer: partially addressed (serve recent from ingesters; cache; shed long-range)
+   - Recommendation: Strengthen (explicitly define: cache warmup strategy, how LIST storms are avoided, whether you rely on periodic metadata sync, and how compactor behaves—pause vs build backlog—and when you page).
+
+4. **Bad limits/config rollout rejects healthy tenants globally**
+   - Design’s answer: not addressed (limits “visible/versioned” is noted, but no rollout mechanics)
+   - Recommendation: Strengthen (add staged rollout + per-tenant overrides + fast revert; require “dry run” mode in gateway that reports would-reject without enforcing).
+
+5. **Traffic 10x + cardinality 10x during an incident (agents retry + deploy bug)**
+   - Design’s answer: partially addressed (reject early; token bucket for new series; query budgets)
+   - Recommendation: Acceptable if you add explicit backpressure contracts: remote_write retry guidance, per-tenant ingest concurrency caps, and a global “protect the cluster” mode that tightens limits automatically.
+
+## Recommendations
+
+### Must Fix
+- Make “hard per-tenant caps” mechanically true: either define coordination for global cardinality or adopt shuffle sharding + per-ingester caps (and be honest that it’s “hard within the shard,” not globally absolute).
+- Specify ring/membership and fencing: what stores ring state, how ingesters join/leave, what happens during partitions, and what guarantees writes rely on.
+- Define multi-tenant safety boundaries end-to-end: authn/z, tenant-aware caches (no cross-tenant leakage), and per-tenant query fairness (not just max limits).
+- Clarify partial results policy: when queries may be partial, how it’s surfaced, and how dashboards/alerts should behave.
+
+### Should Consider
+- Prefer an existing implementation (Mimir/Cortex/Thanos patterns) unless there’s a clear differentiator; your design already matches those primitives, so “compose” may beat “build.”
+- Add an explicit control plane for limits (schema, versioning, rollout, audit, emergency overrides) since limits are now a core product contract.
+- Make object-store read amplification a first-class design point: index-header caching, minimizing LIST calls, and a clear cache hierarchy (RAM vs SSD) for store gateways.
+
+### Nice to Have
+- Tenant isolation upgrades: shuffle sharding everywhere (ingest + query), “noisy neighbor” containment by default.
+- Operator ergonomics: top-N offending label keys/metrics surfaced automatically with runbooks and suggested relabel configs.
+- Clear SLO-driven load shedding: deterministic rules for tightening query windows/steps and disabling expensive features per tenant during incidents.
+
+## What's Working Well
+- The separation of mutable hot path (WAL + ingesters) from immutable long-term blocks is operationally calm and scales naturally.
+- You correctly treat cardinality as a budgeted resource with explicit rejection, which is the difference between “degraded” and “outage” at this scale.
+- Query frontend as a safety layer (splitting, caching, bounded execution) is the right place to make PromQL safe without neutering it.
+- Failure modes are discussed in the right order (cardinality → memory/index → query fanout), and the operational notes focus on the real pager metrics (WAL replay, compaction lag, query budgets).
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/high-cardinality-metrics-pipeline.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afb-dbc4-7fa1-a7ae-6e1106dac9bc
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "High-Cardinality Metrics Pipeline"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["metrics", "tsdb", "prometheus", "cortex", "multitenancy", "object-storage", "cardinality", "indexing", "query-engine"]
+---
+
+## Overview
+
+This system ingests Prometheus-style metrics at very high volume, survives sudden cardinality explosions, and supports fast queries over long retention. The key insight is to **treat “high-cardinality” as a product constraint, not a scaling surprise**: you enforce strict, explicit budgets at the edge and at ingest, then design storage/query around immutable TSDB blocks in cheap object storage.
+
+Elegance comes from a hard separation of concerns: **ingesters are only responsible for the hot, mutable window** (fast writes, recent reads, durability via WAL), while **long-term data is immutable blocks** in object storage queried through cacheable, horizontally scalable gateways. Everything else is boring glue: consistent hashing, rate limits, object storage, and a small number of background jobs.
+
+## What Makes This Hard
+
+Naive designs die in two ways:
+
+1. **Cardinality explosion masquerades as “just more traffic.”** But it’s not. It blows up *memory* (active series), *index size*, and *query fanout* nonlinearly. If you don’t enforce budgets early, you end up with a cluster-wide brownout where even “healthy” tenants can’t query.
+
+2. **Long-term queries tempt you into a centralized index/database.** A single “series index DB” becomes your scaling ceiling and your pager magnet. The trap is coupling queryability to a monolith that must be strongly consistent under write load.
+
+## Requirements
+
+### Functional Requirements
+- **Prometheus remote_write-compatible ingest** with per-tenant isolation.
+- **Cardinality controls**: per-tenant series limits, label allow/deny lists, and hard rejection with clear reasons.
+- **Fast queries for recent data** and acceptable latency for long-range queries (hours–months).
+- **Long-term retention** (months to years) on inexpensive storage.
+- **Safe multi-tenant query execution**: no query can destabilize the cluster.
+
+### Scale Targets
+- Ingest: **10M samples/sec** sustained, **50M samples/sec** bursts (flash release + autoscaling lag).
+- Active series: **200M global**, with **hard per-tenant caps** (e.g., 1–10M depending on plan).
+- Retention: **13 months** raw at 10–15s resolution for “gold” tenants; **downsampled** for cheaper tiers.
+- Queries: **p95 < 2s** for last 15m; **p95 < 8s** for 30d; concurrency in the low thousands.
+
+These numbers matter because the bottleneck shifts: *writes* are bandwidth + memory (active series), while *queries* are CPU + index scan + object GET amplification.
+
+## Key Design Decisions
+
+- **Decision 1: Immutable TSDB blocks in object storage as the source of truth**
+  - Chose: Periodic cutover from ingester head to **TSDB blocks** uploaded to **S3/GCS**.
+  - Rejected: Keeping long-term data in a distributed database (Cassandra/Bigtable) as the primary store.
+  - Why: Object storage gives cheap durability and scaling; immutable blocks make caching and compaction tractable and operationally calm.
+
+- **Decision 2: Enforce cardinality budgets at ingest, not “best-effort”**
+  - Chose: **Per-tenant limits** (active series, label lengths, sample rate) + **write-time validation** + edge relabeling guidance.
+  - Rejected: Let everything in, “deal with it later” via compaction/downsampling.
+  - Why: Once high-cardinality hits memory and index, it’s already an outage. Rejecting early is kinder than failing later.
+
+- **Decision 3: Query protection via sharding + bounded execution**
+  - Chose: Query frontend that **splits by time/range**, enforces **max series / max bytes / max execution time**, and uses results caching.
+  - Rejected: A single stateless query API that forwards raw PromQL to backends.
+  - Why: PromQL is expressive enough to become a denial-of-service vector; the system must make “expensive” queries safe by construction.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[Prometheus / Agents] --> B["Ingest Gateway"]
+  B --> C["Ingester Ring"]
+  C --> D["Object Storage"]
+  D --> E["Store Gateway"]
+  F["Query Frontend"] --> E
+  F --> C
+  D --> G["Compactor"]
+```
+
+### Components
+
+- `Prometheus / Agents`
+  - Scrape locally; use remote_write with backoff. This keeps scrape failures local and makes the central system purely “receive + serve”.
+
+- `Ingest Gateway`
+  - Auth, tenant routing, rate limiting, and *first line* cardinality guardrails. It rejects obviously bad writes before they allocate ingester memory.
+
+- `Ingester Ring`
+  - Consistent-hash sharding by tenant+series fingerprint; replicates to N ingesters; WAL-backed. Serves recent reads without touching object storage.
+
+- `Object Storage`
+  - Durable home for immutable TSDB blocks. The only “database” you truly trust long-term.
+
+- `Store Gateway`
+  - Index-aware reader over object storage; aggressively caches index and hot chunk ranges. Horizontally scalable and restart-friendly.
+
+- `Query Frontend`
+  - Splits/shards queries, enforces budgets, caches results, and merges partials. This is where you keep PromQL powerful without letting it be dangerous.
+
+- `Compactor`
+  - Compacts small blocks into larger ones, applies retention, and optionally downsampling. Without it, object storage costs and query fanout spiral.
+
+## Deep Dive: Cardinality Explosions (and How to Survive Them)
+
+The hardest part is that cardinality is a *memory and index* problem before it’s a throughput problem. If a tenant suddenly starts emitting `user_id` as a label, you don’t just get “more samples”—you get an unbounded number of new series, each requiring head state, postings, and query fanout.
+
+**1) Make cardinality a budgeted resource (per tenant, per metric family).**  
+Track *active series* per tenant in ingesters (in-memory set keyed by series fingerprint, with TTL based on recent samples). Enforce hard caps:
+- `max_active_series_per_tenant`
+- `max_series_per_metric_name` (stops one metric from consuming the whole budget)
+- label count/length limits and reject known-bad label keys
+
+When a new series would exceed budget, reject with a precise error that includes the offending labelset hash and the metric name. This converts “mysterious outage” into “actionable contract violation”.
+
+**2) Reject cheaply, before allocating expensive structures.**  
+Do not accept-and-then-evict. The ingestion pipeline should parse, validate, and fingerprint first; only then touch head state. Use a small, bounded “new series admission” structure per tenant (e.g., token-bucket for new series/sec) so explosions are throttled even below the hard cap. This prevents churn from turning into CPU death.
+
+**3) Protect reads too: expensive queries are just another cardinality vector.**  
+Even with perfect ingest controls, queries like `sum by (pod) (rate(http_requests_total[30d]))` can fan out disastrously. The query frontend enforces:
+- max time range (or mandatory step increases)
+- max series scanned (estimated from index/postings cardinality)
+- max bytes fetched from store gateways
+- query splitting (e.g., 30d => 30x 1d subqueries), with caching per shard
+
+The non-obvious benefit: once queries are sharded and cached, the system becomes stable under load because repeated dashboards stop recomputing the world.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Predictable cluster stability under cardinality spikes | “Accept all data” convenience |
+| Cheap, durable long-term storage | Slightly higher query complexity (block + gateway) |
+| Horizontal scalability of both write and read paths | More moving parts than single-node Prometheus |
+
+## Failure Modes
+
+- **Ingester crashes / rolling restarts**
+  - What happens: recent samples risk loss; queries for the last minutes can become partial.
+  - Detect: WAL replay time, replication quorum misses, increased remote_write retries.
+  - Recover: WAL replay + replication (N=3) so one node loss is survivable; query frontend tolerates partials only for explicitly-configured tenants.
+
+- **Object storage degradation (slow or erroring GET/LIST)**
+  - What happens: long-range queries slow; compaction backlog grows.
+  - Detect: store gateway GET latency, 5xx rates, compactor queue age.
+  - Recover: serve recent queries from ingesters; cache index/chunks; apply query budgets and shed long-range load first.
+
+- **Cardinality incident from a tenant**
+  - What happens: without controls, global memory pressure and cascading failures.
+  - Detect: surge in “new series admitted/sec”, tenant active series approaching cap, query fanout anomalies.
+  - Recover: hard reject new series for that tenant; keep existing series serving; provide top offending metrics/labels to remediate quickly.
+
+## What I'd Do Differently At...
+
+- **10x scale:** move to dedicated **query scheduler + worker pool** to smooth query bursts, increase store-gateway caching tiers (RAM + SSD), and tighten per-tenant SLAs with separate rings for “noisy” tenants.
+- **100x scale:** introduce **hierarchical storage** (tiered blocks, aggressive downsampling), global index acceleration (e.g., per-block bloom filters / partitioned postings caches), and potentially regionalize ingest + query with federation to avoid cross-region object-store hot spots.
+
+## Operational Notes
+
+- Cardinality limits are your primary “circuit breaker”; keep them visible, versioned, and tied to tenant plans.
+- Watch **WAL replay time** like a hawk; it defines recovery time and dictates safe ingester memory sizing.
+- Compaction lag is silent debt: measure “oldest un-compacted block age” and page before dashboards get slow.
+- Treat query budgets as SLO enforcement, not annoyance; without them, one bad dashboard becomes an incident.
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Treating cardinality as an explicit, enforceable budget (not an emergent scaling property), combined with “mutable hot window + immutable blocks in object storage,” is the right conceptual split for stability and long retention.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Ingest Gateway | The only place you can cheaply reject/shape writes before they allocate TSDB head memory and trigger cluster-wide blast radius. |
+| Ingester Ring | Owns the hot window, WAL durability, and low-latency recent reads; isolates object storage from write path. |
+| Object Storage | Cost-effective, durable source of truth for long retention; immutable blocks enable caching and compaction. |
+| Store Gateway | Turns object storage into a scalable read backend via index/chunk caching and restart-friendly behavior. |
+| Query Frontend | The safety valve for PromQL (budgeting, splitting, caching, fairness) so “one bad query” doesn’t become an incident. |
+| Compactor | Prevents long-term cost/query fanout from spiraling; centralizes retention/downsampling semantics. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| “Build this pipeline” as a bespoke system | Adopt an existing battle-tested stack: Grafana Mimir/Cortex (ingest+querier+compactor) + Thanos patterns (index-header, store gateway) | Less design freedom; you inherit project constraints, but you also inherit years of operational edge-case handling. |
+| Custom ring + membership implied | Use memberlist (gossip) or Consul/etcd for ring state (like Cortex/Mimir) | Adds a dependency, but makes failure behavior explicit and reduces “mysterious sharding” bugs. |
+| Hard per-tenant cardinality enforced “in ingesters” | Use shuffle sharding (per-tenant ingester subset) + per-ingester limits, with optional central limit service | True global “hard cap” is tricky without coordination; shuffle sharding gives strong isolation with simpler mechanics. |
+| Custom query cost estimation (“max series scanned”) | Reuse proven query-frontend/querier implementations (Mimir/Cortex) or keep initial guardrails coarse (range/step/concurrency) | Fine-grained estimators are complex and can be wrong; coarse controls are safer early but less user-friendly. |
+| “New series admission structure” local only | Redis-backed token bucket for “new series/sec” (per tenant), or accept per-ingester buckets with shuffle sharding | Redis adds ops; per-ingester buckets are simpler but can be bypassed by fanout unless sharding is tenant-sticky. |
+| “Boring glue” underspecified | Explicit control-plane: tenant configs, limit versions, rollout, audit | More formalism up front, but it’s what prevents 3am “who changed limits?” events. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Ring KV store (etcd/Consul) down for 5 minutes**
+   - Design’s answer: not addressed (ring exists conceptually, but membership/state store isn’t specified)
+   - Recommendation: Strengthen (define whether you use memberlist gossip, a KV store, or both; define read/write behavior during outages and how tokens/ownership changes are gated).
+
+2. **Network partition: ingesters split-brain (two sides accept writes)**
+   - Design’s answer: not addressed (replication mentioned, but quorum/ownership fencing isn’t)
+   - Recommendation: Strengthen (define write quorum rules, how a tenant/series maps to replica set, and how you prevent “dual leaders” from diverging; consider “ingest only if ring is stable” or fencing via KV epochs).
+
+3. **Object storage slow/erroring for hours (not minutes)**
+   - Design’s answer: partially addressed (serve recent from ingesters; cache; shed long-range)
+   - Recommendation: Strengthen (explicitly define: cache warmup strategy, how LIST storms are avoided, whether you rely on periodic metadata sync, and how compactor behaves—pause vs build backlog—and when you page).
+
+4. **Bad limits/config rollout rejects healthy tenants globally**
+   - Design’s answer: not addressed (limits “visible/versioned” is noted, but no rollout mechanics)
+   - Recommendation: Strengthen (add staged rollout + per-tenant overrides + fast revert; require “dry run” mode in gateway that reports would-reject without enforcing).
+
+5. **Traffic 10x + cardinality 10x during an incident (agents retry + deploy bug)**
+   - Design’s answer: partially addressed (reject early; token bucket for new series; query budgets)
+   - Recommendation: Acceptable if you add explicit backpressure contracts: remote_write retry guidance, per-tenant ingest concurrency caps, and a global “protect the cluster” mode that tightens limits automatically.
+
+## Recommendations
+
+### Must Fix
+- Make “hard per-tenant caps” mechanically true: either define coordination for global cardinality or adopt shuffle sharding + per-ingester caps (and be honest that it’s “hard within the shard,” not globally absolute).
+- Specify ring/membership and fencing: what stores ring state, how ingesters join/leave, what happens during partitions, and what guarantees writes rely on.
+- Define multi-tenant safety boundaries end-to-end: authn/z, tenant-aware caches (no cross-tenant leakage), and per-tenant query fairness (not just max limits).
+- Clarify partial results policy: when queries may be partial, how it’s surfaced, and how dashboards/alerts should behave.
+
+### Should Consider
+- Prefer an existing implementation (Mimir/Cortex/Thanos patterns) unless there’s a clear differentiator; your design already matches those primitives, so “compose” may beat “build.”
+- Add an explicit control plane for limits (schema, versioning, rollout, audit, emergency overrides) since limits are now a core product contract.
+- Make object-store read amplification a first-class design point: index-header caching, minimizing LIST calls, and a clear cache hierarchy (RAM vs SSD) for store gateways.
+
+### Nice to Have
+- Tenant isolation upgrades: shuffle sharding everywhere (ingest + query), “noisy neighbor” containment by default.
+- Operator ergonomics: top-N offending label keys/metrics surfaced automatically with runbooks and suggested relabel configs.
+- Clear SLO-driven load shedding: deterministic rules for tightening query windows/steps and disabling expensive features per tenant during incidents.
+
+## What's Working Well
+- The separation of mutable hot path (WAL + ingesters) from immutable long-term blocks is operationally calm and scales naturally.
+- You correctly treat cardinality as a budgeted resource with explicit rejection, which is the difference between “degraded” and “outage” at this scale.
+- Query frontend as a safety layer (splitting, caching, bounded execution) is the right place to make PromQL safe without neutering it.
+- Failure modes are discussed in the right order (cardinality → memory/index → query fanout), and the operational notes focus on the real pager metrics (WAL replay, compaction lag, query budgets).
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+thinking
+**Simplifying documentation**
+
+I need to simplify a document without altering the title, difficulty, or tags. I can't add any new components, but I can remove or merge existing ones. Critiques suggest using the existing stack and defining certain elements, which feels like adding. However, I could merge custom components into a managed service without violating the guidelines. I can condense sections, keeping the same headings while making the content shorter, and I need to ensure I include specifics like architecture and trade-offs.
+thinking
+**Resolving format conflict**
+
+I'm facing a conflict with the instructions that specify an output format requiring a "What We Removed" section while the rules state not to add new sections. The user clearly wants this section, but it conflicts with the guidelines. I might resolve this by reusing existing sections, like "Trade-offs" or "Key Design Decisions," to incorporate the information without technically adding a new section. However, I need to be cautious about how I structure it to avoid violating any rules.
+thinking
+**Integrating requirements**
+
+I’m thinking about how to incorporate the "What We Removed" section while adhering to the requirement that says not to add new sections. I could use the existing heading "Key Design Decisions" and create a bold subsection for "What We Removed" instead of making it a top-level section. This might satisfy both requests. I can also merge "Minimal Architecture" and "Justification" into the Architecture section while simplifying components to use the battle-tested stack like Mimir/Cortex/Thanos, which might address the guidelines without adding new components.
+thinking
+**Addressing component choices**
+
+I need to consider whether to use built-in memberlist or external options like etcd/consul. The rule says no additional components, so I’m leaning towards memberlist since it’s internal, which avoids adding dependencies. But critiques mention scenarios like ring KV going down. Using memberlist helps avoid that, although I must also address issues like split-brain and fencing. Mimir employs gossip and ring tokens, so a gating approach with healthy rings can ensure stability during potential partitions. I’ll specify that remote writes only go through if the ingester can write to quorum based on the ring status.
+thinking
+**Designing efficient documentation**
+
+I need to ensure the document captures the single side’s quorum acceptance while addressing potential token ownership issues. I’ll introduce simplified guarantees like "no split-brain writes" and have clients retry on a 503 response. I can enforce limits through shuffle sharding within each shard, keeping tenant assignments streamlined. To simplify further, I'll avoid downsampling and retain raw data at a fixed resolution, adjusting scrape intervals instead. I'll list failures like network partitions and ensure multi-tenant boundaries are in place. Finally, my architecture will adopt "Grafana Mimir" while maintaining existing section headings, incorporating all critiques effectively.
+exec
+/bin/zsh -lc "rg -n \"title: \\\"High-Cardinality Metrics Pipeline\\\"\" -S ." in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 75ms:
+./solutions/03-observability-reliability/high-cardinality-metrics-pipeline.md:2:title: "High-Cardinality Metrics Pipeline"
+./problems.yaml:141:    title: "High-Cardinality Metrics Pipeline"
+./logs/v2/high-cardinality-metrics-pipeline.log:161:title: "High-Cardinality Metrics Pipeline"
+./logs/v2/high-cardinality-metrics-pipeline.log:316:title: "High-Cardinality Metrics Pipeline"
+./logs/v2/high-cardinality-metrics-pipeline.log:592:title: "High-Cardinality Metrics Pipeline"
+./logs/v2/high-cardinality-metrics-pipeline.log:1005:title: "High-Cardinality Metrics Pipeline"
+./logs/high-cardinality-metrics-pipeline.log:255:title: "High-Cardinality Metrics Pipeline"
+./logs/high-cardinality-metrics-pipeline.log:596:title: "High-Cardinality Metrics Pipeline"
+./logs/high-cardinality-metrics-pipeline.log:1018:title: "High-Cardinality Metrics Pipeline"
+./logs/high-cardinality-metrics-pipeline.log:1383:title: "High-Cardinality Metrics Pipeline"
+./logs/high-cardinality-metrics-pipeline.log:1978:title: "High-Cardinality Metrics Pipeline"
+./logs/high-cardinality-metrics-pipeline.log:2665:title: "High-Cardinality Metrics Pipeline"
+./logs/high-cardinality-metrics-pipeline.log:3289:title: "High-Cardinality Metrics Pipeline"
+./logs/high-cardinality-metrics-pipeline.log:3516:title: "High-Cardinality Metrics Pipeline"
+./grades/high-cardinality-metrics-pipeline.log:52:title: "High-Cardinality Metrics Pipeline"
+./drafts-v2/high-cardinality-metrics-pipeline.md:3:title: "High-Cardinality Metrics Pipeline"
+./reviewed/high-cardinality-metrics-pipeline.md:2:title: "High-Cardinality Metrics Pipeline"
+./drafts/high-cardinality-metrics-pipeline.md:2:title: "High-Cardinality Metrics Pipeline"
+
+thinking
+**Determining the file to update**
+
+I need to figure out which file the user wants, and I suspect it’s the solution file in the solutions folder. I’ll need to check the structure there; maybe drafts are involved. The prompt includes original design elements, but it asks for a final elegant design. I’ll probably need to update the specific file for metrics. I’ll open that and also check the AGENTS instructions, looking for more context.
+exec
+/bin/zsh -lc ls in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 55ms:
+challenges
+drafts
+drafts-v2
+frontend
+grades
+logs
+problems.yaml
+prompts
+reviewed
+scripts
+solutions
+solutions-v2
+exec
+/bin/zsh -lc "sed -n '1,220p' solutions/03-observability-reliability/high-cardinality-metrics-pipeline.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 45ms:
+---
+title: "High-Cardinality Metrics Pipeline"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["metrics", "tsdb", "promql", "cardinality", "object-storage", "multi-tenant", "caching"]
+---
+
+## Overview
+
+This system ingests Prometheus `remote_write` at very high volume across many tenants, enforces strict cardinality controls, and serves low-latency PromQL over recent (“hot”) data while keeping long retention (“cold”) data cost-efficient in object storage.
+
+Key goals:
+- Predictable cost and performance under high cardinality and tenant skew.
+- Strong isolation: one tenant cannot take down ingest or queries for others.
+- Durable writes with `RPO ~0` for acknowledged samples.
+- Efficient long-term retention (months to years) with immutable TSDB blocks.
+
+## Requirements
+
+### Functional Requirements
+exec
+/bin/zsh -lc 'find .. -name AGENTS.md -print' in /Users/dominikdabrowski/pr/system-design-atlas exited 124 in 10.01s:
+
+exec
+/bin/zsh -lc 'find . -name AGENTS.md -print' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 736ms:
+
+exec
+/bin/zsh -lc 'ls solutions-v2/03-observability-reliability' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 49ms:
+distributed-tracing-system.md
+exec
+/bin/zsh -lc "sed -n '1,260p' drafts-v2/high-cardinality-metrics-pipeline.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 42ms:
+```markdown
+---
+title: "High-Cardinality Metrics Pipeline"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["metrics", "tsdb", "prometheus", "cortex", "multitenancy", "object-storage", "cardinality", "indexing", "query-engine"]
+---
+
+## Overview
+
+This system ingests Prometheus-style metrics at very high volume, survives sudden cardinality explosions, and supports fast queries over long retention. The key insight is to **treat “high-cardinality” as a product constraint, not a scaling surprise**: you enforce strict, explicit budgets at the edge and at ingest, then design storage/query around immutable TSDB blocks in cheap object storage.
+
+Elegance comes from a hard separation of concerns: **ingesters are only responsible for the hot, mutable window** (fast writes, recent reads, durability via WAL), while **long-term data is immutable blocks** in object storage queried through cacheable, horizontally scalable gateways. Everything else is boring glue: consistent hashing, rate limits, object storage, and a small number of background jobs.
+
+## What Makes This Hard
+
+Naive designs die in two ways:
+
+1. **Cardinality explosion masquerades as “just more traffic.”** But it’s not. It blows up *memory* (active series), *index size*, and *query fanout* nonlinearly. If you don’t enforce budgets early, you end up with a cluster-wide brownout where even “healthy” tenants can’t query.
+
+exec
+/bin/zsh -lc "sed -n '1,260p' solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md" in /Users/dominikdabrowski/pr/system-design-atlas exited 1 in 42ms:
+sed: solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md: No such file or directory
+exec
+/bin/zsh -lc "sed -n '1,260p' reviewed/high-cardinality-metrics-pipeline.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 44ms:
+---
+title: "High-Cardinality Metrics Pipeline"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["metrics", "tsdb", "promql", "cardinality", "object-storage", "multi-tenant", "caching"]
+---
+
+## Overview
+
+A high-cardinality metrics pipeline (Prometheus/Cortex/Mimir-like) ingests tens of millions of samples per second across many tenants, while serving low-latency PromQL queries over “hot” recent data and cost-efficient “cold” historical data stored for months to years.
+
+The hard parts are:
+
+- **Cardinality explosions** (labels like `user_id`, `pod_uid`, `trace_id`) driving unbounded memory, index bloat, query fanout, and unpredictable cost.
+- **Multi-tenant fairness** under noisy neighbors (one tenant can saturate ingest or queries).
+- **Durable, scalable storage** where recent data is written frequently (append-heavy) but old data should be cheap, immutable, and cache-friendly.
+- **Partial failures** (node/AZ outages, object-store degradation, KV/ring issues) without losing acknowledged data or cascading outages.
+
+This design uses a proven pattern:
+
+
+
+
+thinking
+**Considering file revisions**
+
+I'm trying to figure out if we should be looking at the "reviewed" or "solutions" files. It seems like we could create a new file in `solutions-v2`, but that directory is missing. The `drafts-v2` holds input designs, while `solutions` has the earlier v1 styles. Since the user mentioned a simplifier version, I think we should probably modify the `reviewed` file, but that could risk breaking things if we merge or remove too much. It might be simplest to update `drafts-v2/high-cardinality-metrics-pipeline.md` directly, replacing the content with a simplified version.
+thinking
+**Assessing file structure**
+
+The file is located in drafts-v2 and has code fences, which likely means it's not the final version and could be used as a prompt. I might need to create the solution in either `solutions-v2` or `reviewed`. However, the user specified not to change the title, difficulty, or tags in the YAML frontmatter. Given the repo's structure, `solutions/` contains finalized documents, but it seems there’s a need to edit `reviewed/high-cardinality-metrics-pipeline.md` instead. Yet, its tags don’t match, which could violate the instructions. So, it seems better to edit `drafts-v2/high-cardinality-metrics-pipeline.md`, even if it starts with codefences.
+thinking
+**Checking original document**
+
+I see there's also `drafts/high-cardinality-metrics-pipeline.md`, which might contain the original content without the code fence. I should take a look at that to see what it includes. It’s essential to find the right version so I can work on the simplification effectively. If it has the content without the extra formatting, that will make it easier to edit or merge into a final document without breaking any rules.
+exec
+/bin/zsh -lc "sed -n '1,80p' drafts/high-cardinality-metrics-pipeline.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 43ms:
+---
+title: "High-Cardinality Metrics Pipeline"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["metrics", "tsdb", "promql", "cardinality", "object-storage"]
+---
+
+## Overview
+
+A high-cardinality metrics pipeline (Prometheus/Cortex/Mimir-like) must ingest millions of time series while supporting low-latency queries over both “hot” recent data and years of “cold” historical data. The core challenge is that metrics cardinality can grow explosively (e.g., labels like `user_id`, `pod_uid`, `trace_id`), causing unbounded memory usage, index bloat, query fanout, and unpredictable costs.
+
+The key insight is to split responsibilities across a horizontally scalable ingest path and a query path, backed by an immutable block store in cheap object storage. Hot data lives in memory/SSD-optimized ingesters with replication + WAL; cold data is compacted into time-partitioned blocks with an index that supports label-based lookups. Cardinality is controlled with hard limits, adaptive protection mechanisms, and “make the blast radius small” multi-tenancy.
+
+This design targets production realities: noisy neighbors, partial outages (object store, nodes, AZs), query storms, and operational needs like per-tenant limits, rollouts, and observability of the observability system.
+
+## Requirements
+
+### Functional Requirements
+- Ingest metrics via Prometheus `remote_write` and OpenTelemetry Collector (OTLP → remote_write translation).
+- Query metrics using PromQL-compatible APIs (range queries, instant queries, label APIs).
+
+thinking
+**Organizing documentation tasks**
+
+I'm looking at the typical tasks, like updating an existing design document. I think I should add a new solution file in the right directory, possibly `solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md`. However, this subdirectory doesn’t exist yet in `solutions-v2`, so we might need to create it. But wait, I should check if there’s a specific process for this first. It might be helpful to look at other categories within `solutions-v2`. Let's list those out!
+exec
+/bin/zsh -lc 'find solutions-v2 -maxdepth 2 -type f -print' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 46ms:
+solutions-v2/02-storage-data-platforms/time-series-database.md
+solutions-v2/02-storage-data-platforms/multi-tenant-object-storage.md
+solutions-v2/02-storage-data-platforms/distributed-key-value-store.md
+solutions-v2/02-storage-data-platforms/distributed-file-system-ml.md
+solutions-v2/08-security-access-control/zero-trust-access-proxy.md
+solutions-v2/08-security-access-control/identity-provider.md
+solutions-v2/08-security-access-control/authorization-service-zanzibar.md
+solutions-v2/08-security-access-control/key-management-system.md
+solutions-v2/06-commerce-fintech/payment-processing-gateway.md
+solutions-v2/06-commerce-fintech/food-delivery-logistics.md
+solutions-v2/06-commerce-fintech/digital-wallet.md
+solutions-v2/06-commerce-fintech/ride-hailing-dispatch.md
+solutions-v2/07-ai-ml-infrastructure/llm-inference-gateway.md
+solutions-v2/04-realtime-media/live-video-streaming.md
+solutions-v2/04-realtime-media/chat-system.md
+solutions-v2/04-realtime-media/push-notification-broker.md
+solutions-v2/04-realtime-media/collaborative-document-editing.md
+solutions-v2/03-observability-reliability/multi-region-disaster-recovery.md
+solutions-v2/03-observability-reliability/distributed-tracing-system.md
+solutions-v2/03-observability-reliability/deployment-system.md
+
+
+
+
+
+
+thinking
+**Considering document modification**
+
+I'm noticing that there's no high-cardinality-metrics-pipeline.md in the solutions-v2 documentation. It seems like I should add that as a new solution document. The user asked for a rewrite, which probably means they want a simplified version. I wonder if they want to replace existing solutions or just provide a new one. The user's role suggestion hints they might prefer just the output without additional file changes. However, I'm aware that changes are often expected in such tasks, so it's a bit of a dilemma!
+thinking
+**Crafting a markdown response**
+
+I could just respond with a markdown document, but in this environment, tasks usually require updating the repository. It’s a bit unclear because I can produce a final markdown document without touching files, but the user likely expects more than just that. They might want to incorporate it into Atlas. So, I will add the file to `solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md` with a simplified design while ensuring we follow the minimal architecture and only keep necessary components.
+thinking
+**Organizing the document structure**
+
+I'm thinking it might be better to include a bullet list under the Trade-offs section, but I also need to have an explicit "What We Removed" section. Maybe I can incorporate this into the Trade-offs table, though it may not be clear enough. I could use the existing "Trade-offs" heading and add a bullet list titled "**What We Removed**." 
+
+For the Architecture section, I should include a bullet for "**Minimal architecture**." The output format requires explicit sections: minimal architecture, clear justification for remaining components, an explicit "What We Removed" section, and honest trade-offs. I'll also need to adjust the Failure Modes section accordingly and consider simplifying by using the existing stack while removing the store gateway.
+thinking
+**Simplifying the architecture**
+
+I'm realizing that object storage reads require some considerations. The simplest solution could be to have the query engine read blocks directly from object storage and cache the index locally. I think it’s feasible to merge the store gateway into the query service, which streamlines things. 
+
+I wonder if I can also combine the ingest gateway and query frontend into a single API service with internal paths for ingesting and querying. While it's essential to avoid adding components, merging seems fine. For a small team, it might make sense to keep separate ingesters and API+query. However, the original design had several components, so I can merge to three: API/Query frontend, ingester ring, and object storage. The compactor is essential for retention and efficiency, but it could also run as part of the query service as a background job or cron job, even if it remains a logical component.
+thinking
+**Finalizing architecture and document**
+
+I can simplify to three main components: Agents, a Metrics Backend (which combines ingest, ingesters, query, and compaction), and Object Storage. The ingesters must be stateful and scalable, likely separate deployments but sharing the same binary. I think I can list the Metrics Backend as a single component with two roles: a stateless API and a stateful ingester. 
+
+To meet requirements, I can include elements like a "Safe multi-tenant query" as part of the API service. The minimal setup would be:
+
+- Agents
+- Metrics Backend, which consists of:
+   - API (for ingest and query)
+   - Pool of ingesters with WAL and blocks
+   - A compaction job
+   - Embedded ring membership via gossip
+- Object Storage
+
+I won't officially add the "Metrics Backend" since I'm merging components without increasing total count. The final architecture must remain a subset of the original. 
+
+For the diagram, I plan to show Prometheus/Agents leading to the Metrics Backend, which connects to Object Storage and details how queries flow. We'll simplify by dropping complexity around downsampling, cost estimation, and other estimates. I’ll present this clearly.
+
+Also, I think it's wise to cut out sections that aren't necessary, like "Deep Dive" and "Operational Notes," but keep essential headings and minimal bullet points. I’ll ensure to document failure modes and mechanisms like membership and fencing defined. 
+
+Alright, I'll go ahead and create the new simplified document with the existing name while ensuring to include the required tags and a clear markdown format!
+thinking
+**Planning document updates**
+
+I’m considering replacements based on the rule that says not to add components. Using managed Grafana Cloud might be an option, but then I’d have to remove the object storage component, which seems too far since the title is about a pipeline. I think it’s best to keep the object storage for consistency.
+
+I’ll ensure to maintain the design decisions: storing blocks in object storage, using shuffle sharding with hard limits at ingest, and employing a single codebase instead of bespoke services. The ring membership will also be included, rejecting writes when unstable. 
+
+Now, I'm ready to create a short plan: 
+
+1. Identify the target document location. 
+2. Draft the simplified design text.
+3. Write it to a new solution file.
+4. Check frontmatter and mermaid.
+5. Summarize the changes afterward.
+
+I’ll proceed with this plan!
+Plan update
+  → Choose target markdown file
+  • Draft minimalist design text
+  • Apply patch with final doc
+  • Sanity-check formatting and mermaid
+
+thinking
+**Creating a new file**
+
+I need to decide on the target file. Since there's no existing `solutions-v2` file, I'll create `solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md`, following the existing pattern. Frontmatter will be kept the same. Once I do that, I'll mark this step as complete. I'll make sure to adhere to the naming conventions, using kebab-case for the filename. Updating problems.yaml isn't necessary at this point, so I’ll just proceed with the file creation.
+Plan update
+Target output will be a new v2 solution doc at `solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md` to match the prompt’s frontmatter and keep existing v2 organization.
+  ✓ Choose target markdown file
+  → Draft minimalist design text
+  • Apply patch with final doc
+  • Sanity-check formatting and mermaid
+
+
+
+
+
+thinking
+**Refining scale targets and design decisions**
+
+I'm thinking about the scale targets. Maybe I should keep it but remove the downsampling mention since it's part of the requirement. So, I could say "Retention: 13 months raw; cheaper tiers shorten retention and/or scrape interval." That effectively removes downsampling. I also need to outline the key design decisions like using an existing implementation, immutable blocks, shuffle sharding with limits, and the query protection approach. It feels like I'm structuring this more clearly now!
+thinking
+**Structuring key design decisions and removals**
+
+I'm considering whether to include a "**What We Removed**" label. It seems best to add it at the end of the Key Design Decisions section as a subheading, listing the removed components. This approach satisfies the requirement without needing a new heading. I can also include trade-offs in that section. For the architecture, I'm updating the mermaid diagram to show the relationships and possibly include a compaction job. In the components, I'll clarify the roles of Prometheus, the metrics backend, and their features.
+thinking
+**Clarifying justifications and trade-offs**
+
+I need to provide clear justifications for needing stateful ingestion and query handling. This includes enforcing budgets and ensuring durability. I also plan to incorporate ring membership and fencing components, using a built-in member list. This way, tokens would be persisted, writes would require a quorum, and an unhealthy ring would return a 503 status. For config rollouts, I’ll limit versions and implement canary and dry-run strategies. In the trade-offs table, I’ll outline the optimizations versus sacrifices. It’s essential to articulate these points effectively!
+thinking
+**Detailing query mechanisms and failure modes**
+
+I'll specify that query reads blocks directly from a library, meaning each queryer performs object GETs, and that caching is in-process only. 
+
+For failure modes, I need to outline some key scenarios:  
+- Ring instability will result in rejection of writes unless a quorum is reachable, while local ingesters can continue with hot data queries, although global queries may be incomplete.  
+- Network partitions lead to a prevention mechanism based on quorum, with no writes allowed if quorum isn't reachable.  
+- If object storage is slow, we'll serve hot data from ingesters, but historical queries might return a 503/429 if budgets are exceeded.  
+
+Overall, I have clear strategies in place for configuration rollouts and tenant incidents, ensuring the system can recover effectively!
+thinking
+**Deciding on section edits and operational notes**
+
+I’m considering whether to remove a section or keep it short since it's part of the original, but it might be possible to cut some content. I’ll keep it minimal—mentioning a query result cache and a store gateway for the 10x scenario and a separate scheduler for the 100x. While I shouldn't add components yet, I can note them as future possibilities.  
+
+In the operational notes, I want to maintain a concise bullet list about limits, ring health, error budgets, and canary configurations. I need to ensure the document stays minimal and consistent, so I'll remove anything like a separate control plane database.  
+
+Now, I’ll create a new file for this patch. I'll mark the status as "Draft step in progress" before applying the patch. I've also got to ensure the YAML frontmatter is quoted correctly and keep specific tags intact. I’ll produce the patch accordingly!
+file update
+A /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md
+---
+title: "High-Cardinality Metrics Pipeline"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["metrics", "tsdb", "prometheus", "cortex", "multitenancy", "object-storage", "cardinality", "indexing", "query-engine"]
+---
+
+## Overview
+
+This system ingests Prometheus `remote_write` at very high volume across many tenants, stays stable during cardinality spikes, and serves PromQL over both recent (“hot”) data and long retention (“cold”) data.
+
+The design is a single, proven metrics backend (Cortex/Mimir-style) deployed in two roles: **stateless API** and **stateful ingesters**. Ingesters own the hot window with a WAL; they periodically cut immutable TSDB blocks and upload them to object storage. Queries read hot data from ingesters and cold data from object storage, with strict per-tenant limits so one tenant cannot destabilize the cluster.
+
+## What Makes This Hard
+
+1. **Cardinality is a memory/index failure mode, not a traffic problem.** A label blow-up creates new series, which blows up head state and index fanout before you “run out of CPU.”
+2. **PromQL can be a DoS tool.** Without hard budgets, a single query (or dashboard) can saturate CPU and object-store reads.
+
+## Requirements
+
+### Functional Requirements
+- **Prometheus remote_write-compatible ingest** with per-tenant isolation.
+- **Cardinality controls**: per-tenant series limits, label allow/deny lists, and hard rejection with clear reasons.
+- **Fast queries for recent data** and acceptable latency for long-range queries (hours–months).
+- **Long-term retention** (months to years) on inexpensive storage.
+- **Safe multi-tenant query execution**: no query can destabilize the cluster.
+
+### Scale Targets
+- Ingest: **10M samples/sec** sustained, **50M samples/sec** bursts (flash release + autoscaling lag).
+- Active series: **200M global**, with **hard per-tenant caps** (e.g., 1–10M depending on plan).
+- Retention: **13 months** raw at 10–15s for “gold” tenants; cheaper tiers use shorter retention and/or a larger scrape interval at the source.
+- Queries: **p95 < 2s** for last 15m; **p95 < 8s** for 30d; concurrency in the low thousands.
+
+## Key Design Decisions
+
+- **Decision 1: Use an existing Cortex/Mimir-style backend**
+  - Chose: One codebase that already implements multi-tenancy, TSDB blocks, rings, and query protection.
+  - Why: This problem is operational edge-cases; “build” is the wrong simplification.
+
+- **Decision 2: Hot head + immutable blocks**
+  - Chose: Ingester head (WAL-backed) for the hot window; immutable TSDB blocks in **S3/GCS** for long retention.
+  - Why: Immutable blocks make storage cheap, compaction safe, and reads cacheable.
+
+- **Decision 3: Tenant isolation via shuffle sharding + hard limits**
+  - Chose: Each tenant maps to a stable subset of ingesters; enforce `max_active_series`, `max_new_series_per_sec`, label limits, and sample-rate limits inside that shard.
+  - Why: You get a mechanically true blast-radius boundary without a global “perfect” coordinator.
+
+- **Decision 4: Query safety via coarse budgets**
+  - Chose: Hard caps on time range, minimum step, max concurrency, and max execution time; split long range queries by time and cache subresults in-process.
+  - Why: Fine-grained “query cost estimation” is complexity that fails under real workloads; coarse budgets are predictable.
+
+- **What We Removed**
+  - Separate `Ingest Gateway`, `Query Frontend`, and `Store Gateway` as standalone services (merged into one backend).
+  - External ring KV store dependency (use gossip membership; reject writes when the ring is unstable).
+  - Downsampling pipeline (tiers are retention + source resolution, not post-processing).
+  - Dedicated query scheduler/worker pool (only add when query burst smoothing becomes necessary).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[Prometheus / Agents] --> B["Metrics Backend (Cortex/Mimir-style)"]
+  B <--> C["Object Storage (S3/GCS)"]
+```
+
+### Components
+
+- `Prometheus / Agents`
+  - Scrape locally and `remote_write` with backoff and batching. Retries are expected; ingestion is at-least-once.
+
+- `Metrics Backend (Cortex/Mimir-style)`
+  - What it does: auth + per-tenant limits, sharding and replication, WAL-backed hot ingest, query execution with strict budgets, block shipping, and compaction/retention as a background job.
+  - Why it stays: it’s the only custom logic you can’t outsource—multi-tenant limits + TSDB semantics + query safety.
+  - Ring and fencing:
+    - Membership is gossip-based; token ownership is persisted so restarts don’t reshuffle.
+    - Writes are acknowledged only after **quorum WAL durability**; if quorum can’t be reached or the ring isn’t stable, the API returns `503` so clients back off instead of creating split-brain data.
+  - Limits rollout:
+    - Limits are versioned; rollout is staged per tenant; “dry-run” mode reports would-reject before enforcement; revert is instant.
+
+- `Object Storage`
+  - Stores immutable blocks for long retention. This is the long-term source of truth.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Stability under cardinality spikes | “Accept everything” convenience |
+| Small team operability (few moving parts) | Less independent scaling of query vs ingest roles |
+| Cheap long retention | Historical queries depend on object-store health |
+| Predictable multi-tenant fairness | Some queries are rejected instead of “slow but eventually” |
+
+## Failure Modes
+
+- **Ring instability or membership flapping**
+  - What happens: shard ownership is uncertain; replication sets change too often to be safe.
+  - Recover: stop acknowledging writes (`503`) until the ring is stable; keep serving hot reads from healthy ingesters.
+
+- **Network partition (split-brain risk)**
+  - What happens: two sides may disagree on ownership.
+  - Recover: quorum writes + “ring must be stable” gating means partitions turn into rejected writes, not divergent acknowledged data.
+
+- **Object storage slow/erroring for hours**
+  - What happens: cold reads get slow; compaction falls behind.
+  - Recover: keep hot queries served from ingesters; strictly shed long-range queries first; pause/slow background compaction to avoid LIST/GET storms and let the backlog accumulate.
+
+- **Bad limits/config rollout rejects healthy tenants**
+  - What happens: sudden, widespread ingest failures.
+  - Recover: staged rollout + dry-run prevents global surprises; revert to the previous version immediately.
+
+- **Tenant cardinality incident**
+  - What happens: one tenant tries to create unlimited new series.
+  - Recover: reject new series for that tenant inside its shard; quarantine the tenant if needed; keep everyone else stable.
+
+## What I'd Do Differently At...
+
+- **10x scale:** add a dedicated store-gateway/read-cache layer only if object-store amplification dominates; add SSD caches before adding more services.
+- **100x scale:** split query execution into a scheduler + workers only if fairness and burst smoothing can’t be met with per-tenant queues and caps.
+
+## Operational Notes
+
+- Limits are the product contract: keep them visible, versioned, and easy to revert.
+- Page on ring instability, WAL replay time, and compaction backlog age; those are the real “system is dying” signals.
+- Make “partial results” explicit: only allow them by tenant policy, never silently.
+apply_patch(auto_approved=true) exited 0 in 20ms:
+Success. Updated the following files:
+A solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md
+file update:
+diff --git a/solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md b/solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..4c1620853e2b2a7f06091998b174565800994414
+--- /dev/null
++++ b/solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md
+@@ -0,0 +1,123 @@
++---
++title: "High-Cardinality Metrics Pipeline"
++category: "Observability & Reliability"
++difficulty: "Hard"
++tags: ["metrics", "tsdb", "prometheus", "cortex", "multitenancy", "object-storage", "cardinality", "indexing", "query-engine"]
++---
++
++## Overview
++
++This system ingests Prometheus `remote_write` at very high volume across many tenants, stays stable during cardinality spikes, and serves PromQL over both recent (“hot”) data and long retention (“cold”) data.
++
++The design is a single, proven metrics backend (Cortex/Mimir-style) deployed in two roles: **stateless API** and **stateful ingesters**. Ingesters own the hot window with a WAL; they periodically cut immutable TSDB blocks and upload them to object storage. Queries read hot data from ingesters and cold data from object storage, with strict per-tenant limits so one tenant cannot destabilize the cluster.
++
++## What Makes This Hard
++
++1. **Cardinality is a memory/index failure mode, not a traffic problem.** A label blow-up creates new series, which blows up head state and index fanout before you “run out of CPU.”
++2. **PromQL can be a DoS tool.** Without hard budgets, a single query (or dashboard) can saturate CPU and object-store reads.
++
++## Requirements
++
++### Functional Requirements
++- **Prometheus remote_write-compatible ingest** with per-tenant isolation.
++- **Cardinality controls**: per-tenant series limits, label allow/deny lists, and hard rejection with clear reasons.
++- **Fast queries for recent data** and acceptable latency for long-range queries (hours–months).
++- **Long-term retention** (months to years) on inexpensive storage.
++- **Safe multi-tenant query execution**: no query can destabilize the cluster.
++
++### Scale Targets
++- Ingest: **10M samples/sec** sustained, **50M samples/sec** bursts (flash release + autoscaling lag).
++- Active series: **200M global**, with **hard per-tenant caps** (e.g., 1–10M depending on plan).
++- Retention: **13 months** raw at 10–15s for “gold” tenants; cheaper tiers use shorter retention and/or a larger scrape interval at the source.
++- Queries: **p95 < 2s** for last 15m; **p95 < 8s** for 30d; concurrency in the low thousands.
++
++## Key Design Decisions
++
++- **Decision 1: Use an existing Cortex/Mimir-style backend**
++  - Chose: One codebase that already implements multi-tenancy, TSDB blocks, rings, and query protection.
++  - Why: This problem is operational edge-cases; “build” is the wrong simplification.
++
++- **Decision 2: Hot head + immutable blocks**
++  - Chose: Ingester head (WAL-backed) for the hot window; immutable TSDB blocks in **S3/GCS** for long retention.
++  - Why: Immutable blocks make storage cheap, compaction safe, and reads cacheable.
++
++- **Decision 3: Tenant isolation via shuffle sharding + hard limits**
++  - Chose: Each tenant maps to a stable subset of ingesters; enforce `max_active_series`, `max_new_series_per_sec`, label limits, and sample-rate limits inside that shard.
++  - Why: You get a mechanically true blast-radius boundary without a global “perfect” coordinator.
++
++- **Decision 4: Query safety via coarse budgets**
++  - Chose: Hard caps on time range, minimum step, max concurrency, and max execution time; split long range queries by time and cache subresults in-process.
++  - Why: Fine-grained “query cost estimation” is complexity that fails under real workloads; coarse budgets are predictable.
++
++- **What We Removed**
++  - Separate `Ingest Gateway`, `Query Frontend`, and `Store Gateway` as standalone services (merged into one backend).
++  - External ring KV store dependency (use gossip membership; reject writes when the ring is unstable).
++  - Downsampling pipeline (tiers are retention + source resolution, not post-processing).
++  - Dedicated query scheduler/worker pool (only add when query burst smoothing becomes necessary).
++
++## Architecture
++
++```mermaid
++flowchart LR
++  A[Prometheus / Agents] --> B["Metrics Backend (Cortex/Mimir-style)"]
++  B <--> C["Object Storage (S3/GCS)"]
++```
++
++### Components
++
++- `Prometheus / Agents`
++  - Scrape locally and `remote_write` with backoff and batching. Retries are expected; ingestion is at-least-once.
++
++- `Metrics Backend (Cortex/Mimir-style)`
++  - What it does: auth + per-tenant limits, sharding and replication, WAL-backed hot ingest, query execution with strict budgets, block shipping, and compaction/retention as a background job.
++  - Why it stays: it’s the only custom logic you can’t outsource—multi-tenant limits + TSDB semantics + query safety.
++  - Ring and fencing:
++    - Membership is gossip-based; token ownership is persisted so restarts don’t reshuffle.
++    - Writes are acknowledged only after **quorum WAL durability**; if quorum can’t be reached or the ring isn’t stable, the API returns `503` so clients back off instead of creating split-brain data.
++  - Limits rollout:
++    - Limits are versioned; rollout is staged per tenant; “dry-run” mode reports would-reject before enforcement; revert is instant.
++
++- `Object Storage`
++  - Stores immutable blocks for long retention. This is the long-term source of truth.
++
++## Trade-offs
++
++| Optimized For | Sacrificed |
++|--------------|------------|
++| Stability under cardinality spikes | “Accept everything” convenience |
++| Small team operability (few moving parts) | Less independent scaling of query vs ingest roles |
++| Cheap long retention | Historical queries depend on object-store health |
++| Predictable multi-tenant fairness | Some queries are rejected instead of “slow but eventually” |
++
++## Failure Modes
++
++- **Ring instability or membership flapping**
++  - What happens: shard ownership is uncertain; replication sets change too often to be safe.
++  - Recover: stop acknowledging writes (`503`) until the ring is stable; keep serving hot reads from healthy ingesters.
++
++- **Network partition (split-brain risk)**
++  - What happens: two sides may disagree on ownership.
++  - Recover: quorum writes + “ring must be stable” gating means partitions turn into rejected writes, not divergent acknowledged data.
++
++- **Object storage slow/erroring for hours**
++  - What happens: cold reads get slow; compaction falls behind.
++  - Recover: keep hot queries served from ingesters; strictly shed long-range queries first; pause/slow background compaction to avoid LIST/GET storms and let the backlog accumulate.
++
++- **Bad limits/config rollout rejects healthy tenants**
++  - What happens: sudden, widespread ingest failures.
++  - Recover: staged rollout + dry-run prevents global surprises; revert to the previous version immediately.
++
++- **Tenant cardinality incident**
++  - What happens: one tenant tries to create unlimited new series.
++  - Recover: reject new series for that tenant inside its shard; quarantine the tenant if needed; keep everyone else stable.
++
++## What I'd Do Differently At...
++
++- **10x scale:** add a dedicated store-gateway/read-cache layer only if object-store amplification dominates; add SSD caches before adding more services.
++- **100x scale:** split query execution into a scheduler + workers only if fairness and burst smoothing can’t be met with per-tenant queues and caps.
++
++## Operational Notes
++
++- Limits are the product contract: keep them visible, versioned, and easy to revert.
++- Page on ring instability, WAL replay time, and compaction backlog age; those are the real “system is dying” signals.
++- Make “partial results” explicit: only allow them by tenant policy, never silently.
+
+file update:
+diff --git a/solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md b/solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..4c1620853e2b2a7f06091998b174565800994414
+--- /dev/null
++++ b/solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md
+@@ -0,0 +1,123 @@
++---
++title: "High-Cardinality Metrics Pipeline"
++category: "Observability & Reliability"
++difficulty: "Hard"
++tags: ["metrics", "tsdb", "prometheus", "cortex", "multitenancy", "object-storage", "cardinality", "indexing", "query-engine"]
++---
++
++## Overview
++
++This system ingests Prometheus `remote_write` at very high volume across many tenants, stays stable during cardinality spikes, and serves PromQL over both recent (“hot”) data and long retention (“cold”) data.
++
++The design is a single, proven metrics backend (Cortex/Mimir-style) deployed in two roles: **stateless API** and **stateful ingesters**. Ingesters own the hot window with a WAL; they periodically cut immutable TSDB blocks and upload them to object storage. Queries read hot data from ingesters and cold data from object storage, with strict per-tenant limits so one tenant cannot destabilize the cluster.
++
++## What Makes This Hard
++
++1. **Cardinality is a memory/index failure mode, not a traffic problem.** A label blow-up creates new series, which blows up head state and index fanout before you “run out of CPU.”
++2. **PromQL can be a DoS tool.** Without hard budgets, a single query (or dashboard) can saturate CPU and object-store reads.
++
++## Requirements
++
++### Functional Requirements
++- **Prometheus remote_write-compatible ingest** with per-tenant isolation.
++- **Cardinality controls**: per-tenant series limits, label allow/deny lists, and hard rejection with clear reasons.
++- **Fast queries for recent data** and acceptable latency for long-range queries (hours–months).
++- **Long-term retention** (months to years) on inexpensive storage.
++- **Safe multi-tenant query execution**: no query can destabilize the cluster.
++
++### Scale Targets
++- Ingest: **10M samples/sec** sustained, **50M samples/sec** bursts (flash release + autoscaling lag).
++- Active series: **200M global**, with **hard per-tenant caps** (e.g., 1–10M depending on plan).
++- Retention: **13 months** raw at 10–15s for “gold” tenants; cheaper tiers use shorter retention and/or a larger scrape interval at the source.
++- Queries: **p95 < 2s** for last 15m; **p95 < 8s** for 30d; concurrency in the low thousands.
++
++## Key Design Decisions
++
++- **Decision 1: Use an existing Cortex/Mimir-style backend**
++  - Chose: One codebase that already implements multi-tenancy, TSDB blocks, rings, and query protection.
++  - Why: This problem is operational edge-cases; “build” is the wrong simplification.
++
++- **Decision 2: Hot head + immutable blocks**
++  - Chose: Ingester head (WAL-backed) for the hot window; immutable TSDB blocks in **S3/GCS** for long retention.
++  - Why: Immutable blocks make storage cheap, compaction safe, and reads cacheable.
++
++- **Decision 3: Tenant isolation via shuffle sharding + hard limits**
++  - Chose: Each tenant maps to a stable subset of ingesters; enforce `max_active_series`, `max_new_series_per_sec`, label limits, and sample-rate limits inside that shard.
++  - Why: You get a mechanically true blast-radius boundary without a global “perfect” coordinator.
++
++- **Decision 4: Query safety via coarse budgets**
++  - Chose: Hard caps on time range, minimum step, max concurrency, and max execution time; split long range queries by time and cache subresults in-process.
++  - Why: Fine-grained “query cost estimation” is complexity that fails under real workloads; coarse budgets are predictable.
++
++- **What We Removed**
++  - Separate `Ingest Gateway`, `Query Frontend`, and `Store Gateway` as standalone services (merged into one backend).
++  - External ring KV store dependency (use gossip membership; reject writes when the ring is unstable).
++  - Downsampling pipeline (tiers are retention + source resolution, not post-processing).
++  - Dedicated query scheduler/worker pool (only add when query burst smoothing becomes necessary).
++
++## Architecture
++
++```mermaid
++flowchart LR
++  A[Prometheus / Agents] --> B["Metrics Backend (Cortex/Mimir-style)"]
++  B <--> C["Object Storage (S3/GCS)"]
++```
++
++### Components
++
++- `Prometheus / Agents`
++  - Scrape locally and `remote_write` with backoff and batching. Retries are expected; ingestion is at-least-once.
++
++- `Metrics Backend (Cortex/Mimir-style)`
++  - What it does: auth + per-tenant limits, sharding and replication, WAL-backed hot ingest, query execution with strict budgets, block shipping, and compaction/retention as a background job.
++  - Why it stays: it’s the only custom logic you can’t outsource—multi-tenant limits + TSDB semantics + query safety.
++  - Ring and fencing:
++    - Membership is gossip-based; token ownership is persisted so restarts don’t reshuffle.
++    - Writes are acknowledged only after **quorum WAL durability**; if quorum can’t be reached or the ring isn’t stable, the API returns `503` so clients back off instead of creating split-brain data.
++  - Limits rollout:
++    - Limits are versioned; rollout is staged per tenant; “dry-run” mode reports would-reject before enforcement; revert is instant.
++
++- `Object Storage`
++  - Stores immutable blocks for long retention. This is the long-term source of truth.
++
++## Trade-offs
++
++| Optimized For | Sacrificed |
++|--------------|------------|
++| Stability under cardinality spikes | “Accept everything” convenience |
++| Small team operability (few moving parts) | Less independent scaling of query vs ingest roles |
++| Cheap long retention | Historical queries depend on object-store health |
++| Predictable multi-tenant fairness | Some queries are rejected instead of “slow but eventually” |
++
++## Failure Modes
++
++- **Ring instability or membership flapping**
++  - What happens: shard ownership is uncertain; replication sets change too often to be safe.
++  - Recover: stop acknowledging writes (`503`) until the ring is stable; keep serving hot reads from healthy ingesters.
++
++- **Network partition (split-brain risk)**
++  - What happens: two sides may disagree on ownership.
++  - Recover: quorum writes + “ring must be stable” gating means partitions turn into rejected writes, not divergent acknowledged data.
++
++- **Object storage slow/erroring for hours**
++  - What happens: cold reads get slow; compaction falls behind.
++  - Recover: keep hot queries served from ingesters; strictly shed long-range queries first; pause/slow background compaction to avoid LIST/GET storms and let the backlog accumulate.
++
++- **Bad limits/config rollout rejects healthy tenants**
++  - What happens: sudden, widespread ingest failures.
++  - Recover: staged rollout + dry-run prevents global surprises; revert to the previous version immediately.
++
++- **Tenant cardinality incident**
++  - What happens: one tenant tries to create unlimited new series.
++  - Recover: reject new series for that tenant inside its shard; quarantine the tenant if needed; keep everyone else stable.
++
++## What I'd Do Differently At...
++
++- **10x scale:** add a dedicated store-gateway/read-cache layer only if object-store amplification dominates; add SSD caches before adding more services.
++- **100x scale:** split query execution into a scheduler + workers only if fairness and burst smoothing can’t be met with per-tenant queues and caps.
++
++## Operational Notes
++
++- Limits are the product contract: keep them visible, versioned, and easy to revert.
++- Page on ring instability, WAL replay time, and compaction backlog age; those are the real “system is dying” signals.
++- Make “partial results” explicit: only allow them by tenant policy, never silently.
+
+Plan update
+Added the new v2 solution document with a merged 3-component architecture and an explicit in-section "What We Removed" list.
+  ✓ Choose target markdown file
+  ✓ Draft minimalist design text
+  → Apply patch with final doc
+  • Sanity-check formatting and mermaid
+
+thinking
+**Checking patch application**
+
+I'm in the process of applying a patch, but it seems like we've already done that. I should mark it as completed and move on to the sanity-check. To do this, I'll run `sed` to view the file and check the markdown frontmatter formatting. I might also use `rg` to search for occurrences of "```markdown". After that, I'll open the file to verify everything is in order.
+file update:
+diff --git a/solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md b/solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..4c1620853e2b2a7f06091998b174565800994414
+--- /dev/null
++++ b/solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md
+@@ -0,0 +1,123 @@
++---
++title: "High-Cardinality Metrics Pipeline"
++category: "Observability & Reliability"
++difficulty: "Hard"
++tags: ["metrics", "tsdb", "prometheus", "cortex", "multitenancy", "object-storage", "cardinality", "indexing", "query-engine"]
++---
++
++## Overview
++
++This system ingests Prometheus `remote_write` at very high volume across many tenants, stays stable during cardinality spikes, and serves PromQL over both recent (“hot”) data and long retention (“cold”) data.
++
++The design is a single, proven metrics backend (Cortex/Mimir-style) deployed in two roles: **stateless API** and **stateful ingesters**. Ingesters own the hot window with a WAL; they periodically cut immutable TSDB blocks and upload them to object storage. Queries read hot data from ingesters and cold data from object storage, with strict per-tenant limits so one tenant cannot destabilize the cluster.
++
++## What Makes This Hard
++
++1. **Cardinality is a memory/index failure mode, not a traffic problem.** A label blow-up creates new series, which blows up head state and index fanout before you “run out of CPU.”
++2. **PromQL can be a DoS tool.** Without hard budgets, a single query (or dashboard) can saturate CPU and object-store reads.
++
++## Requirements
++
++### Functional Requirements
++- **Prometheus remote_write-compatible ingest** with per-tenant isolation.
++- **Cardinality controls**: per-tenant series limits, label allow/deny lists, and hard rejection with clear reasons.
++- **Fast queries for recent data** and acceptable latency for long-range queries (hours–months).
++- **Long-term retention** (months to years) on inexpensive storage.
++- **Safe multi-tenant query execution**: no query can destabilize the cluster.
++
++### Scale Targets
++- Ingest: **10M samples/sec** sustained, **50M samples/sec** bursts (flash release + autoscaling lag).
++- Active series: **200M global**, with **hard per-tenant caps** (e.g., 1–10M depending on plan).
++- Retention: **13 months** raw at 10–15s for “gold” tenants; cheaper tiers use shorter retention and/or a larger scrape interval at the source.
++- Queries: **p95 < 2s** for last 15m; **p95 < 8s** for 30d; concurrency in the low thousands.
++
++## Key Design Decisions
++
++- **Decision 1: Use an existing Cortex/Mimir-style backend**
++  - Chose: One codebase that already implements multi-tenancy, TSDB blocks, rings, and query protection.
++  - Why: This problem is operational edge-cases; “build” is the wrong simplification.
++
++- **Decision 2: Hot head + immutable blocks**
++  - Chose: Ingester head (WAL-backed) for the hot window; immutable TSDB blocks in **S3/GCS** for long retention.
++  - Why: Immutable blocks make storage cheap, compaction safe, and reads cacheable.
++
++- **Decision 3: Tenant isolation via shuffle sharding + hard limits**
++  - Chose: Each tenant maps to a stable subset of ingesters; enforce `max_active_series`, `max_new_series_per_sec`, label limits, and sample-rate limits inside that shard.
++  - Why: You get a mechanically true blast-radius boundary without a global “perfect” coordinator.
++
++- **Decision 4: Query safety via coarse budgets**
++  - Chose: Hard caps on time range, minimum step, max concurrency, and max execution time; split long range queries by time and cache subresults in-process.
++  - Why: Fine-grained “query cost estimation” is complexity that fails under real workloads; coarse budgets are predictable.
++
++- **What We Removed**
++  - Separate `Ingest Gateway`, `Query Frontend`, and `Store Gateway` as standalone services (merged into one backend).
++  - External ring KV store dependency (use gossip membership; reject writes when the ring is unstable).
++  - Downsampling pipeline (tiers are retention + source resolution, not post-processing).
++  - Dedicated query scheduler/worker pool (only add when query burst smoothing becomes necessary).
++
++## Architecture
++
++```mermaid
++flowchart LR
++  A[Prometheus / Agents] --> B["Metrics Backend (Cortex/Mimir-style)"]
++  B <--> C["Object Storage (S3/GCS)"]
++```
++
++### Components
++
++- `Prometheus / Agents`
++  - Scrape locally and `remote_write` with backoff and batching. Retries are expected; ingestion is at-least-once.
++
++- `Metrics Backend (Cortex/Mimir-style)`
++  - What it does: auth + per-tenant limits, sharding and replication, WAL-backed hot ingest, query execution with strict budgets, block shipping, and compaction/retention as a background job.
++  - Why it stays: it’s the only custom logic you can’t outsource—multi-tenant limits + TSDB semantics + query safety.
++  - Ring and fencing:
++    - Membership is gossip-based; token ownership is persisted so restarts don’t reshuffle.
++    - Writes are acknowledged only after **quorum WAL durability**; if quorum can’t be reached or the ring isn’t stable, the API returns `503` so clients back off instead of creating split-brain data.
++  - Limits rollout:
++    - Limits are versioned; rollout is staged per tenant; “dry-run” mode reports would-reject before enforcement; revert is instant.
++
++- `Object Storage`
++  - Stores immutable blocks for long retention. This is the long-term source of truth.
++
++## Trade-offs
++
++| Optimized For | Sacrificed |
++|--------------|------------|
++| Stability under cardinality spikes | “Accept everything” convenience |
++| Small team operability (few moving parts) | Less independent scaling of query vs ingest roles |
++| Cheap long retention | Historical queries depend on object-store health |
++| Predictable multi-tenant fairness | Some queries are rejected instead of “slow but eventually” |
++
++## Failure Modes
++
++- **Ring instability or membership flapping**
++  - What happens: shard ownership is uncertain; replication sets change too often to be safe.
++  - Recover: stop acknowledging writes (`503`) until the ring is stable; keep serving hot reads from healthy ingesters.
++
++- **Network partition (split-brain risk)**
++  - What happens: two sides may disagree on ownership.
++  - Recover: quorum writes + “ring must be stable” gating means partitions turn into rejected writes, not divergent acknowledged data.
++
++- **Object storage slow/erroring for hours**
++  - What happens: cold reads get slow; compaction falls behind.
++  - Recover: keep hot queries served from ingesters; strictly shed long-range queries first; pause/slow background compaction to avoid LIST/GET storms and let the backlog accumulate.
++
++- **Bad limits/config rollout rejects healthy tenants**
++  - What happens: sudden, widespread ingest failures.
++  - Recover: staged rollout + dry-run prevents global surprises; revert to the previous version immediately.
++
++- **Tenant cardinality incident**
++  - What happens: one tenant tries to create unlimited new series.
++  - Recover: reject new series for that tenant inside its shard; quarantine the tenant if needed; keep everyone else stable.
++
++## What I'd Do Differently At...
++
++- **10x scale:** add a dedicated store-gateway/read-cache layer only if object-store amplification dominates; add SSD caches before adding more services.
++- **100x scale:** split query execution into a scheduler + workers only if fairness and burst smoothing can’t be met with per-tenant queues and caps.
++
++## Operational Notes
++
++- Limits are the product contract: keep them visible, versioned, and easy to revert.
++- Page on ring instability, WAL replay time, and compaction backlog age; those are the real “system is dying” signals.
++- Make “partial results” explicit: only allow them by tenant policy, never silently.
+
+exec
+/bin/zsh -lc "sed -n '1,220p' solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 44ms:
+---
+title: "High-Cardinality Metrics Pipeline"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["metrics", "tsdb", "prometheus", "cortex", "multitenancy", "object-storage", "cardinality", "indexing", "query-engine"]
+---
+
+## Overview
+
+This system ingests Prometheus `remote_write` at very high volume across many tenants, stays stable during cardinality spikes, and serves PromQL over both recent (“hot”) data and long retention (“cold”) data.
+
+The design is a single, proven metrics backend (Cortex/Mimir-style) deployed in two roles: **stateless API** and **stateful ingesters**. Ingesters own the hot window with a WAL; they periodically cut immutable TSDB blocks and upload them to object storage. Queries read hot data from ingesters and cold data from object storage, with strict per-tenant limits so one tenant cannot destabilize the cluster.
+
+## What Makes This Hard
+
+1. **Cardinality is a memory/index failure mode, not a traffic problem.** A label blow-up creates new series, which blows up head state and index fanout before you “run out of CPU.”
+2. **PromQL can be a DoS tool.** Without hard budgets, a single query (or dashboard) can saturate CPU and object-store reads.
+
+## Requirements
+
+
+thinking
+**Updating progress steps**
+
+I'm noticing that we've applied the patch. Now I can mark step 3 as complete while keeping step 4 in progress. It’s satisfying to see things moving forward! I want to make sure everything is documented properly, so when I look back, I can see the status and any implications of these steps. Let’s keep the momentum going on this!
+file update:
+diff --git a/solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md b/solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..4c1620853e2b2a7f06091998b174565800994414
+--- /dev/null
++++ b/solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md
+@@ -0,0 +1,123 @@
++---
++title: "High-Cardinality Metrics Pipeline"
++category: "Observability & Reliability"
++difficulty: "Hard"
++tags: ["metrics", "tsdb", "prometheus", "cortex", "multitenancy", "object-storage", "cardinality", "indexing", "query-engine"]
++---
++
++## Overview
++
++This system ingests Prometheus `remote_write` at very high volume across many tenants, stays stable during cardinality spikes, and serves PromQL over both recent (“hot”) data and long retention (“cold”) data.
++
++The design is a single, proven metrics backend (Cortex/Mimir-style) deployed in two roles: **stateless API** and **stateful ingesters**. Ingesters own the hot window with a WAL; they periodically cut immutable TSDB blocks and upload them to object storage. Queries read hot data from ingesters and cold data from object storage, with strict per-tenant limits so one tenant cannot destabilize the cluster.
++
++## What Makes This Hard
++
++1. **Cardinality is a memory/index failure mode, not a traffic problem.** A label blow-up creates new series, which blows up head state and index fanout before you “run out of CPU.”
++2. **PromQL can be a DoS tool.** Without hard budgets, a single query (or dashboard) can saturate CPU and object-store reads.
++
++## Requirements
++
++### Functional Requirements
++- **Prometheus remote_write-compatible ingest** with per-tenant isolation.
++- **Cardinality controls**: per-tenant series limits, label allow/deny lists, and hard rejection with clear reasons.
++- **Fast queries for recent data** and acceptable latency for long-range queries (hours–months).
++- **Long-term retention** (months to years) on inexpensive storage.
++- **Safe multi-tenant query execution**: no query can destabilize the cluster.
++
++### Scale Targets
++- Ingest: **10M samples/sec** sustained, **50M samples/sec** bursts (flash release + autoscaling lag).
++- Active series: **200M global**, with **hard per-tenant caps** (e.g., 1–10M depending on plan).
++- Retention: **13 months** raw at 10–15s for “gold” tenants; cheaper tiers use shorter retention and/or a larger scrape interval at the source.
++- Queries: **p95 < 2s** for last 15m; **p95 < 8s** for 30d; concurrency in the low thousands.
++
++## Key Design Decisions
++
++- **Decision 1: Use an existing Cortex/Mimir-style backend**
++  - Chose: One codebase that already implements multi-tenancy, TSDB blocks, rings, and query protection.
++  - Why: This problem is operational edge-cases; “build” is the wrong simplification.
++
++- **Decision 2: Hot head + immutable blocks**
++  - Chose: Ingester head (WAL-backed) for the hot window; immutable TSDB blocks in **S3/GCS** for long retention.
++  - Why: Immutable blocks make storage cheap, compaction safe, and reads cacheable.
++
++- **Decision 3: Tenant isolation via shuffle sharding + hard limits**
++  - Chose: Each tenant maps to a stable subset of ingesters; enforce `max_active_series`, `max_new_series_per_sec`, label limits, and sample-rate limits inside that shard.
++  - Why: You get a mechanically true blast-radius boundary without a global “perfect” coordinator.
++
++- **Decision 4: Query safety via coarse budgets**
++  - Chose: Hard caps on time range, minimum step, max concurrency, and max execution time; split long range queries by time and cache subresults in-process.
++  - Why: Fine-grained “query cost estimation” is complexity that fails under real workloads; coarse budgets are predictable.
++
++- **What We Removed**
++  - Separate `Ingest Gateway`, `Query Frontend`, and `Store Gateway` as standalone services (merged into one backend).
++  - External ring KV store dependency (use gossip membership; reject writes when the ring is unstable).
++  - Downsampling pipeline (tiers are retention + source resolution, not post-processing).
++  - Dedicated query scheduler/worker pool (only add when query burst smoothing becomes necessary).
++
++## Architecture
++
++```mermaid
++flowchart LR
++  A[Prometheus / Agents] --> B["Metrics Backend (Cortex/Mimir-style)"]
++  B <--> C["Object Storage (S3/GCS)"]
++```
++
++### Components
++
++- `Prometheus / Agents`
++  - Scrape locally and `remote_write` with backoff and batching. Retries are expected; ingestion is at-least-once.
++
++- `Metrics Backend (Cortex/Mimir-style)`
++  - What it does: auth + per-tenant limits, sharding and replication, WAL-backed hot ingest, query execution with strict budgets, block shipping, and compaction/retention as a background job.
++  - Why it stays: it’s the only custom logic you can’t outsource—multi-tenant limits + TSDB semantics + query safety.
++  - Ring and fencing:
++    - Membership is gossip-based; token ownership is persisted so restarts don’t reshuffle.
++    - Writes are acknowledged only after **quorum WAL durability**; if quorum can’t be reached or the ring isn’t stable, the API returns `503` so clients back off instead of creating split-brain data.
++  - Limits rollout:
++    - Limits are versioned; rollout is staged per tenant; “dry-run” mode reports would-reject before enforcement; revert is instant.
++
++- `Object Storage`
++  - Stores immutable blocks for long retention. This is the long-term source of truth.
++
++## Trade-offs
++
++| Optimized For | Sacrificed |
++|--------------|------------|
++| Stability under cardinality spikes | “Accept everything” convenience |
++| Small team operability (few moving parts) | Less independent scaling of query vs ingest roles |
++| Cheap long retention | Historical queries depend on object-store health |
++| Predictable multi-tenant fairness | Some queries are rejected instead of “slow but eventually” |
++
++## Failure Modes
++
++- **Ring instability or membership flapping**
++  - What happens: shard ownership is uncertain; replication sets change too often to be safe.
++  - Recover: stop acknowledging writes (`503`) until the ring is stable; keep serving hot reads from healthy ingesters.
++
++- **Network partition (split-brain risk)**
++  - What happens: two sides may disagree on ownership.
++  - Recover: quorum writes + “ring must be stable” gating means partitions turn into rejected writes, not divergent acknowledged data.
++
++- **Object storage slow/erroring for hours**
++  - What happens: cold reads get slow; compaction falls behind.
++  - Recover: keep hot queries served from ingesters; strictly shed long-range queries first; pause/slow background compaction to avoid LIST/GET storms and let the backlog accumulate.
++
++- **Bad limits/config rollout rejects healthy tenants**
++  - What happens: sudden, widespread ingest failures.
++  - Recover: staged rollout + dry-run prevents global surprises; revert to the previous version immediately.
++
++- **Tenant cardinality incident**
++  - What happens: one tenant tries to create unlimited new series.
++  - Recover: reject new series for that tenant inside its shard; quarantine the tenant if needed; keep everyone else stable.
++
++## What I'd Do Differently At...
++
++- **10x scale:** add a dedicated store-gateway/read-cache layer only if object-store amplification dominates; add SSD caches before adding more services.
++- **100x scale:** split query execution into a scheduler + workers only if fairness and burst smoothing can’t be met with per-tenant queues and caps.
++
++## Operational Notes
++
++- Limits are the product contract: keep them visible, versioned, and easy to revert.
++- Page on ring instability, WAL replay time, and compaction backlog age; those are the real “system is dying” signals.
++- Make “partial results” explicit: only allow them by tenant policy, never silently.
+
+Plan update
+Patch applied; now verifying the new document renders cleanly and the mermaid diagram is valid.
+  ✓ Choose target markdown file
+  ✓ Draft minimalist design text
+  ✓ Apply patch with final doc
+  → Sanity-check formatting and mermaid
+
+
+
+thinking
+**Checking markdown and outputs**
+
+I’m sanity-checking the mermaid syntax and making sure the frontmatter is correct, avoiding trailing code fences. I’ll do a grep for non-ASCII quotes, but it seems okay. Should I consider prettier or markdown lint? Maybe not right now. 
+
+I might need to update `problems.yaml`, but it’s not necessary for this task. The user asked for the complete final markdown document, which means I’ll have to include that directly, despite style guidelines.
+thinking
+**Preparing the document output**
+
+In the coding environment, we can refer to files, but since the user requested the complete document, I need to output the file content. Even though the guidelines say to be concise, the user’s requirement supersedes that, so I’ll include the full markdown content in my final response.
+
+While it’s discouraged to include large code blocks, I believe it's still acceptable since this is text. I’ll also sanity-check to ensure there are no imbalances, though we might skip verifying the markdown through scripts.
+thinking
+**Verifying added files**
+
+I’m considering running `python -m py_compile`, but actually, I think it’s simpler to just use `rg` to ensure the file has been added. 
+
+Once that's confirmed, I can move on and mark step 4 of my plan as completed. It’s always nice to check off those steps and see progress! Let's keep things efficient and straightforward here.
+file update:
+diff --git a/solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md b/solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..4c1620853e2b2a7f06091998b174565800994414
+--- /dev/null
++++ b/solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md
+@@ -0,0 +1,123 @@
++---
++title: "High-Cardinality Metrics Pipeline"
++category: "Observability & Reliability"
++difficulty: "Hard"
++tags: ["metrics", "tsdb", "prometheus", "cortex", "multitenancy", "object-storage", "cardinality", "indexing", "query-engine"]
++---
++
++## Overview
++
++This system ingests Prometheus `remote_write` at very high volume across many tenants, stays stable during cardinality spikes, and serves PromQL over both recent (“hot”) data and long retention (“cold”) data.
++
++The design is a single, proven metrics backend (Cortex/Mimir-style) deployed in two roles: **stateless API** and **stateful ingesters**. Ingesters own the hot window with a WAL; they periodically cut immutable TSDB blocks and upload them to object storage. Queries read hot data from ingesters and cold data from object storage, with strict per-tenant limits so one tenant cannot destabilize the cluster.
++
++## What Makes This Hard
++
++1. **Cardinality is a memory/index failure mode, not a traffic problem.** A label blow-up creates new series, which blows up head state and index fanout before you “run out of CPU.”
++2. **PromQL can be a DoS tool.** Without hard budgets, a single query (or dashboard) can saturate CPU and object-store reads.
++
++## Requirements
++
++### Functional Requirements
++- **Prometheus remote_write-compatible ingest** with per-tenant isolation.
++- **Cardinality controls**: per-tenant series limits, label allow/deny lists, and hard rejection with clear reasons.
++- **Fast queries for recent data** and acceptable latency for long-range queries (hours–months).
++- **Long-term retention** (months to years) on inexpensive storage.
++- **Safe multi-tenant query execution**: no query can destabilize the cluster.
++
++### Scale Targets
++- Ingest: **10M samples/sec** sustained, **50M samples/sec** bursts (flash release + autoscaling lag).
++- Active series: **200M global**, with **hard per-tenant caps** (e.g., 1–10M depending on plan).
++- Retention: **13 months** raw at 10–15s for “gold” tenants; cheaper tiers use shorter retention and/or a larger scrape interval at the source.
++- Queries: **p95 < 2s** for last 15m; **p95 < 8s** for 30d; concurrency in the low thousands.
++
++## Key Design Decisions
++
++- **Decision 1: Use an existing Cortex/Mimir-style backend**
++  - Chose: One codebase that already implements multi-tenancy, TSDB blocks, rings, and query protection.
++  - Why: This problem is operational edge-cases; “build” is the wrong simplification.
++
++- **Decision 2: Hot head + immutable blocks**
++  - Chose: Ingester head (WAL-backed) for the hot window; immutable TSDB blocks in **S3/GCS** for long retention.
++  - Why: Immutable blocks make storage cheap, compaction safe, and reads cacheable.
++
++- **Decision 3: Tenant isolation via shuffle sharding + hard limits**
++  - Chose: Each tenant maps to a stable subset of ingesters; enforce `max_active_series`, `max_new_series_per_sec`, label limits, and sample-rate limits inside that shard.
++  - Why: You get a mechanically true blast-radius boundary without a global “perfect” coordinator.
++
++- **Decision 4: Query safety via coarse budgets**
++  - Chose: Hard caps on time range, minimum step, max concurrency, and max execution time; split long range queries by time and cache subresults in-process.
++  - Why: Fine-grained “query cost estimation” is complexity that fails under real workloads; coarse budgets are predictable.
++
++- **What We Removed**
++  - Separate `Ingest Gateway`, `Query Frontend`, and `Store Gateway` as standalone services (merged into one backend).
++  - External ring KV store dependency (use gossip membership; reject writes when the ring is unstable).
++  - Downsampling pipeline (tiers are retention + source resolution, not post-processing).
++  - Dedicated query scheduler/worker pool (only add when query burst smoothing becomes necessary).
++
++## Architecture
++
++```mermaid
++flowchart LR
++  A[Prometheus / Agents] --> B["Metrics Backend (Cortex/Mimir-style)"]
++  B <--> C["Object Storage (S3/GCS)"]
++```
++
++### Components
++
++- `Prometheus / Agents`
++  - Scrape locally and `remote_write` with backoff and batching. Retries are expected; ingestion is at-least-once.
++
++- `Metrics Backend (Cortex/Mimir-style)`
++  - What it does: auth + per-tenant limits, sharding and replication, WAL-backed hot ingest, query execution with strict budgets, block shipping, and compaction/retention as a background job.
++  - Why it stays: it’s the only custom logic you can’t outsource—multi-tenant limits + TSDB semantics + query safety.
++  - Ring and fencing:
++    - Membership is gossip-based; token ownership is persisted so restarts don’t reshuffle.
++    - Writes are acknowledged only after **quorum WAL durability**; if quorum can’t be reached or the ring isn’t stable, the API returns `503` so clients back off instead of creating split-brain data.
++  - Limits rollout:
++    - Limits are versioned; rollout is staged per tenant; “dry-run” mode reports would-reject before enforcement; revert is instant.
++
++- `Object Storage`
++  - Stores immutable blocks for long retention. This is the long-term source of truth.
++
++## Trade-offs
++
++| Optimized For | Sacrificed |
++|--------------|------------|
++| Stability under cardinality spikes | “Accept everything” convenience |
++| Small team operability (few moving parts) | Less independent scaling of query vs ingest roles |
++| Cheap long retention | Historical queries depend on object-store health |
++| Predictable multi-tenant fairness | Some queries are rejected instead of “slow but eventually” |
++
++## Failure Modes
++
++- **Ring instability or membership flapping**
++  - What happens: shard ownership is uncertain; replication sets change too often to be safe.
++  - Recover: stop acknowledging writes (`503`) until the ring is stable; keep serving hot reads from healthy ingesters.
++
++- **Network partition (split-brain risk)**
++  - What happens: two sides may disagree on ownership.
++  - Recover: quorum writes + “ring must be stable” gating means partitions turn into rejected writes, not divergent acknowledged data.
++
++- **Object storage slow/erroring for hours**
++  - What happens: cold reads get slow; compaction falls behind.
++  - Recover: keep hot queries served from ingesters; strictly shed long-range queries first; pause/slow background compaction to avoid LIST/GET storms and let the backlog accumulate.
++
++- **Bad limits/config rollout rejects healthy tenants**
++  - What happens: sudden, widespread ingest failures.
++  - Recover: staged rollout + dry-run prevents global surprises; revert to the previous version immediately.
++
++- **Tenant cardinality incident**
++  - What happens: one tenant tries to create unlimited new series.
++  - Recover: reject new series for that tenant inside its shard; quarantine the tenant if needed; keep everyone else stable.
++
++## What I'd Do Differently At...
++
++- **10x scale:** add a dedicated store-gateway/read-cache layer only if object-store amplification dominates; add SSD caches before adding more services.
++- **100x scale:** split query execution into a scheduler + workers only if fairness and burst smoothing can’t be met with per-tenant queues and caps.
++
++## Operational Notes
++
++- Limits are the product contract: keep them visible, versioned, and easy to revert.
++- Page on ring instability, WAL replay time, and compaction backlog age; those are the real “system is dying” signals.
++- Make “partial results” explicit: only allow them by tenant policy, never silently.
+
+Plan update
+Document content and mermaid syntax look consistent; frontmatter matches the prompt exactly.
+  ✓ Choose target markdown file
+  ✓ Draft minimalist design text
+  ✓ Apply patch with final doc
+  ✓ Sanity-check formatting and mermaid
+
+thinking
+**Finalizing markdown response**
+
+I'm ready to output the complete markdown document and also mention the saved file path. I'll keep it minimal and state: "Wrote to ...; here is the complete document:" followed by the markdown code block. I'll remember not to include backticks within the content. 
+
+It's essential to avoid any argumentative language since the user asked for clarity. I’ll ensure the document presents the simplified design positively without unnecessary qualifiers. The "What We Removed" section will maintain a factual tone, summarizing decisions made without being confrontational.
+codex
+Saved as `solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md`:
+
+```markdown
+---
+title: "High-Cardinality Metrics Pipeline"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["metrics", "tsdb", "prometheus", "cortex", "multitenancy", "object-storage", "cardinality", "indexing", "query-engine"]
+---
+
+## Overview
+
+This system ingests Prometheus `remote_write` at very high volume across many tenants, stays stable during cardinality spikes, and serves PromQL over both recent (“hot”) data and long retention (“cold”) data.
+
+The design is a single, proven metrics backend (Cortex/Mimir-style) deployed in two roles: **stateless API** and **stateful ingesters**. Ingesters own the hot window with a WAL; they periodically cut immutable TSDB blocks and upload them to object storage. Queries read hot data from ingesters and cold data from object storage, with strict per-tenant limits so one tenant cannot destabilize the cluster.
+
+## What Makes This Hard
+
+1. **Cardinality is a memory/index failure mode, not a traffic problem.** A label blow-up creates new series, which blows up head state and index fanout before you “run out of CPU.”
+2. **PromQL can be a DoS tool.** Without hard budgets, a single query (or dashboard) can saturate CPU and object-store reads.
+
+## Requirements
+
+### Functional Requirements
+- **Prometheus remote_write-compatible ingest** with per-tenant isolation.
+- **Cardinality controls**: per-tenant series limits, label allow/deny lists, and hard rejection with clear reasons.
+- **Fast queries for recent data** and acceptable latency for long-range queries (hours–months).
+- **Long-term retention** (months to years) on inexpensive storage.
+- **Safe multi-tenant query execution**: no query can destabilize the cluster.
+
+### Scale Targets
+- Ingest: **10M samples/sec** sustained, **50M samples/sec** bursts (flash release + autoscaling lag).
+- Active series: **200M global**, with **hard per-tenant caps** (e.g., 1–10M depending on plan).
+- Retention: **13 months** raw at 10–15s for “gold” tenants; cheaper tiers use shorter retention and/or a larger scrape interval at the source.
+- Queries: **p95 < 2s** for last 15m; **p95 < 8s** for 30d; concurrency in the low thousands.
+
+## Key Design Decisions
+
+- **Decision 1: Use an existing Cortex/Mimir-style backend**
+  - Chose: One codebase that already implements multi-tenancy, TSDB blocks, rings, and query protection.
+  - Why: This problem is operational edge-cases; “build” is the wrong simplification.
+
+- **Decision 2: Hot head + immutable blocks**
+  - Chose: Ingester head (WAL-backed) for the hot window; immutable TSDB blocks in **S3/GCS** for long retention.
+  - Why: Immutable blocks make storage cheap, compaction safe, and reads cacheable.
+
+- **Decision 3: Tenant isolation via shuffle sharding + hard limits**
+  - Chose: Each tenant maps to a stable subset of ingesters; enforce `max_active_series`, `max_new_series_per_sec`, label limits, and sample-rate limits inside that shard.
+  - Why: You get a mechanically true blast-radius boundary without a global “perfect” coordinator.
+
+- **Decision 4: Query safety via coarse budgets**
+  - Chose: Hard caps on time range, minimum step, max concurrency, and max execution time; split long range queries by time and cache subresults in-process.
+  - Why: Fine-grained “query cost estimation” is complexity that fails under real workloads; coarse budgets are predictable.
+
+- **What We Removed**
+  - Separate `Ingest Gateway`, `Query Frontend`, and `Store Gateway` as standalone services (merged into one backend).
+  - External ring KV store dependency (use gossip membership; reject writes when the ring is unstable).
+  - Downsampling pipeline (tiers are retention + source resolution, not post-processing).
+  - Dedicated query scheduler/worker pool (only add when query burst smoothing becomes necessary).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[Prometheus / Agents] --> B["Metrics Backend (Cortex/Mimir-style)"]
+  B <--> C["Object Storage (S3/GCS)"]
+```
+
+### Components
+
+- `Prometheus / Agents`
+  - Scrape locally and `remote_write` with backoff and batching. Retries are expected; ingestion is at-least-once.
+
+- `Metrics Backend (Cortex/Mimir-style)`
+  - What it does: auth + per-tenant limits, sharding and replication, WAL-backed hot ingest, query execution with strict budgets, block shipping, and compaction/retention as a background job.
+  - Why it stays: it’s the only custom logic you can’t outsource—multi-tenant limits + TSDB semantics + query safety.
+  - Ring and fencing:
+    - Membership is gossip-based; token ownership is persisted so restarts don’t reshuffle.
+    - Writes are acknowledged only after **quorum WAL durability**; if quorum can’t be reached or the ring isn’t stable, the API returns `503` so clients back off instead of creating split-brain data.
+  - Limits rollout:
+    - Limits are versioned; rollout is staged per tenant; “dry-run” mode reports would-reject before enforcement; revert is instant.
+
+- `Object Storage`
+  - Stores immutable blocks for long retention. This is the long-term source of truth.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Stability under cardinality spikes | “Accept everything” convenience |
+| Small team operability (few moving parts) | Less independent scaling of query vs ingest roles |
+| Cheap long retention | Historical queries depend on object-store health |
+| Predictable multi-tenant fairness | Some queries are rejected instead of “slow but eventually” |
+
+## Failure Modes
+
+- **Ring instability or membership flapping**
+  - What happens: shard ownership is uncertain; replication sets change too often to be safe.
+  - Recover: stop acknowledging writes (`503`) until the ring is stable; keep serving hot reads from healthy ingesters.
+
+- **Network partition (split-brain risk)**
+  - What happens: two sides may disagree on ownership.
+  - Recover: quorum writes + “ring must be stable” gating means partitions turn into rejected writes, not divergent acknowledged data.
+
+- **Object storage slow/erroring for hours**
+  - What happens: cold reads get slow; compaction falls behind.
+  - Recover: keep hot queries served from ingesters; strictly shed long-range queries first; pause/slow background compaction to avoid LIST/GET storms and let the backlog accumulate.
+
+- **Bad limits/config rollout rejects healthy tenants**
+  - What happens: sudden, widespread ingest failures.
+  - Recover: staged rollout + dry-run prevents global surprises; revert to the previous version immediately.
+
+- **Tenant cardinality incident**
+  - What happens: one tenant tries to create unlimited new series.
+  - Recover: reject new series for that tenant inside its shard; quarantine the tenant if needed; keep everyone else stable.
+
+## What I'd Do Differently At...
+
+- **10x scale:** add a dedicated store-gateway/read-cache layer only if object-store amplification dominates; add SSD caches before adding more services.
+- **100x scale:** split query execution into a scheduler + workers only if fairness and burst smoothing can’t be met with per-tenant queues and caps.
+
+## Operational Notes
+
+- Limits are the product contract: keep them visible, versioned, and easy to revert.
+- Page on ring instability, WAL replay time, and compaction backlog age; those are the real “system is dying” signals.
+- Make “partial results” explicit: only allow them by tenant policy, never silently.
+```
+file update:
+diff --git a/solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md b/solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..4c1620853e2b2a7f06091998b174565800994414
+--- /dev/null
++++ b/solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md
+@@ -0,0 +1,123 @@
++---
++title: "High-Cardinality Metrics Pipeline"
++category: "Observability & Reliability"
++difficulty: "Hard"
++tags: ["metrics", "tsdb", "prometheus", "cortex", "multitenancy", "object-storage", "cardinality", "indexing", "query-engine"]
++---
++
++## Overview
++
++This system ingests Prometheus `remote_write` at very high volume across many tenants, stays stable during cardinality spikes, and serves PromQL over both recent (“hot”) data and long retention (“cold”) data.
++
++The design is a single, proven metrics backend (Cortex/Mimir-style) deployed in two roles: **stateless API** and **stateful ingesters**. Ingesters own the hot window with a WAL; they periodically cut immutable TSDB blocks and upload them to object storage. Queries read hot data from ingesters and cold data from object storage, with strict per-tenant limits so one tenant cannot destabilize the cluster.
++
++## What Makes This Hard
++
++1. **Cardinality is a memory/index failure mode, not a traffic problem.** A label blow-up creates new series, which blows up head state and index fanout before you “run out of CPU.”
++2. **PromQL can be a DoS tool.** Without hard budgets, a single query (or dashboard) can saturate CPU and object-store reads.
++
++## Requirements
++
++### Functional Requirements
++- **Prometheus remote_write-compatible ingest** with per-tenant isolation.
++- **Cardinality controls**: per-tenant series limits, label allow/deny lists, and hard rejection with clear reasons.
++- **Fast queries for recent data** and acceptable latency for long-range queries (hours–months).
++- **Long-term retention** (months to years) on inexpensive storage.
++- **Safe multi-tenant query execution**: no query can destabilize the cluster.
++
++### Scale Targets
++- Ingest: **10M samples/sec** sustained, **50M samples/sec** bursts (flash release + autoscaling lag).
++- Active series: **200M global**, with **hard per-tenant caps** (e.g., 1–10M depending on plan).
++- Retention: **13 months** raw at 10–15s for “gold” tenants; cheaper tiers use shorter retention and/or a larger scrape interval at the source.
++- Queries: **p95 < 2s** for last 15m; **p95 < 8s** for 30d; concurrency in the low thousands.
++
++## Key Design Decisions
++
++- **Decision 1: Use an existing Cortex/Mimir-style backend**
++  - Chose: One codebase that already implements multi-tenancy, TSDB blocks, rings, and query protection.
++  - Why: This problem is operational edge-cases; “build” is the wrong simplification.
++
++- **Decision 2: Hot head + immutable blocks**
++  - Chose: Ingester head (WAL-backed) for the hot window; immutable TSDB blocks in **S3/GCS** for long retention.
++  - Why: Immutable blocks make storage cheap, compaction safe, and reads cacheable.
++
++- **Decision 3: Tenant isolation via shuffle sharding + hard limits**
++  - Chose: Each tenant maps to a stable subset of ingesters; enforce `max_active_series`, `max_new_series_per_sec`, label limits, and sample-rate limits inside that shard.
++  - Why: You get a mechanically true blast-radius boundary without a global “perfect” coordinator.
++
++- **Decision 4: Query safety via coarse budgets**
++  - Chose: Hard caps on time range, minimum step, max concurrency, and max execution time; split long range queries by time and cache subresults in-process.
++  - Why: Fine-grained “query cost estimation” is complexity that fails under real workloads; coarse budgets are predictable.
++
++- **What We Removed**
++  - Separate `Ingest Gateway`, `Query Frontend`, and `Store Gateway` as standalone services (merged into one backend).
++  - External ring KV store dependency (use gossip membership; reject writes when the ring is unstable).
++  - Downsampling pipeline (tiers are retention + source resolution, not post-processing).
++  - Dedicated query scheduler/worker pool (only add when query burst smoothing becomes necessary).
++
++## Architecture
++
++```mermaid
++flowchart LR
++  A[Prometheus / Agents] --> B["Metrics Backend (Cortex/Mimir-style)"]
++  B <--> C["Object Storage (S3/GCS)"]
++```
++
++### Components
++
++- `Prometheus / Agents`
++  - Scrape locally and `remote_write` with backoff and batching. Retries are expected; ingestion is at-least-once.
++
++- `Metrics Backend (Cortex/Mimir-style)`
++  - What it does: auth + per-tenant limits, sharding and replication, WAL-backed hot ingest, query execution with strict budgets, block shipping, and compaction/retention as a background job.
++  - Why it stays: it’s the only custom logic you can’t outsource—multi-tenant limits + TSDB semantics + query safety.
++  - Ring and fencing:
++    - Membership is gossip-based; token ownership is persisted so restarts don’t reshuffle.
++    - Writes are acknowledged only after **quorum WAL durability**; if quorum can’t be reached or the ring isn’t stable, the API returns `503` so clients back off instead of creating split-brain data.
++  - Limits rollout:
++    - Limits are versioned; rollout is staged per tenant; “dry-run” mode reports would-reject before enforcement; revert is instant.
++
++- `Object Storage`
++  - Stores immutable blocks for long retention. This is the long-term source of truth.
++
++## Trade-offs
++
++| Optimized For | Sacrificed |
++|--------------|------------|
++| Stability under cardinality spikes | “Accept everything” convenience |
++| Small team operability (few moving parts) | Less independent scaling of query vs ingest roles |
++| Cheap long retention | Historical queries depend on object-store health |
++| Predictable multi-tenant fairness | Some queries are rejected instead of “slow but eventually” |
++
++## Failure Modes
++
++- **Ring instability or membership flapping**
++  - What happens: shard ownership is uncertain; replication sets change too often to be safe.
++  - Recover: stop acknowledging writes (`503`) until the ring is stable; keep serving hot reads from healthy ingesters.
++
++- **Network partition (split-brain risk)**
++  - What happens: two sides may disagree on ownership.
++  - Recover: quorum writes + “ring must be stable” gating means partitions turn into rejected writes, not divergent acknowledged data.
++
++- **Object storage slow/erroring for hours**
++  - What happens: cold reads get slow; compaction falls behind.
++  - Recover: keep hot queries served from ingesters; strictly shed long-range queries first; pause/slow background compaction to avoid LIST/GET storms and let the backlog accumulate.
++
++- **Bad limits/config rollout rejects healthy tenants**
++  - What happens: sudden, widespread ingest failures.
++  - Recover: staged rollout + dry-run prevents global surprises; revert to the previous version immediately.
++
++- **Tenant cardinality incident**
++  - What happens: one tenant tries to create unlimited new series.
++  - Recover: reject new series for that tenant inside its shard; quarantine the tenant if needed; keep everyone else stable.
++
++## What I'd Do Differently At...
++
++- **10x scale:** add a dedicated store-gateway/read-cache layer only if object-store amplification dominates; add SSD caches before adding more services.
++- **100x scale:** split query execution into a scheduler + workers only if fairness and burst smoothing can’t be met with per-tenant queues and caps.
++
++## Operational Notes
++
++- Limits are the product contract: keep them visible, versioned, and easy to revert.
++- Page on ring instability, WAL replay time, and compaction backlog age; those are the real “system is dying” signals.
++- Make “partial results” explicit: only allow them by tenant policy, never silently.
+
+tokens used
+34,843
+Saved as `solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md`:
+
+```markdown
+---
+title: "High-Cardinality Metrics Pipeline"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["metrics", "tsdb", "prometheus", "cortex", "multitenancy", "object-storage", "cardinality", "indexing", "query-engine"]
+---
+
+## Overview
+
+This system ingests Prometheus `remote_write` at very high volume across many tenants, stays stable during cardinality spikes, and serves PromQL over both recent (“hot”) data and long retention (“cold”) data.
+
+The design is a single, proven metrics backend (Cortex/Mimir-style) deployed in two roles: **stateless API** and **stateful ingesters**. Ingesters own the hot window with a WAL; they periodically cut immutable TSDB blocks and upload them to object storage. Queries read hot data from ingesters and cold data from object storage, with strict per-tenant limits so one tenant cannot destabilize the cluster.
+
+## What Makes This Hard
+
+1. **Cardinality is a memory/index failure mode, not a traffic problem.** A label blow-up creates new series, which blows up head state and index fanout before you “run out of CPU.”
+2. **PromQL can be a DoS tool.** Without hard budgets, a single query (or dashboard) can saturate CPU and object-store reads.
+
+## Requirements
+
+### Functional Requirements
+- **Prometheus remote_write-compatible ingest** with per-tenant isolation.
+- **Cardinality controls**: per-tenant series limits, label allow/deny lists, and hard rejection with clear reasons.
+- **Fast queries for recent data** and acceptable latency for long-range queries (hours–months).
+- **Long-term retention** (months to years) on inexpensive storage.
+- **Safe multi-tenant query execution**: no query can destabilize the cluster.
+
+### Scale Targets
+- Ingest: **10M samples/sec** sustained, **50M samples/sec** bursts (flash release + autoscaling lag).
+- Active series: **200M global**, with **hard per-tenant caps** (e.g., 1–10M depending on plan).
+- Retention: **13 months** raw at 10–15s for “gold” tenants; cheaper tiers use shorter retention and/or a larger scrape interval at the source.
+- Queries: **p95 < 2s** for last 15m; **p95 < 8s** for 30d; concurrency in the low thousands.
+
+## Key Design Decisions
+
+- **Decision 1: Use an existing Cortex/Mimir-style backend**
+  - Chose: One codebase that already implements multi-tenancy, TSDB blocks, rings, and query protection.
+  - Why: This problem is operational edge-cases; “build” is the wrong simplification.
+
+- **Decision 2: Hot head + immutable blocks**
+  - Chose: Ingester head (WAL-backed) for the hot window; immutable TSDB blocks in **S3/GCS** for long retention.
+  - Why: Immutable blocks make storage cheap, compaction safe, and reads cacheable.
+
+- **Decision 3: Tenant isolation via shuffle sharding + hard limits**
+  - Chose: Each tenant maps to a stable subset of ingesters; enforce `max_active_series`, `max_new_series_per_sec`, label limits, and sample-rate limits inside that shard.
+  - Why: You get a mechanically true blast-radius boundary without a global “perfect” coordinator.
+
+- **Decision 4: Query safety via coarse budgets**
+  - Chose: Hard caps on time range, minimum step, max concurrency, and max execution time; split long range queries by time and cache subresults in-process.
+  - Why: Fine-grained “query cost estimation” is complexity that fails under real workloads; coarse budgets are predictable.
+
+- **What We Removed**
+  - Separate `Ingest Gateway`, `Query Frontend`, and `Store Gateway` as standalone services (merged into one backend).
+  - External ring KV store dependency (use gossip membership; reject writes when the ring is unstable).
+  - Downsampling pipeline (tiers are retention + source resolution, not post-processing).
+  - Dedicated query scheduler/worker pool (only add when query burst smoothing becomes necessary).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[Prometheus / Agents] --> B["Metrics Backend (Cortex/Mimir-style)"]
+  B <--> C["Object Storage (S3/GCS)"]
+```
+
+### Components
+
+- `Prometheus / Agents`
+  - Scrape locally and `remote_write` with backoff and batching. Retries are expected; ingestion is at-least-once.
+
+- `Metrics Backend (Cortex/Mimir-style)`
+  - What it does: auth + per-tenant limits, sharding and replication, WAL-backed hot ingest, query execution with strict budgets, block shipping, and compaction/retention as a background job.
+  - Why it stays: it’s the only custom logic you can’t outsource—multi-tenant limits + TSDB semantics + query safety.
+  - Ring and fencing:
+    - Membership is gossip-based; token ownership is persisted so restarts don’t reshuffle.
+    - Writes are acknowledged only after **quorum WAL durability**; if quorum can’t be reached or the ring isn’t stable, the API returns `503` so clients back off instead of creating split-brain data.
+  - Limits rollout:
+    - Limits are versioned; rollout is staged per tenant; “dry-run” mode reports would-reject before enforcement; revert is instant.
+
+- `Object Storage`
+  - Stores immutable blocks for long retention. This is the long-term source of truth.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Stability under cardinality spikes | “Accept everything” convenience |
+| Small team operability (few moving parts) | Less independent scaling of query vs ingest roles |
+| Cheap long retention | Historical queries depend on object-store health |
+| Predictable multi-tenant fairness | Some queries are rejected instead of “slow but eventually” |
+
+## Failure Modes
+
+- **Ring instability or membership flapping**
+  - What happens: shard ownership is uncertain; replication sets change too often to be safe.
+  - Recover: stop acknowledging writes (`503`) until the ring is stable; keep serving hot reads from healthy ingesters.
+
+- **Network partition (split-brain risk)**
+  - What happens: two sides may disagree on ownership.
+  - Recover: quorum writes + “ring must be stable” gating means partitions turn into rejected writes, not divergent acknowledged data.
+
+- **Object storage slow/erroring for hours**
+  - What happens: cold reads get slow; compaction falls behind.
+  - Recover: keep hot queries served from ingesters; strictly shed long-range queries first; pause/slow background compaction to avoid LIST/GET storms and let the backlog accumulate.
+
+- **Bad limits/config rollout rejects healthy tenants**
+  - What happens: sudden, widespread ingest failures.
+  - Recover: staged rollout + dry-run prevents global surprises; revert to the previous version immediately.
+
+- **Tenant cardinality incident**
+  - What happens: one tenant tries to create unlimited new series.
+  - Recover: reject new series for that tenant inside its shard; quarantine the tenant if needed; keep everyone else stable.
+
+## What I'd Do Differently At...
+
+- **10x scale:** add a dedicated store-gateway/read-cache layer only if object-store amplification dominates; add SSD caches before adding more services.
+- **100x scale:** split query execution into a scheduler + workers only if fairness and burst smoothing can’t be met with per-tenant queues and caps.
+
+## Operational Notes
+
+- Limits are the product contract: keep them visible, versioned, and easy to revert.
+- Page on ring instability, WAL replay time, and compaction backlog age; those are the real “system is dying” signals.
+- Make “partial results” explicit: only allow them by tenant policy, never silently.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): High-Cardinality Metrics Pipeline
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/high-cardinality-metrics-pipeline.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/high-cardinality-metrics-pipeline.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/03-observability-reliability/high-cardinality-metrics-pipeline.md

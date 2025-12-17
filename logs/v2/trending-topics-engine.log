@@ -1,0 +1,1618 @@
+==========================================
+Generating (v2): Trending Topics Engine
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2bf5-7da3-921c-cff25bb78903
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Trending Topics Engine
+**Category**: Social & Discovery
+
+**Problem Statement**:
+Design a stream processing system to identify surging keywords in real-time using sliding windows and heavy-hitter algorithms.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+thinking
+**Designing event counting system**
+
+I'm thinking about counting events based on (keyword, user_id) with a short time-to-live to manage data. A Cuckoo filter might work, but it feels a bit complex. Instead, I wonder if we could compute a weighted count, where each event's weight is calculated as 1 divided by the square root of posts from that user within a certain timeframe.
+
+I’ll also need a per-user rate for better tracking. Upstream, I'll implement throttling and handle bot detection separately. To keep the trending engine resistant to spam, I'll track unique authors over a million events using HyperLogLog, focusing on relevant keywords. 
+
+For the architecture, I'll visualize it as: Client -> Ingestion -> Kafka -> Flink job -> Trending Store (Redis) + Metadata (Postgres) + Dashboard. That might need around seven nodes. I'll also incorporate an object store for checkpoints in S3, although the network will be restricted. Since this involves design, I’ll label it “Object Storage” in the documentation. Now, I just need to start drafting the doc!
+codex
+```markdown
+---
+title: "Trending Topics Engine"
+category: "Social & Discovery"
+difficulty: "Hard"
+tags: ["stream-processing", "heavy-hitters", "sliding-windows", "flink", "kafka", "realtime-analytics"]
+---
+
+## Overview
+
+This system identifies *surging* keywords in real time from a firehose of posts, comments, and searches. The elegant trick is to **separate “finding candidates” from “measuring surge”**: use a heavy-hitter algorithm to keep the candidate set small, then compute accurate sliding-window surge scores only for those candidates.
+
+Naive designs try to maintain per-keyword windowed counts for the entire vocabulary. That explodes state (millions of keywords × many window buckets), melts RocksDB, and still produces junk trends because “popular” is not “surging.” This design stays boring everywhere (Kafka + Flink + RocksDB + Redis) and spends complexity only where it pays off: **approximate discovery + exact scoring for a small set**.
+
+## What Makes This Hard
+
+The trap is treating “trending” as “top counts in the last N minutes.” That yields stable head terms (“news”, “sports”) and misses sudden spikes. Real trending needs **a baseline** and a **surge function** (ratio / delta / z-score) over *sliding* windows.
+
+The second trap is state: sliding windows tempt you into per-term ring buffers for all terms. At real scale, the long tail dwarfs the head, and you end up building an expensive distributed key-value store inside your stream processor.
+
+## Requirements
+
+### Functional Requirements
+- Identify surging keywords in near real time across multiple windows (e.g., 1m, 5m, 1h sliding).
+- Rank by “surge” (not raw volume) with a defensible formula and predictable behavior under bursty traffic.
+- Handle out-of-order events using event time; late events are reflected for a bounded lateness.
+- Provide an API that returns top trends per scope: global, locale, and topic cluster (optional taxonomy is a separate problem).
+- Produce stable results: avoid flip-flopping rank due to tiny count changes.
+
+### Scale Targets
+- Ingest: 200k events/sec peak (posts, comments, searches), 50k/sec sustained.
+- Unique keywords/day: 50–200M; active keywords/minute: 2–10M (long tail dominates).
+- Latency: p95 < 2s from event ingest to trend update; p99 < 5s during spikes.
+- Windows: 1m and 5m are primary (product-facing); 1h supports “what’s rising today.”
+Why these numbers matter: 200k/sec makes “store per keyword per bucket” infeasible; the solution must keep per-event work O(1) and per-key state bounded.
+
+## Key Design Decisions
+
+- **Two-stage pipeline (candidate discovery → exact scoring)**
+  - Chose: heavy-hitter discovery to produce ~10k–50k candidates/minute, then exact sliding-window counts only for candidates.
+  - Rejected: exact window counts for all keywords.
+  - Why: makes sliding-window surge tractable while preserving quality.
+
+- **Event-time processing with bounded lateness**
+  - Chose: Flink event-time windows with watermarks; accept lateness up to 30s (product-tunable).
+  - Rejected: processing-time windows.
+  - Why: trending breaks if mobile clients deliver late or if ingest retries reorder events.
+
+- **Surge score based on ratio + smoothing**
+  - Chose: a smoothed ratio vs baseline with a minimum support threshold:
+    - `score = log((c_now + k) / (c_base + k)) * sqrt(c_now)`
+  - Rejected: pure ratio (too noisy for small counts) and pure delta (biases high-volume terms).
+  - Why: ratio captures “surge,” sqrt support dampens tiny-sample explosions, `k` stabilizes cold starts.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U["Clients"] --> I["Ingest API"]
+  I --> K["Kafka"]
+  K --> F["Flink Trends Job"]
+  F --> R["Redis TopK"]
+  F --> O["Object Store"]
+  R --> A["Trends API"]
+  A --> D["Feed & Search"]
+```
+
+### Components
+
+- **Ingest API**
+  - Normalizes events (timestamp, locale, user id, text), applies basic abuse throttles, and publishes to Kafka with a stable partition key (e.g., locale + hash(keyword)).
+  - Earns its place by preventing downstream from being the first line of defense.
+
+- **Kafka**
+  - The shock absorber and replay log. Trends is inherently “recomputable,” so Kafka is the correct source of truth.
+
+- **Flink Trends Job**
+  - Maintains the heavy-hitter structure, produces candidate sets, computes sliding-window counts for candidates, and emits ranked trend lists per scope (global/locale).
+  - Uses RocksDB state backend + checkpoints to Object Store.
+
+- **Redis TopK**
+  - Serves the latest ranked lists with low latency (sorted sets per scope/window).
+  - This is a cache of computed truth; recomputation comes from Kafka.
+
+- **Trends API**
+  - Simple read-only service: fetches precomputed lists from Redis, applies presentation rules (blacklists, de-dup, “topic grouping” if available).
+
+- **Object Store**
+  - Stores Flink checkpoints/savepoints for fast recovery and safe deploys.
+
+## Deep Dive: Sliding Windows + Heavy Hitters Without Exploding State
+
+The core problem is: “Find top surging keywords over a sliding window when the keyspace is unbounded.” The key insight is to avoid tracking the full keyspace with windowed state. Instead:
+
+1) **Discover candidates with a bounded-memory heavy-hitter algorithm**
+- Per scope (e.g., locale) and per short time slice (e.g., 10s), maintain a **Space-Saving** summary of size `M` (e.g., 20k entries).
+- Space-Saving gives you an explicit set of tracked keys and an error bound; it’s practical to maintain in RocksDB and update in O(1).
+
+2) **Promote candidates into an “exact scoring set”**
+- Every slice, emit the top `N` keys from Space-Saving (e.g., 5k) as *candidates* for that scope.
+- Maintain a TTL’d candidate registry in Flink state: a keyword stays “active” for scoring for, say, 30 minutes after last appearing as a candidate. This prevents thrash.
+
+3) **Compute exact sliding-window counts only for active candidates**
+- For each active candidate, keep a compact ring buffer of counts per small bucket (e.g., 5s buckets over 5m → 60 integers).
+- Update is O(1): compute bucket index from event-time, increment bucket.
+- For scoring, sum the last `W` seconds for `c_now` and the preceding window for `c_base`, both from the ring buffer; apply the surge formula.
+- Result: exact window math for a bounded set, not for millions of terms.
+
+4) **Make results stable and defensible**
+- Enforce minimum support (e.g., `c_now >= 50` per 5m) to block “1 → 5 events” noise.
+- Apply hysteresis on publishing: a term must stay above a score threshold for two consecutive evaluations to enter the list, and drop below a lower threshold to leave. This removes rank flicker without hiding real spikes.
+
+Why this works operationally: Space-Saving adapts to traffic spikes and evolving vocab, while the TTL’d candidate registry ensures we only allocate ring buffers for terms that matter. The system spends memory proportional to “interesting terms,” not “all terms.”
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Low-latency, real-time updates | Perfect recall of every possible spike |
+| Bounded state and predictable cost | Some approximation in candidate discovery |
+| Event-time correctness | Added complexity (watermarks, late events) |
+| Simple serving path (precomputed lists) | Less flexibility for ad-hoc queries |
+
+## Failure Modes
+
+- **Kafka lag spike (downstream can’t keep up)**
+  - What happens: trend updates become stale; watermarks stop advancing.
+  - Detect: consumer lag + watermark age alarms.
+  - Recover: temporarily reduce candidate `N` and increase evaluation interval; scale Flink task slots; reprocess catches up automatically.
+
+- **State blow-up from candidate churn**
+  - What happens: too many candidates promoted; RocksDB grows; checkpoints slow.
+  - Detect: candidate-set cardinality, RocksDB size, checkpoint duration.
+  - Recover: tighten promotion (`N`), shorten candidate TTL, enforce per-scope candidate caps with LRU eviction.
+
+- **Hot partitions from skewed keywords (e.g., one viral term)**
+  - What happens: one Flink subtask becomes CPU bound; latency increases.
+  - Detect: per-subtask busy time and backpressure metrics.
+  - Recover: split processing by scope first (locale shard), then by keyword hash; ensure keying avoids single-key dominance in the scoring stage by aggregating counts with local pre-aggregation.
+
+## What I'd Do Differently At...
+
+- **10x scale:** introduce hierarchical aggregation (local pre-agg → global merge) and move candidate discovery to a dedicated first-stage job to reduce contention with exact scoring; tune RocksDB (bloom filters, compaction) and checkpointing.
+- **100x scale:** make it multi-region with region-level trends computed locally and merged globally; serving becomes “regional truth + global overlay.” Candidate discovery becomes fully hierarchical to avoid shipping huge vocab across regions.
+
+## Operational Notes
+
+- Tune watermarks with real data: lateness is a product decision; too small loses mobile events, too large delays trends.
+- Treat Redis as disposable: if it’s wiped, Flink repopulates from Kafka; keep TTLs on keys to avoid stale lists.
+- Checkpoint health is the canary: alert on checkpoint duration and failure rate; if checkpoints fail, you don’t have recovery.
+- Keep an explicit allow/deny list pipeline outside the core job (policy changes should not require redeploying Flink).
+```
+tokens used
+4,080
+```markdown
+---
+title: "Trending Topics Engine"
+category: "Social & Discovery"
+difficulty: "Hard"
+tags: ["stream-processing", "heavy-hitters", "sliding-windows", "flink", "kafka", "realtime-analytics"]
+---
+
+## Overview
+
+This system identifies *surging* keywords in real time from a firehose of posts, comments, and searches. The elegant trick is to **separate “finding candidates” from “measuring surge”**: use a heavy-hitter algorithm to keep the candidate set small, then compute accurate sliding-window surge scores only for those candidates.
+
+Naive designs try to maintain per-keyword windowed counts for the entire vocabulary. That explodes state (millions of keywords × many window buckets), melts RocksDB, and still produces junk trends because “popular” is not “surging.” This design stays boring everywhere (Kafka + Flink + RocksDB + Redis) and spends complexity only where it pays off: **approximate discovery + exact scoring for a small set**.
+
+## What Makes This Hard
+
+The trap is treating “trending” as “top counts in the last N minutes.” That yields stable head terms (“news”, “sports”) and misses sudden spikes. Real trending needs **a baseline** and a **surge function** (ratio / delta / z-score) over *sliding* windows.
+
+The second trap is state: sliding windows tempt you into per-term ring buffers for all terms. At real scale, the long tail dwarfs the head, and you end up building an expensive distributed key-value store inside your stream processor.
+
+## Requirements
+
+### Functional Requirements
+- Identify surging keywords in near real time across multiple windows (e.g., 1m, 5m, 1h sliding).
+- Rank by “surge” (not raw volume) with a defensible formula and predictable behavior under bursty traffic.
+- Handle out-of-order events using event time; late events are reflected for a bounded lateness.
+- Provide an API that returns top trends per scope: global, locale, and topic cluster (optional taxonomy is a separate problem).
+- Produce stable results: avoid flip-flopping rank due to tiny count changes.
+
+### Scale Targets
+- Ingest: 200k events/sec peak (posts, comments, searches), 50k/sec sustained.
+- Unique keywords/day: 50–200M; active keywords/minute: 2–10M (long tail dominates).
+- Latency: p95 < 2s from event ingest to trend update; p99 < 5s during spikes.
+- Windows: 1m and 5m are primary (product-facing); 1h supports “what’s rising today.”
+Why these numbers matter: 200k/sec makes “store per keyword per bucket” infeasible; the solution must keep per-event work O(1) and per-key state bounded.
+
+## Key Design Decisions
+
+- **Two-stage pipeline (candidate discovery → exact scoring)**
+  - Chose: heavy-hitter discovery to produce ~10k–50k candidates/minute, then exact sliding-window counts only for candidates.
+  - Rejected: exact window counts for all keywords.
+  - Why: makes sliding-window surge tractable while preserving quality.
+
+- **Event-time processing with bounded lateness**
+  - Chose: Flink event-time windows with watermarks; accept lateness up to 30s (product-tunable).
+  - Rejected: processing-time windows.
+  - Why: trending breaks if mobile clients deliver late or if ingest retries reorder events.
+
+- **Surge score based on ratio + smoothing**
+  - Chose: a smoothed ratio vs baseline with a minimum support threshold:
+    - `score = log((c_now + k) / (c_base + k)) * sqrt(c_now)`
+  - Rejected: pure ratio (too noisy for small counts) and pure delta (biases high-volume terms).
+  - Why: ratio captures “surge,” sqrt support dampens tiny-sample explosions, `k` stabilizes cold starts.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U["Clients"] --> I["Ingest API"]
+  I --> K["Kafka"]
+  K --> F["Flink Trends Job"]
+  F --> R["Redis TopK"]
+  F --> O["Object Store"]
+  R --> A["Trends API"]
+  A --> D["Feed & Search"]
+```
+
+### Components
+
+- **Ingest API**
+  - Normalizes events (timestamp, locale, user id, text), applies basic abuse throttles, and publishes to Kafka with a stable partition key (e.g., locale + hash(keyword)).
+  - Earns its place by preventing downstream from being the first line of defense.
+
+- **Kafka**
+  - The shock absorber and replay log. Trends is inherently “recomputable,” so Kafka is the correct source of truth.
+
+- **Flink Trends Job**
+  - Maintains the heavy-hitter structure, produces candidate sets, computes sliding-window counts for candidates, and emits ranked trend lists per scope (global/locale).
+  - Uses RocksDB state backend + checkpoints to Object Store.
+
+- **Redis TopK**
+  - Serves the latest ranked lists with low latency (sorted sets per scope/window).
+  - This is a cache of computed truth; recomputation comes from Kafka.
+
+- **Trends API**
+  - Simple read-only service: fetches precomputed lists from Redis, applies presentation rules (blacklists, de-dup, “topic grouping” if available).
+
+- **Object Store**
+  - Stores Flink checkpoints/savepoints for fast recovery and safe deploys.
+
+## Deep Dive: Sliding Windows + Heavy Hitters Without Exploding State
+
+The core problem is: “Find top surging keywords over a sliding window when the keyspace is unbounded.” The key insight is to avoid tracking the full keyspace with windowed state. Instead:
+
+1) **Discover candidates with a bounded-memory heavy-hitter algorithm**
+- Per scope (e.g., locale) and per short time slice (e.g., 10s), maintain a **Space-Saving** summary of size `M` (e.g., 20k entries).
+- Space-Saving gives you an explicit set of tracked keys and an error bound; it’s practical to maintain in RocksDB and update in O(1).
+
+2) **Promote candidates into an “exact scoring set”**
+- Every slice, emit the top `N` keys from Space-Saving (e.g., 5k) as *candidates* for that scope.
+- Maintain a TTL’d candidate registry in Flink state: a keyword stays “active” for scoring for, say, 30 minutes after last appearing as a candidate. This prevents thrash.
+
+3) **Compute exact sliding-window counts only for active candidates**
+- For each active candidate, keep a compact ring buffer of counts per small bucket (e.g., 5s buckets over 5m → 60 integers).
+- Update is O(1): compute bucket index from event-time, increment bucket.
+- For scoring, sum the last `W` seconds for `c_now` and the preceding window for `c_base`, both from the ring buffer; apply the surge formula.
+- Result: exact window math for a bounded set, not for millions of terms.
+
+4) **Make results stable and defensible**
+- Enforce minimum support (e.g., `c_now >= 50` per 5m) to block “1 → 5 events” noise.
+- Apply hysteresis on publishing: a term must stay above a score threshold for two consecutive evaluations to enter the list, and drop below a lower threshold to leave. This removes rank flicker without hiding real spikes.
+
+Why this works operationally: Space-Saving adapts to traffic spikes and evolving vocab, while the TTL’d candidate registry ensures we only allocate ring buffers for terms that matter. The system spends memory proportional to “interesting terms,” not “all terms.”
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Low-latency, real-time updates | Perfect recall of every possible spike |
+| Bounded state and predictable cost | Some approximation in candidate discovery |
+| Event-time correctness | Added complexity (watermarks, late events) |
+| Simple serving path (precomputed lists) | Less flexibility for ad-hoc queries |
+
+## Failure Modes
+
+- **Kafka lag spike (downstream can’t keep up)**
+  - What happens: trend updates become stale; watermarks stop advancing.
+  - Detect: consumer lag + watermark age alarms.
+  - Recover: temporarily reduce candidate `N` and increase evaluation interval; scale Flink task slots; reprocess catches up automatically.
+
+- **State blow-up from candidate churn**
+  - What happens: too many candidates promoted; RocksDB grows; checkpoints slow.
+  - Detect: candidate-set cardinality, RocksDB size, checkpoint duration.
+  - Recover: tighten promotion (`N`), shorten candidate TTL, enforce per-scope candidate caps with LRU eviction.
+
+- **Hot partitions from skewed keywords (e.g., one viral term)**
+  - What happens: one Flink subtask becomes CPU bound; latency increases.
+  - Detect: per-subtask busy time and backpressure metrics.
+  - Recover: split processing by scope first (locale shard), then by keyword hash; ensure keying avoids single-key dominance in the scoring stage by aggregating counts with local pre-aggregation.
+
+## What I'd Do Differently At...
+
+- **10x scale:** introduce hierarchical aggregation (local pre-agg → global merge) and move candidate discovery to a dedicated first-stage job to reduce contention with exact scoring; tune RocksDB (bloom filters, compaction) and checkpointing.
+- **100x scale:** make it multi-region with region-level trends computed locally and merged globally; serving becomes “regional truth + global overlay.” Candidate discovery becomes fully hierarchical to avoid shipping huge vocab across regions.
+
+## Operational Notes
+
+- Tune watermarks with real data: lateness is a product decision; too small loses mobile events, too large delays trends.
+- Treat Redis as disposable: if it’s wiped, Flink repopulates from Kafka; keep TTLs on keys to avoid stale lists.
+- Checkpoint health is the canary: alert on checkpoint duration and failure rate; if checkpoints fail, you don’t have recovery.
+- Keep an explicit allow/deny list pipeline outside the core job (policy changes should not require redeploying Flink).
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/trending-topics-engine.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-3963-7dd3-96f6-63a042355711
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Trending Topics Engine"
+category: "Social & Discovery"
+difficulty: "Hard"
+tags: ["stream-processing", "heavy-hitters", "sliding-windows", "flink", "kafka", "realtime-analytics"]
+---
+
+## Overview
+
+This system identifies *surging* keywords in real time from a firehose of posts, comments, and searches. The elegant trick is to **separate “finding candidates” from “measuring surge”**: use a heavy-hitter algorithm to keep the candidate set small, then compute accurate sliding-window surge scores only for those candidates.
+
+Naive designs try to maintain per-keyword windowed counts for the entire vocabulary. That explodes state (millions of keywords × many window buckets), melts RocksDB, and still produces junk trends because “popular” is not “surging.” This design stays boring everywhere (Kafka + Flink + RocksDB + Redis) and spends complexity only where it pays off: **approximate discovery + exact scoring for a small set**.
+
+## What Makes This Hard
+
+The trap is treating “trending” as “top counts in the last N minutes.” That yields stable head terms (“news”, “sports”) and misses sudden spikes. Real trending needs **a baseline** and a **surge function** (ratio / delta / z-score) over *sliding* windows.
+
+The second trap is state: sliding windows tempt you into per-term ring buffers for all terms. At real scale, the long tail dwarfs the head, and you end up building an expensive distributed key-value store inside your stream processor.
+
+## Requirements
+
+### Functional Requirements
+- Identify surging keywords in near real time across multiple windows (e.g., 1m, 5m, 1h sliding).
+- Rank by “surge” (not raw volume) with a defensible formula and predictable behavior under bursty traffic.
+- Handle out-of-order events using event time; late events are reflected for a bounded lateness.
+- Provide an API that returns top trends per scope: global, locale, and topic cluster (optional taxonomy is a separate problem).
+- Produce stable results: avoid flip-flopping rank due to tiny count changes.
+
+### Scale Targets
+- Ingest: 200k events/sec peak (posts, comments, searches), 50k/sec sustained.
+- Unique keywords/day: 50–200M; active keywords/minute: 2–10M (long tail dominates).
+- Latency: p95 < 2s from event ingest to trend update; p99 < 5s during spikes.
+- Windows: 1m and 5m are primary (product-facing); 1h supports “what’s rising today.”
+Why these numbers matter: 200k/sec makes “store per keyword per bucket” infeasible; the solution must keep per-event work O(1) and per-key state bounded.
+
+## Key Design Decisions
+
+- **Two-stage pipeline (candidate discovery → exact scoring)**
+  - Chose: heavy-hitter discovery to produce ~10k–50k candidates/minute, then exact sliding-window counts only for candidates.
+  - Rejected: exact window counts for all keywords.
+  - Why: makes sliding-window surge tractable while preserving quality.
+
+- **Event-time processing with bounded lateness**
+  - Chose: Flink event-time windows with watermarks; accept lateness up to 30s (product-tunable).
+  - Rejected: processing-time windows.
+  - Why: trending breaks if mobile clients deliver late or if ingest retries reorder events.
+
+- **Surge score based on ratio + smoothing**
+  - Chose: a smoothed ratio vs baseline with a minimum support threshold:
+    - `score = log((c_now + k) / (c_base + k)) * sqrt(c_now)`
+  - Rejected: pure ratio (too noisy for small counts) and pure delta (biases high-volume terms).
+  - Why: ratio captures “surge,” sqrt support dampens tiny-sample explosions, `k` stabilizes cold starts.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U["Clients"] --> I["Ingest API"]
+  I --> K["Kafka"]
+  K --> F["Flink Trends Job"]
+  F --> R["Redis TopK"]
+  F --> O["Object Store"]
+  R --> A["Trends API"]
+  A --> D["Feed & Search"]
+```
+
+### Components
+
+- **Ingest API**
+  - Normalizes events (timestamp, locale, user id, text), applies basic abuse throttles, and publishes to Kafka with a stable partition key (e.g., locale + hash(keyword)).
+  - Earns its place by preventing downstream from being the first line of defense.
+
+- **Kafka**
+  - The shock absorber and replay log. Trends is inherently “recomputable,” so Kafka is the correct source of truth.
+
+- **Flink Trends Job**
+  - Maintains the heavy-hitter structure, produces candidate sets, computes sliding-window counts for candidates, and emits ranked trend lists per scope (global/locale).
+  - Uses RocksDB state backend + checkpoints to Object Store.
+
+- **Redis TopK**
+  - Serves the latest ranked lists with low latency (sorted sets per scope/window).
+  - This is a cache of computed truth; recomputation comes from Kafka.
+
+- **Trends API**
+  - Simple read-only service: fetches precomputed lists from Redis, applies presentation rules (blacklists, de-dup, “topic grouping” if available).
+
+- **Object Store**
+  - Stores Flink checkpoints/savepoints for fast recovery and safe deploys.
+
+## Deep Dive: Sliding Windows + Heavy Hitters Without Exploding State
+
+The core problem is: “Find top surging keywords over a sliding window when the keyspace is unbounded.” The key insight is to avoid tracking the full keyspace with windowed state. Instead:
+
+1) **Discover candidates with a bounded-memory heavy-hitter algorithm**
+- Per scope (e.g., locale) and per short time slice (e.g., 10s), maintain a **Space-Saving** summary of size `M` (e.g., 20k entries).
+- Space-Saving gives you an explicit set of tracked keys and an error bound; it’s practical to maintain in RocksDB and update in O(1).
+
+2) **Promote candidates into an “exact scoring set”**
+- Every slice, emit the top `N` keys from Space-Saving (e.g., 5k) as *candidates* for that scope.
+- Maintain a TTL’d candidate registry in Flink state: a keyword stays “active” for scoring for, say, 30 minutes after last appearing as a candidate. This prevents thrash.
+
+3) **Compute exact sliding-window counts only for active candidates**
+- For each active candidate, keep a compact ring buffer of counts per small bucket (e.g., 5s buckets over 5m → 60 integers).
+- Update is O(1): compute bucket index from event-time, increment bucket.
+- For scoring, sum the last `W` seconds for `c_now` and the preceding window for `c_base`, both from the ring buffer; apply the surge formula.
+- Result: exact window math for a bounded set, not for millions of terms.
+
+4) **Make results stable and defensible**
+- Enforce minimum support (e.g., `c_now >= 50` per 5m) to block “1 → 5 events” noise.
+- Apply hysteresis on publishing: a term must stay above a score threshold for two consecutive evaluations to enter the list, and drop below a lower threshold to leave. This removes rank flicker without hiding real spikes.
+
+Why this works operationally: Space-Saving adapts to traffic spikes and evolving vocab, while the TTL’d candidate registry ensures we only allocate ring buffers for terms that matter. The system spends memory proportional to “interesting terms,” not “all terms.”
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Low-latency, real-time updates | Perfect recall of every possible spike |
+| Bounded state and predictable cost | Some approximation in candidate discovery |
+| Event-time correctness | Added complexity (watermarks, late events) |
+| Simple serving path (precomputed lists) | Less flexibility for ad-hoc queries |
+
+## Failure Modes
+
+- **Kafka lag spike (downstream can’t keep up)**
+  - What happens: trend updates become stale; watermarks stop advancing.
+  - Detect: consumer lag + watermark age alarms.
+  - Recover: temporarily reduce candidate `N` and increase evaluation interval; scale Flink task slots; reprocess catches up automatically.
+
+- **State blow-up from candidate churn**
+  - What happens: too many candidates promoted; RocksDB grows; checkpoints slow.
+  - Detect: candidate-set cardinality, RocksDB size, checkpoint duration.
+  - Recover: tighten promotion (`N`), shorten candidate TTL, enforce per-scope candidate caps with LRU eviction.
+
+- **Hot partitions from skewed keywords (e.g., one viral term)**
+  - What happens: one Flink subtask becomes CPU bound; latency increases.
+  - Detect: per-subtask busy time and backpressure metrics.
+  - Recover: split processing by scope first (locale shard), then by keyword hash; ensure keying avoids single-key dominance in the scoring stage by aggregating counts with local pre-aggregation.
+
+## What I'd Do Differently At...
+
+- **10x scale:** introduce hierarchical aggregation (local pre-agg → global merge) and move candidate discovery to a dedicated first-stage job to reduce contention with exact scoring; tune RocksDB (bloom filters, compaction) and checkpointing.
+- **100x scale:** make it multi-region with region-level trends computed locally and merged globally; serving becomes “regional truth + global overlay.” Candidate discovery becomes fully hierarchical to avoid shipping huge vocab across regions.
+
+## Operational Notes
+
+- Tune watermarks with real data: lateness is a product decision; too small loses mobile events, too large delays trends.
+- Treat Redis as disposable: if it’s wiped, Flink repopulates from Kafka; keep TTLs on keys to avoid stale lists.
+- Checkpoint health is the canary: alert on checkpoint duration and failure rate; if checkpoints fail, you don’t have recovery.
+- Keep an explicit allow/deny list pipeline outside the core job (policy changes should not require redeploying Flink).
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+thinking
+**Evaluating component simplification**
+
+I’m noticing that vocabulary is extensive, leading to high tokenization costs. I could consider hashing to 64-bit to simplify state key sizes and manage cross-region requirements as well. For each custom component, like the ring buffer and heavy hitters, I’m thinking about alternatives such as Flink’s built-in windowing or using Kafka compacted topics instead of Redis. I want to keep the API fast, so maybe utilizing DynamoDB or Postgres for serving could work, even though it might face high query loads.
+thinking
+**Assessing observability and planning**
+
+I need to focus on observability metrics like candidate sizes, watermark age, lag, and checkpoints. Also, audit logs for blacklists are essential. The user is asking for a critique without code or a plan tool, so I should present my output in a structured markdown format.
+
+I’ll create sections that include the core insight about decoupling candidate discovery from scoring, list important components, and suggest simplification opportunities. I should also outline 3-5 key scenarios for stress testing. Maintaining clarity is my priority!
+thinking
+**Addressing outages and recommendations**
+
+I’m noting several potential issues like Redis and Kafka outages, object store failures, network problems, bad deployment configurations, and significant traffic increases. Each scenario will require specific design responses and recommendations.
+
+For improvements, I need to clarify the candidate discovery window and define key concepts like deduplication and normalization. Considerations include using an EMA baseline, outputting to Kafka, and employing versioned configurations. I'll keep it structured and clear, while highlighting operational notes and the use of RocksDB updates, but I'll mention that they have an operational cost.
+thinking
+**Considering memory and configuration**
+
+I’m thinking about how to better store strings using 64-bit IDs with a dictionary service or utilizing RocksDB for mapping. Multi-window setups like 1m, 5m, and 1h could be improved by consolidating to finer-grain buckets instead of using expensive ring buffers.
+
+When establishing a baseline, relying on preceding windows might not account for cyclical patterns, so using EWMA for the 1h window could be beneficial. I also need to address score calculation and ensure that my dynamic configuration includes key parameters to avoid issues with bad configurations. Time to prepare the final markdown while keeping it comprehensive yet concise!
+thinking
+**Preparing a thorough critique**
+
+I'm aware that there's a setting for minimal verbosity, but the user has requested a more thorough critique. I want to make sure I cover everything important while providing clarity. 
+
+To make it easier to digest, I’ll include tables and bullet points to organize the information. I’ll also outline 3-5 failure scenarios to give a comprehensive view of potential issues. It’s important to keep the information accessible while being detailed. Let’s get started on structuring this!
+codex
+## Elegance Check
+
+### The Core Insight
+Separating **candidate discovery** (approx, bounded state) from **surge scoring** (exact, windowed) is the right “make it tractable” move—and it cleanly focuses complexity where it buys quality.
+
+### Components That Earn Their Place
+| Component | Why It’s Necessary |
+|---|---|
+| Ingest API | Centralizes normalization/abuse throttles; keeps the stream job from becoming the first line of defense. |
+| Kafka | Replayable source of truth; makes “recomputable” analytics operationally sane. |
+| Flink + RocksDB state | Event-time correctness + large keyed state with checkpoints; good fit for bounded-lateness sliding logic. |
+| Heavy-hitter + candidate registry | The one genuinely custom piece that prevents state explosion while keeping recall acceptable. |
+| Redis (serving) | Cheap low-latency reads for “top trends”; keeps API boring and fast. |
+| Object store (checkpoints/savepoints) | Fast recovery + safer deploys; avoids “state is gone” incidents. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---|---|---|
+| Per-key ring buffers for exact sliding windows | Replace baseline with **EMA/decay** (track short EMA + long EMA per key) | Less “exact window” explainability; tuning decay constants becomes critical, but state drops to O(1) per key (no buffers). |
+| Redis as the serving store | Emit ranked lists to a **Kafka compacted topic**; API keeps an in-memory cache (optionally with local persistence) | API becomes stateful and needs replay handling; but you may remove Redis ops entirely for a small team. |
+| Space-Saving stored/updated via RocksDB per event | Add **local pre-aggregation** (per task: map keyword→count for 1–2s, then flush) | Slight latency/complexity increase; drastically reduces RocksDB write amplification and GC/compaction pressure. |
+| Candidate TTL registry inside Flink | Push candidates into **Redis SET with TTL** (or compacted topic) and have scoring stage subscribe | Cross-system coupling and eventual consistency; but can simplify Flink state and improve operability if state growth is a pain point. |
+| One Flink job doing discovery + scoring | Split into **two jobs** (discovery → candidate topic; scoring consumes candidates) | More moving parts and end-to-end latency; but isolates hotspots and makes scaling knobs clearer. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Redis is down or partially unavailable**
+   - Design’s answer: “Redis is disposable; Flink repopulates from Kafka”
+   - Recommendation: Strengthen — specify API behavior (serve stale from local cache? return empty?), and make writes idempotent + batched; ensure Redis key TTLs don’t cause mass-expiry stampedes on recovery.
+
+2. **Flink restart + replay causes duplicate counting (at-least-once)**
+   - Design’s answer: not addressed (checkpointing mentioned, but semantics aren’t)
+   - Recommendation: Must fix — trending is very sensitive to brief spikes; define **exactly-once** requirement (Kafka + Flink EOS) or explicitly accept at-least-once and add bounded dedupe (e.g., per-partition sequence, event-id Bloom/TTL for 30–60s) to prevent “replay = trend”.
+
+3. **Object store outage during checkpoint (5+ minutes)**
+   - Design’s answer: “checkpoint health is canary”; no explicit degrade mode
+   - Recommendation: Strengthen — define what happens when checkpoints fail (job fails vs continues), and have an operator playbook: pause/slow sources, reduce candidate N, extend checkpoint interval, or temporarily switch to in-memory state knowing you may lose correctness.
+
+4. **Hot key / adversarial keyword attacks (one term dominates, or spam creates many near-duplicates)**
+   - Design’s answer: mentions hot partitions + abuse throttles, but not token-level adversarial behavior
+   - Recommendation: Strengthen — add normalization rules (casefolding, Unicode confusables, max token length), per-user/per-IP contribution caps, and consider “unique users” support (approx via HLL) for promotion so one botnet doesn’t manufacture trends with low diversity.
+
+5. **10× traffic spike + slow component (RocksDB compaction / backpressure)**
+   - Design’s answer: scale slots; reduce candidate N; increase evaluation interval
+   - Recommendation: Acceptable, with one addition — define a **graceful degradation ladder** (drop 1h window first, then reduce scopes, then reduce candidate TTL) and ensure you can flip these via runtime config (not redeploy).
+
+## Recommendations
+
+### Must Fix
+- Define processing guarantees: **exactly-once vs at-least-once**, and how duplicates affect scores.
+- Clarify candidate discovery semantics: “per 10s slice” can be misread as “many summaries” (state blow-up); specify whether it’s a resettable summary, a rolling window, or a decayed counter.
+- Define baseline rigorously per window (especially 1h): “preceding window” will over-report diurnal effects; consider long-term baseline (EMA or day-over-day bucket).
+- Put hard caps on “scope explosion” (locales × windows × candidates) with explicit memory math and eviction rules.
+- Specify late-event policy beyond 30s (drop? count but don’t re-rank?); align this with “stable results” requirements.
+
+### Should Consider
+- Local pre-aggregation to cut RocksDB write amplification (often the real limiter at 200k/s).
+- A diversity-aware promotion signal (unique users) so “one actor” spikes don’t dominate.
+- Make tuning knobs dynamic and safe: config in a dedicated topic + validation + staged rollout (bad config is a top-3 real incident cause).
+
+### Nice to Have
+- Explainability endpoint: return `c_now`, `c_base`, support, and a short reason (“spike in last 2m vs prior 5m”) for debugging/product trust.
+- Shadow/scoring A/B: run two score formulas in parallel and compare offline to avoid “score tweaks break the product”.
+- Output versioning: include a `model_version` / `config_version` in emitted trend lists for auditability.
+
+## What’s Working Well
+- The two-stage approach is genuinely elegant: it attacks the *state explosion* root cause without pretending popularity == trending.
+- You explicitly budget complexity (event time, watermarks, hysteresis) only where it improves quality and stability.
+- Operational honesty is strong: Redis as cache, Kafka as truth, checkpoint health as a first-class signal.
+- The design already anticipates the real pain points (candidate churn, hot partitions) and offers practical mitigations.
+tokens used
+6,333
+## Elegance Check
+
+### The Core Insight
+Separating **candidate discovery** (approx, bounded state) from **surge scoring** (exact, windowed) is the right “make it tractable” move—and it cleanly focuses complexity where it buys quality.
+
+### Components That Earn Their Place
+| Component | Why It’s Necessary |
+|---|---|
+| Ingest API | Centralizes normalization/abuse throttles; keeps the stream job from becoming the first line of defense. |
+| Kafka | Replayable source of truth; makes “recomputable” analytics operationally sane. |
+| Flink + RocksDB state | Event-time correctness + large keyed state with checkpoints; good fit for bounded-lateness sliding logic. |
+| Heavy-hitter + candidate registry | The one genuinely custom piece that prevents state explosion while keeping recall acceptable. |
+| Redis (serving) | Cheap low-latency reads for “top trends”; keeps API boring and fast. |
+| Object store (checkpoints/savepoints) | Fast recovery + safer deploys; avoids “state is gone” incidents. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---|---|---|
+| Per-key ring buffers for exact sliding windows | Replace baseline with **EMA/decay** (track short EMA + long EMA per key) | Less “exact window” explainability; tuning decay constants becomes critical, but state drops to O(1) per key (no buffers). |
+| Redis as the serving store | Emit ranked lists to a **Kafka compacted topic**; API keeps an in-memory cache (optionally with local persistence) | API becomes stateful and needs replay handling; but you may remove Redis ops entirely for a small team. |
+| Space-Saving stored/updated via RocksDB per event | Add **local pre-aggregation** (per task: map keyword→count for 1–2s, then flush) | Slight latency/complexity increase; drastically reduces RocksDB write amplification and GC/compaction pressure. |
+| Candidate TTL registry inside Flink | Push candidates into **Redis SET with TTL** (or compacted topic) and have scoring stage subscribe | Cross-system coupling and eventual consistency; but can simplify Flink state and improve operability if state growth is a pain point. |
+| One Flink job doing discovery + scoring | Split into **two jobs** (discovery → candidate topic; scoring consumes candidates) | More moving parts and end-to-end latency; but isolates hotspots and makes scaling knobs clearer. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Redis is down or partially unavailable**
+   - Design’s answer: “Redis is disposable; Flink repopulates from Kafka”
+   - Recommendation: Strengthen — specify API behavior (serve stale from local cache? return empty?), and make writes idempotent + batched; ensure Redis key TTLs don’t cause mass-expiry stampedes on recovery.
+
+2. **Flink restart + replay causes duplicate counting (at-least-once)**
+   - Design’s answer: not addressed (checkpointing mentioned, but semantics aren’t)
+   - Recommendation: Must fix — trending is very sensitive to brief spikes; define **exactly-once** requirement (Kafka + Flink EOS) or explicitly accept at-least-once and add bounded dedupe (e.g., per-partition sequence, event-id Bloom/TTL for 30–60s) to prevent “replay = trend”.
+
+3. **Object store outage during checkpoint (5+ minutes)**
+   - Design’s answer: “checkpoint health is canary”; no explicit degrade mode
+   - Recommendation: Strengthen — define what happens when checkpoints fail (job fails vs continues), and have an operator playbook: pause/slow sources, reduce candidate N, extend checkpoint interval, or temporarily switch to in-memory state knowing you may lose correctness.
+
+4. **Hot key / adversarial keyword attacks (one term dominates, or spam creates many near-duplicates)**
+   - Design’s answer: mentions hot partitions + abuse throttles, but not token-level adversarial behavior
+   - Recommendation: Strengthen — add normalization rules (casefolding, Unicode confusables, max token length), per-user/per-IP contribution caps, and consider “unique users” support (approx via HLL) for promotion so one botnet doesn’t manufacture trends with low diversity.
+
+5. **10× traffic spike + slow component (RocksDB compaction / backpressure)**
+   - Design’s answer: scale slots; reduce candidate N; increase evaluation interval
+   - Recommendation: Acceptable, with one addition — define a **graceful degradation ladder** (drop 1h window first, then reduce scopes, then reduce candidate TTL) and ensure you can flip these via runtime config (not redeploy).
+
+## Recommendations
+
+### Must Fix
+- Define processing guarantees: **exactly-once vs at-least-once**, and how duplicates affect scores.
+- Clarify candidate discovery semantics: “per 10s slice” can be misread as “many summaries” (state blow-up); specify whether it’s a resettable summary, a rolling window, or a decayed counter.
+- Define baseline rigorously per window (especially 1h): “preceding window” will over-report diurnal effects; consider long-term baseline (EMA or day-over-day bucket).
+- Put hard caps on “scope explosion” (locales × windows × candidates) with explicit memory math and eviction rules.
+- Specify late-event policy beyond 30s (drop? count but don’t re-rank?); align this with “stable results” requirements.
+
+### Should Consider
+- Local pre-aggregation to cut RocksDB write amplification (often the real limiter at 200k/s).
+- A diversity-aware promotion signal (unique users) so “one actor” spikes don’t dominate.
+- Make tuning knobs dynamic and safe: config in a dedicated topic + validation + staged rollout (bad config is a top-3 real incident cause).
+
+### Nice to Have
+- Explainability endpoint: return `c_now`, `c_base`, support, and a short reason (“spike in last 2m vs prior 5m”) for debugging/product trust.
+- Shadow/scoring A/B: run two score formulas in parallel and compare offline to avoid “score tweaks break the product”.
+- Output versioning: include a `model_version` / `config_version` in emitted trend lists for auditability.
+
+## What’s Working Well
+- The two-stage approach is genuinely elegant: it attacks the *state explosion* root cause without pretending popularity == trending.
+- You explicitly budget complexity (event time, watermarks, hysteresis) only where it improves quality and stability.
+- Operational honesty is strong: Redis as cache, Kafka as truth, checkpoint health as a first-class signal.
+- The design already anticipates the real pain points (candidate churn, hot partitions) and offers practical mitigations.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/trending-topics-engine.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afc-bdc7-7582-adc3-82eb7c833e04
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Trending Topics Engine"
+category: "Social & Discovery"
+difficulty: "Hard"
+tags: ["stream-processing", "heavy-hitters", "sliding-windows", "flink", "kafka", "realtime-analytics"]
+---
+
+## Overview
+
+This system identifies *surging* keywords in real time from a firehose of posts, comments, and searches. The elegant trick is to **separate “finding candidates” from “measuring surge”**: use a heavy-hitter algorithm to keep the candidate set small, then compute accurate sliding-window surge scores only for those candidates.
+
+Naive designs try to maintain per-keyword windowed counts for the entire vocabulary. That explodes state (millions of keywords × many window buckets), melts RocksDB, and still produces junk trends because “popular” is not “surging.” This design stays boring everywhere (Kafka + Flink + RocksDB + Redis) and spends complexity only where it pays off: **approximate discovery + exact scoring for a small set**.
+
+## What Makes This Hard
+
+The trap is treating “trending” as “top counts in the last N minutes.” That yields stable head terms (“news”, “sports”) and misses sudden spikes. Real trending needs **a baseline** and a **surge function** (ratio / delta / z-score) over *sliding* windows.
+
+The second trap is state: sliding windows tempt you into per-term ring buffers for all terms. At real scale, the long tail dwarfs the head, and you end up building an expensive distributed key-value store inside your stream processor.
+
+## Requirements
+
+### Functional Requirements
+- Identify surging keywords in near real time across multiple windows (e.g., 1m, 5m, 1h sliding).
+- Rank by “surge” (not raw volume) with a defensible formula and predictable behavior under bursty traffic.
+- Handle out-of-order events using event time; late events are reflected for a bounded lateness.
+- Provide an API that returns top trends per scope: global, locale, and topic cluster (optional taxonomy is a separate problem).
+- Produce stable results: avoid flip-flopping rank due to tiny count changes.
+
+### Scale Targets
+- Ingest: 200k events/sec peak (posts, comments, searches), 50k/sec sustained.
+- Unique keywords/day: 50–200M; active keywords/minute: 2–10M (long tail dominates).
+- Latency: p95 < 2s from event ingest to trend update; p99 < 5s during spikes.
+- Windows: 1m and 5m are primary (product-facing); 1h supports “what’s rising today.”
+Why these numbers matter: 200k/sec makes “store per keyword per bucket” infeasible; the solution must keep per-event work O(1) and per-key state bounded.
+
+## Key Design Decisions
+
+- **Two-stage pipeline (candidate discovery → exact scoring)**
+  - Chose: heavy-hitter discovery to produce ~10k–50k candidates/minute, then exact sliding-window counts only for candidates.
+  - Rejected: exact window counts for all keywords.
+  - Why: makes sliding-window surge tractable while preserving quality.
+
+- **Event-time processing with bounded lateness**
+  - Chose: Flink event-time windows with watermarks; accept lateness up to 30s (product-tunable).
+  - Rejected: processing-time windows.
+  - Why: trending breaks if mobile clients deliver late or if ingest retries reorder events.
+
+- **Surge score based on ratio + smoothing**
+  - Chose: a smoothed ratio vs baseline with a minimum support threshold:
+    - `score = log((c_now + k) / (c_base + k)) * sqrt(c_now)`
+  - Rejected: pure ratio (too noisy for small counts) and pure delta (biases high-volume terms).
+  - Why: ratio captures “surge,” sqrt support dampens tiny-sample explosions, `k` stabilizes cold starts.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U["Clients"] --> I["Ingest API"]
+  I --> K["Kafka"]
+  K --> F["Flink Trends Job"]
+  F --> R["Redis TopK"]
+  F --> O["Object Store"]
+  R --> A["Trends API"]
+  A --> D["Feed & Search"]
+```
+
+### Components
+
+- **Ingest API**
+  - Normalizes events (timestamp, locale, user id, text), applies basic abuse throttles, and publishes to Kafka with a stable partition key (e.g., locale + hash(keyword)).
+  - Earns its place by preventing downstream from being the first line of defense.
+
+- **Kafka**
+  - The shock absorber and replay log. Trends is inherently “recomputable,” so Kafka is the correct source of truth.
+
+- **Flink Trends Job**
+  - Maintains the heavy-hitter structure, produces candidate sets, computes sliding-window counts for candidates, and emits ranked trend lists per scope (global/locale).
+  - Uses RocksDB state backend + checkpoints to Object Store.
+
+- **Redis TopK**
+  - Serves the latest ranked lists with low latency (sorted sets per scope/window).
+  - This is a cache of computed truth; recomputation comes from Kafka.
+
+- **Trends API**
+  - Simple read-only service: fetches precomputed lists from Redis, applies presentation rules (blacklists, de-dup, “topic grouping” if available).
+
+- **Object Store**
+  - Stores Flink checkpoints/savepoints for fast recovery and safe deploys.
+
+## Deep Dive: Sliding Windows + Heavy Hitters Without Exploding State
+
+The core problem is: “Find top surging keywords over a sliding window when the keyspace is unbounded.” The key insight is to avoid tracking the full keyspace with windowed state. Instead:
+
+1) **Discover candidates with a bounded-memory heavy-hitter algorithm**
+- Per scope (e.g., locale) and per short time slice (e.g., 10s), maintain a **Space-Saving** summary of size `M` (e.g., 20k entries).
+- Space-Saving gives you an explicit set of tracked keys and an error bound; it’s practical to maintain in RocksDB and update in O(1).
+
+2) **Promote candidates into an “exact scoring set”**
+- Every slice, emit the top `N` keys from Space-Saving (e.g., 5k) as *candidates* for that scope.
+- Maintain a TTL’d candidate registry in Flink state: a keyword stays “active” for scoring for, say, 30 minutes after last appearing as a candidate. This prevents thrash.
+
+3) **Compute exact sliding-window counts only for active candidates**
+- For each active candidate, keep a compact ring buffer of counts per small bucket (e.g., 5s buckets over 5m → 60 integers).
+- Update is O(1): compute bucket index from event-time, increment bucket.
+- For scoring, sum the last `W` seconds for `c_now` and the preceding window for `c_base`, both from the ring buffer; apply the surge formula.
+- Result: exact window math for a bounded set, not for millions of terms.
+
+4) **Make results stable and defensible**
+- Enforce minimum support (e.g., `c_now >= 50` per 5m) to block “1 → 5 events” noise.
+- Apply hysteresis on publishing: a term must stay above a score threshold for two consecutive evaluations to enter the list, and drop below a lower threshold to leave. This removes rank flicker without hiding real spikes.
+
+Why this works operationally: Space-Saving adapts to traffic spikes and evolving vocab, while the TTL’d candidate registry ensures we only allocate ring buffers for terms that matter. The system spends memory proportional to “interesting terms,” not “all terms.”
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Low-latency, real-time updates | Perfect recall of every possible spike |
+| Bounded state and predictable cost | Some approximation in candidate discovery |
+| Event-time correctness | Added complexity (watermarks, late events) |
+| Simple serving path (precomputed lists) | Less flexibility for ad-hoc queries |
+
+## Failure Modes
+
+- **Kafka lag spike (downstream can’t keep up)**
+  - What happens: trend updates become stale; watermarks stop advancing.
+  - Detect: consumer lag + watermark age alarms.
+  - Recover: temporarily reduce candidate `N` and increase evaluation interval; scale Flink task slots; reprocess catches up automatically.
+
+- **State blow-up from candidate churn**
+  - What happens: too many candidates promoted; RocksDB grows; checkpoints slow.
+  - Detect: candidate-set cardinality, RocksDB size, checkpoint duration.
+  - Recover: tighten promotion (`N`), shorten candidate TTL, enforce per-scope candidate caps with LRU eviction.
+
+- **Hot partitions from skewed keywords (e.g., one viral term)**
+  - What happens: one Flink subtask becomes CPU bound; latency increases.
+  - Detect: per-subtask busy time and backpressure metrics.
+  - Recover: split processing by scope first (locale shard), then by keyword hash; ensure keying avoids single-key dominance in the scoring stage by aggregating counts with local pre-aggregation.
+
+## What I'd Do Differently At...
+
+- **10x scale:** introduce hierarchical aggregation (local pre-agg → global merge) and move candidate discovery to a dedicated first-stage job to reduce contention with exact scoring; tune RocksDB (bloom filters, compaction) and checkpointing.
+- **100x scale:** make it multi-region with region-level trends computed locally and merged globally; serving becomes “regional truth + global overlay.” Candidate discovery becomes fully hierarchical to avoid shipping huge vocab across regions.
+
+## Operational Notes
+
+- Tune watermarks with real data: lateness is a product decision; too small loses mobile events, too large delays trends.
+- Treat Redis as disposable: if it’s wiped, Flink repopulates from Kafka; keep TTLs on keys to avoid stale lists.
+- Checkpoint health is the canary: alert on checkpoint duration and failure rate; if checkpoints fail, you don’t have recovery.
+- Keep an explicit allow/deny list pipeline outside the core job (policy changes should not require redeploying Flink).
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Separating **candidate discovery** (approx, bounded state) from **surge scoring** (exact, windowed) is the right “make it tractable” move—and it cleanly focuses complexity where it buys quality.
+
+### Components That Earn Their Place
+| Component | Why It’s Necessary |
+|---|---|
+| Ingest API | Centralizes normalization/abuse throttles; keeps the stream job from becoming the first line of defense. |
+| Kafka | Replayable source of truth; makes “recomputable” analytics operationally sane. |
+| Flink + RocksDB state | Event-time correctness + large keyed state with checkpoints; good fit for bounded-lateness sliding logic. |
+| Heavy-hitter + candidate registry | The one genuinely custom piece that prevents state explosion while keeping recall acceptable. |
+| Redis (serving) | Cheap low-latency reads for “top trends”; keeps API boring and fast. |
+| Object store (checkpoints/savepoints) | Fast recovery + safer deploys; avoids “state is gone” incidents. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---|---|---|
+| Per-key ring buffers for exact sliding windows | Replace baseline with **EMA/decay** (track short EMA + long EMA per key) | Less “exact window” explainability; tuning decay constants becomes critical, but state drops to O(1) per key (no buffers). |
+| Redis as the serving store | Emit ranked lists to a **Kafka compacted topic**; API keeps an in-memory cache (optionally with local persistence) | API becomes stateful and needs replay handling; but you may remove Redis ops entirely for a small team. |
+| Space-Saving stored/updated via RocksDB per event | Add **local pre-aggregation** (per task: map keyword→count for 1–2s, then flush) | Slight latency/complexity increase; drastically reduces RocksDB write amplification and GC/compaction pressure. |
+| Candidate TTL registry inside Flink | Push candidates into **Redis SET with TTL** (or compacted topic) and have scoring stage subscribe | Cross-system coupling and eventual consistency; but can simplify Flink state and improve operability if state growth is a pain point. |
+| One Flink job doing discovery + scoring | Split into **two jobs** (discovery → candidate topic; scoring consumes candidates) | More moving parts and end-to-end latency; but isolates hotspots and makes scaling knobs clearer. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Redis is down or partially unavailable**
+   - Design’s answer: “Redis is disposable; Flink repopulates from Kafka”
+   - Recommendation: Strengthen — specify API behavior (serve stale from local cache? return empty?), and make writes idempotent + batched; ensure Redis key TTLs don’t cause mass-expiry stampedes on recovery.
+
+2. **Flink restart + replay causes duplicate counting (at-least-once)**
+   - Design’s answer: not addressed (checkpointing mentioned, but semantics aren’t)
+   - Recommendation: Must fix — trending is very sensitive to brief spikes; define **exactly-once** requirement (Kafka + Flink EOS) or explicitly accept at-least-once and add bounded dedupe (e.g., per-partition sequence, event-id Bloom/TTL for 30–60s) to prevent “replay = trend”.
+
+3. **Object store outage during checkpoint (5+ minutes)**
+   - Design’s answer: “checkpoint health is canary”; no explicit degrade mode
+   - Recommendation: Strengthen — define what happens when checkpoints fail (job fails vs continues), and have an operator playbook: pause/slow sources, reduce candidate N, extend checkpoint interval, or temporarily switch to in-memory state knowing you may lose correctness.
+
+4. **Hot key / adversarial keyword attacks (one term dominates, or spam creates many near-duplicates)**
+   - Design’s answer: mentions hot partitions + abuse throttles, but not token-level adversarial behavior
+   - Recommendation: Strengthen — add normalization rules (casefolding, Unicode confusables, max token length), per-user/per-IP contribution caps, and consider “unique users” support (approx via HLL) for promotion so one botnet doesn’t manufacture trends with low diversity.
+
+5. **10× traffic spike + slow component (RocksDB compaction / backpressure)**
+   - Design’s answer: scale slots; reduce candidate N; increase evaluation interval
+   - Recommendation: Acceptable, with one addition — define a **graceful degradation ladder** (drop 1h window first, then reduce scopes, then reduce candidate TTL) and ensure you can flip these via runtime config (not redeploy).
+
+## Recommendations
+
+### Must Fix
+- Define processing guarantees: **exactly-once vs at-least-once**, and how duplicates affect scores.
+- Clarify candidate discovery semantics: “per 10s slice” can be misread as “many summaries” (state blow-up); specify whether it’s a resettable summary, a rolling window, or a decayed counter.
+- Define baseline rigorously per window (especially 1h): “preceding window” will over-report diurnal effects; consider long-term baseline (EMA or day-over-day bucket).
+- Put hard caps on “scope explosion” (locales × windows × candidates) with explicit memory math and eviction rules.
+- Specify late-event policy beyond 30s (drop? count but don’t re-rank?); align this with “stable results” requirements.
+
+### Should Consider
+- Local pre-aggregation to cut RocksDB write amplification (often the real limiter at 200k/s).
+- A diversity-aware promotion signal (unique users) so “one actor” spikes don’t dominate.
+- Make tuning knobs dynamic and safe: config in a dedicated topic + validation + staged rollout (bad config is a top-3 real incident cause).
+
+### Nice to Have
+- Explainability endpoint: return `c_now`, `c_base`, support, and a short reason (“spike in last 2m vs prior 5m”) for debugging/product trust.
+- Shadow/scoring A/B: run two score formulas in parallel and compare offline to avoid “score tweaks break the product”.
+- Output versioning: include a `model_version` / `config_version` in emitted trend lists for auditability.
+
+## What’s Working Well
+- The two-stage approach is genuinely elegant: it attacks the *state explosion* root cause without pretending popularity == trending.
+- You explicitly budget complexity (event time, watermarks, hysteresis) only where it improves quality and stability.
+- Operational honesty is strong: Redis as cache, Kafka as truth, checkpoint health as a first-class signal.
+- The design already anticipates the real pain points (candidate churn, hot partitions) and offers practical mitigations.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+
+
+
+
+thinking
+**Resolving design output confusion**
+
+I'm working on producing a final design that simplifies the response, integrates critique, and addresses failure scenarios for a small team. The final markdown document must include minimal architecture, justification, and trade-offs. However, there's a contradiction regarding adding sections. "What We Removed" is not a current section, yet the user specifies it needs to be included. I'll have to find a way to incorporate that without creating new headings, which is a puzzling challenge.
+thinking
+**Adapting section headings**
+
+I'm considering how to repurpose existing headings for the document. I could use "Architecture" for minimal architecture, and "Components" for justification while using "Trade-offs" for honest trade-offs. The challenge is incorporating "What We Removed" without directly changing a section title. It seems I can rename but not add new sections. I might combine "Operational Notes" with "What We Removed," but that may not meet the explicit requirement. I could go for a bullet list or replace "Operational Notes," which could still be within the rules!
+thinking
+**Restructuring the document**
+
+I'm planning to keep important sections while renaming them for clarity. I think I'll remove "What Makes This Hard" since it seems redundant. The "Output Format" requires minimal architecture and justification, so I need to restructure within existing sections: condensing Overview, Requirements, and Key Design Decisions. I can rename "Operational Notes" to "What We Removed" and consider removing unnecessarily deep details. I'll also address critiques like duplicates and issues with redis, incorporating those into Key Design Decisions and Failure Modes. I'm exploring replacing sliding window ring buffers with EMA short/long to simplify things!
+thinking
+**Deciding on component structure**
+
+I think I'll keep "decayed counts approximating sliding windows" for reducing state. Removing Redis by emitting lists to Kafka seems like a good idea since Kafka is already in place, and it simplifies operations. However, I wonder if I can remove the Object Store if I keep Flink, as I’d need it for checkpoints. Alternatively, switching to Kafka Streams could allow me to eliminate the Object Store. Yet, I must keep the Flink tags as the guidelines say not to modify them, complicating my decision. Can I keep Flink but remove the Object Store?
+thinking
+**Finalizing the design structure**
+
+I’m consolidating the design structure while keeping components streamlined. I plan to retain the existing set-up with an Ingest API leading into Kafka, Flink, and a Trends API while dropping Redis. Removing the Object Store might work by using Flink’s built-in checkpointing, but it complicates things. I need to ensure I maintain the section titles while implementing the "What We Removed" section without adding new headings, balancing complexity and clarity. I think the final output should be a simplified markdown document that captures all these decisions!
+thinking
+**Crafting the final design document**
+
+I’m focusing on crafting the complete markdown document as requested, sticking to content transformation without making code changes. I think it’s best to output the design and ensure it adheres to the "ruthless simplifier" rules. 
+
+I’ll clearly outline components and justifications, including failure scenarios. We need to incorporate existing Kafka for the allow/deny list configuration without adding new components. I’ll also decide on event processing, ensuring that we maintain efficient use of state while simplifying where possible. 
+
+Finally, I will output everything in a clean markdown format!
+thinking
+**Optimizing the design with EMA**
+
+I'm working on streamlining the design by replacing ring buffers with exponential moving average (EMA), which will reduce complexity. My plan includes maintaining event-time order using small buckets for incoming data. However, I’m considering processing time as an alternative to handle late events. 
+
+I’ll aggregate counts and utilize decayed counts with specific half-lives to calculate scores for candidates. The design will serve ranked lists through Kafka topics while addressing potential failure modes like lag and outages without adding new components. 
+
+Overall, I’m focused on simplification while ensuring effective event handling!
+thinking
+**Finalizing the markdown document**
+
+I'm focusing on finalizing the markdown document by removing unnecessary sections like "What Makes This Hard" and summarizing the key design decisions. I’ll emphasize components without adding any new ones and ensure the architecture diagram flows logically with the updated process. 
+
+Next, I'll write a brief overview and a detailed algorithm explanation while maintaining a trade-offs table. Importantly, I need to state that we'll accept events up to 30 seconds late, focusing on clarity and meeting all the functional requirements. Let's ensure everything is concise yet informative!
+thinking
+**Clarifying processing guarantees**
+
+I’m determining that we’ll accept late events up to 30 seconds, which should be fine. For processing guarantees, I’ll opt for exactly-once with an idempotent producer and Flink checkpoints included in the config. 
+
+Regarding candidate discovery, I think maintaining a Space-Saving summary with a periodic reset is the simplest solution. I’ll plan to reset every minute and focus on a short rolling horizon for the last minute, ensuring it captures spikes while managing state efficiently. Let’s produce the output without any tool calls!
+codex
+---
+title: "Trending Topics Engine"
+category: "Social & Discovery"
+difficulty: "Hard"
+tags: ["stream-processing", "heavy-hitters", "sliding-windows", "flink", "kafka", "realtime-analytics"]
+---
+
+## Overview
+
+This system finds *surging* keywords from a firehose of posts, comments, and searches. It stays fast by separating **candidate discovery** from **surge scoring**: first keep a small, bounded set of likely trends, then compute surge scores only for that set.
+
+“Trending” is not “highest count.” It’s “recently increased vs baseline,” with rules that avoid flicker and tiny-sample noise.
+
+## Requirements
+
+### Functional Requirements
+- Identify surging keywords in near real time for 1m, 5m, and 1h views.
+- Rank by a surge score with stable, predictable behavior under bursts.
+- Accept late/out-of-order events up to a bounded lateness; drop beyond that bound.
+- Provide an API returning top trends per scope: global and locale (topic cluster is optional).
+- Avoid rank flip-flopping from small count changes.
+
+### Scale Targets
+- Ingest: 200k events/sec peak, 50k/sec sustained.
+- Active keywords/minute: 2–10M; long tail dominates.
+- Latency: p95 < 2s ingest → trend update; p99 < 5s during spikes.
+
+## Key Design Decisions
+
+- **Two-stage pipeline (candidates → scoring)**: bounded heavy-hitter discovery produces a small “active set,” and only that set gets scored.
+- **Bounded lateness policy**: accept events up to 30s late based on normalized event timestamp; later events are dropped (no retro re-ranking beyond the bound).
+- **Exactly-once counting**: idempotent Kafka producer in ingest + Flink checkpointed Kafka source + exactly-once Kafka sink for trend lists.
+- **Serving via Kafka compacted topic**: Flink publishes per-scope ranked lists to a compacted topic; the API keeps an in-memory view (no separate serving datastore).
+- **Hard caps everywhere**: explicit per-scope caps on active candidates and published list sizes to prevent state blow-ups.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U["Clients"] --> I["Ingest API"]
+  I --> K["Kafka (events + compacted trend lists)"]
+  K --> F["Flink Trends Job"]
+  F --> K
+  F --> O["Object Store (checkpoints)"]
+  K --> A["Trends API"]
+  A --> D["Feed & Search"]
+```
+
+### Components
+
+- **Ingest API**
+  - Justification: canonicalizes tokens and timestamps, blocks obvious abuse, and produces an idempotent stream so downstream counts don’t spike on retries.
+  - Responsibilities: tokenize + normalize (casefold, Unicode normalization, max token length), clamp timestamps (too old/future → ingest time), basic throttles.
+
+- **Kafka**
+  - Justification: replayable log makes the pipeline recomputable and operationally recoverable.
+
+- **Flink Trends Job**
+  - Justification: maintains bounded state for candidate discovery and scoring, and publishes ranked lists with exactly-once semantics.
+
+- **Trends API**
+  - Justification: thin read path; serves precomputed lists from its local in-memory view and applies lightweight presentation rules (denylist, de-dup).
+
+- **Object Store**
+  - Justification: durable Flink checkpoints for recovery and safe deploys.
+
+## Deep Dive: Bounded Candidates + Simple Surge Scoring
+
+1) **Candidate discovery (bounded)**
+- Per scope (global, locale), maintain a single **Space-Saving** summary of size `M` (e.g., 20k).
+- The summary is continuously updated and **reset on a fixed cadence** (e.g., every 60s) so it represents “what’s hot recently” without keeping many per-slice summaries.
+- Every evaluation tick (e.g., 10s), emit the top `N` (e.g., 5k) as candidates.
+
+2) **Active candidate registry (bounded)**
+- Maintain a TTL’d active set per scope: candidates stay active for `T` (e.g., 30 minutes) after last promotion.
+- Enforce a per-scope cap (e.g., 50k); evict least-recently-promoted when full.
+
+3) **Surge scoring (only for the active set)**
+- For each active keyword, maintain lightweight counters for “now” and “baseline” per window view (1m, 5m, 1h) plus last-update time.
+- Compute a smoothed surge score with minimum support and hysteresis:
+  - `score = log((c_now + k) / (c_base + k)) * sqrt(c_now)`
+  - enforce `c_now >= min_support` per window, and publish with enter/exit thresholds to prevent flicker.
+- Publish top K lists per scope/window to a **Kafka compacted topic** keyed by `(scope, window)`.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Simple ops (Kafka + one Flink job + stateless-ish API) | No ad-hoc analytics; only precomputed lists |
+| Bounded state and predictable cost | Candidate stage can miss rare spikes |
+| Stable rankings | Slight delay from hysteresis/eval tick |
+| Exactly-once lists | Requires correct EOS configuration end-to-end |
+
+## Failure Modes
+
+- **Kafka lag spike**
+  - Behavior: updates get stale; API serves last known list with an “age” timestamp.
+  - Mitigation: degradation ladder (drop 1h first → increase eval tick → reduce `N` → shorten candidate TTL).
+
+- **Flink restart + replay**
+  - Behavior: without EOS, retries can inflate counts and create fake trends.
+  - Mitigation: require idempotent ingest producer + Flink checkpoints + exactly-once sink for trend-list topic.
+
+- **Object store outage (checkpoints fail)**
+  - Behavior: job cannot checkpoint; recovery guarantees degrade.
+  - Mitigation: configure Flink to fail fast on sustained checkpoint failures; API continues serving last lists until recovery.
+
+- **Hot keys / adversarial tokens**
+  - Behavior: skew/backpressure or spammy near-duplicate tokens pollute candidates.
+  - Mitigation: aggressive normalization (Unicode normalization, max length), per-event token caps, basic abuse throttles in ingest; per-scope caps prevent state blow-up.
+
+- **Candidate churn → state growth**
+  - Behavior: active set grows; checkpoints slow.
+  - Mitigation: strict caps + TTL + LRU eviction; reduce `N` under load.
+
+- **10× traffic spike + backpressure**
+  - Behavior: latency rises; trend freshness degrades.
+  - Mitigation: same degradation ladder as lag; prioritize 1m/5m lists over 1h.
+
+## What We Removed
+
+- Redis serving layer; trend lists are served from the API’s in-memory view built from a Kafka compacted topic.
+- Per-key ring buffers for exact sliding windows across the whole vocabulary; only active candidates are tracked, with hard caps and simple per-window counters.
+- Multi-job discovery/scoring split; one Flink job is the only stream compute unit.
+- External candidate registry; the active set is internal bounded Flink state.
+
+## Operational Notes
+
+- Keep evaluation tick coarse (e.g., 10s) and list size small (e.g., top 100–500 per scope/window).
+- Enforce explicit caps: locales × windows × active candidates must be bounded by configuration.
+- Expose minimal debug output per list entry (e.g., `c_now`, `c_base`, `score`, `updated_at`) for product trust and incident response.
+tokens used
+12,032
+---
+title: "Trending Topics Engine"
+category: "Social & Discovery"
+difficulty: "Hard"
+tags: ["stream-processing", "heavy-hitters", "sliding-windows", "flink", "kafka", "realtime-analytics"]
+---
+
+## Overview
+
+This system finds *surging* keywords from a firehose of posts, comments, and searches. It stays fast by separating **candidate discovery** from **surge scoring**: first keep a small, bounded set of likely trends, then compute surge scores only for that set.
+
+“Trending” is not “highest count.” It’s “recently increased vs baseline,” with rules that avoid flicker and tiny-sample noise.
+
+## Requirements
+
+### Functional Requirements
+- Identify surging keywords in near real time for 1m, 5m, and 1h views.
+- Rank by a surge score with stable, predictable behavior under bursts.
+- Accept late/out-of-order events up to a bounded lateness; drop beyond that bound.
+- Provide an API returning top trends per scope: global and locale (topic cluster is optional).
+- Avoid rank flip-flopping from small count changes.
+
+### Scale Targets
+- Ingest: 200k events/sec peak, 50k/sec sustained.
+- Active keywords/minute: 2–10M; long tail dominates.
+- Latency: p95 < 2s ingest → trend update; p99 < 5s during spikes.
+
+## Key Design Decisions
+
+- **Two-stage pipeline (candidates → scoring)**: bounded heavy-hitter discovery produces a small “active set,” and only that set gets scored.
+- **Bounded lateness policy**: accept events up to 30s late based on normalized event timestamp; later events are dropped (no retro re-ranking beyond the bound).
+- **Exactly-once counting**: idempotent Kafka producer in ingest + Flink checkpointed Kafka source + exactly-once Kafka sink for trend lists.
+- **Serving via Kafka compacted topic**: Flink publishes per-scope ranked lists to a compacted topic; the API keeps an in-memory view (no separate serving datastore).
+- **Hard caps everywhere**: explicit per-scope caps on active candidates and published list sizes to prevent state blow-ups.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U["Clients"] --> I["Ingest API"]
+  I --> K["Kafka (events + compacted trend lists)"]
+  K --> F["Flink Trends Job"]
+  F --> K
+  F --> O["Object Store (checkpoints)"]
+  K --> A["Trends API"]
+  A --> D["Feed & Search"]
+```
+
+### Components
+
+- **Ingest API**
+  - Justification: canonicalizes tokens and timestamps, blocks obvious abuse, and produces an idempotent stream so downstream counts don’t spike on retries.
+  - Responsibilities: tokenize + normalize (casefold, Unicode normalization, max token length), clamp timestamps (too old/future → ingest time), basic throttles.
+
+- **Kafka**
+  - Justification: replayable log makes the pipeline recomputable and operationally recoverable.
+
+- **Flink Trends Job**
+  - Justification: maintains bounded state for candidate discovery and scoring, and publishes ranked lists with exactly-once semantics.
+
+- **Trends API**
+  - Justification: thin read path; serves precomputed lists from its local in-memory view and applies lightweight presentation rules (denylist, de-dup).
+
+- **Object Store**
+  - Justification: durable Flink checkpoints for recovery and safe deploys.
+
+## Deep Dive: Bounded Candidates + Simple Surge Scoring
+
+1) **Candidate discovery (bounded)**
+- Per scope (global, locale), maintain a single **Space-Saving** summary of size `M` (e.g., 20k).
+- The summary is continuously updated and **reset on a fixed cadence** (e.g., every 60s) so it represents “what’s hot recently” without keeping many per-slice summaries.
+- Every evaluation tick (e.g., 10s), emit the top `N` (e.g., 5k) as candidates.
+
+2) **Active candidate registry (bounded)**
+- Maintain a TTL’d active set per scope: candidates stay active for `T` (e.g., 30 minutes) after last promotion.
+- Enforce a per-scope cap (e.g., 50k); evict least-recently-promoted when full.
+
+3) **Surge scoring (only for the active set)**
+- For each active keyword, maintain lightweight counters for “now” and “baseline” per window view (1m, 5m, 1h) plus last-update time.
+- Compute a smoothed surge score with minimum support and hysteresis:
+  - `score = log((c_now + k) / (c_base + k)) * sqrt(c_now)`
+  - enforce `c_now >= min_support` per window, and publish with enter/exit thresholds to prevent flicker.
+- Publish top K lists per scope/window to a **Kafka compacted topic** keyed by `(scope, window)`.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Simple ops (Kafka + one Flink job + stateless-ish API) | No ad-hoc analytics; only precomputed lists |
+| Bounded state and predictable cost | Candidate stage can miss rare spikes |
+| Stable rankings | Slight delay from hysteresis/eval tick |
+| Exactly-once lists | Requires correct EOS configuration end-to-end |
+
+## Failure Modes
+
+- **Kafka lag spike**
+  - Behavior: updates get stale; API serves last known list with an “age” timestamp.
+  - Mitigation: degradation ladder (drop 1h first → increase eval tick → reduce `N` → shorten candidate TTL).
+
+- **Flink restart + replay**
+  - Behavior: without EOS, retries can inflate counts and create fake trends.
+  - Mitigation: require idempotent ingest producer + Flink checkpoints + exactly-once sink for trend-list topic.
+
+- **Object store outage (checkpoints fail)**
+  - Behavior: job cannot checkpoint; recovery guarantees degrade.
+  - Mitigation: configure Flink to fail fast on sustained checkpoint failures; API continues serving last lists until recovery.
+
+- **Hot keys / adversarial tokens**
+  - Behavior: skew/backpressure or spammy near-duplicate tokens pollute candidates.
+  - Mitigation: aggressive normalization (Unicode normalization, max length), per-event token caps, basic abuse throttles in ingest; per-scope caps prevent state blow-up.
+
+- **Candidate churn → state growth**
+  - Behavior: active set grows; checkpoints slow.
+  - Mitigation: strict caps + TTL + LRU eviction; reduce `N` under load.
+
+- **10× traffic spike + backpressure**
+  - Behavior: latency rises; trend freshness degrades.
+  - Mitigation: same degradation ladder as lag; prioritize 1m/5m lists over 1h.
+
+## What We Removed
+
+- Redis serving layer; trend lists are served from the API’s in-memory view built from a Kafka compacted topic.
+- Per-key ring buffers for exact sliding windows across the whole vocabulary; only active candidates are tracked, with hard caps and simple per-window counters.
+- Multi-job discovery/scoring split; one Flink job is the only stream compute unit.
+- External candidate registry; the active set is internal bounded Flink state.
+
+## Operational Notes
+
+- Keep evaluation tick coarse (e.g., 10s) and list size small (e.g., top 100–500 per scope/window).
+- Enforce explicit caps: locales × windows × active candidates must be bounded by configuration.
+- Expose minimal debug output per list entry (e.g., `c_now`, `c_base`, `score`, `updated_at`) for product trust and incident response.
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/05-social-discovery/trending-topics-engine.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Trending Topics Engine
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/trending-topics-engine.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/trending-topics-engine.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/05-social-discovery/trending-topics-engine.md

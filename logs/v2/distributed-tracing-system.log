@@ -1,0 +1,1847 @@
+==========================================
+Generating (v2): Distributed Tracing System
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-28cf-7810-bbab-48372579e0b2
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Distributed Tracing System
+**Category**: Observability & Reliability
+
+**Problem Statement**:
+Design an OpenTelemetry backend handling sampling strategies (head-based vs tail-based), decision making, and cost controls.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+codex
+```markdown
+---
+title: "Distributed Tracing System"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["distributed-tracing", "opentelemetry", "sampling", "tail-sampling", "cost-control", "kafka", "clickhouse", "object-storage"]
+---
+
+## Overview
+
+This system is an OpenTelemetry (OTLP) backend that ingests spans, makes sampling decisions (head-based and tail-based), and stores traces for fast search and reliable retrieval—while enforcing hard cost controls per tenant and per service.
+
+The key insight: **treat sampling as a budgeted decisioning problem, not a boolean filter**. Head sampling is your cheap “front door” to keep the system upright; tail sampling is your “quality layer” that spends budget where it buys the most debugging value (errors, high latency, rare paths). The elegant design is a **hybrid pipeline**: always apply a lightweight head gate at ingest, then do tail decisions asynchronously off a span log with bounded memory and explicit late-span behavior.
+
+Everything else is boring on purpose: OTLP ingest + Kafka as the span bus, a tail-sampling cluster that consumes spans and emits keep/drop decisions, and storage split into **cheap immutable blob storage** for trace bodies and a **columnar index** for fast search.
+
+## What Makes This Hard
+
+Naive tail sampling assumes you can “wait for the full trace,” but at scale you can’t: traces are long-lived, spans arrive out of order, and some never arrive. If you buffer too long, you blow memory; if you buffer too short, you miss the very spans that would have changed the decision (errors that occur late, slow child spans, retries).
+
+The second trap is cost control. If you let teams “turn on tail sampling for everything,” the backend becomes a shared tragedy-of-the-commons: one noisy service (or one tenant) drives Kafka lag, hot partitions, and storage bills. Cost controls must be **enforced at ingest** (hard caps) and **encoded into the sampling policy** (soft budgets with predictable behavior).
+
+## Requirements
+
+### Functional Requirements
+
+- Ingest OTLP spans from collectors with multi-tenant isolation (authn/authz, per-tenant config).
+- Support **head-based sampling** (probabilistic, rate-limited, attribute-based) with deterministic decisions per trace.
+- Support **tail-based sampling** based on observed properties (error present, latency percentile, specific routes, rare attributes).
+- Ensure consistent trace decisions: either you keep a trace (most spans) or you drop it; minimize “partial traces” and label them when unavoidable.
+- Enforce cost controls:
+  - per-tenant ingestion ceilings (bytes/sec, spans/sec)
+  - per-tenant retained trace budget (kept spans/sec, kept bytes/day)
+  - per-service fairness inside a tenant
+- Provide search and retrieval:
+  - query by service, operation, time range, duration, status, tags
+  - fetch full trace by trace ID
+- Provide auditability:
+  - explain *why* a trace was kept/dropped (policy + budget + rule hit)
+
+### Scale Targets
+
+Assume a mid-large SaaS observability backend:
+
+- 5,000 tenants
+- 200,000 active services (long tail), ~20,000 “hot” services
+- Ingest: 2M spans/sec sustained, 10M spans/sec burst (deploy events, incidents)
+- Average span size: 500B–1.5KB (attributes-heavy), so 1–10 GB/min burst ingress
+- Retention:
+  - indexed search: 7 days
+  - raw trace bodies: 14–30 days (cheap storage)
+- Query: 2k QPS search, 10k QPS trace-by-id (on-call spikes)
+
+These numbers matter because they force: (1) Kafka for burst absorption, (2) bounded-memory tail sampling, (3) storage that separates “search index” from “raw payload.”
+
+## Key Design Decisions
+
+- **Hybrid sampling (head gate + tail refinement)**
+  - Chose: head-based sampling at ingest to cap worst-case load, then tail sampling on a subset stream for quality.
+  - Rejected: pure tail sampling for all traffic.
+  - Why: pure tail requires buffering the full firehose and collapses under burst; a head gate makes capacity predictable.
+
+- **Kafka as the span log (the system’s spine)**
+  - Chose: write spans to Kafka immediately; all downstream (tail sampling, storage, metrics) consumes from it.
+  - Rejected: direct ingest-to-storage with synchronous tail decisions.
+  - Why: Kafka is the shock absorber and replay mechanism; it turns “real-time ingest” into “stream processing with backpressure.”
+
+- **Two-tier storage: object store for bodies + columnar DB for search**
+  - Chose: write trace bodies as compressed chunks to S3/GCS-compatible storage; write searchable fields to ClickHouse.
+  - Rejected: putting everything into one general-purpose database.
+  - Why: tracing payload is huge and cheap to store immutably; search needs fast scans/aggregations with tight indexing.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["OTel Collectors"] --> B["OTLP Ingest"]
+  B --> C["Head Sampler"]
+  C --> D["Kafka Span Log"]
+  D --> E["Tail Sampler"]
+  E --> F["Storage Writer"]
+  F --> G["Object Store"]
+  F --> H["ClickHouse Index"]
+  I["Query API"] --> H
+  I --> G
+  J["Policy & Budgets"] --> C
+  J --> E
+```
+
+### Components
+
+- **OTLP Ingest**
+  - Terminates gRPC/HTTP OTLP, authenticates tenant, normalizes resource/service identity, and performs early rejects (bad payloads, missing tenant).
+  - Earns its place by being the single choke-point for *hard* cost controls and consistent identity.
+
+- **Head Sampler**
+  - Makes fast, deterministic decisions per trace ID using tenant policy + budgets.
+  - Primary job is not “quality,” it’s “keep the system alive”: enforce tenant ceilings and prevent burst-induced collapse.
+
+- **Kafka Span Log**
+  - Durable buffer and decoupling point; partitions by `(tenant_id, trace_id hash)` to keep per-trace ordering *mostly* local and make tail aggregation feasible.
+  - Enables replay for backfills and policy changes (within retention).
+
+- **Tail Sampler**
+  - Consumes spans, buffers by trace for a bounded window, computes features (error present, duration estimate, route, rarity), then decides keep/drop within tenant budgets.
+  - Emits a decision plus a “reason code” for explainability.
+
+- **Storage Writer**
+  - Writes kept trace bodies to object storage in time-bucketed, tenant-partitioned blocks.
+  - Writes search index rows (trace summary + selected span tags) to ClickHouse for low-latency queries.
+
+- **Object Store**
+  - Cheap, scalable retention of full trace payloads; retrieval by trace ID uses an index pointer from ClickHouse.
+
+- **ClickHouse Index**
+  - Stores trace-level summaries (start time, duration, service set, error flag) and a curated tag set for search.
+  - Also stores sampling decision metadata for audits (“kept because error+budget class=gold”).
+
+- **Policy & Budgets Service**
+  - Central policy store (Postgres-backed) and a fast distribution layer (in-memory caches) for sampling rules and per-tenant budgets.
+  - Budgeting is explicit and enforced: token buckets per tenant and per service tier.
+
+- **Query API**
+  - Provides search and trace retrieval; merges ClickHouse search with object-store fetch.
+  - Responsible for presenting partial traces clearly and surfacing decision reasons.
+
+## Deep Dive: Tail Sampling With Bounded Memory And Predictable Cost
+
+The hardest part is making tail decisions without pretending you’ll ever have “the whole trace.” The tail sampler operates like a stream processor with three constraints: **bounded memory**, **bounded decision latency**, and **bounded tenant spend**.
+
+**1) Partitioning and trace affinity**
+Spans are keyed to Kafka by `(tenant_id, trace_id hash)` so most spans for a trace land in the same partition, maximizing locality. This reduces cross-node coordination: a single tail-sampler instance can usually decide for a trace without RPC fan-out. You still accept that some traces will fragment (multi-collector paths, retries, rare key skew); you handle that with “partial trace” semantics rather than heroic distributed joins.
+
+**2) The trace buffer is a timed cache, not a database**
+For each active trace, the sampler keeps a compact state:
+- start timestamp (min observed)
+- latest timestamp (max observed)
+- flags: error_seen, force_keep_hint (from head sampling hints), sampled_parent
+- incremental duration estimate (max-min)
+- top-K attributes needed for rules (route, service, status code), capped to avoid cardinality blowups
+- a small span reservoir (optional) for writing a minimally useful partial trace if decision must be made early
+
+Eviction is controlled by a **decision window** (e.g., 5–15s) plus a **hard cap on active traces**. When under pressure, the window shrinks and the policy degrades gracefully (favor errors, then latency, then baseline).
+
+**3) Decisions are budgeted, tiered, and monotonic**
+Tail sampling is “monotonic”: once a trace is marked keep, you never flip it to drop. This avoids oscillations when late spans arrive. Budgeting is implemented with token buckets:
+- **Tenant budget**: tokens represent “kept bytes” or “kept spans.”
+- **Service fairness**: a sub-budget per service (or per service tier) prevents one hot endpoint from consuming the tenant’s entire allotment.
+- **Priority classes**: rules map traces into classes (P0 error, P1 slow, P2 baseline). Tokens are reserved by class so baseline traffic can’t starve incident traffic.
+
+Decision logic:
+- If `error_seen`: keep if tenant P0 tokens available; otherwise keep a minimal summary and emit “budget_exhausted_error” (visible to operators).
+- Else if `duration > threshold` (threshold can be dynamic, e.g., p99 per service): keep if P1 tokens available.
+- Else: keep by probabilistic baseline governed by remaining P2 tokens.
+
+**4) Late spans: explicit policy, not wishful thinking**
+Late spans are inevitable. You pick a stance:
+- If trace already kept: accept late spans for a limited “late acceptance window” (e.g., +30s) and append to the trace block if the storage format supports it; otherwise store them as a “late fragment” linked to the trace ID.
+- If trace dropped: do not resurrect it except for a narrow set of overrides (e.g., error span arrives late and tenant has an emergency override enabled). Resurrections are rare and clearly labeled because they break predictability.
+
+This makes on-call life saner: tail sampling becomes explainable and stable under load.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Predictable cost and stability under burst | Perfectly complete traces in all cases |
+| High-value trace retention (errors/slow/rare) | Simplicity of “one sampling mode” |
+| Fast search with cheap retention | Single-store elegance (everything in one DB) |
+| Tenant isolation and fairness | Some throughput overhead for budgeting/accounting |
+
+## Failure Modes
+
+- **Kafka lag spikes (downstream slow or burst ingest)**
+  - What happens: tail decisions arrive late; buffers grow; storage delay increases.
+  - Detect: consumer lag, tail sampler memory pressure, decision latency SLO.
+  - Recover: shrink tail decision window, tighten head gate, shed low-priority classes (P2), scale tail sampler consumers.
+
+- **Tail sampler overload / OOM risk**
+  - What happens: active trace set exceeds memory; eviction increases; more partial traces.
+  - Detect: active trace count, eviction rate, GC/memory high-water marks, partial-trace ratio.
+  - Recover: apply backpressure by lowering ingest keep rate, reduce attribute capture, enforce stricter per-service fairness, autoscale consumers.
+
+- **Object store or ClickHouse degradation**
+  - What happens: search or retrieval degrades; ingest should continue (Kafka absorbs).
+  - Detect: write error rates, query latency, backlog in storage-writer consumer group.
+  - Recover: keep ingesting into Kafka, throttle tail keep decisions if storage backlog grows, replay from Kafka when storage recovers.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Move tail sampling to a more explicit stream engine model (still Kafka-based) with clearer state management and autoscaling.
+  - Introduce per-tenant “burst credits” so brief incidents don’t immediately clamp sampling.
+
+- **100x scale:**
+  - Re-architect storage layout to reduce hot-spotting and retrieval fan-out (more aggressive trace chunking, tiered indexes, possibly dedicated trace store like Tempo-style block compaction).
+  - Split Kafka by tenant tier (enterprise vs long-tail) to isolate noisy neighbors at the infrastructure level.
+
+## Operational Notes
+
+- Sampling changes are production changes: roll out policies gradually and monitor kept-by-class ratios and budget burn rates.
+- Track three golden signals per tenant: ingest rate, kept rate, and budget exhaustion events; budget exhaustion should page *product owners*, not just infra.
+- “Partial trace” is a first-class state surfaced in UI and APIs; hiding it creates false confidence during incidents.
+- Keep a small always-on baseline (e.g., 0.1–1%) even when budgets are tight; it’s your canary for unknown unknowns.
+```
+tokens used
+3,513
+```markdown
+---
+title: "Distributed Tracing System"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["distributed-tracing", "opentelemetry", "sampling", "tail-sampling", "cost-control", "kafka", "clickhouse", "object-storage"]
+---
+
+## Overview
+
+This system is an OpenTelemetry (OTLP) backend that ingests spans, makes sampling decisions (head-based and tail-based), and stores traces for fast search and reliable retrieval—while enforcing hard cost controls per tenant and per service.
+
+The key insight: **treat sampling as a budgeted decisioning problem, not a boolean filter**. Head sampling is your cheap “front door” to keep the system upright; tail sampling is your “quality layer” that spends budget where it buys the most debugging value (errors, high latency, rare paths). The elegant design is a **hybrid pipeline**: always apply a lightweight head gate at ingest, then do tail decisions asynchronously off a span log with bounded memory and explicit late-span behavior.
+
+Everything else is boring on purpose: OTLP ingest + Kafka as the span bus, a tail-sampling cluster that consumes spans and emits keep/drop decisions, and storage split into **cheap immutable blob storage** for trace bodies and a **columnar index** for fast search.
+
+## What Makes This Hard
+
+Naive tail sampling assumes you can “wait for the full trace,” but at scale you can’t: traces are long-lived, spans arrive out of order, and some never arrive. If you buffer too long, you blow memory; if you buffer too short, you miss the very spans that would have changed the decision (errors that occur late, slow child spans, retries).
+
+The second trap is cost control. If you let teams “turn on tail sampling for everything,” the backend becomes a shared tragedy-of-the-commons: one noisy service (or one tenant) drives Kafka lag, hot partitions, and storage bills. Cost controls must be **enforced at ingest** (hard caps) and **encoded into the sampling policy** (soft budgets with predictable behavior).
+
+## Requirements
+
+### Functional Requirements
+
+- Ingest OTLP spans from collectors with multi-tenant isolation (authn/authz, per-tenant config).
+- Support **head-based sampling** (probabilistic, rate-limited, attribute-based) with deterministic decisions per trace.
+- Support **tail-based sampling** based on observed properties (error present, latency percentile, specific routes, rare attributes).
+- Ensure consistent trace decisions: either you keep a trace (most spans) or you drop it; minimize “partial traces” and label them when unavoidable.
+- Enforce cost controls:
+  - per-tenant ingestion ceilings (bytes/sec, spans/sec)
+  - per-tenant retained trace budget (kept spans/sec, kept bytes/day)
+  - per-service fairness inside a tenant
+- Provide search and retrieval:
+  - query by service, operation, time range, duration, status, tags
+  - fetch full trace by trace ID
+- Provide auditability:
+  - explain *why* a trace was kept/dropped (policy + budget + rule hit)
+
+### Scale Targets
+
+Assume a mid-large SaaS observability backend:
+
+- 5,000 tenants
+- 200,000 active services (long tail), ~20,000 “hot” services
+- Ingest: 2M spans/sec sustained, 10M spans/sec burst (deploy events, incidents)
+- Average span size: 500B–1.5KB (attributes-heavy), so 1–10 GB/min burst ingress
+- Retention:
+  - indexed search: 7 days
+  - raw trace bodies: 14–30 days (cheap storage)
+- Query: 2k QPS search, 10k QPS trace-by-id (on-call spikes)
+
+These numbers matter because they force: (1) Kafka for burst absorption, (2) bounded-memory tail sampling, (3) storage that separates “search index” from “raw payload.”
+
+## Key Design Decisions
+
+- **Hybrid sampling (head gate + tail refinement)**
+  - Chose: head-based sampling at ingest to cap worst-case load, then tail sampling on a subset stream for quality.
+  - Rejected: pure tail sampling for all traffic.
+  - Why: pure tail requires buffering the full firehose and collapses under burst; a head gate makes capacity predictable.
+
+- **Kafka as the span log (the system’s spine)**
+  - Chose: write spans to Kafka immediately; all downstream (tail sampling, storage, metrics) consumes from it.
+  - Rejected: direct ingest-to-storage with synchronous tail decisions.
+  - Why: Kafka is the shock absorber and replay mechanism; it turns “real-time ingest” into “stream processing with backpressure.”
+
+- **Two-tier storage: object store for bodies + columnar DB for search**
+  - Chose: write trace bodies as compressed chunks to S3/GCS-compatible storage; write searchable fields to ClickHouse.
+  - Rejected: putting everything into one general-purpose database.
+  - Why: tracing payload is huge and cheap to store immutably; search needs fast scans/aggregations with tight indexing.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["OTel Collectors"] --> B["OTLP Ingest"]
+  B --> C["Head Sampler"]
+  C --> D["Kafka Span Log"]
+  D --> E["Tail Sampler"]
+  E --> F["Storage Writer"]
+  F --> G["Object Store"]
+  F --> H["ClickHouse Index"]
+  I["Query API"] --> H
+  I --> G
+  J["Policy & Budgets"] --> C
+  J --> E
+```
+
+### Components
+
+- **OTLP Ingest**
+  - Terminates gRPC/HTTP OTLP, authenticates tenant, normalizes resource/service identity, and performs early rejects (bad payloads, missing tenant).
+  - Earns its place by being the single choke-point for *hard* cost controls and consistent identity.
+
+- **Head Sampler**
+  - Makes fast, deterministic decisions per trace ID using tenant policy + budgets.
+  - Primary job is not “quality,” it’s “keep the system alive”: enforce tenant ceilings and prevent burst-induced collapse.
+
+- **Kafka Span Log**
+  - Durable buffer and decoupling point; partitions by `(tenant_id, trace_id hash)` to keep per-trace ordering *mostly* local and make tail aggregation feasible.
+  - Enables replay for backfills and policy changes (within retention).
+
+- **Tail Sampler**
+  - Consumes spans, buffers by trace for a bounded window, computes features (error present, duration estimate, route, rarity), then decides keep/drop within tenant budgets.
+  - Emits a decision plus a “reason code” for explainability.
+
+- **Storage Writer**
+  - Writes kept trace bodies to object storage in time-bucketed, tenant-partitioned blocks.
+  - Writes search index rows (trace summary + selected span tags) to ClickHouse for low-latency queries.
+
+- **Object Store**
+  - Cheap, scalable retention of full trace payloads; retrieval by trace ID uses an index pointer from ClickHouse.
+
+- **ClickHouse Index**
+  - Stores trace-level summaries (start time, duration, service set, error flag) and a curated tag set for search.
+  - Also stores sampling decision metadata for audits (“kept because error+budget class=gold”).
+
+- **Policy & Budgets Service**
+  - Central policy store (Postgres-backed) and a fast distribution layer (in-memory caches) for sampling rules and per-tenant budgets.
+  - Budgeting is explicit and enforced: token buckets per tenant and per service tier.
+
+- **Query API**
+  - Provides search and trace retrieval; merges ClickHouse search with object-store fetch.
+  - Responsible for presenting partial traces clearly and surfacing decision reasons.
+
+## Deep Dive: Tail Sampling With Bounded Memory And Predictable Cost
+
+The hardest part is making tail decisions without pretending you’ll ever have “the whole trace.” The tail sampler operates like a stream processor with three constraints: **bounded memory**, **bounded decision latency**, and **bounded tenant spend**.
+
+**1) Partitioning and trace affinity**
+Spans are keyed to Kafka by `(tenant_id, trace_id hash)` so most spans for a trace land in the same partition, maximizing locality. This reduces cross-node coordination: a single tail-sampler instance can usually decide for a trace without RPC fan-out. You still accept that some traces will fragment (multi-collector paths, retries, rare key skew); you handle that with “partial trace” semantics rather than heroic distributed joins.
+
+**2) The trace buffer is a timed cache, not a database**
+For each active trace, the sampler keeps a compact state:
+- start timestamp (min observed)
+- latest timestamp (max observed)
+- flags: error_seen, force_keep_hint (from head sampling hints), sampled_parent
+- incremental duration estimate (max-min)
+- top-K attributes needed for rules (route, service, status code), capped to avoid cardinality blowups
+- a small span reservoir (optional) for writing a minimally useful partial trace if decision must be made early
+
+Eviction is controlled by a **decision window** (e.g., 5–15s) plus a **hard cap on active traces**. When under pressure, the window shrinks and the policy degrades gracefully (favor errors, then latency, then baseline).
+
+**3) Decisions are budgeted, tiered, and monotonic**
+Tail sampling is “monotonic”: once a trace is marked keep, you never flip it to drop. This avoids oscillations when late spans arrive. Budgeting is implemented with token buckets:
+- **Tenant budget**: tokens represent “kept bytes” or “kept spans.”
+- **Service fairness**: a sub-budget per service (or per service tier) prevents one hot endpoint from consuming the tenant’s entire allotment.
+- **Priority classes**: rules map traces into classes (P0 error, P1 slow, P2 baseline). Tokens are reserved by class so baseline traffic can’t starve incident traffic.
+
+Decision logic:
+- If `error_seen`: keep if tenant P0 tokens available; otherwise keep a minimal summary and emit “budget_exhausted_error” (visible to operators).
+- Else if `duration > threshold` (threshold can be dynamic, e.g., p99 per service): keep if P1 tokens available.
+- Else: keep by probabilistic baseline governed by remaining P2 tokens.
+
+**4) Late spans: explicit policy, not wishful thinking**
+Late spans are inevitable. You pick a stance:
+- If trace already kept: accept late spans for a limited “late acceptance window” (e.g., +30s) and append to the trace block if the storage format supports it; otherwise store them as a “late fragment” linked to the trace ID.
+- If trace dropped: do not resurrect it except for a narrow set of overrides (e.g., error span arrives late and tenant has an emergency override enabled). Resurrections are rare and clearly labeled because they break predictability.
+
+This makes on-call life saner: tail sampling becomes explainable and stable under load.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Predictable cost and stability under burst | Perfectly complete traces in all cases |
+| High-value trace retention (errors/slow/rare) | Simplicity of “one sampling mode” |
+| Fast search with cheap retention | Single-store elegance (everything in one DB) |
+| Tenant isolation and fairness | Some throughput overhead for budgeting/accounting |
+
+## Failure Modes
+
+- **Kafka lag spikes (downstream slow or burst ingest)**
+  - What happens: tail decisions arrive late; buffers grow; storage delay increases.
+  - Detect: consumer lag, tail sampler memory pressure, decision latency SLO.
+  - Recover: shrink tail decision window, tighten head gate, shed low-priority classes (P2), scale tail sampler consumers.
+
+- **Tail sampler overload / OOM risk**
+  - What happens: active trace set exceeds memory; eviction increases; more partial traces.
+  - Detect: active trace count, eviction rate, GC/memory high-water marks, partial-trace ratio.
+  - Recover: apply backpressure by lowering ingest keep rate, reduce attribute capture, enforce stricter per-service fairness, autoscale consumers.
+
+- **Object store or ClickHouse degradation**
+  - What happens: search or retrieval degrades; ingest should continue (Kafka absorbs).
+  - Detect: write error rates, query latency, backlog in storage-writer consumer group.
+  - Recover: keep ingesting into Kafka, throttle tail keep decisions if storage backlog grows, replay from Kafka when storage recovers.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Move tail sampling to a more explicit stream engine model (still Kafka-based) with clearer state management and autoscaling.
+  - Introduce per-tenant “burst credits” so brief incidents don’t immediately clamp sampling.
+
+- **100x scale:**
+  - Re-architect storage layout to reduce hot-spotting and retrieval fan-out (more aggressive trace chunking, tiered indexes, possibly dedicated trace store like Tempo-style block compaction).
+  - Split Kafka by tenant tier (enterprise vs long-tail) to isolate noisy neighbors at the infrastructure level.
+
+## Operational Notes
+
+- Sampling changes are production changes: roll out policies gradually and monitor kept-by-class ratios and budget burn rates.
+- Track three golden signals per tenant: ingest rate, kept rate, and budget exhaustion events; budget exhaustion should page *product owners*, not just infra.
+- “Partial trace” is a first-class state surfaced in UI and APIs; hiding it creates false confidence during incidents.
+- Keep a small always-on baseline (e.g., 0.1–1%) even when budgets are tight; it’s your canary for unknown unknowns.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/distributed-tracing-system.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-495e-7683-9460-0f081c0debb7
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Distributed Tracing System"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["distributed-tracing", "opentelemetry", "sampling", "tail-sampling", "cost-control", "kafka", "clickhouse", "object-storage"]
+---
+
+## Overview
+
+This system is an OpenTelemetry (OTLP) backend that ingests spans, makes sampling decisions (head-based and tail-based), and stores traces for fast search and reliable retrieval—while enforcing hard cost controls per tenant and per service.
+
+The key insight: **treat sampling as a budgeted decisioning problem, not a boolean filter**. Head sampling is your cheap “front door” to keep the system upright; tail sampling is your “quality layer” that spends budget where it buys the most debugging value (errors, high latency, rare paths). The elegant design is a **hybrid pipeline**: always apply a lightweight head gate at ingest, then do tail decisions asynchronously off a span log with bounded memory and explicit late-span behavior.
+
+Everything else is boring on purpose: OTLP ingest + Kafka as the span bus, a tail-sampling cluster that consumes spans and emits keep/drop decisions, and storage split into **cheap immutable blob storage** for trace bodies and a **columnar index** for fast search.
+
+## What Makes This Hard
+
+Naive tail sampling assumes you can “wait for the full trace,” but at scale you can’t: traces are long-lived, spans arrive out of order, and some never arrive. If you buffer too long, you blow memory; if you buffer too short, you miss the very spans that would have changed the decision (errors that occur late, slow child spans, retries).
+
+The second trap is cost control. If you let teams “turn on tail sampling for everything,” the backend becomes a shared tragedy-of-the-commons: one noisy service (or one tenant) drives Kafka lag, hot partitions, and storage bills. Cost controls must be **enforced at ingest** (hard caps) and **encoded into the sampling policy** (soft budgets with predictable behavior).
+
+## Requirements
+
+### Functional Requirements
+
+- Ingest OTLP spans from collectors with multi-tenant isolation (authn/authz, per-tenant config).
+- Support **head-based sampling** (probabilistic, rate-limited, attribute-based) with deterministic decisions per trace.
+- Support **tail-based sampling** based on observed properties (error present, latency percentile, specific routes, rare attributes).
+- Ensure consistent trace decisions: either you keep a trace (most spans) or you drop it; minimize “partial traces” and label them when unavoidable.
+- Enforce cost controls:
+  - per-tenant ingestion ceilings (bytes/sec, spans/sec)
+  - per-tenant retained trace budget (kept spans/sec, kept bytes/day)
+  - per-service fairness inside a tenant
+- Provide search and retrieval:
+  - query by service, operation, time range, duration, status, tags
+  - fetch full trace by trace ID
+- Provide auditability:
+  - explain *why* a trace was kept/dropped (policy + budget + rule hit)
+
+### Scale Targets
+
+Assume a mid-large SaaS observability backend:
+
+- 5,000 tenants
+- 200,000 active services (long tail), ~20,000 “hot” services
+- Ingest: 2M spans/sec sustained, 10M spans/sec burst (deploy events, incidents)
+- Average span size: 500B–1.5KB (attributes-heavy), so 1–10 GB/min burst ingress
+- Retention:
+  - indexed search: 7 days
+  - raw trace bodies: 14–30 days (cheap storage)
+- Query: 2k QPS search, 10k QPS trace-by-id (on-call spikes)
+
+These numbers matter because they force: (1) Kafka for burst absorption, (2) bounded-memory tail sampling, (3) storage that separates “search index” from “raw payload.”
+
+## Key Design Decisions
+
+- **Hybrid sampling (head gate + tail refinement)**
+  - Chose: head-based sampling at ingest to cap worst-case load, then tail sampling on a subset stream for quality.
+  - Rejected: pure tail sampling for all traffic.
+  - Why: pure tail requires buffering the full firehose and collapses under burst; a head gate makes capacity predictable.
+
+- **Kafka as the span log (the system’s spine)**
+  - Chose: write spans to Kafka immediately; all downstream (tail sampling, storage, metrics) consumes from it.
+  - Rejected: direct ingest-to-storage with synchronous tail decisions.
+  - Why: Kafka is the shock absorber and replay mechanism; it turns “real-time ingest” into “stream processing with backpressure.”
+
+- **Two-tier storage: object store for bodies + columnar DB for search**
+  - Chose: write trace bodies as compressed chunks to S3/GCS-compatible storage; write searchable fields to ClickHouse.
+  - Rejected: putting everything into one general-purpose database.
+  - Why: tracing payload is huge and cheap to store immutably; search needs fast scans/aggregations with tight indexing.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["OTel Collectors"] --> B["OTLP Ingest"]
+  B --> C["Head Sampler"]
+  C --> D["Kafka Span Log"]
+  D --> E["Tail Sampler"]
+  E --> F["Storage Writer"]
+  F --> G["Object Store"]
+  F --> H["ClickHouse Index"]
+  I["Query API"] --> H
+  I --> G
+  J["Policy & Budgets"] --> C
+  J --> E
+```
+
+### Components
+
+- **OTLP Ingest**
+  - Terminates gRPC/HTTP OTLP, authenticates tenant, normalizes resource/service identity, and performs early rejects (bad payloads, missing tenant).
+  - Earns its place by being the single choke-point for *hard* cost controls and consistent identity.
+
+- **Head Sampler**
+  - Makes fast, deterministic decisions per trace ID using tenant policy + budgets.
+  - Primary job is not “quality,” it’s “keep the system alive”: enforce tenant ceilings and prevent burst-induced collapse.
+
+- **Kafka Span Log**
+  - Durable buffer and decoupling point; partitions by `(tenant_id, trace_id hash)` to keep per-trace ordering *mostly* local and make tail aggregation feasible.
+  - Enables replay for backfills and policy changes (within retention).
+
+- **Tail Sampler**
+  - Consumes spans, buffers by trace for a bounded window, computes features (error present, duration estimate, route, rarity), then decides keep/drop within tenant budgets.
+  - Emits a decision plus a “reason code” for explainability.
+
+- **Storage Writer**
+  - Writes kept trace bodies to object storage in time-bucketed, tenant-partitioned blocks.
+  - Writes search index rows (trace summary + selected span tags) to ClickHouse for low-latency queries.
+
+- **Object Store**
+  - Cheap, scalable retention of full trace payloads; retrieval by trace ID uses an index pointer from ClickHouse.
+
+- **ClickHouse Index**
+  - Stores trace-level summaries (start time, duration, service set, error flag) and a curated tag set for search.
+  - Also stores sampling decision metadata for audits (“kept because error+budget class=gold”).
+
+- **Policy & Budgets Service**
+  - Central policy store (Postgres-backed) and a fast distribution layer (in-memory caches) for sampling rules and per-tenant budgets.
+  - Budgeting is explicit and enforced: token buckets per tenant and per service tier.
+
+- **Query API**
+  - Provides search and trace retrieval; merges ClickHouse search with object-store fetch.
+  - Responsible for presenting partial traces clearly and surfacing decision reasons.
+
+## Deep Dive: Tail Sampling With Bounded Memory And Predictable Cost
+
+The hardest part is making tail decisions without pretending you’ll ever have “the whole trace.” The tail sampler operates like a stream processor with three constraints: **bounded memory**, **bounded decision latency**, and **bounded tenant spend**.
+
+**1) Partitioning and trace affinity**
+Spans are keyed to Kafka by `(tenant_id, trace_id hash)` so most spans for a trace land in the same partition, maximizing locality. This reduces cross-node coordination: a single tail-sampler instance can usually decide for a trace without RPC fan-out. You still accept that some traces will fragment (multi-collector paths, retries, rare key skew); you handle that with “partial trace” semantics rather than heroic distributed joins.
+
+**2) The trace buffer is a timed cache, not a database**
+For each active trace, the sampler keeps a compact state:
+- start timestamp (min observed)
+- latest timestamp (max observed)
+- flags: error_seen, force_keep_hint (from head sampling hints), sampled_parent
+- incremental duration estimate (max-min)
+- top-K attributes needed for rules (route, service, status code), capped to avoid cardinality blowups
+- a small span reservoir (optional) for writing a minimally useful partial trace if decision must be made early
+
+Eviction is controlled by a **decision window** (e.g., 5–15s) plus a **hard cap on active traces**. When under pressure, the window shrinks and the policy degrades gracefully (favor errors, then latency, then baseline).
+
+**3) Decisions are budgeted, tiered, and monotonic**
+Tail sampling is “monotonic”: once a trace is marked keep, you never flip it to drop. This avoids oscillations when late spans arrive. Budgeting is implemented with token buckets:
+- **Tenant budget**: tokens represent “kept bytes” or “kept spans.”
+- **Service fairness**: a sub-budget per service (or per service tier) prevents one hot endpoint from consuming the tenant’s entire allotment.
+- **Priority classes**: rules map traces into classes (P0 error, P1 slow, P2 baseline). Tokens are reserved by class so baseline traffic can’t starve incident traffic.
+
+Decision logic:
+- If `error_seen`: keep if tenant P0 tokens available; otherwise keep a minimal summary and emit “budget_exhausted_error” (visible to operators).
+- Else if `duration > threshold` (threshold can be dynamic, e.g., p99 per service): keep if P1 tokens available.
+- Else: keep by probabilistic baseline governed by remaining P2 tokens.
+
+**4) Late spans: explicit policy, not wishful thinking**
+Late spans are inevitable. You pick a stance:
+- If trace already kept: accept late spans for a limited “late acceptance window” (e.g., +30s) and append to the trace block if the storage format supports it; otherwise store them as a “late fragment” linked to the trace ID.
+- If trace dropped: do not resurrect it except for a narrow set of overrides (e.g., error span arrives late and tenant has an emergency override enabled). Resurrections are rare and clearly labeled because they break predictability.
+
+This makes on-call life saner: tail sampling becomes explainable and stable under load.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Predictable cost and stability under burst | Perfectly complete traces in all cases |
+| High-value trace retention (errors/slow/rare) | Simplicity of “one sampling mode” |
+| Fast search with cheap retention | Single-store elegance (everything in one DB) |
+| Tenant isolation and fairness | Some throughput overhead for budgeting/accounting |
+
+## Failure Modes
+
+- **Kafka lag spikes (downstream slow or burst ingest)**
+  - What happens: tail decisions arrive late; buffers grow; storage delay increases.
+  - Detect: consumer lag, tail sampler memory pressure, decision latency SLO.
+  - Recover: shrink tail decision window, tighten head gate, shed low-priority classes (P2), scale tail sampler consumers.
+
+- **Tail sampler overload / OOM risk**
+  - What happens: active trace set exceeds memory; eviction increases; more partial traces.
+  - Detect: active trace count, eviction rate, GC/memory high-water marks, partial-trace ratio.
+  - Recover: apply backpressure by lowering ingest keep rate, reduce attribute capture, enforce stricter per-service fairness, autoscale consumers.
+
+- **Object store or ClickHouse degradation**
+  - What happens: search or retrieval degrades; ingest should continue (Kafka absorbs).
+  - Detect: write error rates, query latency, backlog in storage-writer consumer group.
+  - Recover: keep ingesting into Kafka, throttle tail keep decisions if storage backlog grows, replay from Kafka when storage recovers.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Move tail sampling to a more explicit stream engine model (still Kafka-based) with clearer state management and autoscaling.
+  - Introduce per-tenant “burst credits” so brief incidents don’t immediately clamp sampling.
+
+- **100x scale:**
+  - Re-architect storage layout to reduce hot-spotting and retrieval fan-out (more aggressive trace chunking, tiered indexes, possibly dedicated trace store like Tempo-style block compaction).
+  - Split Kafka by tenant tier (enterprise vs long-tail) to isolate noisy neighbors at the infrastructure level.
+
+## Operational Notes
+
+- Sampling changes are production changes: roll out policies gradually and monitor kept-by-class ratios and budget burn rates.
+- Track three golden signals per tenant: ingest rate, kept rate, and budget exhaustion events; budget exhaustion should page *product owners*, not just infra.
+- “Partial trace” is a first-class state surfaced in UI and APIs; hiding it creates false confidence during incidents.
+- Keep a small always-on baseline (e.g., 0.1–1%) even when budgets are tight; it’s your canary for unknown unknowns.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+codex
+## Elegance Check
+
+### The Core Insight
+Sampling as a *budgeted, tiered decisioning system* (with monotonic “keep” and explicit late-span semantics) is the genuinely clever part; it turns tracing from “best effort” into an SLO- and cost-governed product.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| OTLP Ingest + Head Gate | Hard caps and fast protection against burst/abuse; the only place that can reliably keep the system upright. |
+| Kafka Span Log | Burst absorption + replay + decoupling; makes downstream failures survivable without dropping ingress. |
+| Tail Sampler | The only component that can convert “observed trace value” (error/latency/rarity) into budget-aware retention. |
+| Object Store | Cheapest durable retention for full-fidelity payloads; avoids bloating the search store. |
+| ClickHouse | Efficient search/aggregation over trace summaries/tags at your stated QPS/retention. |
+| Query API | “Partial trace” truth-telling + joining index to blobs; product correctness depends on it. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom ingest service | Run OTel Collector (or a thin gateway) with authn/z + per-tenant routing + a minimal custom “budget head gate” extension | Less custom surface area; you may still need custom auth/budget enforcement. |
+| Custom tail sampling engine | Start with OTel Collector `tailsamplingprocessor` semantics (plus your budget tiers), or adopt a Tempo-style model | Faster time-to-correctness; might constrain your “reason codes + fairness” model unless extended. |
+| Policy & Budgets “service” | Postgres as source of truth + CDN/edge config distribution + *push* via Kafka topic (policies as events) | Fewer moving parts than RPC+cache; slower to react than direct reads, but more debuggable/replayable. |
+| Token buckets everywhere | Redis for distributed token buckets (per-tenant/per-service) | Simpler correctness story across a sampler fleet; adds Redis dependency and failure mode. |
+| “Append late spans to blocks if supported” | Always write late spans as fragments (linked by trace_id) | Removes tricky object mutation; retrieval has to merge fragments (slightly higher read amp). |
+| ClickHouse as both search + audit | Split: ClickHouse for search + object-store audit log (decision events) | Reduces CH retention pressure; audit queries become slower unless indexed. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Policy DB down for 5 minutes**
+   - Design’s answer: partially addressed (“Postgres-backed + caches”), but cache staleness + rollout safety aren’t explicit.
+   - Recommendation: Strengthen — define “safe fallback policy” (per-tenant default caps), max staleness, and a kill-switch to freeze policy at last-known-good.
+
+2. **Kafka partially unavailable (ISR shrink / leader flaps)**
+   - Design’s answer: not addressed (assumes Kafka is the spine).
+   - Recommendation: Strengthen — specify ingest behavior (buffer/429/drop), producer acks, idempotent producers, and tenant-level admission control when Kafka is unhealthy.
+
+3. **Network partition between Tail Sampler and Budget source**
+   - Design’s answer: not addressed.
+   - Recommendation: Strengthen — budgets must degrade predictably (e.g., “fail-closed to P0-only with tiny baseline” or “fail-open within hard head caps”); document which and why.
+
+4. **One component slow but not failing (ClickHouse write latency climbs)**
+   - Design’s answer: addressed (“Kafka absorbs”, “throttle keep decisions if backlog grows”) but the control loop is underspecified.
+   - Recommendation: Strengthen — define concrete backpressure signals (writer lag, CH insert latency) and a deterministic throttle mapping by priority class.
+
+5. **Bad config rollout (policy turns P0 to 100% keep)**
+   - Design’s answer: indirectly addressed (“sampling changes are production changes”), but lacks guardrails.
+   - Recommendation: Must strengthen — add policy validation + staged rollout + hard global/tenant ceilings that policies cannot override, plus “blast radius” limits per change.
+
+## Recommendations
+
+### Must Fix
+- Define the *end-to-end decision contract*: how storage-writer learns “keep/drop”, how you prevent “kept” traces from being lost to races (decision arrives after spans aged out), and how you label/serve partials consistently.
+- Make budgets operationally crisp: what is the unit (bytes vs spans), where accounting happens, how you handle estimation error (pre-decision vs post-compression actuals), and how you prevent double-spend across retries/replays.
+- Specify Kafka correctness knobs (partition key, ordering assumptions, producer acks/idempotency, consumer semantics) and the failure behavior when those assumptions break.
+- Pin down late-span policy into something implementable and cheap (fragments vs mutation), and ensure Query API semantics are stable for users.
+
+### Should Consider
+- Treat “Policy & Budgets” as an evented config stream (Kafka topic) with versioning + last-known-good, so every decision can cite `policy_version` deterministically.
+- Use Redis (or an embedded local bucket with periodic reconciliation) if you need fleet-wide budget correctness; otherwise explicitly accept “approximate fairness” to reduce dependencies.
+- Reduce custom attribute handling risk: define a strict, curated tag allowlist per tenant/service (with caps) to avoid cardinality explosions in both tail state and ClickHouse.
+
+### Nice to Have
+- Add an explicit “emergency mode” playbook: when storage is degraded, force P0-only + minimal summaries, and keep a tiny baseline canary.
+- Provide per-tenant “debug override” workflows with time-boxing and audit trails (who increased budgets, for how long).
+- Consider prebuilt ecosystem leverage: Grafana Tempo-style block compaction patterns for object store layout and retrieval fanout control.
+
+## What’s Working Well
+- The design is honest about tail sampling realities (out-of-order, missing spans) and makes late-span handling a first-class policy instead of hand-waving.
+- The budget-tier model (P0/P1/P2 with reservations) is a product-quality mechanism that aligns “debug value” with spend and prevents baseline traffic from starving incident signals.
+- Separating immutable payload (object store) from search (ClickHouse) is the right cost/perf split for your retention + QPS targets.
+- Calling out “partial traces” explicitly (and surfacing them) is operationally mature; it prevents misleading on-call experiences.
+tokens used
+5,476
+## Elegance Check
+
+### The Core Insight
+Sampling as a *budgeted, tiered decisioning system* (with monotonic “keep” and explicit late-span semantics) is the genuinely clever part; it turns tracing from “best effort” into an SLO- and cost-governed product.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| OTLP Ingest + Head Gate | Hard caps and fast protection against burst/abuse; the only place that can reliably keep the system upright. |
+| Kafka Span Log | Burst absorption + replay + decoupling; makes downstream failures survivable without dropping ingress. |
+| Tail Sampler | The only component that can convert “observed trace value” (error/latency/rarity) into budget-aware retention. |
+| Object Store | Cheapest durable retention for full-fidelity payloads; avoids bloating the search store. |
+| ClickHouse | Efficient search/aggregation over trace summaries/tags at your stated QPS/retention. |
+| Query API | “Partial trace” truth-telling + joining index to blobs; product correctness depends on it. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom ingest service | Run OTel Collector (or a thin gateway) with authn/z + per-tenant routing + a minimal custom “budget head gate” extension | Less custom surface area; you may still need custom auth/budget enforcement. |
+| Custom tail sampling engine | Start with OTel Collector `tailsamplingprocessor` semantics (plus your budget tiers), or adopt a Tempo-style model | Faster time-to-correctness; might constrain your “reason codes + fairness” model unless extended. |
+| Policy & Budgets “service” | Postgres as source of truth + CDN/edge config distribution + *push* via Kafka topic (policies as events) | Fewer moving parts than RPC+cache; slower to react than direct reads, but more debuggable/replayable. |
+| Token buckets everywhere | Redis for distributed token buckets (per-tenant/per-service) | Simpler correctness story across a sampler fleet; adds Redis dependency and failure mode. |
+| “Append late spans to blocks if supported” | Always write late spans as fragments (linked by trace_id) | Removes tricky object mutation; retrieval has to merge fragments (slightly higher read amp). |
+| ClickHouse as both search + audit | Split: ClickHouse for search + object-store audit log (decision events) | Reduces CH retention pressure; audit queries become slower unless indexed. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Policy DB down for 5 minutes**
+   - Design’s answer: partially addressed (“Postgres-backed + caches”), but cache staleness + rollout safety aren’t explicit.
+   - Recommendation: Strengthen — define “safe fallback policy” (per-tenant default caps), max staleness, and a kill-switch to freeze policy at last-known-good.
+
+2. **Kafka partially unavailable (ISR shrink / leader flaps)**
+   - Design’s answer: not addressed (assumes Kafka is the spine).
+   - Recommendation: Strengthen — specify ingest behavior (buffer/429/drop), producer acks, idempotent producers, and tenant-level admission control when Kafka is unhealthy.
+
+3. **Network partition between Tail Sampler and Budget source**
+   - Design’s answer: not addressed.
+   - Recommendation: Strengthen — budgets must degrade predictably (e.g., “fail-closed to P0-only with tiny baseline” or “fail-open within hard head caps”); document which and why.
+
+4. **One component slow but not failing (ClickHouse write latency climbs)**
+   - Design’s answer: addressed (“Kafka absorbs”, “throttle keep decisions if backlog grows”) but the control loop is underspecified.
+   - Recommendation: Strengthen — define concrete backpressure signals (writer lag, CH insert latency) and a deterministic throttle mapping by priority class.
+
+5. **Bad config rollout (policy turns P0 to 100% keep)**
+   - Design’s answer: indirectly addressed (“sampling changes are production changes”), but lacks guardrails.
+   - Recommendation: Must strengthen — add policy validation + staged rollout + hard global/tenant ceilings that policies cannot override, plus “blast radius” limits per change.
+
+## Recommendations
+
+### Must Fix
+- Define the *end-to-end decision contract*: how storage-writer learns “keep/drop”, how you prevent “kept” traces from being lost to races (decision arrives after spans aged out), and how you label/serve partials consistently.
+- Make budgets operationally crisp: what is the unit (bytes vs spans), where accounting happens, how you handle estimation error (pre-decision vs post-compression actuals), and how you prevent double-spend across retries/replays.
+- Specify Kafka correctness knobs (partition key, ordering assumptions, producer acks/idempotency, consumer semantics) and the failure behavior when those assumptions break.
+- Pin down late-span policy into something implementable and cheap (fragments vs mutation), and ensure Query API semantics are stable for users.
+
+### Should Consider
+- Treat “Policy & Budgets” as an evented config stream (Kafka topic) with versioning + last-known-good, so every decision can cite `policy_version` deterministically.
+- Use Redis (or an embedded local bucket with periodic reconciliation) if you need fleet-wide budget correctness; otherwise explicitly accept “approximate fairness” to reduce dependencies.
+- Reduce custom attribute handling risk: define a strict, curated tag allowlist per tenant/service (with caps) to avoid cardinality explosions in both tail state and ClickHouse.
+
+### Nice to Have
+- Add an explicit “emergency mode” playbook: when storage is degraded, force P0-only + minimal summaries, and keep a tiny baseline canary.
+- Provide per-tenant “debug override” workflows with time-boxing and audit trails (who increased budgets, for how long).
+- Consider prebuilt ecosystem leverage: Grafana Tempo-style block compaction patterns for object store layout and retrieval fanout control.
+
+## What’s Working Well
+- The design is honest about tail sampling realities (out-of-order, missing spans) and makes late-span handling a first-class policy instead of hand-waving.
+- The budget-tier model (P0/P1/P2 with reservations) is a product-quality mechanism that aligns “debug value” with spend and prevents baseline traffic from starving incident signals.
+- Separating immutable payload (object store) from search (ClickHouse) is the right cost/perf split for your retention + QPS targets.
+- Calling out “partial traces” explicitly (and surfacing them) is operationally mature; it prevents misleading on-call experiences.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/distributed-tracing-system.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af9-4c0d-7140-8f50-479172659e03
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Distributed Tracing System"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["distributed-tracing", "opentelemetry", "sampling", "tail-sampling", "cost-control", "kafka", "clickhouse", "object-storage"]
+---
+
+## Overview
+
+This system is an OpenTelemetry (OTLP) backend that ingests spans, makes sampling decisions (head-based and tail-based), and stores traces for fast search and reliable retrieval—while enforcing hard cost controls per tenant and per service.
+
+The key insight: **treat sampling as a budgeted decisioning problem, not a boolean filter**. Head sampling is your cheap “front door” to keep the system upright; tail sampling is your “quality layer” that spends budget where it buys the most debugging value (errors, high latency, rare paths). The elegant design is a **hybrid pipeline**: always apply a lightweight head gate at ingest, then do tail decisions asynchronously off a span log with bounded memory and explicit late-span behavior.
+
+Everything else is boring on purpose: OTLP ingest + Kafka as the span bus, a tail-sampling cluster that consumes spans and emits keep/drop decisions, and storage split into **cheap immutable blob storage** for trace bodies and a **columnar index** for fast search.
+
+## What Makes This Hard
+
+Naive tail sampling assumes you can “wait for the full trace,” but at scale you can’t: traces are long-lived, spans arrive out of order, and some never arrive. If you buffer too long, you blow memory; if you buffer too short, you miss the very spans that would have changed the decision (errors that occur late, slow child spans, retries).
+
+The second trap is cost control. If you let teams “turn on tail sampling for everything,” the backend becomes a shared tragedy-of-the-commons: one noisy service (or one tenant) drives Kafka lag, hot partitions, and storage bills. Cost controls must be **enforced at ingest** (hard caps) and **encoded into the sampling policy** (soft budgets with predictable behavior).
+
+## Requirements
+
+### Functional Requirements
+
+- Ingest OTLP spans from collectors with multi-tenant isolation (authn/authz, per-tenant config).
+- Support **head-based sampling** (probabilistic, rate-limited, attribute-based) with deterministic decisions per trace.
+- Support **tail-based sampling** based on observed properties (error present, latency percentile, specific routes, rare attributes).
+- Ensure consistent trace decisions: either you keep a trace (most spans) or you drop it; minimize “partial traces” and label them when unavoidable.
+- Enforce cost controls:
+  - per-tenant ingestion ceilings (bytes/sec, spans/sec)
+  - per-tenant retained trace budget (kept spans/sec, kept bytes/day)
+  - per-service fairness inside a tenant
+- Provide search and retrieval:
+  - query by service, operation, time range, duration, status, tags
+  - fetch full trace by trace ID
+- Provide auditability:
+  - explain *why* a trace was kept/dropped (policy + budget + rule hit)
+
+### Scale Targets
+
+Assume a mid-large SaaS observability backend:
+
+- 5,000 tenants
+- 200,000 active services (long tail), ~20,000 “hot” services
+- Ingest: 2M spans/sec sustained, 10M spans/sec burst (deploy events, incidents)
+- Average span size: 500B–1.5KB (attributes-heavy), so 1–10 GB/min burst ingress
+- Retention:
+  - indexed search: 7 days
+  - raw trace bodies: 14–30 days (cheap storage)
+- Query: 2k QPS search, 10k QPS trace-by-id (on-call spikes)
+
+These numbers matter because they force: (1) Kafka for burst absorption, (2) bounded-memory tail sampling, (3) storage that separates “search index” from “raw payload.”
+
+## Key Design Decisions
+
+- **Hybrid sampling (head gate + tail refinement)**
+  - Chose: head-based sampling at ingest to cap worst-case load, then tail sampling on a subset stream for quality.
+  - Rejected: pure tail sampling for all traffic.
+  - Why: pure tail requires buffering the full firehose and collapses under burst; a head gate makes capacity predictable.
+
+- **Kafka as the span log (the system’s spine)**
+  - Chose: write spans to Kafka immediately; all downstream (tail sampling, storage, metrics) consumes from it.
+  - Rejected: direct ingest-to-storage with synchronous tail decisions.
+  - Why: Kafka is the shock absorber and replay mechanism; it turns “real-time ingest” into “stream processing with backpressure.”
+
+- **Two-tier storage: object store for bodies + columnar DB for search**
+  - Chose: write trace bodies as compressed chunks to S3/GCS-compatible storage; write searchable fields to ClickHouse.
+  - Rejected: putting everything into one general-purpose database.
+  - Why: tracing payload is huge and cheap to store immutably; search needs fast scans/aggregations with tight indexing.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["OTel Collectors"] --> B["OTLP Ingest"]
+  B --> C["Head Sampler"]
+  C --> D["Kafka Span Log"]
+  D --> E["Tail Sampler"]
+  E --> F["Storage Writer"]
+  F --> G["Object Store"]
+  F --> H["ClickHouse Index"]
+  I["Query API"] --> H
+  I --> G
+  J["Policy & Budgets"] --> C
+  J --> E
+```
+
+### Components
+
+- **OTLP Ingest**
+  - Terminates gRPC/HTTP OTLP, authenticates tenant, normalizes resource/service identity, and performs early rejects (bad payloads, missing tenant).
+  - Earns its place by being the single choke-point for *hard* cost controls and consistent identity.
+
+- **Head Sampler**
+  - Makes fast, deterministic decisions per trace ID using tenant policy + budgets.
+  - Primary job is not “quality,” it’s “keep the system alive”: enforce tenant ceilings and prevent burst-induced collapse.
+
+- **Kafka Span Log**
+  - Durable buffer and decoupling point; partitions by `(tenant_id, trace_id hash)` to keep per-trace ordering *mostly* local and make tail aggregation feasible.
+  - Enables replay for backfills and policy changes (within retention).
+
+- **Tail Sampler**
+  - Consumes spans, buffers by trace for a bounded window, computes features (error present, duration estimate, route, rarity), then decides keep/drop within tenant budgets.
+  - Emits a decision plus a “reason code” for explainability.
+
+- **Storage Writer**
+  - Writes kept trace bodies to object storage in time-bucketed, tenant-partitioned blocks.
+  - Writes search index rows (trace summary + selected span tags) to ClickHouse for low-latency queries.
+
+- **Object Store**
+  - Cheap, scalable retention of full trace payloads; retrieval by trace ID uses an index pointer from ClickHouse.
+
+- **ClickHouse Index**
+  - Stores trace-level summaries (start time, duration, service set, error flag) and a curated tag set for search.
+  - Also stores sampling decision metadata for audits (“kept because error+budget class=gold”).
+
+- **Policy & Budgets Service**
+  - Central policy store (Postgres-backed) and a fast distribution layer (in-memory caches) for sampling rules and per-tenant budgets.
+  - Budgeting is explicit and enforced: token buckets per tenant and per service tier.
+
+- **Query API**
+  - Provides search and trace retrieval; merges ClickHouse search with object-store fetch.
+  - Responsible for presenting partial traces clearly and surfacing decision reasons.
+
+## Deep Dive: Tail Sampling With Bounded Memory And Predictable Cost
+
+The hardest part is making tail decisions without pretending you’ll ever have “the whole trace.” The tail sampler operates like a stream processor with three constraints: **bounded memory**, **bounded decision latency**, and **bounded tenant spend**.
+
+**1) Partitioning and trace affinity**
+Spans are keyed to Kafka by `(tenant_id, trace_id hash)` so most spans for a trace land in the same partition, maximizing locality. This reduces cross-node coordination: a single tail-sampler instance can usually decide for a trace without RPC fan-out. You still accept that some traces will fragment (multi-collector paths, retries, rare key skew); you handle that with “partial trace” semantics rather than heroic distributed joins.
+
+**2) The trace buffer is a timed cache, not a database**
+For each active trace, the sampler keeps a compact state:
+- start timestamp (min observed)
+- latest timestamp (max observed)
+- flags: error_seen, force_keep_hint (from head sampling hints), sampled_parent
+- incremental duration estimate (max-min)
+- top-K attributes needed for rules (route, service, status code), capped to avoid cardinality blowups
+- a small span reservoir (optional) for writing a minimally useful partial trace if decision must be made early
+
+Eviction is controlled by a **decision window** (e.g., 5–15s) plus a **hard cap on active traces**. When under pressure, the window shrinks and the policy degrades gracefully (favor errors, then latency, then baseline).
+
+**3) Decisions are budgeted, tiered, and monotonic**
+Tail sampling is “monotonic”: once a trace is marked keep, you never flip it to drop. This avoids oscillations when late spans arrive. Budgeting is implemented with token buckets:
+- **Tenant budget**: tokens represent “kept bytes” or “kept spans.”
+- **Service fairness**: a sub-budget per service (or per service tier) prevents one hot endpoint from consuming the tenant’s entire allotment.
+- **Priority classes**: rules map traces into classes (P0 error, P1 slow, P2 baseline). Tokens are reserved by class so baseline traffic can’t starve incident traffic.
+
+Decision logic:
+- If `error_seen`: keep if tenant P0 tokens available; otherwise keep a minimal summary and emit “budget_exhausted_error” (visible to operators).
+- Else if `duration > threshold` (threshold can be dynamic, e.g., p99 per service): keep if P1 tokens available.
+- Else: keep by probabilistic baseline governed by remaining P2 tokens.
+
+**4) Late spans: explicit policy, not wishful thinking**
+Late spans are inevitable. You pick a stance:
+- If trace already kept: accept late spans for a limited “late acceptance window” (e.g., +30s) and append to the trace block if the storage format supports it; otherwise store them as a “late fragment” linked to the trace ID.
+- If trace dropped: do not resurrect it except for a narrow set of overrides (e.g., error span arrives late and tenant has an emergency override enabled). Resurrections are rare and clearly labeled because they break predictability.
+
+This makes on-call life saner: tail sampling becomes explainable and stable under load.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Predictable cost and stability under burst | Perfectly complete traces in all cases |
+| High-value trace retention (errors/slow/rare) | Simplicity of “one sampling mode” |
+| Fast search with cheap retention | Single-store elegance (everything in one DB) |
+| Tenant isolation and fairness | Some throughput overhead for budgeting/accounting |
+
+## Failure Modes
+
+- **Kafka lag spikes (downstream slow or burst ingest)**
+  - What happens: tail decisions arrive late; buffers grow; storage delay increases.
+  - Detect: consumer lag, tail sampler memory pressure, decision latency SLO.
+  - Recover: shrink tail decision window, tighten head gate, shed low-priority classes (P2), scale tail sampler consumers.
+
+- **Tail sampler overload / OOM risk**
+  - What happens: active trace set exceeds memory; eviction increases; more partial traces.
+  - Detect: active trace count, eviction rate, GC/memory high-water marks, partial-trace ratio.
+  - Recover: apply backpressure by lowering ingest keep rate, reduce attribute capture, enforce stricter per-service fairness, autoscale consumers.
+
+- **Object store or ClickHouse degradation**
+  - What happens: search or retrieval degrades; ingest should continue (Kafka absorbs).
+  - Detect: write error rates, query latency, backlog in storage-writer consumer group.
+  - Recover: keep ingesting into Kafka, throttle tail keep decisions if storage backlog grows, replay from Kafka when storage recovers.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Move tail sampling to a more explicit stream engine model (still Kafka-based) with clearer state management and autoscaling.
+  - Introduce per-tenant “burst credits” so brief incidents don’t immediately clamp sampling.
+
+- **100x scale:**
+  - Re-architect storage layout to reduce hot-spotting and retrieval fan-out (more aggressive trace chunking, tiered indexes, possibly dedicated trace store like Tempo-style block compaction).
+  - Split Kafka by tenant tier (enterprise vs long-tail) to isolate noisy neighbors at the infrastructure level.
+
+## Operational Notes
+
+- Sampling changes are production changes: roll out policies gradually and monitor kept-by-class ratios and budget burn rates.
+- Track three golden signals per tenant: ingest rate, kept rate, and budget exhaustion events; budget exhaustion should page *product owners*, not just infra.
+- “Partial trace” is a first-class state surfaced in UI and APIs; hiding it creates false confidence during incidents.
+- Keep a small always-on baseline (e.g., 0.1–1%) even when budgets are tight; it’s your canary for unknown unknowns.
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Sampling as a *budgeted, tiered decisioning system* (with monotonic “keep” and explicit late-span semantics) is the genuinely clever part; it turns tracing from “best effort” into an SLO- and cost-governed product.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| OTLP Ingest + Head Gate | Hard caps and fast protection against burst/abuse; the only place that can reliably keep the system upright. |
+| Kafka Span Log | Burst absorption + replay + decoupling; makes downstream failures survivable without dropping ingress. |
+| Tail Sampler | The only component that can convert “observed trace value” (error/latency/rarity) into budget-aware retention. |
+| Object Store | Cheapest durable retention for full-fidelity payloads; avoids bloating the search store. |
+| ClickHouse | Efficient search/aggregation over trace summaries/tags at your stated QPS/retention. |
+| Query API | “Partial trace” truth-telling + joining index to blobs; product correctness depends on it. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom ingest service | Run OTel Collector (or a thin gateway) with authn/z + per-tenant routing + a minimal custom “budget head gate” extension | Less custom surface area; you may still need custom auth/budget enforcement. |
+| Custom tail sampling engine | Start with OTel Collector `tailsamplingprocessor` semantics (plus your budget tiers), or adopt a Tempo-style model | Faster time-to-correctness; might constrain your “reason codes + fairness” model unless extended. |
+| Policy & Budgets “service” | Postgres as source of truth + CDN/edge config distribution + *push* via Kafka topic (policies as events) | Fewer moving parts than RPC+cache; slower to react than direct reads, but more debuggable/replayable. |
+| Token buckets everywhere | Redis for distributed token buckets (per-tenant/per-service) | Simpler correctness story across a sampler fleet; adds Redis dependency and failure mode. |
+| “Append late spans to blocks if supported” | Always write late spans as fragments (linked by trace_id) | Removes tricky object mutation; retrieval has to merge fragments (slightly higher read amp). |
+| ClickHouse as both search + audit | Split: ClickHouse for search + object-store audit log (decision events) | Reduces CH retention pressure; audit queries become slower unless indexed. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Policy DB down for 5 minutes**
+   - Design’s answer: partially addressed (“Postgres-backed + caches”), but cache staleness + rollout safety aren’t explicit.
+   - Recommendation: Strengthen — define “safe fallback policy” (per-tenant default caps), max staleness, and a kill-switch to freeze policy at last-known-good.
+
+2. **Kafka partially unavailable (ISR shrink / leader flaps)**
+   - Design’s answer: not addressed (assumes Kafka is the spine).
+   - Recommendation: Strengthen — specify ingest behavior (buffer/429/drop), producer acks, idempotent producers, and tenant-level admission control when Kafka is unhealthy.
+
+3. **Network partition between Tail Sampler and Budget source**
+   - Design’s answer: not addressed.
+   - Recommendation: Strengthen — budgets must degrade predictably (e.g., “fail-closed to P0-only with tiny baseline” or “fail-open within hard head caps”); document which and why.
+
+4. **One component slow but not failing (ClickHouse write latency climbs)**
+   - Design’s answer: addressed (“Kafka absorbs”, “throttle keep decisions if backlog grows”) but the control loop is underspecified.
+   - Recommendation: Strengthen — define concrete backpressure signals (writer lag, CH insert latency) and a deterministic throttle mapping by priority class.
+
+5. **Bad config rollout (policy turns P0 to 100% keep)**
+   - Design’s answer: indirectly addressed (“sampling changes are production changes”), but lacks guardrails.
+   - Recommendation: Must strengthen — add policy validation + staged rollout + hard global/tenant ceilings that policies cannot override, plus “blast radius” limits per change.
+
+## Recommendations
+
+### Must Fix
+- Define the *end-to-end decision contract*: how storage-writer learns “keep/drop”, how you prevent “kept” traces from being lost to races (decision arrives after spans aged out), and how you label/serve partials consistently.
+- Make budgets operationally crisp: what is the unit (bytes vs spans), where accounting happens, how you handle estimation error (pre-decision vs post-compression actuals), and how you prevent double-spend across retries/replays.
+- Specify Kafka correctness knobs (partition key, ordering assumptions, producer acks/idempotency, consumer semantics) and the failure behavior when those assumptions break.
+- Pin down late-span policy into something implementable and cheap (fragments vs mutation), and ensure Query API semantics are stable for users.
+
+### Should Consider
+- Treat “Policy & Budgets” as an evented config stream (Kafka topic) with versioning + last-known-good, so every decision can cite `policy_version` deterministically.
+- Use Redis (or an embedded local bucket with periodic reconciliation) if you need fleet-wide budget correctness; otherwise explicitly accept “approximate fairness” to reduce dependencies.
+- Reduce custom attribute handling risk: define a strict, curated tag allowlist per tenant/service (with caps) to avoid cardinality explosions in both tail state and ClickHouse.
+
+### Nice to Have
+- Add an explicit “emergency mode” playbook: when storage is degraded, force P0-only + minimal summaries, and keep a tiny baseline canary.
+- Provide per-tenant “debug override” workflows with time-boxing and audit trails (who increased budgets, for how long).
+- Consider prebuilt ecosystem leverage: Grafana Tempo-style block compaction patterns for object store layout and retrieval fanout control.
+
+## What’s Working Well
+- The design is honest about tail sampling realities (out-of-order, missing spans) and makes late-span handling a first-class policy instead of hand-waving.
+- The budget-tier model (P0/P1/P2 with reservations) is a product-quality mechanism that aligns “debug value” with spend and prevents baseline traffic from starving incident signals.
+- Separating immutable payload (object store) from search (ClickHouse) is the right cost/perf split for your retention + QPS targets.
+- Calling out “partial traces” explicitly (and surfacing them) is operationally mature; it prevents misleading on-call experiences.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+
+
+thinking
+**Evaluating components and structure**
+
+I'm pondering the rules around adding components while trying to replace "Policy & Budgets Service" with "Postgres." Maybe I can simplify it by saying "Policy table in Postgres + cached in each sampler via Kafka topic." I think I could merge the Tail Sampler and Storage Writer into one consumer group to streamline the process. I’m also considering removing the head sampler and merging it into the ingest collector. It seems like I need to condense without adding sections, just focusing on existing headings.
+thinking
+**Clarifying content adjustment rules**
+
+I can adjust content within existing sections while ensuring to include the required output components like minimal architecture, justifications, things we've removed, and trade-offs. But wait, there’s a bit of conflict here: the prompt implies that we need to include those items, yet it says not to add sections, just to cut or condense. I think I can embed these within the existing sections instead. For example, I could describe minimal architecture under "Architecture" and list removals in "Key Design Decisions." I also need to address failure scenarios, keeping relevant details concise.
+thinking
+**Simplifying decision contract requirements**
+
+I need to focus on the requirements for the decision contract and budgeting, aiming for clarity without being overly detailed. I should provide a manageable implementable contract, meaning the Ingest/head gate writes spans to Kafka with something like a "head_keep_hint" and a policy version or budget snapshot. The tail sampler will consume and emit decision events to a Kafka "decisions" topic. I could simplify the storage writer by merging it with the tail sampler into one service called "Sampler+Writer." This service would handle decision-making and writing traces, while also buffering until I'm ready to emit trace blocks to the object store and index rows.
+thinking
+**Addressing dropped traces and policies**
+
+For dropped traces, I'm thinking that it writes just the decision row to ClickHouse for audit purposes, which would eliminate the need for a separate storage writer. The Query API will still be available. Regarding policy distribution, I want to keep Postgres as the source of truth and push policy snapshots through a compacted Kafka topic. Samplers will need to retain the last-known-good status as a safe fallback, especially during policy database issues or network partitions. For budgets, using spans per second rather than bytes simplifies things, and I can apply token buckets per tenant and service tier, ensuring to enforce hard caps at ingestion. I'll consume tokens based on estimated size during decisions and reconcile later.
+thinking
+**Simplifying trace handling and documentation**
+
+I want to keep the process simple: tokens are "kept spans," incremented by the number of spans seen at decision time, with late spans accepted up to a certain window. I need to ensure there's no race condition since the tail sampler handles both decisions and buffering. Regarding documentation, I plan to provide an overview of the OTLP backend with budgeted sampling, outline key design decisions, and include a simplified architecture. I'll also condense sections like "Deep Dive" and "Operational Notes," ensuring I mention what was removed without adding sections. It's important to maintain clarity while avoiding unnecessary complexity!
+thinking
+**Refining token management and design requirements**
+
+I think we need to simplify token management using buckets per tenant and class while ensuring the tail sampler maintains approximate counters per partition. The head gate will enforce ingestion ceilings but should apply deterministic sampling. I want error spans to be captured, even if they arrive late. The head gate shouldn't silently drop spans; instead, it should return rate limiting responses like 429, which can help document decisions. For auditing, I propose writing head decisions into ClickHouse and retaining metrics for stored traces and budget exhaustion. We can condense the requirements but must ensure we meet the core functionality.
+thinking
+
+codex
+```markdown
+---
+title: "Distributed Tracing System"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["distributed-tracing", "opentelemetry", "sampling", "tail-sampling", "cost-control", "kafka", "clickhouse", "object-storage"]
+---
+
+## Overview
+
+This is an OTLP backend that ingests spans, makes **budgeted sampling decisions**, and stores traces for **fast search** and **reliable retrieval** with hard cost controls per tenant.
+
+Sampling is treated as a tiered spending problem: enforce hard caps at ingest, then spend limited retention budget on traces that are most useful (errors, slow paths), with explicit partial/late-span behavior.
+
+## What Makes This Hard
+
+Traces are incomplete by default: spans arrive out of order, arrive late, or never arrive. Tail sampling must work with bounded memory and bounded decision time while remaining predictable under burst.
+
+Cost control is the other half of correctness: without enforced ceilings and budgets, one noisy tenant/service turns everyone’s tracing into downtime and surprise bills.
+
+## Requirements
+
+### Functional Requirements
+
+- Ingest OTLP spans from collectors with multi-tenant isolation (authn/authz, per-tenant config).
+- Support **head-based controls** at ingest (hard ceilings + optional deterministic admission sampling per trace ID).
+- Support **tail-based sampling** using observed properties (error present, latency, specific routes/attributes).
+- Ensure consistent trace decisions: keep or drop, label partials when unavoidable.
+- Enforce cost controls:
+  - per-tenant ingestion ceilings (bytes/sec, spans/sec)
+  - per-tenant retained trace budget (kept spans/sec or kept bytes/day)
+  - per-service fairness inside a tenant (approximate is acceptable)
+- Provide search and retrieval:
+  - query by service, operation, time range, duration, status, tags
+  - fetch full trace by trace ID (with fragments if late)
+- Provide auditability:
+  - explain why a trace was kept/dropped (policy version + rule + budget result)
+
+### Scale Targets
+
+- 5,000 tenants
+- Ingest: 2M spans/sec sustained, 10M spans/sec burst
+- Retention:
+  - indexed search: 7 days
+  - raw trace bodies: 14–30 days
+- Query: 2k QPS search, 10k QPS trace-by-id (spiky)
+
+These numbers force burst absorption, bounded tail state, and a storage split between search and payload.
+
+## Key Design Decisions
+
+- **OTel Collector gateway for ingest + head gate**
+  - Terminates OTLP, authenticates tenants, normalizes identity, enforces hard ceilings, and optionally applies deterministic admission sampling by trace ID.
+  - Keeps the “front door” small: one gateway binary plus a minimal custom processor for auth/budgets.
+
+- **Kafka as the spine (spans + policies)**
+  - Spans go to Kafka immediately for backpressure and replay.
+  - Policies are distributed as a versioned, compacted Kafka topic so every sampler can run on last-known-good without a live RPC dependency.
+
+- **Tail sampler writes storage directly**
+  - One consumer service makes tail decisions and writes:
+    - trace payload blobs to object storage
+    - trace/search rows + decision/audit rows to ClickHouse
+  - This removes a separate “storage writer” hop and avoids decision-vs-write races.
+
+**What We Removed**
+- Separate `OTLP Ingest`, `Head Sampler`, `Storage Writer`, and `Policy & Budgets Service` as standalone services (collapsed into gateway + Kafka policy stream + tail sampler).
+- Redis/distributed token buckets (budgets are enforced with hard ingest ceilings plus approximate per-sampler tail budgets).
+- Mutable “append late spans into existing blobs” behavior (late spans are always written as fragments).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["OTel Collectors"] --> B["OTel Gateway (Auth + Head Gate)"]
+  B --> C["Kafka (Spans)"]
+  D["Policy DB (Postgres)"] --> E["Kafka (Policy Topic)"]
+  E --> B
+  E --> F["Tail Sampler + Writer"]
+  C --> F
+  F --> G["Object Store (Trace Blobs + Fragments)"]
+  F --> H["ClickHouse (Search + Decisions)"]
+  I["Query API"] --> H
+  I --> G
+```
+
+### Components
+
+- **OTel Gateway (Auth + Head Gate)**
+  - Justification: the only reliable choke-point for tenant identity and **hard** ceilings under burst/Kafka trouble.
+  - Behavior: enforce per-tenant bytes/sec + spans/sec; optionally admit only a deterministic fraction per trace ID when ceilings are tight; emit policy version used.
+
+- **Kafka**
+  - Justification: burst absorption and replay; the system stays up when storage is slow.
+  - Correctness knobs: idempotent producers, `acks=all`, bounded producer buffering; partition key `(tenant_id, trace_id_hash)`.
+
+- **Tail Sampler + Writer**
+  - Justification: converts “observed value” into budgeted retention and produces the stored truth.
+  - Behavior: bounded per-trace state with a fixed decision window; monotonic keep; writes blobs + indexes + decision/audit records.
+
+- **Object Store**
+  - Justification: cheapest durable retention for large payloads.
+  - Layout: immutable blobs per `(tenant_id, trace_id, chunk_id)`; late spans are separate fragment blobs linked by trace ID.
+
+- **ClickHouse**
+  - Justification: fast search/aggregation at stated QPS.
+  - Stores: trace summaries/tags for search, plus decision/audit rows keyed by `(tenant_id, trace_id, policy_version)`.
+
+- **Query API**
+  - Justification: stable user semantics: search from ClickHouse, fetch payload from object store, merge fragments, and surface partial/late labels + decision reasons.
+
+## Deep Dive: Tail Sampling With Bounded Memory And Predictable Cost
+
+**Decision contract**
+- A trace is “kept” only if the tail sampler writes:
+  1) a trace blob (possibly partial) and
+  2) a ClickHouse decision row referencing blob keys.
+- This keeps “kept” from becoming a best-effort promise that can be lost to races.
+
+**Budgets (simple and enforceable)**
+- Unit: `kept_spans` (optionally also `kept_bytes` as an estimate).
+- Accounting happens in the tail sampler at decision time; estimation error is accepted and bounded by ingest ceilings.
+- Fairness: approximate per-service (or per service tier) within a tenant, enforced locally per sampler instance; hard tenant ceilings at the gateway prevent worst-case abuse.
+
+**Rules (tiered, monotonic)**
+- P0: error seen → keep if P0 budget available; else record `budget_exhausted_p0`.
+- P1: slow trace (duration estimate above threshold) → keep if P1 budget available.
+- P2: baseline → keep with probability bounded by remaining P2 budget.
+
+**Late spans (always fragments)**
+- If trace is kept: accept late spans for a fixed late window and write fragment blobs + fragment rows.
+- If trace is dropped: no resurrection by default; the only override is an explicit tenant “debug override” policy version (time-boxed).
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Small team operability | Perfect completeness of traces |
+| Predictable cost under burst | Fleet-wide exact budget fairness |
+| Clear failure behavior | “One-store” elegance |
+| Fast search + cheap retention | More moving parts than pure ClickHouse |
+
+## Failure Modes
+
+- **Policy DB down (minutes)**
+  - Behavior: samplers continue on last-known-good from Kafka policy topic; gateway uses a safe fallback cap if policy is stale.
+  - Guardrail: policies are versioned; decisions always record `policy_version`.
+
+- **Kafka partially unavailable (ISR shrink / leader flaps)**
+  - Behavior: gateway fails admission deterministically per tenant (429) once bounded buffers fill; no unbounded in-memory spooling.
+  - Settings: `acks=all`, idempotent producer; if Kafka can’t confirm, treat as not admitted.
+
+- **Network partition: sampler can’t fetch policy**
+  - Behavior: keep running on last-known-good; if staleness exceeds a max, degrade to P0-only + tiny baseline within hard ingest caps.
+
+- **ClickHouse writes slow (not failing)**
+  - Behavior: tail sampler throttles keep decisions by priority (drop P2, then P1) based on ClickHouse insert latency and internal backlog; Kafka continues absorbing spans.
+  - Recovery: replay from Kafka when steady.
+
+- **Bad policy rollout (e.g., P0 becomes 100% keep)**
+  - Behavior: hard ceilings at the gateway are non-overridable; tail budgets have fixed upper bounds.
+  - Guardrails: policy validation on write + staged activation by tenant (policy versioning).
+
+## What I'd Do Differently At...
+
+- **10x scale:** split Kafka by tenant tier and make tail sampler state management more explicit (still Kafka-first).
+- **100x scale:** adopt a block-compaction trace layout in object storage to reduce retrieval fanout.
+
+## Operational Notes
+
+- Treat policy changes as production changes: versioned, reversible, and observable via kept-by-class and budget-exhaustion rates.
+- Surface partial/late as first-class in APIs/UI; never pretend a trace is complete.
+- Keep a tiny always-on baseline even in degradation modes; it’s your canary.
+```
+tokens used
+11,118
+```markdown
+---
+title: "Distributed Tracing System"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["distributed-tracing", "opentelemetry", "sampling", "tail-sampling", "cost-control", "kafka", "clickhouse", "object-storage"]
+---
+
+## Overview
+
+This is an OTLP backend that ingests spans, makes **budgeted sampling decisions**, and stores traces for **fast search** and **reliable retrieval** with hard cost controls per tenant.
+
+Sampling is treated as a tiered spending problem: enforce hard caps at ingest, then spend limited retention budget on traces that are most useful (errors, slow paths), with explicit partial/late-span behavior.
+
+## What Makes This Hard
+
+Traces are incomplete by default: spans arrive out of order, arrive late, or never arrive. Tail sampling must work with bounded memory and bounded decision time while remaining predictable under burst.
+
+Cost control is the other half of correctness: without enforced ceilings and budgets, one noisy tenant/service turns everyone’s tracing into downtime and surprise bills.
+
+## Requirements
+
+### Functional Requirements
+
+- Ingest OTLP spans from collectors with multi-tenant isolation (authn/authz, per-tenant config).
+- Support **head-based controls** at ingest (hard ceilings + optional deterministic admission sampling per trace ID).
+- Support **tail-based sampling** using observed properties (error present, latency, specific routes/attributes).
+- Ensure consistent trace decisions: keep or drop, label partials when unavoidable.
+- Enforce cost controls:
+  - per-tenant ingestion ceilings (bytes/sec, spans/sec)
+  - per-tenant retained trace budget (kept spans/sec or kept bytes/day)
+  - per-service fairness inside a tenant (approximate is acceptable)
+- Provide search and retrieval:
+  - query by service, operation, time range, duration, status, tags
+  - fetch full trace by trace ID (with fragments if late)
+- Provide auditability:
+  - explain why a trace was kept/dropped (policy version + rule + budget result)
+
+### Scale Targets
+
+- 5,000 tenants
+- Ingest: 2M spans/sec sustained, 10M spans/sec burst
+- Retention:
+  - indexed search: 7 days
+  - raw trace bodies: 14–30 days
+- Query: 2k QPS search, 10k QPS trace-by-id (spiky)
+
+These numbers force burst absorption, bounded tail state, and a storage split between search and payload.
+
+## Key Design Decisions
+
+- **OTel Collector gateway for ingest + head gate**
+  - Terminates OTLP, authenticates tenants, normalizes identity, enforces hard ceilings, and optionally applies deterministic admission sampling by trace ID.
+  - Keeps the “front door” small: one gateway binary plus a minimal custom processor for auth/budgets.
+
+- **Kafka as the spine (spans + policies)**
+  - Spans go to Kafka immediately for backpressure and replay.
+  - Policies are distributed as a versioned, compacted Kafka topic so every sampler can run on last-known-good without a live RPC dependency.
+
+- **Tail sampler writes storage directly**
+  - One consumer service makes tail decisions and writes:
+    - trace payload blobs to object storage
+    - trace/search rows + decision/audit rows to ClickHouse
+  - This removes a separate “storage writer” hop and avoids decision-vs-write races.
+
+**What We Removed**
+- Separate `OTLP Ingest`, `Head Sampler`, `Storage Writer`, and `Policy & Budgets Service` as standalone services (collapsed into gateway + Kafka policy stream + tail sampler).
+- Redis/distributed token buckets (budgets are enforced with hard ingest ceilings plus approximate per-sampler tail budgets).
+- Mutable “append late spans into existing blobs” behavior (late spans are always written as fragments).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["OTel Collectors"] --> B["OTel Gateway (Auth + Head Gate)"]
+  B --> C["Kafka (Spans)"]
+  D["Policy DB (Postgres)"] --> E["Kafka (Policy Topic)"]
+  E --> B
+  E --> F["Tail Sampler + Writer"]
+  C --> F
+  F --> G["Object Store (Trace Blobs + Fragments)"]
+  F --> H["ClickHouse (Search + Decisions)"]
+  I["Query API"] --> H
+  I --> G
+```
+
+### Components
+
+- **OTel Gateway (Auth + Head Gate)**
+  - Justification: the only reliable choke-point for tenant identity and **hard** ceilings under burst/Kafka trouble.
+  - Behavior: enforce per-tenant bytes/sec + spans/sec; optionally admit only a deterministic fraction per trace ID when ceilings are tight; emit policy version used.
+
+- **Kafka**
+  - Justification: burst absorption and replay; the system stays up when storage is slow.
+  - Correctness knobs: idempotent producers, `acks=all`, bounded producer buffering; partition key `(tenant_id, trace_id_hash)`.
+
+- **Tail Sampler + Writer**
+  - Justification: converts “observed value” into budgeted retention and produces the stored truth.
+  - Behavior: bounded per-trace state with a fixed decision window; monotonic keep; writes blobs + indexes + decision/audit records.
+
+- **Object Store**
+  - Justification: cheapest durable retention for large payloads.
+  - Layout: immutable blobs per `(tenant_id, trace_id, chunk_id)`; late spans are separate fragment blobs linked by trace ID.
+
+- **ClickHouse**
+  - Justification: fast search/aggregation at stated QPS.
+  - Stores: trace summaries/tags for search, plus decision/audit rows keyed by `(tenant_id, trace_id, policy_version)`.
+
+- **Query API**
+  - Justification: stable user semantics: search from ClickHouse, fetch payload from object store, merge fragments, and surface partial/late labels + decision reasons.
+
+## Deep Dive: Tail Sampling With Bounded Memory And Predictable Cost
+
+**Decision contract**
+- A trace is “kept” only if the tail sampler writes:
+  1) a trace blob (possibly partial) and
+  2) a ClickHouse decision row referencing blob keys.
+- This keeps “kept” from becoming a best-effort promise that can be lost to races.
+
+**Budgets (simple and enforceable)**
+- Unit: `kept_spans` (optionally also `kept_bytes` as an estimate).
+- Accounting happens in the tail sampler at decision time; estimation error is accepted and bounded by ingest ceilings.
+- Fairness: approximate per-service (or per service tier) within a tenant, enforced locally per sampler instance; hard tenant ceilings at the gateway prevent worst-case abuse.
+
+**Rules (tiered, monotonic)**
+- P0: error seen → keep if P0 budget available; else record `budget_exhausted_p0`.
+- P1: slow trace (duration estimate above threshold) → keep if P1 budget available.
+- P2: baseline → keep with probability bounded by remaining P2 budget.
+
+**Late spans (always fragments)**
+- If trace is kept: accept late spans for a fixed late window and write fragment blobs + fragment rows.
+- If trace is dropped: no resurrection by default; the only override is an explicit tenant “debug override” policy version (time-boxed).
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Small team operability | Perfect completeness of traces |
+| Predictable cost under burst | Fleet-wide exact budget fairness |
+| Clear failure behavior | “One-store” elegance |
+| Fast search + cheap retention | More moving parts than pure ClickHouse |
+
+## Failure Modes
+
+- **Policy DB down (minutes)**
+  - Behavior: samplers continue on last-known-good from Kafka policy topic; gateway uses a safe fallback cap if policy is stale.
+  - Guardrail: policies are versioned; decisions always record `policy_version`.
+
+- **Kafka partially unavailable (ISR shrink / leader flaps)**
+  - Behavior: gateway fails admission deterministically per tenant (429) once bounded buffers fill; no unbounded in-memory spooling.
+  - Settings: `acks=all`, idempotent producer; if Kafka can’t confirm, treat as not admitted.
+
+- **Network partition: sampler can’t fetch policy**
+  - Behavior: keep running on last-known-good; if staleness exceeds a max, degrade to P0-only + tiny baseline within hard ingest caps.
+
+- **ClickHouse writes slow (not failing)**
+  - Behavior: tail sampler throttles keep decisions by priority (drop P2, then P1) based on ClickHouse insert latency and internal backlog; Kafka continues absorbing spans.
+  - Recovery: replay from Kafka when steady.
+
+- **Bad policy rollout (e.g., P0 becomes 100% keep)**
+  - Behavior: hard ceilings at the gateway are non-overridable; tail budgets have fixed upper bounds.
+  - Guardrails: policy validation on write + staged activation by tenant (policy versioning).
+
+## What I'd Do Differently At...
+
+- **10x scale:** split Kafka by tenant tier and make tail sampler state management more explicit (still Kafka-first).
+- **100x scale:** adopt a block-compaction trace layout in object storage to reduce retrieval fanout.
+
+## Operational Notes
+
+- Treat policy changes as production changes: versioned, reversible, and observable via kept-by-class and budget-exhaustion rates.
+- Surface partial/late as first-class in APIs/UI; never pretend a trace is complete.
+- Keep a tiny always-on baseline even in degradation modes; it’s your canary.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/03-observability-reliability/distributed-tracing-system.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Distributed Tracing System
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/distributed-tracing-system.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/distributed-tracing-system.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/03-observability-reliability/distributed-tracing-system.md

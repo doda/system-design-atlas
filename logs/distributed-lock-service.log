@@ -1,0 +1,4078 @@
+==========================================
+Generating: Distributed Lock Service
+==========================================
+
+[Pass 1/3] Generating initial draft...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b29d3-810b-7072-b159-525736918e97
+--------
+user
+# System Design Solution Generator
+
+You are an expert Principal Engineer creating comprehensive system design solutions for the "System Design Atlas" - an educational resource for engineers preparing for system design interviews and architectural reviews.
+
+## Your Task
+
+Generate a complete, production-grade system design document for the given problem. Your solution should demonstrate deep technical expertise and real-world experience.
+
+## Output Format
+
+Your response must be a complete Markdown document with the following structure:
+
+```markdown
+---
+title: "{Problem Title}"
+category: "{Category Name}"
+difficulty: "{Easy|Medium|Hard}"
+tags: ["{tag1}", "{tag2}", "{tag3}"]
+---
+
+## Overview
+
+A 2-3 paragraph executive summary of the problem space, why it's challenging, and the key insight behind your solution.
+
+## Requirements
+
+### Functional Requirements
+- List 5-8 core features the system must support
+- Be specific about user-facing behaviors
+
+### Non-Functional Requirements
+- **Scale**: Expected QPS, data volume, user counts
+- **Latency**: P50, P99 targets for critical paths
+- **Availability**: Target uptime (e.g., 99.99%)
+- **Consistency**: Strong vs eventual, and where each applies
+- **Durability**: Data loss tolerance
+
+### Constraints & Assumptions
+- State key assumptions about the environment
+- Note any constraints (budget, team size, compliance)
+
+## High-Level Architecture
+
+Provide a Mermaid diagram showing the main components and data flow:
+
+```mermaid
+graph TB
+    subgraph "Client Layer"
+        ...
+    end
+    subgraph "Service Layer"
+        ...
+    end
+    subgraph "Data Layer"
+        ...
+    end
+```
+
+Follow with 2-3 paragraphs explaining the architecture and why this structure was chosen.
+
+## Component Deep-Dive
+
+For each major component (3-5 components):
+
+### {Component Name}
+
+**Responsibility**: What this component does
+
+**Key Design Decisions**:
+- Decision 1 and rationale
+- Decision 2 and rationale
+
+**Technology Choice**: Recommended tech and why
+
+**Scaling Strategy**: How this component scales
+
+## Data Model
+
+### Storage Schema
+
+Show the primary data structures (tables, documents, etc.) with field definitions.
+
+### Data Flow
+
+Explain how data moves through the system for key operations.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Service
+    participant DB
+    ...
+```
+
+## API Design
+
+Define the key APIs (REST, gRPC, or GraphQL) with:
+- Endpoint/method signatures
+- Request/response schemas
+- Error handling approach
+- Idempotency considerations
+
+## Scaling & Performance
+
+### Bottleneck Analysis
+- Identify the primary bottlenecks
+- Explain mitigation strategies
+
+### Horizontal Scaling
+- How each layer scales out
+- Sharding/partitioning strategy if applicable
+
+### Caching Strategy
+- What to cache, where, and for how long
+- Cache invalidation approach
+
+## Trade-offs & Alternatives
+
+### Key Trade-offs Made
+For each major decision, explain:
+- What was chosen
+- What was sacrificed
+- Why this trade-off makes sense
+
+### Alternative Approaches
+- Briefly describe 2-3 alternative architectures
+- Explain why they were not chosen
+
+## Failure Modes & Mitigations
+
+### Failure Scenarios
+For each critical failure mode:
+- **Scenario**: What can fail
+- **Impact**: Blast radius
+- **Detection**: How we know it failed
+- **Mitigation**: How the system recovers
+
+### Disaster Recovery
+- RTO/RPO targets
+- Backup strategy
+- Failover procedures
+
+## Operational Considerations
+
+### Monitoring & Alerting
+- Key metrics to track
+- Alert thresholds
+
+### Deployment Strategy
+- How to roll out changes safely
+- Rollback procedures
+
+## References & Further Reading
+
+- Link to relevant papers, blog posts, or documentation
+- Note any real-world implementations to study
+```
+
+## Guidelines
+
+1. **Be Specific**: Use concrete numbers for scale (e.g., "100M DAU", "10K QPS", "50ms P99")
+2. **Show Trade-offs**: Every decision has costs - acknowledge them
+3. **Think Production**: Include operational concerns, not just happy-path design
+4. **Use Mermaid**: All diagrams must be valid Mermaid syntax
+5. **Real-World Grounding**: Reference actual systems (Cassandra, Kafka, etc.) where appropriate
+6. **Interview Ready**: Structure answers as you would in a senior engineering interview
+
+---
+
+## Problem to Solve
+
+**Title**: Distributed Lock Service
+**Category**: Foundational Infrastructure
+
+**Problem Statement**:
+Design a coordination service (like Chubby/ZooKeeper) focusing on lease management, fencing tokens, and client failure detection.
+
+Generate the complete system design document now.
+mcp startup: no servers
+codex
+```markdown
+---
+title: "Distributed Lock Service"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["coordination", "distributed-systems", "consensus"]
+---
+
+## Overview
+
+A distributed lock service is a coordination primitive used to ensure mutually exclusive access to shared resources across a fleet of unreliable clients and servers. The hard part is not “who holds the lock,” but doing so safely under network partitions, process crashes, GC pauses, clock drift, and retry storms—while still providing low-latency, linearizable semantics that higher-level systems can trust.
+
+The key insight is to separate **liveness** (leases + failure detection) from **safety** (consensus + fencing tokens). Leases with heartbeats determine when a client is considered alive and when its locks should be revoked; consensus ensures there is a single authoritative history of lock ownership; fencing tokens ensure that even if an old client continues running after losing its lease, it cannot corrupt downstream systems.
+
+This design is essentially a focused “Chubby/ZooKeeper/etcd-like” service: a small replicated control-plane cluster providing linearizable metadata operations (lock acquire/release, session/lease management) plus watch notifications for scalable coordination patterns.
+
+## Requirements
+
+### Functional Requirements
+- Create and manage **client sessions** with server-assigned leases (TTL-based).
+- Support **acquire** and **release** of named locks with **linearizable** semantics.
+- Provide **fencing tokens** (monotonically increasing per lock) on successful acquire.
+- Detect client failures via **heartbeats**; automatically revoke locks when leases expire.
+- Offer **watch/notify** APIs so clients can wait on lock availability without polling.
+- Support **reentrant lock** behavior per session (optional but common) and explicit “try-acquire with timeout”.
+- Provide **leader election** and “ephemeral membership” primitives (often built atop ephemeral keys/leases).
+- Expose **admin** endpoints for health, metrics, and cluster membership changes.
+
+### Non-Functional Requirements
+- **Scale**:
+  - 50k concurrent clients (sessions)
+  - 200k active locks (keys) and 5M total keys (including ephemeral/membership keys)
+  - 20k QPS reads (Get/Watch) and 5k QPS writes (Acquire/Release/KeepAlive) per cluster
+  - Typical cluster size: 3–5 nodes
+- **Latency** (single region):
+  - Acquire/Release/KeepAlive (linearizable writes): P50 < 10ms, P99 < 50ms
+  - Get (linearizable read): P50 < 5ms, P99 < 25ms
+  - Watch delivery: P99 < 250ms from commit to client notification
+- **Availability**:
+  - 99.99% for quorum-available scenarios (tolerate 1 failure in 3-node cluster)
+  - Clear behavior under partitions (no split-brain): prefer safety over availability for writes
+- **Consistency**:
+  - Linearizable for lock operations, session state, fencing token assignment
+  - Watch notifications are “at least once” and may be delayed; clients must re-check state
+- **Durability**:
+  - No loss of committed operations (WAL + fsync or equivalent)
+  - RPO = 0 within a region; cross-region DR may be RPO minutes depending on replication mode
+
+### Constraints & Assumptions
+- Small team operating a control-plane service; correctness prioritized over maximal throughput.
+- Clients may be in multiple languages; provide official libraries (Go/Java/Python) with consistent semantics.
+- Running in a single primary region for low latency; optional DR in secondary region.
+- Compliance: audit logs for admin actions; TLS everywhere; mTLS optional for internal workloads.
+- Cost constraints favor small clusters with predictable resource usage; avoid heavyweight dependencies.
+
+## High-Level Architecture
+
+```mermaid
+graph TB
+    subgraph "Client Layer"
+        CL["Client Apps"]
+        LIB["Lock Client Library\n(retries, backoff, keepalive)"]
+        CL --> LIB
+    end
+
+    subgraph "Service Layer"
+        GW["API Gateway / LB\n(TLS termination, routing)"]
+        LDR["Leader Node\n(Raft leader)"]
+        FOL["Follower Nodes\n(Raft followers)"]
+        FD["Lease & Session Manager\n(heartbeats, expiry)"]
+        WCH["Watch Dispatcher\n(streaming notifications)"]
+    end
+
+    subgraph "Data Layer"
+        WAL["Write-Ahead Log (WAL)\n+ snapshots"]
+        SM["State Machine\n(KV + locks + sessions)"]
+    end
+
+    LIB --> GW
+    GW --> LDR
+    GW --> FOL
+
+    LDR <--> FOL
+    LDR --> WAL
+    LDR --> SM
+    LDR --> FD
+    LDR --> WCH
+    FOL --> SM
+```
+
+A small cluster runs a consensus protocol (Raft) to maintain a single, authoritative sequence of state transitions for sessions, leases, and locks. All lock acquisitions and releases are replicated through Raft to guarantee linearizability and to ensure fencing tokens are monotonically increasing.
+
+Clients interact through a library that maintains a session, sends periodic keepalives, and manages retries with jittered backoff. Watches are served via streaming RPCs; they do not replace linearizable reads/writes—clients always re-check state after receiving notifications.
+
+## Component Deep-Dive
+
+### Consensus Cluster (Raft)
+
+**Responsibility**: Provide linearizable replication of all state changes (sessions, locks, tokens) with a single leader.
+
+**Key Design Decisions**:
+- Use **Raft** with a single leader per term to simplify correctness and operational debugging.
+- Persist operations via **WAL + snapshots** to bound replay time and storage growth.
+
+**Technology Choice**: etcd-style Raft implementation (production proven) or a mature Raft library in the service’s language (Go strongly favored).
+
+**Scaling Strategy**:
+- Scale writes by keeping cluster small (3–5) and fast disks.
+- Scale reads via **linearizable reads** (leader lease / ReadIndex) and optional **serializable reads** for non-critical operations.
+
+### Lease & Session Manager
+
+**Responsibility**: Track session liveness, enforce TTL, revoke ephemeral keys/locks on expiry, and provide failure detection.
+
+**Key Design Decisions**:
+- Server uses **monotonic time** for TTL accounting; never trusts client clocks.
+- Sessions are renewed only through **KeepAlive**; missed keepalives trigger expiry and cleanup via the replicated state machine.
+
+**Technology Choice**: In-process module integrated with the Raft state machine; timers drive expirations, but expiry is finalized by committing a revoke operation (or applying deterministic expiry rules on leaders with replication).
+
+**Scaling Strategy**:
+- Heartbeats aggregated by client library (single stream) instead of per-lock heartbeats.
+- Batch keepalive processing (e.g., coalesce renewals per session per 200ms).
+
+### Lock Manager (Fencing Tokens)
+
+**Responsibility**: Implement lock semantics and generate fencing tokens to protect downstream resources.
+
+**Key Design Decisions**:
+- Fencing token is a **monotonic counter per lock name** stored in the replicated state; increment only on successful acquisition.
+- Locks are bound to a **session lease**; if the session expires, the lock is revoked automatically.
+
+**Technology Choice**: Implemented as part of the Raft state machine (a specialized KV with lock metadata).
+
+**Scaling Strategy**:
+- Hot locks are unavoidable bottlenecks; mitigate by client-side backoff and watch-based waiting (no polling storms).
+- Partition the problem by namespace (multiple clusters) rather than sharding within a single lock keyspace, since consensus is the bottleneck.
+
+### Watch Dispatcher
+
+**Responsibility**: Deliver change notifications to clients (lock released, key changed) efficiently.
+
+**Key Design Decisions**:
+- Watches are **edge-triggered** and “at least once”; client must re-read state on notification.
+- Notifications are driven from committed log indexes; clients can resume from a known revision.
+
+**Technology Choice**: gRPC streaming with backpressure; per-connection buffers and drop/rewind rules.
+
+**Scaling Strategy**:
+- Fanout optimized by grouping watches by key/prefix.
+- Apply rate limits and enforce max watches per client to prevent memory blowups.
+
+## Data Model
+
+### Storage Schema
+
+A single replicated state machine maintains these core objects (shown as logical tables; physically this can be a KV map keyed by IDs/names plus indexes).
+
+**sessions**
+- `session_id` (UUID)
+- `client_id` (string; for observability)
+- `lease_ttl_ms` (int)
+- `lease_expiry_monotonic_ms` (int; derived)
+- `last_keepalive_revision` (int64; Raft index / revision)
+- `status` (`ACTIVE|EXPIRED|REVOKED`)
+- `created_at_unix_ms` (int64)
+
+**locks**
+- `lock_name` (string; primary key)
+- `holder_session_id` (UUID; nullable)
+- `lease_session_id` (UUID; nullable; typically same as holder)
+- `fencing_token` (int64; monotonically increasing per `lock_name`)
+- `reentrancy_count` (int32; optional)
+- `acquired_revision` (int64)
+- `updated_revision` (int64)
+
+**idempotency_keys** (optional but recommended)
+- `session_id` (UUID)
+- `request_id` (UUID)
+- `operation` (string)
+- `result_blob` (bytes/json)
+- `expires_at_revision_or_time` (int64)
+
+**events** (logical stream; can be derived from revisions)
+- `revision` (int64)
+- `type` (`LOCK_ACQUIRED|LOCK_RELEASED|SESSION_EXPIRED|...`)
+- `entity_key` (string)
+- `payload` (bytes/json)
+
+### Data Flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant L as Leader
+    participant F as Followers
+    participant SM as State Machine
+
+    C->>L: CreateSession(ttl=10s)
+    L->>F: Replicate (Raft log)
+    F-->>L: Ack quorum
+    L->>SM: Apply session create
+    L-->>C: session_id
+
+    loop every 3s
+        C->>L: KeepAlive(session_id)
+        L->>F: Replicate keepalive
+        F-->>L: Ack quorum
+        L->>SM: Extend lease
+        L-->>C: ok
+    end
+
+    C->>L: AcquireLock(name="A", session_id)
+    L->>F: Replicate acquire
+    F-->>L: Ack quorum
+    L->>SM: If free, set holder + token++
+    L-->>C: success, fencing_token=42
+
+    Note over C,L: If keepalives stop...
+    L->>SM: On expiry, revoke lock + session
+    L-->>C: (watch) lock released event
+```
+
+## API Design
+
+Use **gRPC** for low-latency streaming watches and keepalives; expose a REST gateway optionally for debugging/admin.
+
+### Core gRPC APIs
+
+**CreateSession**
+- `CreateSessionRequest { string client_id; int32 ttl_ms; }`
+- `CreateSessionResponse { string session_id; int64 lease_expiry_unix_ms; }`
+- Errors: `INVALID_ARGUMENT`, `RESOURCE_EXHAUSTED`, `UNAVAILABLE`
+
+**KeepAlive (streaming recommended)**
+- Client stream: `KeepAliveRequest { string session_id; }`
+- Server stream: `KeepAliveResponse { string session_id; int64 lease_expiry_unix_ms; int64 revision; }`
+- Semantics: idempotent; last-write-wins on lease extension
+- Errors: `NOT_FOUND` (unknown session), `FAILED_PRECONDITION` (expired), `UNAVAILABLE`
+
+**AcquireLock**
+- `AcquireLockRequest { string session_id; string lock_name; bool wait; int32 timeout_ms; string request_id; }`
+- `AcquireLockResponse { bool acquired; int64 fencing_token; int64 revision; }`
+- Semantics:
+  - Linearizable. If `wait=false` and held, returns `acquired=false`.
+  - If `wait=true`, server may either block until available or instruct client to watch (preferred for fairness/backpressure).
+- Idempotency:
+  - `request_id` scoped to `session_id`. Server stores result to avoid double-token increments on retries.
+- Errors: `NOT_FOUND` (no session), `DEADLINE_EXCEEDED`, `ABORTED` (leader change), `UNAVAILABLE`
+
+**ReleaseLock**
+- `ReleaseLockRequest { string session_id; string lock_name; string request_id; }`
+- `ReleaseLockResponse { bool released; int64 revision; }`
+- Semantics: Idempotent; releasing a lock not held by session returns `released=false` (or `PERMISSION_DENIED` depending on policy).
+
+**GetLock**
+- `GetLockRequest { string lock_name; bool linearizable; }`
+- `GetLockResponse { bool held; string holder_session_id; int64 fencing_token; int64 revision; }`
+
+**WatchLocks**
+- `WatchRequest { string prefix; int64 start_revision; }`
+- Stream `WatchEvent { int64 revision; string key; string type; bytes payload; }`
+- Semantics: at-least-once; clients resume by `start_revision`.
+
+### Error Handling Approach
+- Use gRPC status codes + structured error details:
+  - `ABORTED` for leader change / retryable conflicts
+  - `FAILED_PRECONDITION` for expired session
+  - `RESOURCE_EXHAUSTED` for watch/session limits
+- Client library implements:
+  - Exponential backoff with jitter
+  - Request hedging disabled for writes (to avoid duplicate pressure)
+  - Automatic leader re-discovery
+
+### Fencing Token Usage (Downstream)
+Any protected resource (DB, object store, scheduler) must check `fencing_token` monotonicity:
+- Example: when writing to a shared worker assignment record, include `token` and enforce `token > stored_token`.
+- This prevents a stalled/partitioned client from acting after losing its lease.
+
+## Scaling & Performance
+
+### Bottleneck Analysis
+- **Consensus write throughput** is the primary bottleneck (every Acquire/Release/KeepAlive is replicated).
+  - Mitigation: streaming keepalives, batching, minimize write amplification, compact logs.
+- **Hot locks** cause contention and watch fanout.
+  - Mitigation: watch-based waiting, backoff, and application-level lock striping/sharding.
+- **Watch memory usage** can spike with many watchers.
+  - Mitigation: limits per client, bounded buffers, and requiring resume revisions.
+
+### Horizontal Scaling
+- A single Raft group does not scale writes linearly; instead:
+  - Run **multiple independent clusters** per environment/namespace/tenant.
+  - Encourage **lock keyspace partitioning** by prefix (e.g., `teamA/*`, `teamB/*`) across clusters.
+- Within a cluster:
+  - Add followers to improve read scalability (if allowing serializable reads on followers).
+  - Keep cluster size small for low commit latency (3 is typical; 5 for higher fault tolerance).
+
+### Caching Strategy
+- **Client-side caching** for non-critical reads (e.g., cached lock state with short TTL like 250ms).
+- **Server-side**: avoid caching that weakens correctness; linearizable reads should consult leader (ReadIndex).
+- Watch-based invalidation:
+  - Clients cache `GetLock` results and invalidate on watch events for the lock/prefix.
+- Cache invalidation is “best-effort”; correctness always relies on linearizable acquire.
+
+## Trade-offs & Alternatives
+
+### Key Trade-offs Made
+- **Chosen**: Linearizable lock operations via Raft  
+  **Sacrificed**: Availability of writes during partitions (CAP)  
+  **Why**: Locking requires safety; split-brain locks are catastrophic.
+
+- **Chosen**: Server-managed leases + fencing tokens  
+  **Sacrificed**: Simplicity (more metadata and downstream enforcement)  
+  **Why**: Leases alone do not prevent stale clients from acting; fencing tokens close that hole.
+
+- **Chosen**: Watch-based waiting  
+  **Sacrificed**: Complexity of streaming + backpressure handling  
+  **Why**: Prevents thundering herds and reduces QPS under contention.
+
+### Alternative Approaches
+- **Redis-based locks (including Redlock)**:
+  - Pros: simple, fast
+  - Cons: tricky correctness under failover/partitions; fencing often missing; not ideal for foundational coordination
+- **Database row locks / advisory locks**:
+  - Pros: reuse existing infra
+  - Cons: couples coordination to DB availability/perf; cross-service scaling and watch semantics are poor
+- **Gossip / eventual consistency coordination**:
+  - Pros: high availability
+  - Cons: cannot provide linearizable mutual exclusion; unsafe for general-purpose locks
+
+## Failure Modes & Mitigations
+
+### Failure Scenarios
+- **Scenario**: Leader crashes  
+  **Impact**: Writes unavailable during election (typically 100ms–2s)  
+  **Detection**: Raft election timeouts; client `UNAVAILABLE/ABORTED`  
+  **Mitigation**: Fast elections, client retries with backoff, persistent WAL to avoid data loss
+
+- **Scenario**: Network partition splits cluster  
+  **Impact**: Minority partition becomes read-only; no split-brain writes  
+  **Detection**: Loss of quorum, Raft step-down  
+  **Mitigation**: Require quorum for writes; expose clear errors; optionally allow serializable reads on followers
+
+- **Scenario**: Client GC pause or stall beyond TTL  
+  **Impact**: Session expires; lock revoked; client may still run  
+  **Detection**: Missed keepalive; session moves to EXPIRED  
+  **Mitigation**: Fencing tokens prevent stale client actions; client library surfaces “lease lost” and forces re-acquire
+
+- **Scenario**: Clock drift  
+  **Impact**: Incorrect lease timing if client clocks used  
+  **Detection**: N/A  
+  **Mitigation**: Only server monotonic clock used for TTL; client TTL is advisory for UX only
+
+- **Scenario**: Watcher overload / slow consumers  
+  **Impact**: Memory pressure, delayed notifications  
+  **Detection**: Queue depth, backpressure metrics  
+  **Mitigation**: Bounded buffers, drop policy with resume-from-revision, per-client limits, rate limiting
+
+### Disaster Recovery
+- **Targets**:
+  - In-region: RPO 0, RTO < 1 minute (single cluster, automated restart)
+  - Cross-region DR: RPO 1–5 minutes, RTO 15–30 minutes (configurable)
+- **Backup strategy**:
+  - Periodic snapshots + WAL archiving to object storage
+  - Verify restore regularly (automated fire drills)
+- **Failover procedures**:
+  - Passive secondary restored from snapshot/WAL
+  - DNS/service discovery cutover
+  - Clients reconnect and establish new sessions; locks are not “magically preserved” across region failover—applications must tolerate re-acquire and use fencing to ensure safety
+
+## Operational Considerations
+
+### Monitoring & Alerting
+- Key metrics:
+  - Raft: leader changes, commit latency, WAL fsync time, log size, snapshot duration
+  - API: QPS by method, P50/P99 latency, error rates by code
+  - Leases: active sessions, keepalive rate, expirations/minute
+  - Watches: active watches, queue depth, dropped events, reconnect rate
+  - Resource: CPU, RSS, disk IOPS, disk latency, file descriptor usage
+- Alerts (examples):
+  - Commit P99 > 100ms for 5m
+  - No leader for > 10s
+  - Disk fsync P99 > 20ms
+  - Watch drops > 0.1% events
+  - Session expirations spike 10x baseline (could indicate network issues)
+
+### Deployment Strategy
+- Rolling upgrades with one node at a time; ensure quorum remains.
+- Use canary clients or shadow traffic for new versions (especially client libraries).
+- Backward-compatible wire protocol; versioned APIs.
+- Rollback:
+  - Prefer “roll forward” for state machine changes; if rollback needed, ensure snapshot/WAL compatibility or gate new features behind cluster-version checks.
+
+## References & Further Reading
+- Chubby: *The Chubby lock service for loosely-coupled distributed systems*
+- ZooKeeper: Zab / ZooKeeper docs and recipes (leader election, locks)
+- etcd: Raft-based coordination store; watch semantics and linearizable reads
+- Raft paper: *In Search of an Understandable Consensus Algorithm*
+- “Fencing tokens” discussion: common patterns in distributed locks (also used in HDFS, Kubernetes controllers)
+- Jepsen analyses of coordination systems (practical failure modes under partitions)
+```
+tokens used
+6,083
+```markdown
+---
+title: "Distributed Lock Service"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["coordination", "distributed-systems", "consensus"]
+---
+
+## Overview
+
+A distributed lock service is a coordination primitive used to ensure mutually exclusive access to shared resources across a fleet of unreliable clients and servers. The hard part is not “who holds the lock,” but doing so safely under network partitions, process crashes, GC pauses, clock drift, and retry storms—while still providing low-latency, linearizable semantics that higher-level systems can trust.
+
+The key insight is to separate **liveness** (leases + failure detection) from **safety** (consensus + fencing tokens). Leases with heartbeats determine when a client is considered alive and when its locks should be revoked; consensus ensures there is a single authoritative history of lock ownership; fencing tokens ensure that even if an old client continues running after losing its lease, it cannot corrupt downstream systems.
+
+This design is essentially a focused “Chubby/ZooKeeper/etcd-like” service: a small replicated control-plane cluster providing linearizable metadata operations (lock acquire/release, session/lease management) plus watch notifications for scalable coordination patterns.
+
+## Requirements
+
+### Functional Requirements
+- Create and manage **client sessions** with server-assigned leases (TTL-based).
+- Support **acquire** and **release** of named locks with **linearizable** semantics.
+- Provide **fencing tokens** (monotonically increasing per lock) on successful acquire.
+- Detect client failures via **heartbeats**; automatically revoke locks when leases expire.
+- Offer **watch/notify** APIs so clients can wait on lock availability without polling.
+- Support **reentrant lock** behavior per session (optional but common) and explicit “try-acquire with timeout”.
+- Provide **leader election** and “ephemeral membership” primitives (often built atop ephemeral keys/leases).
+- Expose **admin** endpoints for health, metrics, and cluster membership changes.
+
+### Non-Functional Requirements
+- **Scale**:
+  - 50k concurrent clients (sessions)
+  - 200k active locks (keys) and 5M total keys (including ephemeral/membership keys)
+  - 20k QPS reads (Get/Watch) and 5k QPS writes (Acquire/Release/KeepAlive) per cluster
+  - Typical cluster size: 3–5 nodes
+- **Latency** (single region):
+  - Acquire/Release/KeepAlive (linearizable writes): P50 < 10ms, P99 < 50ms
+  - Get (linearizable read): P50 < 5ms, P99 < 25ms
+  - Watch delivery: P99 < 250ms from commit to client notification
+- **Availability**:
+  - 99.99% for quorum-available scenarios (tolerate 1 failure in 3-node cluster)
+  - Clear behavior under partitions (no split-brain): prefer safety over availability for writes
+- **Consistency**:
+  - Linearizable for lock operations, session state, fencing token assignment
+  - Watch notifications are “at least once” and may be delayed; clients must re-check state
+- **Durability**:
+  - No loss of committed operations (WAL + fsync or equivalent)
+  - RPO = 0 within a region; cross-region DR may be RPO minutes depending on replication mode
+
+### Constraints & Assumptions
+- Small team operating a control-plane service; correctness prioritized over maximal throughput.
+- Clients may be in multiple languages; provide official libraries (Go/Java/Python) with consistent semantics.
+- Running in a single primary region for low latency; optional DR in secondary region.
+- Compliance: audit logs for admin actions; TLS everywhere; mTLS optional for internal workloads.
+- Cost constraints favor small clusters with predictable resource usage; avoid heavyweight dependencies.
+
+## High-Level Architecture
+
+```mermaid
+graph TB
+    subgraph "Client Layer"
+        CL["Client Apps"]
+        LIB["Lock Client Library\n(retries, backoff, keepalive)"]
+        CL --> LIB
+    end
+
+    subgraph "Service Layer"
+        GW["API Gateway / LB\n(TLS termination, routing)"]
+        LDR["Leader Node\n(Raft leader)"]
+        FOL["Follower Nodes\n(Raft followers)"]
+        FD["Lease & Session Manager\n(heartbeats, expiry)"]
+        WCH["Watch Dispatcher\n(streaming notifications)"]
+    end
+
+    subgraph "Data Layer"
+        WAL["Write-Ahead Log (WAL)\n+ snapshots"]
+        SM["State Machine\n(KV + locks + sessions)"]
+    end
+
+    LIB --> GW
+    GW --> LDR
+    GW --> FOL
+
+    LDR <--> FOL
+    LDR --> WAL
+    LDR --> SM
+    LDR --> FD
+    LDR --> WCH
+    FOL --> SM
+```
+
+A small cluster runs a consensus protocol (Raft) to maintain a single, authoritative sequence of state transitions for sessions, leases, and locks. All lock acquisitions and releases are replicated through Raft to guarantee linearizability and to ensure fencing tokens are monotonically increasing.
+
+Clients interact through a library that maintains a session, sends periodic keepalives, and manages retries with jittered backoff. Watches are served via streaming RPCs; they do not replace linearizable reads/writes—clients always re-check state after receiving notifications.
+
+## Component Deep-Dive
+
+### Consensus Cluster (Raft)
+
+**Responsibility**: Provide linearizable replication of all state changes (sessions, locks, tokens) with a single leader.
+
+**Key Design Decisions**:
+- Use **Raft** with a single leader per term to simplify correctness and operational debugging.
+- Persist operations via **WAL + snapshots** to bound replay time and storage growth.
+
+**Technology Choice**: etcd-style Raft implementation (production proven) or a mature Raft library in the service’s language (Go strongly favored).
+
+**Scaling Strategy**:
+- Scale writes by keeping cluster small (3–5) and fast disks.
+- Scale reads via **linearizable reads** (leader lease / ReadIndex) and optional **serializable reads** for non-critical operations.
+
+### Lease & Session Manager
+
+**Responsibility**: Track session liveness, enforce TTL, revoke ephemeral keys/locks on expiry, and provide failure detection.
+
+**Key Design Decisions**:
+- Server uses **monotonic time** for TTL accounting; never trusts client clocks.
+- Sessions are renewed only through **KeepAlive**; missed keepalives trigger expiry and cleanup via the replicated state machine.
+
+**Technology Choice**: In-process module integrated with the Raft state machine; timers drive expirations, but expiry is finalized by committing a revoke operation (or applying deterministic expiry rules on leaders with replication).
+
+**Scaling Strategy**:
+- Heartbeats aggregated by client library (single stream) instead of per-lock heartbeats.
+- Batch keepalive processing (e.g., coalesce renewals per session per 200ms).
+
+### Lock Manager (Fencing Tokens)
+
+**Responsibility**: Implement lock semantics and generate fencing tokens to protect downstream resources.
+
+**Key Design Decisions**:
+- Fencing token is a **monotonic counter per lock name** stored in the replicated state; increment only on successful acquisition.
+- Locks are bound to a **session lease**; if the session expires, the lock is revoked automatically.
+
+**Technology Choice**: Implemented as part of the Raft state machine (a specialized KV with lock metadata).
+
+**Scaling Strategy**:
+- Hot locks are unavoidable bottlenecks; mitigate by client-side backoff and watch-based waiting (no polling storms).
+- Partition the problem by namespace (multiple clusters) rather than sharding within a single lock keyspace, since consensus is the bottleneck.
+
+### Watch Dispatcher
+
+**Responsibility**: Deliver change notifications to clients (lock released, key changed) efficiently.
+
+**Key Design Decisions**:
+- Watches are **edge-triggered** and “at least once”; client must re-read state on notification.
+- Notifications are driven from committed log indexes; clients can resume from a known revision.
+
+**Technology Choice**: gRPC streaming with backpressure; per-connection buffers and drop/rewind rules.
+
+**Scaling Strategy**:
+- Fanout optimized by grouping watches by key/prefix.
+- Apply rate limits and enforce max watches per client to prevent memory blowups.
+
+## Data Model
+
+### Storage Schema
+
+A single replicated state machine maintains these core objects (shown as logical tables; physically this can be a KV map keyed by IDs/names plus indexes).
+
+**sessions**
+- `session_id` (UUID)
+- `client_id` (string; for observability)
+- `lease_ttl_ms` (int)
+- `lease_expiry_monotonic_ms` (int; derived)
+- `last_keepalive_revision` (int64; Raft index / revision)
+- `status` (`ACTIVE|EXPIRED|REVOKED`)
+- `created_at_unix_ms` (int64)
+
+**locks**
+- `lock_name` (string; primary key)
+- `holder_session_id` (UUID; nullable)
+- `lease_session_id` (UUID; nullable; typically same as holder)
+- `fencing_token` (int64; monotonically increasing per `lock_name`)
+- `reentrancy_count` (int32; optional)
+- `acquired_revision` (int64)
+- `updated_revision` (int64)
+
+**idempotency_keys** (optional but recommended)
+- `session_id` (UUID)
+- `request_id` (UUID)
+- `operation` (string)
+- `result_blob` (bytes/json)
+- `expires_at_revision_or_time` (int64)
+
+**events** (logical stream; can be derived from revisions)
+- `revision` (int64)
+- `type` (`LOCK_ACQUIRED|LOCK_RELEASED|SESSION_EXPIRED|...`)
+- `entity_key` (string)
+- `payload` (bytes/json)
+
+### Data Flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant L as Leader
+    participant F as Followers
+    participant SM as State Machine
+
+    C->>L: CreateSession(ttl=10s)
+    L->>F: Replicate (Raft log)
+    F-->>L: Ack quorum
+    L->>SM: Apply session create
+    L-->>C: session_id
+
+    loop every 3s
+        C->>L: KeepAlive(session_id)
+        L->>F: Replicate keepalive
+        F-->>L: Ack quorum
+        L->>SM: Extend lease
+        L-->>C: ok
+    end
+
+    C->>L: AcquireLock(name="A", session_id)
+    L->>F: Replicate acquire
+    F-->>L: Ack quorum
+    L->>SM: If free, set holder + token++
+    L-->>C: success, fencing_token=42
+
+    Note over C,L: If keepalives stop...
+    L->>SM: On expiry, revoke lock + session
+    L-->>C: (watch) lock released event
+```
+
+## API Design
+
+Use **gRPC** for low-latency streaming watches and keepalives; expose a REST gateway optionally for debugging/admin.
+
+### Core gRPC APIs
+
+**CreateSession**
+- `CreateSessionRequest { string client_id; int32 ttl_ms; }`
+- `CreateSessionResponse { string session_id; int64 lease_expiry_unix_ms; }`
+- Errors: `INVALID_ARGUMENT`, `RESOURCE_EXHAUSTED`, `UNAVAILABLE`
+
+**KeepAlive (streaming recommended)**
+- Client stream: `KeepAliveRequest { string session_id; }`
+- Server stream: `KeepAliveResponse { string session_id; int64 lease_expiry_unix_ms; int64 revision; }`
+- Semantics: idempotent; last-write-wins on lease extension
+- Errors: `NOT_FOUND` (unknown session), `FAILED_PRECONDITION` (expired), `UNAVAILABLE`
+
+**AcquireLock**
+- `AcquireLockRequest { string session_id; string lock_name; bool wait; int32 timeout_ms; string request_id; }`
+- `AcquireLockResponse { bool acquired; int64 fencing_token; int64 revision; }`
+- Semantics:
+  - Linearizable. If `wait=false` and held, returns `acquired=false`.
+  - If `wait=true`, server may either block until available or instruct client to watch (preferred for fairness/backpressure).
+- Idempotency:
+  - `request_id` scoped to `session_id`. Server stores result to avoid double-token increments on retries.
+- Errors: `NOT_FOUND` (no session), `DEADLINE_EXCEEDED`, `ABORTED` (leader change), `UNAVAILABLE`
+
+**ReleaseLock**
+- `ReleaseLockRequest { string session_id; string lock_name; string request_id; }`
+- `ReleaseLockResponse { bool released; int64 revision; }`
+- Semantics: Idempotent; releasing a lock not held by session returns `released=false` (or `PERMISSION_DENIED` depending on policy).
+
+**GetLock**
+- `GetLockRequest { string lock_name; bool linearizable; }`
+- `GetLockResponse { bool held; string holder_session_id; int64 fencing_token; int64 revision; }`
+
+**WatchLocks**
+- `WatchRequest { string prefix; int64 start_revision; }`
+- Stream `WatchEvent { int64 revision; string key; string type; bytes payload; }`
+- Semantics: at-least-once; clients resume by `start_revision`.
+
+### Error Handling Approach
+- Use gRPC status codes + structured error details:
+  - `ABORTED` for leader change / retryable conflicts
+  - `FAILED_PRECONDITION` for expired session
+  - `RESOURCE_EXHAUSTED` for watch/session limits
+- Client library implements:
+  - Exponential backoff with jitter
+  - Request hedging disabled for writes (to avoid duplicate pressure)
+  - Automatic leader re-discovery
+
+### Fencing Token Usage (Downstream)
+Any protected resource (DB, object store, scheduler) must check `fencing_token` monotonicity:
+- Example: when writing to a shared worker assignment record, include `token` and enforce `token > stored_token`.
+- This prevents a stalled/partitioned client from acting after losing its lease.
+
+## Scaling & Performance
+
+### Bottleneck Analysis
+- **Consensus write throughput** is the primary bottleneck (every Acquire/Release/KeepAlive is replicated).
+  - Mitigation: streaming keepalives, batching, minimize write amplification, compact logs.
+- **Hot locks** cause contention and watch fanout.
+  - Mitigation: watch-based waiting, backoff, and application-level lock striping/sharding.
+- **Watch memory usage** can spike with many watchers.
+  - Mitigation: limits per client, bounded buffers, and requiring resume revisions.
+
+### Horizontal Scaling
+- A single Raft group does not scale writes linearly; instead:
+  - Run **multiple independent clusters** per environment/namespace/tenant.
+  - Encourage **lock keyspace partitioning** by prefix (e.g., `teamA/*`, `teamB/*`) across clusters.
+- Within a cluster:
+  - Add followers to improve read scalability (if allowing serializable reads on followers).
+  - Keep cluster size small for low commit latency (3 is typical; 5 for higher fault tolerance).
+
+### Caching Strategy
+- **Client-side caching** for non-critical reads (e.g., cached lock state with short TTL like 250ms).
+- **Server-side**: avoid caching that weakens correctness; linearizable reads should consult leader (ReadIndex).
+- Watch-based invalidation:
+  - Clients cache `GetLock` results and invalidate on watch events for the lock/prefix.
+- Cache invalidation is “best-effort”; correctness always relies on linearizable acquire.
+
+## Trade-offs & Alternatives
+
+### Key Trade-offs Made
+- **Chosen**: Linearizable lock operations via Raft  
+  **Sacrificed**: Availability of writes during partitions (CAP)  
+  **Why**: Locking requires safety; split-brain locks are catastrophic.
+
+- **Chosen**: Server-managed leases + fencing tokens  
+  **Sacrificed**: Simplicity (more metadata and downstream enforcement)  
+  **Why**: Leases alone do not prevent stale clients from acting; fencing tokens close that hole.
+
+- **Chosen**: Watch-based waiting  
+  **Sacrificed**: Complexity of streaming + backpressure handling  
+  **Why**: Prevents thundering herds and reduces QPS under contention.
+
+### Alternative Approaches
+- **Redis-based locks (including Redlock)**:
+  - Pros: simple, fast
+  - Cons: tricky correctness under failover/partitions; fencing often missing; not ideal for foundational coordination
+- **Database row locks / advisory locks**:
+  - Pros: reuse existing infra
+  - Cons: couples coordination to DB availability/perf; cross-service scaling and watch semantics are poor
+- **Gossip / eventual consistency coordination**:
+  - Pros: high availability
+  - Cons: cannot provide linearizable mutual exclusion; unsafe for general-purpose locks
+
+## Failure Modes & Mitigations
+
+### Failure Scenarios
+- **Scenario**: Leader crashes  
+  **Impact**: Writes unavailable during election (typically 100ms–2s)  
+  **Detection**: Raft election timeouts; client `UNAVAILABLE/ABORTED`  
+  **Mitigation**: Fast elections, client retries with backoff, persistent WAL to avoid data loss
+
+- **Scenario**: Network partition splits cluster  
+  **Impact**: Minority partition becomes read-only; no split-brain writes  
+  **Detection**: Loss of quorum, Raft step-down  
+  **Mitigation**: Require quorum for writes; expose clear errors; optionally allow serializable reads on followers
+
+- **Scenario**: Client GC pause or stall beyond TTL  
+  **Impact**: Session expires; lock revoked; client may still run  
+  **Detection**: Missed keepalive; session moves to EXPIRED  
+  **Mitigation**: Fencing tokens prevent stale client actions; client library surfaces “lease lost” and forces re-acquire
+
+- **Scenario**: Clock drift  
+  **Impact**: Incorrect lease timing if client clocks used  
+  **Detection**: N/A  
+  **Mitigation**: Only server monotonic clock used for TTL; client TTL is advisory for UX only
+
+- **Scenario**: Watcher overload / slow consumers  
+  **Impact**: Memory pressure, delayed notifications  
+  **Detection**: Queue depth, backpressure metrics  
+  **Mitigation**: Bounded buffers, drop policy with resume-from-revision, per-client limits, rate limiting
+
+### Disaster Recovery
+- **Targets**:
+  - In-region: RPO 0, RTO < 1 minute (single cluster, automated restart)
+  - Cross-region DR: RPO 1–5 minutes, RTO 15–30 minutes (configurable)
+- **Backup strategy**:
+  - Periodic snapshots + WAL archiving to object storage
+  - Verify restore regularly (automated fire drills)
+- **Failover procedures**:
+  - Passive secondary restored from snapshot/WAL
+  - DNS/service discovery cutover
+  - Clients reconnect and establish new sessions; locks are not “magically preserved” across region failover—applications must tolerate re-acquire and use fencing to ensure safety
+
+## Operational Considerations
+
+### Monitoring & Alerting
+- Key metrics:
+  - Raft: leader changes, commit latency, WAL fsync time, log size, snapshot duration
+  - API: QPS by method, P50/P99 latency, error rates by code
+  - Leases: active sessions, keepalive rate, expirations/minute
+  - Watches: active watches, queue depth, dropped events, reconnect rate
+  - Resource: CPU, RSS, disk IOPS, disk latency, file descriptor usage
+- Alerts (examples):
+  - Commit P99 > 100ms for 5m
+  - No leader for > 10s
+  - Disk fsync P99 > 20ms
+  - Watch drops > 0.1% events
+  - Session expirations spike 10x baseline (could indicate network issues)
+
+### Deployment Strategy
+- Rolling upgrades with one node at a time; ensure quorum remains.
+- Use canary clients or shadow traffic for new versions (especially client libraries).
+- Backward-compatible wire protocol; versioned APIs.
+- Rollback:
+  - Prefer “roll forward” for state machine changes; if rollback needed, ensure snapshot/WAL compatibility or gate new features behind cluster-version checks.
+
+## References & Further Reading
+- Chubby: *The Chubby lock service for loosely-coupled distributed systems*
+- ZooKeeper: Zab / ZooKeeper docs and recipes (leader election, locks)
+- etcd: Raft-based coordination store; watch semantics and linearizable reads
+- Raft paper: *In Search of an Understandable Consensus Algorithm*
+- “Fencing tokens” discussion: common patterns in distributed locks (also used in HDFS, Kubernetes controllers)
+- Jepsen analyses of coordination systems (practical failure modes under partitions)
+```
+
+[Pass 1/3] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts/distributed-lock-service.md
+
+[Pass 2/3] Reviewing and improving draft...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b29d4-fddb-7e50-8ed9-897c56ecc085
+--------
+user
+# System Design Solution Reviewer
+
+You are a Staff/Principal Engineer reviewing a system design document for the "System Design Atlas" educational resource.
+
+## Your Task
+
+Review the provided system design draft and improve it. Your goal is to ensure the document is:
+- Technically accurate and production-ready
+- Complete with no missing critical sections
+- Consistent in formatting and style
+- Clear and educational for the target audience
+
+## Review Checklist
+
+### Technical Accuracy
+- [ ] Are the scale estimates realistic?
+- [ ] Are the latency targets achievable with the proposed architecture?
+- [ ] Are the technology choices appropriate for the requirements?
+- [ ] Are there any architectural flaws or anti-patterns?
+- [ ] Is the consistency model correctly applied?
+- [ ] Are failure modes properly addressed?
+
+### Completeness
+- [ ] YAML frontmatter present with title, category, difficulty, tags
+- [ ] All required sections present (Overview, Requirements, Architecture, Components, Data Model, API, Scaling, Trade-offs, Failure Modes, Operations)
+- [ ] Mermaid diagrams included for architecture and data flow
+- [ ] Concrete numbers for scale, latency, availability
+- [ ] At least 3 trade-offs discussed
+- [ ] At least 3 failure scenarios covered
+
+### Clarity & Style
+- [ ] Consistent heading levels and formatting
+- [ ] Technical jargon explained or linked
+- [ ] Diagrams are clear and properly formatted
+- [ ] Code/API examples are syntactically correct
+- [ ] No redundant or contradictory information
+
+### Educational Value
+- [ ] Would this help someone in a system design interview?
+- [ ] Are the "why" explanations sufficient?
+- [ ] Are alternative approaches mentioned?
+- [ ] Are real-world references included?
+
+## Output Format
+
+Return the **complete, improved document** - not just the changes. The output should be a polished, publication-ready Markdown file.
+
+When making improvements:
+1. Fix any technical inaccuracies
+2. Add missing sections or details
+3. Improve Mermaid diagrams for clarity
+4. Strengthen trade-off discussions
+5. Add concrete numbers where vague
+6. Ensure all Mermaid syntax is valid
+7. Improve flow and readability
+
+## Quality Bar
+
+The final document should be something a Principal Engineer would be proud to present in an architecture review. It should demonstrate both breadth (covering all aspects of the system) and depth (showing mastery of the hard problems).
+
+Do NOT add commentary about your changes - just output the improved document.
+
+---
+
+## Draft to Review
+
+```markdown
+---
+title: "Distributed Lock Service"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["coordination", "distributed-systems", "consensus"]
+---
+
+## Overview
+
+A distributed lock service is a coordination primitive used to ensure mutually exclusive access to shared resources across a fleet of unreliable clients and servers. The hard part is not “who holds the lock,” but doing so safely under network partitions, process crashes, GC pauses, clock drift, and retry storms—while still providing low-latency, linearizable semantics that higher-level systems can trust.
+
+The key insight is to separate **liveness** (leases + failure detection) from **safety** (consensus + fencing tokens). Leases with heartbeats determine when a client is considered alive and when its locks should be revoked; consensus ensures there is a single authoritative history of lock ownership; fencing tokens ensure that even if an old client continues running after losing its lease, it cannot corrupt downstream systems.
+
+This design is essentially a focused “Chubby/ZooKeeper/etcd-like” service: a small replicated control-plane cluster providing linearizable metadata operations (lock acquire/release, session/lease management) plus watch notifications for scalable coordination patterns.
+
+## Requirements
+
+### Functional Requirements
+- Create and manage **client sessions** with server-assigned leases (TTL-based).
+- Support **acquire** and **release** of named locks with **linearizable** semantics.
+- Provide **fencing tokens** (monotonically increasing per lock) on successful acquire.
+- Detect client failures via **heartbeats**; automatically revoke locks when leases expire.
+- Offer **watch/notify** APIs so clients can wait on lock availability without polling.
+- Support **reentrant lock** behavior per session (optional but common) and explicit “try-acquire with timeout”.
+- Provide **leader election** and “ephemeral membership” primitives (often built atop ephemeral keys/leases).
+- Expose **admin** endpoints for health, metrics, and cluster membership changes.
+
+### Non-Functional Requirements
+- **Scale**:
+  - 50k concurrent clients (sessions)
+  - 200k active locks (keys) and 5M total keys (including ephemeral/membership keys)
+  - 20k QPS reads (Get/Watch) and 5k QPS writes (Acquire/Release/KeepAlive) per cluster
+  - Typical cluster size: 3–5 nodes
+- **Latency** (single region):
+  - Acquire/Release/KeepAlive (linearizable writes): P50 < 10ms, P99 < 50ms
+  - Get (linearizable read): P50 < 5ms, P99 < 25ms
+  - Watch delivery: P99 < 250ms from commit to client notification
+- **Availability**:
+  - 99.99% for quorum-available scenarios (tolerate 1 failure in 3-node cluster)
+  - Clear behavior under partitions (no split-brain): prefer safety over availability for writes
+- **Consistency**:
+  - Linearizable for lock operations, session state, fencing token assignment
+  - Watch notifications are “at least once” and may be delayed; clients must re-check state
+- **Durability**:
+  - No loss of committed operations (WAL + fsync or equivalent)
+  - RPO = 0 within a region; cross-region DR may be RPO minutes depending on replication mode
+
+### Constraints & Assumptions
+- Small team operating a control-plane service; correctness prioritized over maximal throughput.
+- Clients may be in multiple languages; provide official libraries (Go/Java/Python) with consistent semantics.
+- Running in a single primary region for low latency; optional DR in secondary region.
+- Compliance: audit logs for admin actions; TLS everywhere; mTLS optional for internal workloads.
+- Cost constraints favor small clusters with predictable resource usage; avoid heavyweight dependencies.
+
+## High-Level Architecture
+
+```mermaid
+graph TB
+    subgraph "Client Layer"
+        CL["Client Apps"]
+        LIB["Lock Client Library\n(retries, backoff, keepalive)"]
+        CL --> LIB
+    end
+
+    subgraph "Service Layer"
+        GW["API Gateway / LB\n(TLS termination, routing)"]
+        LDR["Leader Node\n(Raft leader)"]
+        FOL["Follower Nodes\n(Raft followers)"]
+        FD["Lease & Session Manager\n(heartbeats, expiry)"]
+        WCH["Watch Dispatcher\n(streaming notifications)"]
+    end
+
+    subgraph "Data Layer"
+        WAL["Write-Ahead Log (WAL)\n+ snapshots"]
+        SM["State Machine\n(KV + locks + sessions)"]
+    end
+
+    LIB --> GW
+    GW --> LDR
+    GW --> FOL
+
+    LDR <--> FOL
+    LDR --> WAL
+    LDR --> SM
+    LDR --> FD
+    LDR --> WCH
+    FOL --> SM
+```
+
+A small cluster runs a consensus protocol (Raft) to maintain a single, authoritative sequence of state transitions for sessions, leases, and locks. All lock acquisitions and releases are replicated through Raft to guarantee linearizability and to ensure fencing tokens are monotonically increasing.
+
+Clients interact through a library that maintains a session, sends periodic keepalives, and manages retries with jittered backoff. Watches are served via streaming RPCs; they do not replace linearizable reads/writes—clients always re-check state after receiving notifications.
+
+## Component Deep-Dive
+
+### Consensus Cluster (Raft)
+
+**Responsibility**: Provide linearizable replication of all state changes (sessions, locks, tokens) with a single leader.
+
+**Key Design Decisions**:
+- Use **Raft** with a single leader per term to simplify correctness and operational debugging.
+- Persist operations via **WAL + snapshots** to bound replay time and storage growth.
+
+**Technology Choice**: etcd-style Raft implementation (production proven) or a mature Raft library in the service’s language (Go strongly favored).
+
+**Scaling Strategy**:
+- Scale writes by keeping cluster small (3–5) and fast disks.
+- Scale reads via **linearizable reads** (leader lease / ReadIndex) and optional **serializable reads** for non-critical operations.
+
+### Lease & Session Manager
+
+**Responsibility**: Track session liveness, enforce TTL, revoke ephemeral keys/locks on expiry, and provide failure detection.
+
+**Key Design Decisions**:
+- Server uses **monotonic time** for TTL accounting; never trusts client clocks.
+- Sessions are renewed only through **KeepAlive**; missed keepalives trigger expiry and cleanup via the replicated state machine.
+
+**Technology Choice**: In-process module integrated with the Raft state machine; timers drive expirations, but expiry is finalized by committing a revoke operation (or applying deterministic expiry rules on leaders with replication).
+
+**Scaling Strategy**:
+- Heartbeats aggregated by client library (single stream) instead of per-lock heartbeats.
+- Batch keepalive processing (e.g., coalesce renewals per session per 200ms).
+
+### Lock Manager (Fencing Tokens)
+
+**Responsibility**: Implement lock semantics and generate fencing tokens to protect downstream resources.
+
+**Key Design Decisions**:
+- Fencing token is a **monotonic counter per lock name** stored in the replicated state; increment only on successful acquisition.
+- Locks are bound to a **session lease**; if the session expires, the lock is revoked automatically.
+
+**Technology Choice**: Implemented as part of the Raft state machine (a specialized KV with lock metadata).
+
+**Scaling Strategy**:
+- Hot locks are unavoidable bottlenecks; mitigate by client-side backoff and watch-based waiting (no polling storms).
+- Partition the problem by namespace (multiple clusters) rather than sharding within a single lock keyspace, since consensus is the bottleneck.
+
+### Watch Dispatcher
+
+**Responsibility**: Deliver change notifications to clients (lock released, key changed) efficiently.
+
+**Key Design Decisions**:
+- Watches are **edge-triggered** and “at least once”; client must re-read state on notification.
+- Notifications are driven from committed log indexes; clients can resume from a known revision.
+
+**Technology Choice**: gRPC streaming with backpressure; per-connection buffers and drop/rewind rules.
+
+**Scaling Strategy**:
+- Fanout optimized by grouping watches by key/prefix.
+- Apply rate limits and enforce max watches per client to prevent memory blowups.
+
+## Data Model
+
+### Storage Schema
+
+A single replicated state machine maintains these core objects (shown as logical tables; physically this can be a KV map keyed by IDs/names plus indexes).
+
+**sessions**
+- `session_id` (UUID)
+- `client_id` (string; for observability)
+- `lease_ttl_ms` (int)
+- `lease_expiry_monotonic_ms` (int; derived)
+- `last_keepalive_revision` (int64; Raft index / revision)
+- `status` (`ACTIVE|EXPIRED|REVOKED`)
+- `created_at_unix_ms` (int64)
+
+**locks**
+- `lock_name` (string; primary key)
+- `holder_session_id` (UUID; nullable)
+- `lease_session_id` (UUID; nullable; typically same as holder)
+- `fencing_token` (int64; monotonically increasing per `lock_name`)
+- `reentrancy_count` (int32; optional)
+- `acquired_revision` (int64)
+- `updated_revision` (int64)
+
+**idempotency_keys** (optional but recommended)
+- `session_id` (UUID)
+- `request_id` (UUID)
+- `operation` (string)
+- `result_blob` (bytes/json)
+- `expires_at_revision_or_time` (int64)
+
+**events** (logical stream; can be derived from revisions)
+- `revision` (int64)
+- `type` (`LOCK_ACQUIRED|LOCK_RELEASED|SESSION_EXPIRED|...`)
+- `entity_key` (string)
+- `payload` (bytes/json)
+
+### Data Flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant L as Leader
+    participant F as Followers
+    participant SM as State Machine
+
+    C->>L: CreateSession(ttl=10s)
+    L->>F: Replicate (Raft log)
+    F-->>L: Ack quorum
+    L->>SM: Apply session create
+    L-->>C: session_id
+
+    loop every 3s
+        C->>L: KeepAlive(session_id)
+        L->>F: Replicate keepalive
+        F-->>L: Ack quorum
+        L->>SM: Extend lease
+        L-->>C: ok
+    end
+
+    C->>L: AcquireLock(name="A", session_id)
+    L->>F: Replicate acquire
+    F-->>L: Ack quorum
+    L->>SM: If free, set holder + token++
+    L-->>C: success, fencing_token=42
+
+    Note over C,L: If keepalives stop...
+    L->>SM: On expiry, revoke lock + session
+    L-->>C: (watch) lock released event
+```
+
+## API Design
+
+Use **gRPC** for low-latency streaming watches and keepalives; expose a REST gateway optionally for debugging/admin.
+
+### Core gRPC APIs
+
+**CreateSession**
+- `CreateSessionRequest { string client_id; int32 ttl_ms; }`
+- `CreateSessionResponse { string session_id; int64 lease_expiry_unix_ms; }`
+- Errors: `INVALID_ARGUMENT`, `RESOURCE_EXHAUSTED`, `UNAVAILABLE`
+
+**KeepAlive (streaming recommended)**
+- Client stream: `KeepAliveRequest { string session_id; }`
+- Server stream: `KeepAliveResponse { string session_id; int64 lease_expiry_unix_ms; int64 revision; }`
+- Semantics: idempotent; last-write-wins on lease extension
+- Errors: `NOT_FOUND` (unknown session), `FAILED_PRECONDITION` (expired), `UNAVAILABLE`
+
+**AcquireLock**
+- `AcquireLockRequest { string session_id; string lock_name; bool wait; int32 timeout_ms; string request_id; }`
+- `AcquireLockResponse { bool acquired; int64 fencing_token; int64 revision; }`
+- Semantics:
+  - Linearizable. If `wait=false` and held, returns `acquired=false`.
+  - If `wait=true`, server may either block until available or instruct client to watch (preferred for fairness/backpressure).
+- Idempotency:
+  - `request_id` scoped to `session_id`. Server stores result to avoid double-token increments on retries.
+- Errors: `NOT_FOUND` (no session), `DEADLINE_EXCEEDED`, `ABORTED` (leader change), `UNAVAILABLE`
+
+**ReleaseLock**
+- `ReleaseLockRequest { string session_id; string lock_name; string request_id; }`
+- `ReleaseLockResponse { bool released; int64 revision; }`
+- Semantics: Idempotent; releasing a lock not held by session returns `released=false` (or `PERMISSION_DENIED` depending on policy).
+
+**GetLock**
+- `GetLockRequest { string lock_name; bool linearizable; }`
+- `GetLockResponse { bool held; string holder_session_id; int64 fencing_token; int64 revision; }`
+
+**WatchLocks**
+- `WatchRequest { string prefix; int64 start_revision; }`
+- Stream `WatchEvent { int64 revision; string key; string type; bytes payload; }`
+- Semantics: at-least-once; clients resume by `start_revision`.
+
+### Error Handling Approach
+- Use gRPC status codes + structured error details:
+  - `ABORTED` for leader change / retryable conflicts
+  - `FAILED_PRECONDITION` for expired session
+  - `RESOURCE_EXHAUSTED` for watch/session limits
+- Client library implements:
+  - Exponential backoff with jitter
+  - Request hedging disabled for writes (to avoid duplicate pressure)
+  - Automatic leader re-discovery
+
+### Fencing Token Usage (Downstream)
+Any protected resource (DB, object store, scheduler) must check `fencing_token` monotonicity:
+- Example: when writing to a shared worker assignment record, include `token` and enforce `token > stored_token`.
+- This prevents a stalled/partitioned client from acting after losing its lease.
+
+## Scaling & Performance
+
+### Bottleneck Analysis
+- **Consensus write throughput** is the primary bottleneck (every Acquire/Release/KeepAlive is replicated).
+  - Mitigation: streaming keepalives, batching, minimize write amplification, compact logs.
+- **Hot locks** cause contention and watch fanout.
+  - Mitigation: watch-based waiting, backoff, and application-level lock striping/sharding.
+- **Watch memory usage** can spike with many watchers.
+  - Mitigation: limits per client, bounded buffers, and requiring resume revisions.
+
+### Horizontal Scaling
+- A single Raft group does not scale writes linearly; instead:
+  - Run **multiple independent clusters** per environment/namespace/tenant.
+  - Encourage **lock keyspace partitioning** by prefix (e.g., `teamA/*`, `teamB/*`) across clusters.
+- Within a cluster:
+  - Add followers to improve read scalability (if allowing serializable reads on followers).
+  - Keep cluster size small for low commit latency (3 is typical; 5 for higher fault tolerance).
+
+### Caching Strategy
+- **Client-side caching** for non-critical reads (e.g., cached lock state with short TTL like 250ms).
+- **Server-side**: avoid caching that weakens correctness; linearizable reads should consult leader (ReadIndex).
+- Watch-based invalidation:
+  - Clients cache `GetLock` results and invalidate on watch events for the lock/prefix.
+- Cache invalidation is “best-effort”; correctness always relies on linearizable acquire.
+
+## Trade-offs & Alternatives
+
+### Key Trade-offs Made
+- **Chosen**: Linearizable lock operations via Raft  
+  **Sacrificed**: Availability of writes during partitions (CAP)  
+  **Why**: Locking requires safety; split-brain locks are catastrophic.
+
+- **Chosen**: Server-managed leases + fencing tokens  
+  **Sacrificed**: Simplicity (more metadata and downstream enforcement)  
+  **Why**: Leases alone do not prevent stale clients from acting; fencing tokens close that hole.
+
+- **Chosen**: Watch-based waiting  
+  **Sacrificed**: Complexity of streaming + backpressure handling  
+  **Why**: Prevents thundering herds and reduces QPS under contention.
+
+### Alternative Approaches
+- **Redis-based locks (including Redlock)**:
+  - Pros: simple, fast
+  - Cons: tricky correctness under failover/partitions; fencing often missing; not ideal for foundational coordination
+- **Database row locks / advisory locks**:
+  - Pros: reuse existing infra
+  - Cons: couples coordination to DB availability/perf; cross-service scaling and watch semantics are poor
+- **Gossip / eventual consistency coordination**:
+  - Pros: high availability
+  - Cons: cannot provide linearizable mutual exclusion; unsafe for general-purpose locks
+
+## Failure Modes & Mitigations
+
+### Failure Scenarios
+- **Scenario**: Leader crashes  
+  **Impact**: Writes unavailable during election (typically 100ms–2s)  
+  **Detection**: Raft election timeouts; client `UNAVAILABLE/ABORTED`  
+  **Mitigation**: Fast elections, client retries with backoff, persistent WAL to avoid data loss
+
+- **Scenario**: Network partition splits cluster  
+  **Impact**: Minority partition becomes read-only; no split-brain writes  
+  **Detection**: Loss of quorum, Raft step-down  
+  **Mitigation**: Require quorum for writes; expose clear errors; optionally allow serializable reads on followers
+
+- **Scenario**: Client GC pause or stall beyond TTL  
+  **Impact**: Session expires; lock revoked; client may still run  
+  **Detection**: Missed keepalive; session moves to EXPIRED  
+  **Mitigation**: Fencing tokens prevent stale client actions; client library surfaces “lease lost” and forces re-acquire
+
+- **Scenario**: Clock drift  
+  **Impact**: Incorrect lease timing if client clocks used  
+  **Detection**: N/A  
+  **Mitigation**: Only server monotonic clock used for TTL; client TTL is advisory for UX only
+
+- **Scenario**: Watcher overload / slow consumers  
+  **Impact**: Memory pressure, delayed notifications  
+  **Detection**: Queue depth, backpressure metrics  
+  **Mitigation**: Bounded buffers, drop policy with resume-from-revision, per-client limits, rate limiting
+
+### Disaster Recovery
+- **Targets**:
+  - In-region: RPO 0, RTO < 1 minute (single cluster, automated restart)
+  - Cross-region DR: RPO 1–5 minutes, RTO 15–30 minutes (configurable)
+- **Backup strategy**:
+  - Periodic snapshots + WAL archiving to object storage
+  - Verify restore regularly (automated fire drills)
+- **Failover procedures**:
+  - Passive secondary restored from snapshot/WAL
+  - DNS/service discovery cutover
+  - Clients reconnect and establish new sessions; locks are not “magically preserved” across region failover—applications must tolerate re-acquire and use fencing to ensure safety
+
+## Operational Considerations
+
+### Monitoring & Alerting
+- Key metrics:
+  - Raft: leader changes, commit latency, WAL fsync time, log size, snapshot duration
+  - API: QPS by method, P50/P99 latency, error rates by code
+  - Leases: active sessions, keepalive rate, expirations/minute
+  - Watches: active watches, queue depth, dropped events, reconnect rate
+  - Resource: CPU, RSS, disk IOPS, disk latency, file descriptor usage
+- Alerts (examples):
+  - Commit P99 > 100ms for 5m
+  - No leader for > 10s
+  - Disk fsync P99 > 20ms
+  - Watch drops > 0.1% events
+  - Session expirations spike 10x baseline (could indicate network issues)
+
+### Deployment Strategy
+- Rolling upgrades with one node at a time; ensure quorum remains.
+- Use canary clients or shadow traffic for new versions (especially client libraries).
+- Backward-compatible wire protocol; versioned APIs.
+- Rollback:
+  - Prefer “roll forward” for state machine changes; if rollback needed, ensure snapshot/WAL compatibility or gate new features behind cluster-version checks.
+
+## References & Further Reading
+- Chubby: *The Chubby lock service for loosely-coupled distributed systems*
+- ZooKeeper: Zab / ZooKeeper docs and recipes (leader election, locks)
+- etcd: Raft-based coordination store; watch semantics and linearizable reads
+- Raft paper: *In Search of an Understandable Consensus Algorithm*
+- “Fencing tokens” discussion: common patterns in distributed locks (also used in HDFS, Kubernetes controllers)
+- Jepsen analyses of coordination systems (practical failure modes under partitions)
+```
+
+---
+
+Output the complete, improved document now.
+mcp startup: no servers
+
+
+
+thinking
+**Enhancing document structure**
+
+I’m adding a scale estimates section covering calculations like keepalive QPS and lock QPS to ensure it's production-ready and discussing multi-region setups. I need to include disaster recovery options, such as async snapshot shipping versus raft across regions. There are operations to cover including membership changes, compaction, and backups. 
+
+I'll discuss state machine representation, idempotency storage with TTL and LRU, and conflict management with reentrancy counts. The approach for implementing Acquire with wait will be considered too, emphasizing fairness and noting best-effort FIFO ordering while ensuring security with ACLs.
+thinking
+**Improving documentation**
+
+The quality bar demands both breadth and depth, so we aim for about 250-400 lines of code. I need to ensure all mermaid diagrams are valid, including graphs and sequences; I’ll skip the `%%{init: ...}%%` part since it isn’t necessary. 
+
+Key modifications include specifying explicit SLOs like 99.99 and p99. We'll address scaling, noting that we can manage 50k sessions with a TTL of 30 seconds, translating to 5k QPS for keepalives and 2k for acquire/release. Total writes will reach up to 7k QPS. I'll also include storage estimates and client library behaviors.
+thinking
+**Crafting documentation enhancements**
+
+I'm considering adding a small snippet of sample pseudo-code for fencing, even though the user didn't specifically ask for it. It could be helpful anyway! I should also mention anti-patterns, like relying on lock release, having long TTLs, and using a lock as a data store in a pitfalls section. Additionally, I'll include "Operations," which will encompass SRE runbooks. Overall, I want to ensure that the documentation is comprehensive and user-friendly. Let’s get started on those additions!
+codex
+```markdown
+---
+title: "Distributed Lock Service"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["coordination", "distributed-systems", "consensus"]
+---
+
+## Overview
+
+A distributed lock service is a coordination primitive that provides **mutual exclusion** for shared resources across many unreliable clients. The hard part is not tracking “who holds the lock,” but doing so **safely** under network partitions, process crashes, long GC pauses, clock drift, and retry storms—while still offering **low-latency, linearizable** semantics that other systems can trust.
+
+This design follows the proven pattern of **Chubby / ZooKeeper / etcd**: a small replicated control-plane cluster that provides:
+
+- **Linearizable writes** (acquire/release, session/lease state)
+- **Linearizable reads** (optional but supported) and cheaper **serializable reads** (optional)
+- **Leases/sessions** for liveness and automatic cleanup of ephemeral state
+- **Watches** for efficient notification (to avoid polling)
+- **Fencing tokens** to prevent stale clients from corrupting downstream systems
+
+The key separation is:
+
+- **Safety**: ensured by **consensus** (single authoritative history) and **fencing tokens**
+- **Liveness**: ensured by **leases/sessions** (TTL + keepalive) and bounded failure detection
+
+> Core rule: locks are only “safe” if *downstream systems enforce fencing tokens* (or an equivalent monotonic guard).
+
+---
+
+## Requirements
+
+### Functional Requirements
+
+- Create and manage **sessions** with server-assigned leases (TTL-based).
+- Support **Acquire/Release** of named locks with **linearizable** semantics.
+- Return a **fencing token** (monotonically increasing per lock name) on successful acquire.
+- Automatically revoke locks and ephemeral keys when a session expires.
+- Provide **watch/notify** APIs to wait for changes without polling.
+- Support:
+  - `TryAcquire` (no-wait)
+  - `Acquire(wait, timeout)` (wait with bounded resource usage)
+  - **Reentrant** locks per session (optional; common in practice)
+- Provide primitives commonly built atop leases:
+  - ephemeral membership (presence)
+  - leader election recipes (e.g., “smallest sequential node” pattern, if implemented)
+- Expose admin endpoints for:
+  - health and readiness
+  - metrics
+  - membership changes (add/remove voter/learner)
+  - snapshots/backup triggers (optional)
+
+### Non-Functional Requirements
+
+#### Scale (single cluster, single region)
+- **Sessions**: 50,000 concurrent
+- **Locks (active)**: 200,000
+- **Total keys** (locks + ephemeral/membership + metadata): up to 5,000,000
+- **Traffic**
+  - Reads (`Get`, `Watch` streams): ~20,000 QPS
+  - Writes (linearizable): ~7,000 QPS typical peak
+    - KeepAlive: 50k sessions, keepalive every 10s ⇒ **~5,000 QPS**
+    - Lock ops (Acquire/Release combined): **~2,000 QPS** peak
+
+> If you need materially higher write rates, you typically scale by **more clusters** (namespaces/tenants) rather than trying to shard a single consensus group.
+
+#### Latency targets (single region, healthy quorum, NVMe/SSD)
+- Linearizable writes (Acquire/Release/KeepAlive):
+  - P50 **< 10ms**
+  - P99 **< 50ms**
+- Linearizable reads (`Get` with `linearizable=true`):
+  - P50 **< 5ms**
+  - P99 **< 25ms**
+- Watch delivery:
+  - P99 **< 250ms** from commit to client receive (assuming healthy client connection)
+
+#### Availability & behavior under partitions
+- **SLO**: 99.99% monthly availability for quorum-available scenarios
+- **Safety over availability** for writes:
+  - Without quorum: **no lock writes** (Acquire/Release/KeepAlive reject)
+  - Optional: allow **serializable reads** from followers when leader/quorum unavailable (clearly labeled as potentially stale)
+
+#### Consistency model
+- **Linearizable**:
+  - Acquire/Release
+  - session lifecycle (create/renew/expire)
+  - fencing token assignment
+- **Watch**:
+  - at-least-once delivery
+  - may include duplicates / reordering across reconnects
+  - clients must treat watch events as **hints** and re-check state (via `Get` or retry Acquire)
+
+#### Durability & recovery
+- Committed operations are not lost:
+  - WAL is persisted before acknowledging commit (fsync or equivalent durability)
+  - snapshots bound replay time
+- In-region: **RPO = 0** (for committed entries), **RTO < 1 minute** typical for single-node restart / leader failover
+- Cross-region DR: configurable, typically **RPO minutes** and **RTO 15–30 minutes** (unless you accept higher latency by doing synchronous multi-region consensus)
+
+### Constraints & Assumptions
+
+- Small ops team; correctness and operability prioritized over maximum throughput.
+- Client libraries exist for at least Go/Java/Python and provide consistent semantics.
+- Primary deployment is single region for low latency; DR is optional.
+- Security baseline:
+  - TLS everywhere; optional mTLS for internal workloads
+  - authn/authz and audit logs for administrative actions
+- Cost: small clusters (3–5 nodes) with predictable CPU/disk; avoid heavyweight dependencies.
+
+---
+
+## Architecture
+
+### High-level diagram
+
+```mermaid
+graph TB
+  subgraph Clients
+    A[Client Apps]
+    B[Client Library<br/>sessions, retries, keepalive, watches]
+    A --> B
+  end
+
+  subgraph Cluster["Lock Service Cluster (Raft Group)"]
+    LB[Load Balancer / VIP<br/>TLS, routing]
+    L[Leader]
+    F1[Follower]
+    F2[Follower]
+
+    SM[Replicated State Machine<br/>sessions, locks, tokens, KV]
+    WAL[WAL + Snapshots<br/>fsync, compaction]
+    W[Watch Fanout<br/>per-connection backpressure]
+
+    LB --> L
+    LB --> F1
+    LB --> F2
+
+    L <--> F1
+    L <--> F2
+
+    L --> WAL
+    F1 --> WAL
+    F2 --> WAL
+
+    L --> SM
+    F1 --> SM
+    F2 --> SM
+
+    SM --> W
+  end
+
+  B --> LB
+```
+
+### Core invariants
+
+1. **Single-writer history**: all state transitions that affect lock ownership and fencing tokens are committed through Raft.
+2. **Leases are authoritative**: sessions are considered valid only if their lease is valid in the replicated state.
+3. **Fencing tokens are monotonic per lock**: incremented only on successful acquisition, and never reused.
+4. **Watches are advisory**: correctness never depends on receiving watch events.
+
+---
+
+## Components
+
+### 1) Raft Consensus Layer
+
+**Responsibility**: Provide a single, linearizable log of state transitions with a leader per term.
+
+**Key design choices**
+- 3 nodes is typical for latency and cost; 5 nodes for higher fault tolerance (but higher write latency).
+- Use a production-proven Raft implementation (etcd-style) with:
+  - pre-vote to reduce disruption
+  - joint consensus for membership changes
+  - snapshotting + log compaction
+
+**Write path (linearizable)**
+- Client request → leader appends log entry → replicate to followers → quorum fsync/ack → commit → apply to state machine → respond.
+
+**Read path**
+- Linearizable read: leader uses `ReadIndex` (or equivalent) to ensure it is current with quorum.
+- Optional serializable read: follower/local read without quorum (stale possible).
+
+### 2) Replicated State Machine (Locks + Sessions)
+
+**Responsibility**: Deterministically apply committed log entries to produce:
+- session table (lease TTL, expiry, status)
+- lock table (holder session, reentrancy count, fencing token)
+- optional KV namespace (for ephemeral membership and recipes)
+
+**Important properties**
+- Deterministic application: given the same log, all nodes converge to identical state.
+- Revisioning: each committed log index becomes a **revision** used by:
+  - watch resume (`start_revision`)
+  - idempotency records
+  - debugging and audits
+
+### 3) Lease & Session Manager
+
+**Responsibility**: Manage session leases (TTL) and ensure cleanup of ephemeral state.
+
+**Key design choices**
+- Server uses **monotonic time** for lease accounting; never trusts client clocks.
+- KeepAlive updates are committed (linearizable), so lease extensions are consistent across the cluster.
+- Expiry is applied via a committed operation (e.g., `ExpireSession(session_id, at_revision)`), triggered by the leader when it observes TTL elapsed.
+
+**Tuning defaults**
+- Default TTL: **30s**
+- Client keepalive period: **10s** (≈ TTL/3)
+- Expiry grace: small jitter (e.g., ±250ms) to avoid synchronized storms
+
+### 4) Lock Manager (with Fencing Tokens)
+
+**Responsibility**: Implement lock semantics and generate fencing tokens.
+
+**Lock semantics**
+- Acquire is successful if:
+  - session is ACTIVE
+  - lock is free, or is already held by the same session (reentrant)
+- Release is successful if:
+  - lock is held by the session (or reentrant count decrements to zero)
+
+**Fencing tokens**
+- Per `lock_name`, store a counter `next_token`.
+- On successful acquisition from free → held:
+  - increment token and return the new value.
+- On reentrant acquire:
+  - typically return the *existing* fencing token for that holder.
+
+> Tokens must be enforced by the downstream resource to be meaningful.
+
+### 5) Watch Dispatcher
+
+**Responsibility**: Efficiently notify clients of state changes.
+
+**Semantics**
+- At-least-once delivery per stream.
+- Events are tagged with revision.
+- On overflow/slow consumers:
+  - drop buffered events and send a “compacted/overflow” signal requiring client resync from a revision or do a fresh `Get`.
+
+**Resource controls**
+- Max watches per session/client.
+- Per-stream outbound buffer limits (bytes and event count).
+- Rate limits on watch creation and event delivery.
+
+---
+
+## Data Model
+
+The physical storage is typically a key-value map plus indexes, but shown here logically.
+
+### Sessions
+
+**sessions**
+- `session_id` (UUID)
+- `client_id` (string)
+- `ttl_ms` (int32)
+- `lease_expiry_mono_ms` (int64)
+- `status` (`ACTIVE|EXPIRED|REVOKED`)
+- `created_revision` (int64)
+- `last_keepalive_revision` (int64)
+
+### Locks
+
+**locks**
+- `lock_name` (string, primary key)
+- `holder_session_id` (UUID, nullable)
+- `fencing_token` (int64, last issued token for this lock)
+- `reentrancy_count` (int32)
+- `acquired_revision` (int64)
+- `updated_revision` (int64)
+
+### Idempotency (recommended)
+
+**idempotency_keys**
+- `session_id` (UUID)
+- `request_id` (string/UUID)
+- `op` (enum/string)
+- `result` (bytes/json)
+- `expires_revision` or `expires_mono_ms`
+
+> Must be bounded (TTL + size cap) to prevent unbounded growth.
+
+### Events / Revisions
+
+Events can be derived from state transitions; many systems store a compact “watch event” stream keyed by revision.
+
+**watch_events** (optional materialization)
+- `revision` (int64)
+- `key` (string)
+- `type` (enum: `LOCK_UPDATED`, `SESSION_EXPIRED`, …)
+- `payload` (bytes/json)
+
+---
+
+## Request/Response Flows
+
+### Acquire with fencing token
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant L as Leader
+  participant F as Followers
+  participant SM as State Machine
+  participant W as Watch Streams
+
+  C->>L: AcquireLock(lock=A, session=S, request_id=R)
+  L->>SM: Validate session S ACTIVE
+  L->>F: Replicate log entry (Acquire A by S)
+  F-->>L: Quorum acks (durable)
+  L->>SM: Apply: set holder=S, token++
+  SM-->>W: Emit event (LOCK_UPDATED A @rev)
+  L-->>C: acquired=true, token=42, revision=rev
+```
+
+### Lease expiry and automatic revoke
+
+```mermaid
+sequenceDiagram
+  participant T as Leader Timer
+  participant L as Leader
+  participant F as Followers
+  participant SM as State Machine
+  participant W as Watch Streams
+
+  T->>L: Detect TTL elapsed for session S
+  L->>F: Replicate log entry (ExpireSession S)
+  F-->>L: Quorum acks
+  L->>SM: Apply: mark S EXPIRED, release locks held by S
+  SM-->>W: Emit events (SESSION_EXPIRED S, LOCK_UPDATED ...)
+```
+
+---
+
+## API Design (gRPC)
+
+Use gRPC for low-latency streaming (KeepAlive/Watch). A REST gateway can be added for admin/debug, but core correctness should rely on gRPC.
+
+### Core RPCs (proto-like)
+
+#### CreateSession
+- Request: `client_id`, `ttl_ms`
+- Response: `session_id`, `lease_expiry_unix_ms`, `revision`
+
+Errors:
+- `INVALID_ARGUMENT` (bad TTL)
+- `RESOURCE_EXHAUSTED` (session limits)
+- `UNAVAILABLE` (no leader/quorum)
+
+#### KeepAlive (bi-directional stream)
+Client stream:
+- `session_id`
+
+Server stream:
+- `session_id`, `lease_expiry_unix_ms`, `revision`
+
+Semantics:
+- Linearizable lease extension.
+- If session is expired/revoked, server returns `FAILED_PRECONDITION`.
+
+Errors:
+- `NOT_FOUND` (unknown session)
+- `FAILED_PRECONDITION` (expired/revoked)
+- `UNAVAILABLE` (no leader/quorum)
+
+#### AcquireLock
+Request:
+- `session_id`
+- `lock_name`
+- `wait` (bool)
+- `timeout_ms` (int32)
+- `request_id` (string/UUID)
+
+Response:
+- `acquired` (bool)
+- `fencing_token` (int64, only meaningful if acquired)
+- `revision` (int64)
+
+Semantics:
+- Linearizable.
+- If `wait=false` and lock is held by another session → `acquired=false`.
+- If `wait=true`, recommended pattern is:
+  1) server returns quickly with `acquired=false` and `recommended_start_revision`
+  2) client sets a watch and retries Acquire on notification (avoids server-side waiter buildup)
+
+Idempotency:
+- `(session_id, request_id)` must not cause multiple token increments on retry.
+
+Errors:
+- `NOT_FOUND` (no session)
+- `DEADLINE_EXCEEDED` (timeout)
+- `ABORTED` (leader change; retryable)
+- `UNAVAILABLE` (no leader/quorum)
+
+#### ReleaseLock
+Request:
+- `session_id`, `lock_name`, `request_id`
+
+Response:
+- `released` (bool), `revision`
+
+Semantics:
+- Linearizable and idempotent.
+- If lock not held by session:
+  - either `released=false` (simple) or `PERMISSION_DENIED` (stricter). Pick one and keep consistent.
+
+#### GetLock
+Request:
+- `lock_name`
+- `linearizable` (bool)
+
+Response:
+- `held` (bool)
+- `holder_session_id` (string)
+- `fencing_token` (int64)
+- `revision` (int64)
+
+#### Watch
+Request:
+- `prefix` (string) or `key`
+- `start_revision` (int64)
+
+Stream:
+- `revision`, `key`, `type`, `payload`
+
+Semantics:
+- at-least-once
+- on compaction/overflow: server returns a special error/detail instructing client to resync
+
+### Client-library contract (what interviewers look for)
+
+- Maintains exactly one session per process (or per logical client identity).
+- Keeps KeepAlive stream open; reconnects with backoff and jitter.
+- Treats `FAILED_PRECONDITION` (expired) as terminal: stop using any held locks and force re-acquire.
+- Uses watches for waiting; does not busy-loop Acquire.
+- Exposes a clear “lease lost” signal to application code.
+
+---
+
+## Fencing Tokens (Downstream Enforcement)
+
+A lock service can only guarantee “at most one holder at a time” at the lock layer. To protect the *resource*, downstream must enforce the fencing token.
+
+Common enforcement patterns:
+
+- **Database row**: `UPDATE resource SET owner=?, token=? WHERE token < ?`
+- **Job scheduler**: accept work only if `token` ≥ last seen token for that resource
+- **Object store / blob**: store token in metadata and reject writes with smaller token
+
+If the downstream cannot enforce monotonicity, the lock is vulnerable to:
+- stalled client resuming after lease expiry
+- partitioned client continuing to act locally
+
+---
+
+## Scaling & Performance
+
+### Capacity reality check
+
+With the targets above:
+- KeepAlive write rate is dominated by session count:
+  - 50k sessions / 10s = **5k writes/s**
+- Each write requires:
+  - leader append + fsync (group commit helps)
+  - replication to followers
+  - quorum ack
+
+This is achievable on 3 nodes with fast disks and careful batching, but:
+- **disk latency variance** (fsync tail latency) is often the primary driver of P99
+- watch fanout and connection count drive memory and CPU
+
+### Primary bottlenecks & mitigations
+
+- **Consensus write throughput**
+  - Streaming keepalive (one stream per client) to reduce per-request overhead
+  - Coalesce keepalive updates (e.g., apply at most once per session per 200ms)
+  - Snapshot + compaction to keep log small
+  - Fast NVMe/SSD; avoid network-attached disks with unpredictable fsync
+
+- **Hot locks / thundering herd**
+  - Watch-based waiting + jittered retry
+  - Application-level lock striping (e.g., shard work items)
+  - Rate limits per lock prefix if a single lock becomes pathological
+
+- **Watch memory pressure**
+  - Bound per-stream buffers
+  - Drop + resync semantics
+  - Max watches per client; require prefix selection discipline
+
+### Horizontal scaling strategy
+
+A single Raft group does not scale writes linearly. The standard approach is:
+- Run **multiple independent clusters** partitioned by:
+  - tenant
+  - environment (prod/staging)
+  - namespace/prefix (`teamA/*`, `teamB/*`)
+- Keep each cluster 3 nodes unless you have a strong reason for 5.
+
+Within one cluster:
+- Use followers for cheaper (serializable) reads if acceptable.
+- Keep linearizable reads on leader (ReadIndex) for correctness.
+
+### Caching
+
+- Client-side cache for non-critical reads (short TTL, e.g. 250ms) is fine if:
+  - Acquire remains linearizable
+  - cache is invalidated on watch events (best-effort)
+- Avoid server-side caching that weakens read-your-writes guarantees.
+
+---
+
+## Trade-offs & Alternatives
+
+### Trade-offs made
+
+1) **Linearizable locking via consensus**
+- Benefit: no split-brain locks; strong correctness
+- Cost: writes unavailable without quorum; throughput bounded by quorum commit latency
+
+2) **Leases + fencing tokens**
+- Benefit: protects against stalled clients and ambiguous failure detection
+- Cost: more complexity; requires downstream enforcement to be truly safe
+
+3) **Watch-based waiting instead of server-side waiter queues**
+- Benefit: avoids unbounded server memory under contention; scales better
+- Cost: more client complexity; duplicates/reconnect handling required
+
+### Alternatives (and when they fit)
+
+- **Redis locks / Redlock**
+  - Good for: best-effort coordination where occasional anomalies are tolerable
+  - Risk: subtle failure modes under partitions/failover; fencing often missing; not ideal for foundational primitives
+
+- **Database locks (row/advisory locks)**
+  - Good for: coordination tightly coupled to a single DB, small scale
+  - Limitations: hard to scale cross-service; poor watch semantics; can overload the DB
+
+- **Gossip / eventual coordination**
+  - Good for: high availability membership/health hints
+  - Not suitable for: general-purpose mutual exclusion requiring linearizability
+
+- **Single-writer ownership service**
+  - If one service can safely own the resource, you can sometimes avoid distributed locks entirely.
+
+---
+
+## Failure Modes & Mitigations
+
+### 1) Leader crash / restart
+- Impact: write unavailability during election (typically 200ms–2s, depending on timeouts)
+- Mitigations:
+  - tuned election timeouts (avoid too-low values causing flapping)
+  - client retries with jittered backoff
+  - expose leader identity for faster reroute (optional)
+
+### 2) Cluster partition / quorum loss
+- Impact:
+  - minority partition becomes read-only
+  - writes rejected (safety preserved)
+- Mitigations:
+  - clear `UNAVAILABLE` / “no quorum” errors
+  - optional serializable reads from followers for diagnostics only
+
+### 3) Client stall (GC pause) beyond TTL
+- Impact:
+  - session expires; locks revoked; client may continue executing
+- Mitigations:
+  - fencing tokens prevent stale writes
+  - client library emits “lease lost” and forces stop/re-acquire
+
+### 4) Slow disk / fsync tail latency
+- Impact:
+  - write P99 spikes; watch delivery delays; potential timeouts
+- Mitigations:
+  - NVMe/SSD and disk health monitoring
+  - WAL group commit
+  - alert on fsync P99 and queue growth
+  - shed load (rate limit keepalive bursts) before collapse
+
+### 5) Watch overload / slow consumer
+- Impact:
+  - memory pressure; delayed events; dropped buffers
+- Mitigations:
+  - bounded buffers + drop/resync protocol
+  - per-client watch limits
+  - backpressure-aware streaming and metrics
+
+### 6) Bugs or non-determinism in state machine
+- Impact: divergence across replicas (worst-case catastrophic)
+- Mitigations:
+  - strict determinism rules
+  - schema/version gating
+  - replay tests on recorded WAL segments
+  - canary rollout + feature flags for state changes
+
+---
+
+## Disaster Recovery
+
+### In-region
+- RPO: **0** for committed operations
+- RTO: **< 1 minute** typical for leader failover + process restart
+- Practice:
+  - anti-affinity across AZs
+  - automated restart
+  - periodic snapshots for fast recovery
+
+### Cross-region
+Two common approaches:
+
+1) **Async DR (recommended for low-latency primary)**
+- Ship snapshots + WAL segments to object storage in another region.
+- RPO: **1–5 minutes** (configurable)
+- RTO: **15–30 minutes**
+
+2) **Synchronous multi-region consensus (rare; expensive)**
+- Stronger RPO, but much higher write latency (cross-region RTT).
+- Usually only justified for very high criticality and when clients tolerate higher latencies.
+
+Failover behavior:
+- Clients reconnect and create new sessions.
+- Locks are not guaranteed to be “preserved” across region failover; applications must tolerate re-acquire and rely on fencing.
+
+---
+
+## Operations
+
+### Monitoring (golden signals + Raft specifics)
+
+Key metrics:
+- Raft:
+  - leader changes / term increases
+  - commit latency (P50/P99)
+  - replication lag per follower
+  - log size, snapshot duration, compaction time
+- Storage:
+  - WAL fsync latency (P50/P99)
+  - disk queue depth, IOPS, %util, free space
+- API:
+  - QPS by method
+  - error rate by code (`UNAVAILABLE`, `ABORTED`, `FAILED_PRECONDITION`, …)
+  - end-to-end latency P50/P99
+- Leases:
+  - active sessions
+  - keepalive QPS
+  - expirations per minute (and spikes)
+- Watches:
+  - active watch streams
+  - event fanout rate
+  - dropped/compacted events
+  - reconnect rate
+
+Example alerts:
+- No leader for > 10s
+- Commit latency P99 > 100ms for 5m
+- WAL fsync P99 > 20ms for 5m
+- Snapshot/compaction failures > 0
+- Watch drops > 0.1% of events
+- Session expirations spike > 10× baseline (often indicates network issues)
+
+### Deployment & upgrades
+
+- Rolling upgrade one node at a time; maintain quorum.
+- Version state machine changes carefully:
+  - forward-compatible encodings
+  - feature gated by cluster version
+- Prefer “roll forward” for state machine bugs; rollback can be unsafe if log/snapshot formats change.
+
+### Administrative controls
+
+- Authenticated membership changes (learner → voter).
+- Snapshot and compaction controls (with safe defaults).
+- Rate limit knobs (per-client sessions/watches/QPS).
+- Audit logs for:
+  - membership changes
+  - config changes
+  - manual revokes (if supported)
+
+### Common pitfalls (practical interview guidance)
+
+- Using locks for long-lived work without heartbeats/checkpoints.
+- Assuming “Release succeeded” implies safety (it doesn’t under partitions).
+- Building workflows that require strict fairness (most lock services provide only best-effort fairness).
+- Relying on watches without re-checking state (watches are advisory).
+
+---
+
+## References & Further Reading
+
+- *The Chubby lock service for loosely-coupled distributed systems* (Burrows)
+- ZooKeeper documentation and recipes (watches, ephemeral nodes)
+- etcd documentation (Raft, linearizable reads, watch semantics)
+- *In Search of an Understandable Consensus Algorithm (Raft)* (Ongaro, Ousterhout)
+- Jepsen analyses of coordination systems (real failure modes under partitions)
+- Fencing token patterns (e.g., HDFS, Kubernetes controllers, distributed schedulers)
+```
+tokens used
+12,021
+```markdown
+---
+title: "Distributed Lock Service"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["coordination", "distributed-systems", "consensus"]
+---
+
+## Overview
+
+A distributed lock service is a coordination primitive that provides **mutual exclusion** for shared resources across many unreliable clients. The hard part is not tracking “who holds the lock,” but doing so **safely** under network partitions, process crashes, long GC pauses, clock drift, and retry storms—while still offering **low-latency, linearizable** semantics that other systems can trust.
+
+This design follows the proven pattern of **Chubby / ZooKeeper / etcd**: a small replicated control-plane cluster that provides:
+
+- **Linearizable writes** (acquire/release, session/lease state)
+- **Linearizable reads** (optional but supported) and cheaper **serializable reads** (optional)
+- **Leases/sessions** for liveness and automatic cleanup of ephemeral state
+- **Watches** for efficient notification (to avoid polling)
+- **Fencing tokens** to prevent stale clients from corrupting downstream systems
+
+The key separation is:
+
+- **Safety**: ensured by **consensus** (single authoritative history) and **fencing tokens**
+- **Liveness**: ensured by **leases/sessions** (TTL + keepalive) and bounded failure detection
+
+> Core rule: locks are only “safe” if *downstream systems enforce fencing tokens* (or an equivalent monotonic guard).
+
+---
+
+## Requirements
+
+### Functional Requirements
+
+- Create and manage **sessions** with server-assigned leases (TTL-based).
+- Support **Acquire/Release** of named locks with **linearizable** semantics.
+- Return a **fencing token** (monotonically increasing per lock name) on successful acquire.
+- Automatically revoke locks and ephemeral keys when a session expires.
+- Provide **watch/notify** APIs to wait for changes without polling.
+- Support:
+  - `TryAcquire` (no-wait)
+  - `Acquire(wait, timeout)` (wait with bounded resource usage)
+  - **Reentrant** locks per session (optional; common in practice)
+- Provide primitives commonly built atop leases:
+  - ephemeral membership (presence)
+  - leader election recipes (e.g., “smallest sequential node” pattern, if implemented)
+- Expose admin endpoints for:
+  - health and readiness
+  - metrics
+  - membership changes (add/remove voter/learner)
+  - snapshots/backup triggers (optional)
+
+### Non-Functional Requirements
+
+#### Scale (single cluster, single region)
+- **Sessions**: 50,000 concurrent
+- **Locks (active)**: 200,000
+- **Total keys** (locks + ephemeral/membership + metadata): up to 5,000,000
+- **Traffic**
+  - Reads (`Get`, `Watch` streams): ~20,000 QPS
+  - Writes (linearizable): ~7,000 QPS typical peak
+    - KeepAlive: 50k sessions, keepalive every 10s ⇒ **~5,000 QPS**
+    - Lock ops (Acquire/Release combined): **~2,000 QPS** peak
+
+> If you need materially higher write rates, you typically scale by **more clusters** (namespaces/tenants) rather than trying to shard a single consensus group.
+
+#### Latency targets (single region, healthy quorum, NVMe/SSD)
+- Linearizable writes (Acquire/Release/KeepAlive):
+  - P50 **< 10ms**
+  - P99 **< 50ms**
+- Linearizable reads (`Get` with `linearizable=true`):
+  - P50 **< 5ms**
+  - P99 **< 25ms**
+- Watch delivery:
+  - P99 **< 250ms** from commit to client receive (assuming healthy client connection)
+
+#### Availability & behavior under partitions
+- **SLO**: 99.99% monthly availability for quorum-available scenarios
+- **Safety over availability** for writes:
+  - Without quorum: **no lock writes** (Acquire/Release/KeepAlive reject)
+  - Optional: allow **serializable reads** from followers when leader/quorum unavailable (clearly labeled as potentially stale)
+
+#### Consistency model
+- **Linearizable**:
+  - Acquire/Release
+  - session lifecycle (create/renew/expire)
+  - fencing token assignment
+- **Watch**:
+  - at-least-once delivery
+  - may include duplicates / reordering across reconnects
+  - clients must treat watch events as **hints** and re-check state (via `Get` or retry Acquire)
+
+#### Durability & recovery
+- Committed operations are not lost:
+  - WAL is persisted before acknowledging commit (fsync or equivalent durability)
+  - snapshots bound replay time
+- In-region: **RPO = 0** (for committed entries), **RTO < 1 minute** typical for single-node restart / leader failover
+- Cross-region DR: configurable, typically **RPO minutes** and **RTO 15–30 minutes** (unless you accept higher latency by doing synchronous multi-region consensus)
+
+### Constraints & Assumptions
+
+- Small ops team; correctness and operability prioritized over maximum throughput.
+- Client libraries exist for at least Go/Java/Python and provide consistent semantics.
+- Primary deployment is single region for low latency; DR is optional.
+- Security baseline:
+  - TLS everywhere; optional mTLS for internal workloads
+  - authn/authz and audit logs for administrative actions
+- Cost: small clusters (3–5 nodes) with predictable CPU/disk; avoid heavyweight dependencies.
+
+---
+
+## Architecture
+
+### High-level diagram
+
+```mermaid
+graph TB
+  subgraph Clients
+    A[Client Apps]
+    B[Client Library<br/>sessions, retries, keepalive, watches]
+    A --> B
+  end
+
+  subgraph Cluster["Lock Service Cluster (Raft Group)"]
+    LB[Load Balancer / VIP<br/>TLS, routing]
+    L[Leader]
+    F1[Follower]
+    F2[Follower]
+
+    SM[Replicated State Machine<br/>sessions, locks, tokens, KV]
+    WAL[WAL + Snapshots<br/>fsync, compaction]
+    W[Watch Fanout<br/>per-connection backpressure]
+
+    LB --> L
+    LB --> F1
+    LB --> F2
+
+    L <--> F1
+    L <--> F2
+
+    L --> WAL
+    F1 --> WAL
+    F2 --> WAL
+
+    L --> SM
+    F1 --> SM
+    F2 --> SM
+
+    SM --> W
+  end
+
+  B --> LB
+```
+
+### Core invariants
+
+1. **Single-writer history**: all state transitions that affect lock ownership and fencing tokens are committed through Raft.
+2. **Leases are authoritative**: sessions are considered valid only if their lease is valid in the replicated state.
+3. **Fencing tokens are monotonic per lock**: incremented only on successful acquisition, and never reused.
+4. **Watches are advisory**: correctness never depends on receiving watch events.
+
+---
+
+## Components
+
+### 1) Raft Consensus Layer
+
+**Responsibility**: Provide a single, linearizable log of state transitions with a leader per term.
+
+**Key design choices**
+- 3 nodes is typical for latency and cost; 5 nodes for higher fault tolerance (but higher write latency).
+- Use a production-proven Raft implementation (etcd-style) with:
+  - pre-vote to reduce disruption
+  - joint consensus for membership changes
+  - snapshotting + log compaction
+
+**Write path (linearizable)**
+- Client request → leader appends log entry → replicate to followers → quorum fsync/ack → commit → apply to state machine → respond.
+
+**Read path**
+- Linearizable read: leader uses `ReadIndex` (or equivalent) to ensure it is current with quorum.
+- Optional serializable read: follower/local read without quorum (stale possible).
+
+### 2) Replicated State Machine (Locks + Sessions)
+
+**Responsibility**: Deterministically apply committed log entries to produce:
+- session table (lease TTL, expiry, status)
+- lock table (holder session, reentrancy count, fencing token)
+- optional KV namespace (for ephemeral membership and recipes)
+
+**Important properties**
+- Deterministic application: given the same log, all nodes converge to identical state.
+- Revisioning: each committed log index becomes a **revision** used by:
+  - watch resume (`start_revision`)
+  - idempotency records
+  - debugging and audits
+
+### 3) Lease & Session Manager
+
+**Responsibility**: Manage session leases (TTL) and ensure cleanup of ephemeral state.
+
+**Key design choices**
+- Server uses **monotonic time** for lease accounting; never trusts client clocks.
+- KeepAlive updates are committed (linearizable), so lease extensions are consistent across the cluster.
+- Expiry is applied via a committed operation (e.g., `ExpireSession(session_id, at_revision)`), triggered by the leader when it observes TTL elapsed.
+
+**Tuning defaults**
+- Default TTL: **30s**
+- Client keepalive period: **10s** (≈ TTL/3)
+- Expiry grace: small jitter (e.g., ±250ms) to avoid synchronized storms
+
+### 4) Lock Manager (with Fencing Tokens)
+
+**Responsibility**: Implement lock semantics and generate fencing tokens.
+
+**Lock semantics**
+- Acquire is successful if:
+  - session is ACTIVE
+  - lock is free, or is already held by the same session (reentrant)
+- Release is successful if:
+  - lock is held by the session (or reentrant count decrements to zero)
+
+**Fencing tokens**
+- Per `lock_name`, store a counter `next_token`.
+- On successful acquisition from free → held:
+  - increment token and return the new value.
+- On reentrant acquire:
+  - typically return the *existing* fencing token for that holder.
+
+> Tokens must be enforced by the downstream resource to be meaningful.
+
+### 5) Watch Dispatcher
+
+**Responsibility**: Efficiently notify clients of state changes.
+
+**Semantics**
+- At-least-once delivery per stream.
+- Events are tagged with revision.
+- On overflow/slow consumers:
+  - drop buffered events and send a “compacted/overflow” signal requiring client resync from a revision or do a fresh `Get`.
+
+**Resource controls**
+- Max watches per session/client.
+- Per-stream outbound buffer limits (bytes and event count).
+- Rate limits on watch creation and event delivery.
+
+---
+
+## Data Model
+
+The physical storage is typically a key-value map plus indexes, but shown here logically.
+
+### Sessions
+
+**sessions**
+- `session_id` (UUID)
+- `client_id` (string)
+- `ttl_ms` (int32)
+- `lease_expiry_mono_ms` (int64)
+- `status` (`ACTIVE|EXPIRED|REVOKED`)
+- `created_revision` (int64)
+- `last_keepalive_revision` (int64)
+
+### Locks
+
+**locks**
+- `lock_name` (string, primary key)
+- `holder_session_id` (UUID, nullable)
+- `fencing_token` (int64, last issued token for this lock)
+- `reentrancy_count` (int32)
+- `acquired_revision` (int64)
+- `updated_revision` (int64)
+
+### Idempotency (recommended)
+
+**idempotency_keys**
+- `session_id` (UUID)
+- `request_id` (string/UUID)
+- `op` (enum/string)
+- `result` (bytes/json)
+- `expires_revision` or `expires_mono_ms`
+
+> Must be bounded (TTL + size cap) to prevent unbounded growth.
+
+### Events / Revisions
+
+Events can be derived from state transitions; many systems store a compact “watch event” stream keyed by revision.
+
+**watch_events** (optional materialization)
+- `revision` (int64)
+- `key` (string)
+- `type` (enum: `LOCK_UPDATED`, `SESSION_EXPIRED`, …)
+- `payload` (bytes/json)
+
+---
+
+## Request/Response Flows
+
+### Acquire with fencing token
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant L as Leader
+  participant F as Followers
+  participant SM as State Machine
+  participant W as Watch Streams
+
+  C->>L: AcquireLock(lock=A, session=S, request_id=R)
+  L->>SM: Validate session S ACTIVE
+  L->>F: Replicate log entry (Acquire A by S)
+  F-->>L: Quorum acks (durable)
+  L->>SM: Apply: set holder=S, token++
+  SM-->>W: Emit event (LOCK_UPDATED A @rev)
+  L-->>C: acquired=true, token=42, revision=rev
+```
+
+### Lease expiry and automatic revoke
+
+```mermaid
+sequenceDiagram
+  participant T as Leader Timer
+  participant L as Leader
+  participant F as Followers
+  participant SM as State Machine
+  participant W as Watch Streams
+
+  T->>L: Detect TTL elapsed for session S
+  L->>F: Replicate log entry (ExpireSession S)
+  F-->>L: Quorum acks
+  L->>SM: Apply: mark S EXPIRED, release locks held by S
+  SM-->>W: Emit events (SESSION_EXPIRED S, LOCK_UPDATED ...)
+```
+
+---
+
+## API Design (gRPC)
+
+Use gRPC for low-latency streaming (KeepAlive/Watch). A REST gateway can be added for admin/debug, but core correctness should rely on gRPC.
+
+### Core RPCs (proto-like)
+
+#### CreateSession
+- Request: `client_id`, `ttl_ms`
+- Response: `session_id`, `lease_expiry_unix_ms`, `revision`
+
+Errors:
+- `INVALID_ARGUMENT` (bad TTL)
+- `RESOURCE_EXHAUSTED` (session limits)
+- `UNAVAILABLE` (no leader/quorum)
+
+#### KeepAlive (bi-directional stream)
+Client stream:
+- `session_id`
+
+Server stream:
+- `session_id`, `lease_expiry_unix_ms`, `revision`
+
+Semantics:
+- Linearizable lease extension.
+- If session is expired/revoked, server returns `FAILED_PRECONDITION`.
+
+Errors:
+- `NOT_FOUND` (unknown session)
+- `FAILED_PRECONDITION` (expired/revoked)
+- `UNAVAILABLE` (no leader/quorum)
+
+#### AcquireLock
+Request:
+- `session_id`
+- `lock_name`
+- `wait` (bool)
+- `timeout_ms` (int32)
+- `request_id` (string/UUID)
+
+Response:
+- `acquired` (bool)
+- `fencing_token` (int64, only meaningful if acquired)
+- `revision` (int64)
+
+Semantics:
+- Linearizable.
+- If `wait=false` and lock is held by another session → `acquired=false`.
+- If `wait=true`, recommended pattern is:
+  1) server returns quickly with `acquired=false` and `recommended_start_revision`
+  2) client sets a watch and retries Acquire on notification (avoids server-side waiter buildup)
+
+Idempotency:
+- `(session_id, request_id)` must not cause multiple token increments on retry.
+
+Errors:
+- `NOT_FOUND` (no session)
+- `DEADLINE_EXCEEDED` (timeout)
+- `ABORTED` (leader change; retryable)
+- `UNAVAILABLE` (no leader/quorum)
+
+#### ReleaseLock
+Request:
+- `session_id`, `lock_name`, `request_id`
+
+Response:
+- `released` (bool), `revision`
+
+Semantics:
+- Linearizable and idempotent.
+- If lock not held by session:
+  - either `released=false` (simple) or `PERMISSION_DENIED` (stricter). Pick one and keep consistent.
+
+#### GetLock
+Request:
+- `lock_name`
+- `linearizable` (bool)
+
+Response:
+- `held` (bool)
+- `holder_session_id` (string)
+- `fencing_token` (int64)
+- `revision` (int64)
+
+#### Watch
+Request:
+- `prefix` (string) or `key`
+- `start_revision` (int64)
+
+Stream:
+- `revision`, `key`, `type`, `payload`
+
+Semantics:
+- at-least-once
+- on compaction/overflow: server returns a special error/detail instructing client to resync
+
+### Client-library contract (what interviewers look for)
+
+- Maintains exactly one session per process (or per logical client identity).
+- Keeps KeepAlive stream open; reconnects with backoff and jitter.
+- Treats `FAILED_PRECONDITION` (expired) as terminal: stop using any held locks and force re-acquire.
+- Uses watches for waiting; does not busy-loop Acquire.
+- Exposes a clear “lease lost” signal to application code.
+
+---
+
+## Fencing Tokens (Downstream Enforcement)
+
+A lock service can only guarantee “at most one holder at a time” at the lock layer. To protect the *resource*, downstream must enforce the fencing token.
+
+Common enforcement patterns:
+
+- **Database row**: `UPDATE resource SET owner=?, token=? WHERE token < ?`
+- **Job scheduler**: accept work only if `token` ≥ last seen token for that resource
+- **Object store / blob**: store token in metadata and reject writes with smaller token
+
+If the downstream cannot enforce monotonicity, the lock is vulnerable to:
+- stalled client resuming after lease expiry
+- partitioned client continuing to act locally
+
+---
+
+## Scaling & Performance
+
+### Capacity reality check
+
+With the targets above:
+- KeepAlive write rate is dominated by session count:
+  - 50k sessions / 10s = **5k writes/s**
+- Each write requires:
+  - leader append + fsync (group commit helps)
+  - replication to followers
+  - quorum ack
+
+This is achievable on 3 nodes with fast disks and careful batching, but:
+- **disk latency variance** (fsync tail latency) is often the primary driver of P99
+- watch fanout and connection count drive memory and CPU
+
+### Primary bottlenecks & mitigations
+
+- **Consensus write throughput**
+  - Streaming keepalive (one stream per client) to reduce per-request overhead
+  - Coalesce keepalive updates (e.g., apply at most once per session per 200ms)
+  - Snapshot + compaction to keep log small
+  - Fast NVMe/SSD; avoid network-attached disks with unpredictable fsync
+
+- **Hot locks / thundering herd**
+  - Watch-based waiting + jittered retry
+  - Application-level lock striping (e.g., shard work items)
+  - Rate limits per lock prefix if a single lock becomes pathological
+
+- **Watch memory pressure**
+  - Bound per-stream buffers
+  - Drop + resync semantics
+  - Max watches per client; require prefix selection discipline
+
+### Horizontal scaling strategy
+
+A single Raft group does not scale writes linearly. The standard approach is:
+- Run **multiple independent clusters** partitioned by:
+  - tenant
+  - environment (prod/staging)
+  - namespace/prefix (`teamA/*`, `teamB/*`)
+- Keep each cluster 3 nodes unless you have a strong reason for 5.
+
+Within one cluster:
+- Use followers for cheaper (serializable) reads if acceptable.
+- Keep linearizable reads on leader (ReadIndex) for correctness.
+
+### Caching
+
+- Client-side cache for non-critical reads (short TTL, e.g. 250ms) is fine if:
+  - Acquire remains linearizable
+  - cache is invalidated on watch events (best-effort)
+- Avoid server-side caching that weakens read-your-writes guarantees.
+
+---
+
+## Trade-offs & Alternatives
+
+### Trade-offs made
+
+1) **Linearizable locking via consensus**
+- Benefit: no split-brain locks; strong correctness
+- Cost: writes unavailable without quorum; throughput bounded by quorum commit latency
+
+2) **Leases + fencing tokens**
+- Benefit: protects against stalled clients and ambiguous failure detection
+- Cost: more complexity; requires downstream enforcement to be truly safe
+
+3) **Watch-based waiting instead of server-side waiter queues**
+- Benefit: avoids unbounded server memory under contention; scales better
+- Cost: more client complexity; duplicates/reconnect handling required
+
+### Alternatives (and when they fit)
+
+- **Redis locks / Redlock**
+  - Good for: best-effort coordination where occasional anomalies are tolerable
+  - Risk: subtle failure modes under partitions/failover; fencing often missing; not ideal for foundational primitives
+
+- **Database locks (row/advisory locks)**
+  - Good for: coordination tightly coupled to a single DB, small scale
+  - Limitations: hard to scale cross-service; poor watch semantics; can overload the DB
+
+- **Gossip / eventual coordination**
+  - Good for: high availability membership/health hints
+  - Not suitable for: general-purpose mutual exclusion requiring linearizability
+
+- **Single-writer ownership service**
+  - If one service can safely own the resource, you can sometimes avoid distributed locks entirely.
+
+---
+
+## Failure Modes & Mitigations
+
+### 1) Leader crash / restart
+- Impact: write unavailability during election (typically 200ms–2s, depending on timeouts)
+- Mitigations:
+  - tuned election timeouts (avoid too-low values causing flapping)
+  - client retries with jittered backoff
+  - expose leader identity for faster reroute (optional)
+
+### 2) Cluster partition / quorum loss
+- Impact:
+  - minority partition becomes read-only
+  - writes rejected (safety preserved)
+- Mitigations:
+  - clear `UNAVAILABLE` / “no quorum” errors
+  - optional serializable reads from followers for diagnostics only
+
+### 3) Client stall (GC pause) beyond TTL
+- Impact:
+  - session expires; locks revoked; client may continue executing
+- Mitigations:
+  - fencing tokens prevent stale writes
+  - client library emits “lease lost” and forces stop/re-acquire
+
+### 4) Slow disk / fsync tail latency
+- Impact:
+  - write P99 spikes; watch delivery delays; potential timeouts
+- Mitigations:
+  - NVMe/SSD and disk health monitoring
+  - WAL group commit
+  - alert on fsync P99 and queue growth
+  - shed load (rate limit keepalive bursts) before collapse
+
+### 5) Watch overload / slow consumer
+- Impact:
+  - memory pressure; delayed events; dropped buffers
+- Mitigations:
+  - bounded buffers + drop/resync protocol
+  - per-client watch limits
+  - backpressure-aware streaming and metrics
+
+### 6) Bugs or non-determinism in state machine
+- Impact: divergence across replicas (worst-case catastrophic)
+- Mitigations:
+  - strict determinism rules
+  - schema/version gating
+  - replay tests on recorded WAL segments
+  - canary rollout + feature flags for state changes
+
+---
+
+## Disaster Recovery
+
+### In-region
+- RPO: **0** for committed operations
+- RTO: **< 1 minute** typical for leader failover + process restart
+- Practice:
+  - anti-affinity across AZs
+  - automated restart
+  - periodic snapshots for fast recovery
+
+### Cross-region
+Two common approaches:
+
+1) **Async DR (recommended for low-latency primary)**
+- Ship snapshots + WAL segments to object storage in another region.
+- RPO: **1–5 minutes** (configurable)
+- RTO: **15–30 minutes**
+
+2) **Synchronous multi-region consensus (rare; expensive)**
+- Stronger RPO, but much higher write latency (cross-region RTT).
+- Usually only justified for very high criticality and when clients tolerate higher latencies.
+
+Failover behavior:
+- Clients reconnect and create new sessions.
+- Locks are not guaranteed to be “preserved” across region failover; applications must tolerate re-acquire and rely on fencing.
+
+---
+
+## Operations
+
+### Monitoring (golden signals + Raft specifics)
+
+Key metrics:
+- Raft:
+  - leader changes / term increases
+  - commit latency (P50/P99)
+  - replication lag per follower
+  - log size, snapshot duration, compaction time
+- Storage:
+  - WAL fsync latency (P50/P99)
+  - disk queue depth, IOPS, %util, free space
+- API:
+  - QPS by method
+  - error rate by code (`UNAVAILABLE`, `ABORTED`, `FAILED_PRECONDITION`, …)
+  - end-to-end latency P50/P99
+- Leases:
+  - active sessions
+  - keepalive QPS
+  - expirations per minute (and spikes)
+- Watches:
+  - active watch streams
+  - event fanout rate
+  - dropped/compacted events
+  - reconnect rate
+
+Example alerts:
+- No leader for > 10s
+- Commit latency P99 > 100ms for 5m
+- WAL fsync P99 > 20ms for 5m
+- Snapshot/compaction failures > 0
+- Watch drops > 0.1% of events
+- Session expirations spike > 10× baseline (often indicates network issues)
+
+### Deployment & upgrades
+
+- Rolling upgrade one node at a time; maintain quorum.
+- Version state machine changes carefully:
+  - forward-compatible encodings
+  - feature gated by cluster version
+- Prefer “roll forward” for state machine bugs; rollback can be unsafe if log/snapshot formats change.
+
+### Administrative controls
+
+- Authenticated membership changes (learner → voter).
+- Snapshot and compaction controls (with safe defaults).
+- Rate limit knobs (per-client sessions/watches/QPS).
+- Audit logs for:
+  - membership changes
+  - config changes
+  - manual revokes (if supported)
+
+### Common pitfalls (practical interview guidance)
+
+- Using locks for long-lived work without heartbeats/checkpoints.
+- Assuming “Release succeeded” implies safety (it doesn’t under partitions).
+- Building workflows that require strict fairness (most lock services provide only best-effort fairness).
+- Relying on watches without re-checking state (watches are advisory).
+
+---
+
+## References & Further Reading
+
+- *The Chubby lock service for loosely-coupled distributed systems* (Burrows)
+- ZooKeeper documentation and recipes (watches, ephemeral nodes)
+- etcd documentation (Raft, linearizable reads, watch semantics)
+- *In Search of an Understandable Consensus Algorithm (Raft)* (Ongaro, Ousterhout)
+- Jepsen analyses of coordination systems (real failure modes under partitions)
+- Fencing token patterns (e.g., HDFS, Kubernetes controllers, distributed schedulers)
+```
+
+[Pass 2/3] Reviewed version saved to: /Users/dominikdabrowski/pr/system-design-atlas/reviewed/distributed-lock-service.md
+
+[Pass 3/3] Simplifying for clarity...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b29d6-faa8-7f83-bb61-f22e6251e6a9
+--------
+user
+# System Design Simplifier
+
+You are a pragmatic Staff Engineer who believes the best systems are the simplest ones that meet the requirements. Your job is to challenge every component and dependency in this design.
+
+## Your Task
+
+Review the system design and aggressively simplify it. For every component, service, database, cache, queue, or dependency, ask:
+
+1. **Do we actually need this?** What breaks if we remove it?
+2. **Can we merge this with something else?** Two services doing related things → one service
+3. **Can we use a simpler alternative?** Kafka → Redis streams? Cassandra → Postgres? Microservice → library?
+4. **Are we over-engineering for scale we don't have?** Start simple, scale later
+5. **Is this dependency worth the operational cost?** Every new technology = on-call burden
+
+## Simplification Principles
+
+### Remove Before You Add
+- Question every cache layer - do we need it at this scale?
+- Question every queue - can we use synchronous calls?
+- Question every separate service - can it be a library or module?
+- Question every "scalable" database - would Postgres work?
+
+### Merge When Possible
+- Combine services that always deploy together
+- Use one database instead of three specialized ones
+- Use existing infrastructure before adding new
+
+### Challenge Complexity
+- "Eventually consistent" → Can we just use strong consistency?
+- "Sharded across regions" → Do we need multi-region yet?
+- "Event-driven architecture" → Would request/response be simpler?
+- "Microservices" → Would a modular monolith work?
+
+### Keep What's Essential
+- Don't remove things that are genuinely needed for correctness
+- Keep redundancy that's required for the stated availability target
+- Keep components that handle genuinely different scaling dimensions
+
+## Output Format
+
+Return the **complete, simplified document** with:
+
+1. **Simplified architecture** - Fewer boxes in the diagram
+2. **Merged components** - Combine where possible
+3. **Removed dependencies** - Cut unnecessary tech
+4. **Justified complexity** - What remains should have clear reasons
+
+For each major simplification, briefly note what was removed/merged and why it's acceptable.
+
+Add a "## Simplification Notes" section at the end listing:
+- What was removed and why
+- What was merged and why
+- What complexity remains and why it's necessary
+
+Do NOT add other commentary - just output the simplified document.
+
+---
+
+## Document to Simplify
+
+```markdown
+---
+title: "Distributed Lock Service"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["coordination", "distributed-systems", "consensus"]
+---
+
+## Overview
+
+A distributed lock service is a coordination primitive that provides **mutual exclusion** for shared resources across many unreliable clients. The hard part is not tracking “who holds the lock,” but doing so **safely** under network partitions, process crashes, long GC pauses, clock drift, and retry storms—while still offering **low-latency, linearizable** semantics that other systems can trust.
+
+This design follows the proven pattern of **Chubby / ZooKeeper / etcd**: a small replicated control-plane cluster that provides:
+
+- **Linearizable writes** (acquire/release, session/lease state)
+- **Linearizable reads** (optional but supported) and cheaper **serializable reads** (optional)
+- **Leases/sessions** for liveness and automatic cleanup of ephemeral state
+- **Watches** for efficient notification (to avoid polling)
+- **Fencing tokens** to prevent stale clients from corrupting downstream systems
+
+The key separation is:
+
+- **Safety**: ensured by **consensus** (single authoritative history) and **fencing tokens**
+- **Liveness**: ensured by **leases/sessions** (TTL + keepalive) and bounded failure detection
+
+> Core rule: locks are only “safe” if *downstream systems enforce fencing tokens* (or an equivalent monotonic guard).
+
+---
+
+## Requirements
+
+### Functional Requirements
+
+- Create and manage **sessions** with server-assigned leases (TTL-based).
+- Support **Acquire/Release** of named locks with **linearizable** semantics.
+- Return a **fencing token** (monotonically increasing per lock name) on successful acquire.
+- Automatically revoke locks and ephemeral keys when a session expires.
+- Provide **watch/notify** APIs to wait for changes without polling.
+- Support:
+  - `TryAcquire` (no-wait)
+  - `Acquire(wait, timeout)` (wait with bounded resource usage)
+  - **Reentrant** locks per session (optional; common in practice)
+- Provide primitives commonly built atop leases:
+  - ephemeral membership (presence)
+  - leader election recipes (e.g., “smallest sequential node” pattern, if implemented)
+- Expose admin endpoints for:
+  - health and readiness
+  - metrics
+  - membership changes (add/remove voter/learner)
+  - snapshots/backup triggers (optional)
+
+### Non-Functional Requirements
+
+#### Scale (single cluster, single region)
+- **Sessions**: 50,000 concurrent
+- **Locks (active)**: 200,000
+- **Total keys** (locks + ephemeral/membership + metadata): up to 5,000,000
+- **Traffic**
+  - Reads (`Get`, `Watch` streams): ~20,000 QPS
+  - Writes (linearizable): ~7,000 QPS typical peak
+    - KeepAlive: 50k sessions, keepalive every 10s ⇒ **~5,000 QPS**
+    - Lock ops (Acquire/Release combined): **~2,000 QPS** peak
+
+> If you need materially higher write rates, you typically scale by **more clusters** (namespaces/tenants) rather than trying to shard a single consensus group.
+
+#### Latency targets (single region, healthy quorum, NVMe/SSD)
+- Linearizable writes (Acquire/Release/KeepAlive):
+  - P50 **< 10ms**
+  - P99 **< 50ms**
+- Linearizable reads (`Get` with `linearizable=true`):
+  - P50 **< 5ms**
+  - P99 **< 25ms**
+- Watch delivery:
+  - P99 **< 250ms** from commit to client receive (assuming healthy client connection)
+
+#### Availability & behavior under partitions
+- **SLO**: 99.99% monthly availability for quorum-available scenarios
+- **Safety over availability** for writes:
+  - Without quorum: **no lock writes** (Acquire/Release/KeepAlive reject)
+  - Optional: allow **serializable reads** from followers when leader/quorum unavailable (clearly labeled as potentially stale)
+
+#### Consistency model
+- **Linearizable**:
+  - Acquire/Release
+  - session lifecycle (create/renew/expire)
+  - fencing token assignment
+- **Watch**:
+  - at-least-once delivery
+  - may include duplicates / reordering across reconnects
+  - clients must treat watch events as **hints** and re-check state (via `Get` or retry Acquire)
+
+#### Durability & recovery
+- Committed operations are not lost:
+  - WAL is persisted before acknowledging commit (fsync or equivalent durability)
+  - snapshots bound replay time
+- In-region: **RPO = 0** (for committed entries), **RTO < 1 minute** typical for single-node restart / leader failover
+- Cross-region DR: configurable, typically **RPO minutes** and **RTO 15–30 minutes** (unless you accept higher latency by doing synchronous multi-region consensus)
+
+### Constraints & Assumptions
+
+- Small ops team; correctness and operability prioritized over maximum throughput.
+- Client libraries exist for at least Go/Java/Python and provide consistent semantics.
+- Primary deployment is single region for low latency; DR is optional.
+- Security baseline:
+  - TLS everywhere; optional mTLS for internal workloads
+  - authn/authz and audit logs for administrative actions
+- Cost: small clusters (3–5 nodes) with predictable CPU/disk; avoid heavyweight dependencies.
+
+---
+
+## Architecture
+
+### High-level diagram
+
+```mermaid
+graph TB
+  subgraph Clients
+    A[Client Apps]
+    B[Client Library<br/>sessions, retries, keepalive, watches]
+    A --> B
+  end
+
+  subgraph Cluster["Lock Service Cluster (Raft Group)"]
+    LB[Load Balancer / VIP<br/>TLS, routing]
+    L[Leader]
+    F1[Follower]
+    F2[Follower]
+
+    SM[Replicated State Machine<br/>sessions, locks, tokens, KV]
+    WAL[WAL + Snapshots<br/>fsync, compaction]
+    W[Watch Fanout<br/>per-connection backpressure]
+
+    LB --> L
+    LB --> F1
+    LB --> F2
+
+    L <--> F1
+    L <--> F2
+
+    L --> WAL
+    F1 --> WAL
+    F2 --> WAL
+
+    L --> SM
+    F1 --> SM
+    F2 --> SM
+
+    SM --> W
+  end
+
+  B --> LB
+```
+
+### Core invariants
+
+1. **Single-writer history**: all state transitions that affect lock ownership and fencing tokens are committed through Raft.
+2. **Leases are authoritative**: sessions are considered valid only if their lease is valid in the replicated state.
+3. **Fencing tokens are monotonic per lock**: incremented only on successful acquisition, and never reused.
+4. **Watches are advisory**: correctness never depends on receiving watch events.
+
+---
+
+## Components
+
+### 1) Raft Consensus Layer
+
+**Responsibility**: Provide a single, linearizable log of state transitions with a leader per term.
+
+**Key design choices**
+- 3 nodes is typical for latency and cost; 5 nodes for higher fault tolerance (but higher write latency).
+- Use a production-proven Raft implementation (etcd-style) with:
+  - pre-vote to reduce disruption
+  - joint consensus for membership changes
+  - snapshotting + log compaction
+
+**Write path (linearizable)**
+- Client request → leader appends log entry → replicate to followers → quorum fsync/ack → commit → apply to state machine → respond.
+
+**Read path**
+- Linearizable read: leader uses `ReadIndex` (or equivalent) to ensure it is current with quorum.
+- Optional serializable read: follower/local read without quorum (stale possible).
+
+### 2) Replicated State Machine (Locks + Sessions)
+
+**Responsibility**: Deterministically apply committed log entries to produce:
+- session table (lease TTL, expiry, status)
+- lock table (holder session, reentrancy count, fencing token)
+- optional KV namespace (for ephemeral membership and recipes)
+
+**Important properties**
+- Deterministic application: given the same log, all nodes converge to identical state.
+- Revisioning: each committed log index becomes a **revision** used by:
+  - watch resume (`start_revision`)
+  - idempotency records
+  - debugging and audits
+
+### 3) Lease & Session Manager
+
+**Responsibility**: Manage session leases (TTL) and ensure cleanup of ephemeral state.
+
+**Key design choices**
+- Server uses **monotonic time** for lease accounting; never trusts client clocks.
+- KeepAlive updates are committed (linearizable), so lease extensions are consistent across the cluster.
+- Expiry is applied via a committed operation (e.g., `ExpireSession(session_id, at_revision)`), triggered by the leader when it observes TTL elapsed.
+
+**Tuning defaults**
+- Default TTL: **30s**
+- Client keepalive period: **10s** (≈ TTL/3)
+- Expiry grace: small jitter (e.g., ±250ms) to avoid synchronized storms
+
+### 4) Lock Manager (with Fencing Tokens)
+
+**Responsibility**: Implement lock semantics and generate fencing tokens.
+
+**Lock semantics**
+- Acquire is successful if:
+  - session is ACTIVE
+  - lock is free, or is already held by the same session (reentrant)
+- Release is successful if:
+  - lock is held by the session (or reentrant count decrements to zero)
+
+**Fencing tokens**
+- Per `lock_name`, store a counter `next_token`.
+- On successful acquisition from free → held:
+  - increment token and return the new value.
+- On reentrant acquire:
+  - typically return the *existing* fencing token for that holder.
+
+> Tokens must be enforced by the downstream resource to be meaningful.
+
+### 5) Watch Dispatcher
+
+**Responsibility**: Efficiently notify clients of state changes.
+
+**Semantics**
+- At-least-once delivery per stream.
+- Events are tagged with revision.
+- On overflow/slow consumers:
+  - drop buffered events and send a “compacted/overflow” signal requiring client resync from a revision or do a fresh `Get`.
+
+**Resource controls**
+- Max watches per session/client.
+- Per-stream outbound buffer limits (bytes and event count).
+- Rate limits on watch creation and event delivery.
+
+---
+
+## Data Model
+
+The physical storage is typically a key-value map plus indexes, but shown here logically.
+
+### Sessions
+
+**sessions**
+- `session_id` (UUID)
+- `client_id` (string)
+- `ttl_ms` (int32)
+- `lease_expiry_mono_ms` (int64)
+- `status` (`ACTIVE|EXPIRED|REVOKED`)
+- `created_revision` (int64)
+- `last_keepalive_revision` (int64)
+
+### Locks
+
+**locks**
+- `lock_name` (string, primary key)
+- `holder_session_id` (UUID, nullable)
+- `fencing_token` (int64, last issued token for this lock)
+- `reentrancy_count` (int32)
+- `acquired_revision` (int64)
+- `updated_revision` (int64)
+
+### Idempotency (recommended)
+
+**idempotency_keys**
+- `session_id` (UUID)
+- `request_id` (string/UUID)
+- `op` (enum/string)
+- `result` (bytes/json)
+- `expires_revision` or `expires_mono_ms`
+
+> Must be bounded (TTL + size cap) to prevent unbounded growth.
+
+### Events / Revisions
+
+Events can be derived from state transitions; many systems store a compact “watch event” stream keyed by revision.
+
+**watch_events** (optional materialization)
+- `revision` (int64)
+- `key` (string)
+- `type` (enum: `LOCK_UPDATED`, `SESSION_EXPIRED`, …)
+- `payload` (bytes/json)
+
+---
+
+## Request/Response Flows
+
+### Acquire with fencing token
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant L as Leader
+  participant F as Followers
+  participant SM as State Machine
+  participant W as Watch Streams
+
+  C->>L: AcquireLock(lock=A, session=S, request_id=R)
+  L->>SM: Validate session S ACTIVE
+  L->>F: Replicate log entry (Acquire A by S)
+  F-->>L: Quorum acks (durable)
+  L->>SM: Apply: set holder=S, token++
+  SM-->>W: Emit event (LOCK_UPDATED A @rev)
+  L-->>C: acquired=true, token=42, revision=rev
+```
+
+### Lease expiry and automatic revoke
+
+```mermaid
+sequenceDiagram
+  participant T as Leader Timer
+  participant L as Leader
+  participant F as Followers
+  participant SM as State Machine
+  participant W as Watch Streams
+
+  T->>L: Detect TTL elapsed for session S
+  L->>F: Replicate log entry (ExpireSession S)
+  F-->>L: Quorum acks
+  L->>SM: Apply: mark S EXPIRED, release locks held by S
+  SM-->>W: Emit events (SESSION_EXPIRED S, LOCK_UPDATED ...)
+```
+
+---
+
+## API Design (gRPC)
+
+Use gRPC for low-latency streaming (KeepAlive/Watch). A REST gateway can be added for admin/debug, but core correctness should rely on gRPC.
+
+### Core RPCs (proto-like)
+
+#### CreateSession
+- Request: `client_id`, `ttl_ms`
+- Response: `session_id`, `lease_expiry_unix_ms`, `revision`
+
+Errors:
+- `INVALID_ARGUMENT` (bad TTL)
+- `RESOURCE_EXHAUSTED` (session limits)
+- `UNAVAILABLE` (no leader/quorum)
+
+#### KeepAlive (bi-directional stream)
+Client stream:
+- `session_id`
+
+Server stream:
+- `session_id`, `lease_expiry_unix_ms`, `revision`
+
+Semantics:
+- Linearizable lease extension.
+- If session is expired/revoked, server returns `FAILED_PRECONDITION`.
+
+Errors:
+- `NOT_FOUND` (unknown session)
+- `FAILED_PRECONDITION` (expired/revoked)
+- `UNAVAILABLE` (no leader/quorum)
+
+#### AcquireLock
+Request:
+- `session_id`
+- `lock_name`
+- `wait` (bool)
+- `timeout_ms` (int32)
+- `request_id` (string/UUID)
+
+Response:
+- `acquired` (bool)
+- `fencing_token` (int64, only meaningful if acquired)
+- `revision` (int64)
+
+Semantics:
+- Linearizable.
+- If `wait=false` and lock is held by another session → `acquired=false`.
+- If `wait=true`, recommended pattern is:
+  1) server returns quickly with `acquired=false` and `recommended_start_revision`
+  2) client sets a watch and retries Acquire on notification (avoids server-side waiter buildup)
+
+Idempotency:
+- `(session_id, request_id)` must not cause multiple token increments on retry.
+
+Errors:
+- `NOT_FOUND` (no session)
+- `DEADLINE_EXCEEDED` (timeout)
+- `ABORTED` (leader change; retryable)
+- `UNAVAILABLE` (no leader/quorum)
+
+#### ReleaseLock
+Request:
+- `session_id`, `lock_name`, `request_id`
+
+Response:
+- `released` (bool), `revision`
+
+Semantics:
+- Linearizable and idempotent.
+- If lock not held by session:
+  - either `released=false` (simple) or `PERMISSION_DENIED` (stricter). Pick one and keep consistent.
+
+#### GetLock
+Request:
+- `lock_name`
+- `linearizable` (bool)
+
+Response:
+- `held` (bool)
+- `holder_session_id` (string)
+- `fencing_token` (int64)
+- `revision` (int64)
+
+#### Watch
+Request:
+- `prefix` (string) or `key`
+- `start_revision` (int64)
+
+Stream:
+- `revision`, `key`, `type`, `payload`
+
+Semantics:
+- at-least-once
+- on compaction/overflow: server returns a special error/detail instructing client to resync
+
+### Client-library contract (what interviewers look for)
+
+- Maintains exactly one session per process (or per logical client identity).
+- Keeps KeepAlive stream open; reconnects with backoff and jitter.
+- Treats `FAILED_PRECONDITION` (expired) as terminal: stop using any held locks and force re-acquire.
+- Uses watches for waiting; does not busy-loop Acquire.
+- Exposes a clear “lease lost” signal to application code.
+
+---
+
+## Fencing Tokens (Downstream Enforcement)
+
+A lock service can only guarantee “at most one holder at a time” at the lock layer. To protect the *resource*, downstream must enforce the fencing token.
+
+Common enforcement patterns:
+
+- **Database row**: `UPDATE resource SET owner=?, token=? WHERE token < ?`
+- **Job scheduler**: accept work only if `token` ≥ last seen token for that resource
+- **Object store / blob**: store token in metadata and reject writes with smaller token
+
+If the downstream cannot enforce monotonicity, the lock is vulnerable to:
+- stalled client resuming after lease expiry
+- partitioned client continuing to act locally
+
+---
+
+## Scaling & Performance
+
+### Capacity reality check
+
+With the targets above:
+- KeepAlive write rate is dominated by session count:
+  - 50k sessions / 10s = **5k writes/s**
+- Each write requires:
+  - leader append + fsync (group commit helps)
+  - replication to followers
+  - quorum ack
+
+This is achievable on 3 nodes with fast disks and careful batching, but:
+- **disk latency variance** (fsync tail latency) is often the primary driver of P99
+- watch fanout and connection count drive memory and CPU
+
+### Primary bottlenecks & mitigations
+
+- **Consensus write throughput**
+  - Streaming keepalive (one stream per client) to reduce per-request overhead
+  - Coalesce keepalive updates (e.g., apply at most once per session per 200ms)
+  - Snapshot + compaction to keep log small
+  - Fast NVMe/SSD; avoid network-attached disks with unpredictable fsync
+
+- **Hot locks / thundering herd**
+  - Watch-based waiting + jittered retry
+  - Application-level lock striping (e.g., shard work items)
+  - Rate limits per lock prefix if a single lock becomes pathological
+
+- **Watch memory pressure**
+  - Bound per-stream buffers
+  - Drop + resync semantics
+  - Max watches per client; require prefix selection discipline
+
+### Horizontal scaling strategy
+
+A single Raft group does not scale writes linearly. The standard approach is:
+- Run **multiple independent clusters** partitioned by:
+  - tenant
+  - environment (prod/staging)
+  - namespace/prefix (`teamA/*`, `teamB/*`)
+- Keep each cluster 3 nodes unless you have a strong reason for 5.
+
+Within one cluster:
+- Use followers for cheaper (serializable) reads if acceptable.
+- Keep linearizable reads on leader (ReadIndex) for correctness.
+
+### Caching
+
+- Client-side cache for non-critical reads (short TTL, e.g. 250ms) is fine if:
+  - Acquire remains linearizable
+  - cache is invalidated on watch events (best-effort)
+- Avoid server-side caching that weakens read-your-writes guarantees.
+
+---
+
+## Trade-offs & Alternatives
+
+### Trade-offs made
+
+1) **Linearizable locking via consensus**
+- Benefit: no split-brain locks; strong correctness
+- Cost: writes unavailable without quorum; throughput bounded by quorum commit latency
+
+2) **Leases + fencing tokens**
+- Benefit: protects against stalled clients and ambiguous failure detection
+- Cost: more complexity; requires downstream enforcement to be truly safe
+
+3) **Watch-based waiting instead of server-side waiter queues**
+- Benefit: avoids unbounded server memory under contention; scales better
+- Cost: more client complexity; duplicates/reconnect handling required
+
+### Alternatives (and when they fit)
+
+- **Redis locks / Redlock**
+  - Good for: best-effort coordination where occasional anomalies are tolerable
+  - Risk: subtle failure modes under partitions/failover; fencing often missing; not ideal for foundational primitives
+
+- **Database locks (row/advisory locks)**
+  - Good for: coordination tightly coupled to a single DB, small scale
+  - Limitations: hard to scale cross-service; poor watch semantics; can overload the DB
+
+- **Gossip / eventual coordination**
+  - Good for: high availability membership/health hints
+  - Not suitable for: general-purpose mutual exclusion requiring linearizability
+
+- **Single-writer ownership service**
+  - If one service can safely own the resource, you can sometimes avoid distributed locks entirely.
+
+---
+
+## Failure Modes & Mitigations
+
+### 1) Leader crash / restart
+- Impact: write unavailability during election (typically 200ms–2s, depending on timeouts)
+- Mitigations:
+  - tuned election timeouts (avoid too-low values causing flapping)
+  - client retries with jittered backoff
+  - expose leader identity for faster reroute (optional)
+
+### 2) Cluster partition / quorum loss
+- Impact:
+  - minority partition becomes read-only
+  - writes rejected (safety preserved)
+- Mitigations:
+  - clear `UNAVAILABLE` / “no quorum” errors
+  - optional serializable reads from followers for diagnostics only
+
+### 3) Client stall (GC pause) beyond TTL
+- Impact:
+  - session expires; locks revoked; client may continue executing
+- Mitigations:
+  - fencing tokens prevent stale writes
+  - client library emits “lease lost” and forces stop/re-acquire
+
+### 4) Slow disk / fsync tail latency
+- Impact:
+  - write P99 spikes; watch delivery delays; potential timeouts
+- Mitigations:
+  - NVMe/SSD and disk health monitoring
+  - WAL group commit
+  - alert on fsync P99 and queue growth
+  - shed load (rate limit keepalive bursts) before collapse
+
+### 5) Watch overload / slow consumer
+- Impact:
+  - memory pressure; delayed events; dropped buffers
+- Mitigations:
+  - bounded buffers + drop/resync protocol
+  - per-client watch limits
+  - backpressure-aware streaming and metrics
+
+### 6) Bugs or non-determinism in state machine
+- Impact: divergence across replicas (worst-case catastrophic)
+- Mitigations:
+  - strict determinism rules
+  - schema/version gating
+  - replay tests on recorded WAL segments
+  - canary rollout + feature flags for state changes
+
+---
+
+## Disaster Recovery
+
+### In-region
+- RPO: **0** for committed operations
+- RTO: **< 1 minute** typical for leader failover + process restart
+- Practice:
+  - anti-affinity across AZs
+  - automated restart
+  - periodic snapshots for fast recovery
+
+### Cross-region
+Two common approaches:
+
+1) **Async DR (recommended for low-latency primary)**
+- Ship snapshots + WAL segments to object storage in another region.
+- RPO: **1–5 minutes** (configurable)
+- RTO: **15–30 minutes**
+
+2) **Synchronous multi-region consensus (rare; expensive)**
+- Stronger RPO, but much higher write latency (cross-region RTT).
+- Usually only justified for very high criticality and when clients tolerate higher latencies.
+
+Failover behavior:
+- Clients reconnect and create new sessions.
+- Locks are not guaranteed to be “preserved” across region failover; applications must tolerate re-acquire and rely on fencing.
+
+---
+
+## Operations
+
+### Monitoring (golden signals + Raft specifics)
+
+Key metrics:
+- Raft:
+  - leader changes / term increases
+  - commit latency (P50/P99)
+  - replication lag per follower
+  - log size, snapshot duration, compaction time
+- Storage:
+  - WAL fsync latency (P50/P99)
+  - disk queue depth, IOPS, %util, free space
+- API:
+  - QPS by method
+  - error rate by code (`UNAVAILABLE`, `ABORTED`, `FAILED_PRECONDITION`, …)
+  - end-to-end latency P50/P99
+- Leases:
+  - active sessions
+  - keepalive QPS
+  - expirations per minute (and spikes)
+- Watches:
+  - active watch streams
+  - event fanout rate
+  - dropped/compacted events
+  - reconnect rate
+
+Example alerts:
+- No leader for > 10s
+- Commit latency P99 > 100ms for 5m
+- WAL fsync P99 > 20ms for 5m
+- Snapshot/compaction failures > 0
+- Watch drops > 0.1% of events
+- Session expirations spike > 10× baseline (often indicates network issues)
+
+### Deployment & upgrades
+
+- Rolling upgrade one node at a time; maintain quorum.
+- Version state machine changes carefully:
+  - forward-compatible encodings
+  - feature gated by cluster version
+- Prefer “roll forward” for state machine bugs; rollback can be unsafe if log/snapshot formats change.
+
+### Administrative controls
+
+- Authenticated membership changes (learner → voter).
+- Snapshot and compaction controls (with safe defaults).
+- Rate limit knobs (per-client sessions/watches/QPS).
+- Audit logs for:
+  - membership changes
+  - config changes
+  - manual revokes (if supported)
+
+### Common pitfalls (practical interview guidance)
+
+- Using locks for long-lived work without heartbeats/checkpoints.
+- Assuming “Release succeeded” implies safety (it doesn’t under partitions).
+- Building workflows that require strict fairness (most lock services provide only best-effort fairness).
+- Relying on watches without re-checking state (watches are advisory).
+
+---
+
+## References & Further Reading
+
+- *The Chubby lock service for loosely-coupled distributed systems* (Burrows)
+- ZooKeeper documentation and recipes (watches, ephemeral nodes)
+- etcd documentation (Raft, linearizable reads, watch semantics)
+- *In Search of an Understandable Consensus Algorithm (Raft)* (Ongaro, Ousterhout)
+- Jepsen analyses of coordination systems (real failure modes under partitions)
+- Fencing token patterns (e.g., HDFS, Kubernetes controllers, distributed schedulers)
+```
+
+---
+
+Output the complete, simplified document now.
+mcp startup: no servers
+
+
+
+
+
+thinking
+**Simplifying lock service architecture**
+
+Failover is tricky, especially since advisory locks can be lost, potentially breaking strong semantics. The most practical approach would be to avoid building a lock service and utilize an etcd cluster instead. I can create a small wrapper library that utilizes etcd's lease and lock concurrency API, relying on its built-in components. The documentation should show a simplified architecture with clients connecting to a 3-node etcd cluster and implementing locks using leases and transactions.
+thinking
+**Streamlining the data model**
+
+I want to simplify the data model for etcd. Keys should look like this: /locks/<name>/owner session ID and /locks/<name>/token counter. The session ID serves as a lease ID since etcd uses leases. I’ll manage reentrancy client-side with a reference count in the library. For idempotency, using etcd transactions with unique request keys works well. Additionally, scaling can be handled by emphasizing multiple etcd clusters or namespaces as needed. I also plan to drastically reduce documentation while covering essentials like architecture, components, and API methods without extra commentary.
+thinking
+**Creating a Simplified Document**
+
+I’m focusing on a writing task, so no tool usage is needed—just markdown. I'll keep the title and provide an overview that emphasizes using etcd as a distributed lock service without custom raft involvement.
+
+For requirements, I'll condense essential functionalities while still noting scale, latency, availability, and the importance of linearizable acquire/release, tokens, and lease-based sessions.
+
+The architecture will show clients connecting to a 3-node etcd cluster without a separate load balancer. Components will be limited to the client library and the etcd cluster. 
+
+I’ll outline the data model for etcd key schemas, including locks and optional ephemeral members. The acquire process will involve transactions for setting holder keys while addressing the limitations of atomic increments.
+thinking
+**Refining the fencing token**
+
+I’m considering using the revision as a fencing token, specifically the mod_revision of the holder key. The token should be monotonic for each lock, and since the revision is globally monotonic, this approach simplifies things—no extra counter needed.
+
+The downstream systems can utilize this token effectively. The requirement states that each lock should increase monotonically, and using the mod_revision achieves that. Each lock acquisition updates the mod_revision, allowing it to serve as a solid fencing token and removing the need for a separate per-lock counter. This really simplifies the process!
+thinking
+**Drafting the acquisition and release process**
+
+In the Acquire phase, the transaction should check if the holder key exists. If it doesn’t, we put the holder key with the session ID and lease, then respond with header.revision as the token. For reentrant locks, if the session ID is the same, I’ll allow it, but concurrency will be managed client-side.
+
+For releasing, the transaction checks if the holder key value matches the session ID before deletion. The client library uses etcd watches on the /locks/ prefix to wait and retry. I'll also note that failover is managed by etcd, and while cross-region replication is optional, we’ll start with a single region.
+
+At the end, I'll include simplification notes, highlighting what was removed and merged to create a more streamlined library and mention security features like TLS/mTLS, authentication, and RBAC. Let's proceed with drafting!
+codex
+```markdown
+---
+title: "Distributed Lock Service (Simplified)"
+category: "Foundational Infrastructure"
+difficulty: "Medium"
+tags: ["coordination", "distributed-systems", "consensus"]
+---
+
+## Overview
+
+Do not build a new lock service. Use an existing, proven consensus-backed KV store (**etcd**) and provide a small **client library** that exposes locks, sessions (leases), watches, and fencing tokens.
+
+This keeps the only “hard” part (consensus, linearizability, failover) in a battle-tested system, and keeps our code focused on ergonomics and guardrails.
+
+Core rule still applies: locks are only “safe” if **downstream systems enforce fencing tokens** (monotonic guard).
+
+---
+
+## Requirements (Kept, Trimmed)
+
+### Functional
+- **Sessions via leases**: create/renew, TTL-based expiry; automatic cleanup of ephemeral state.
+- **Locks**: `TryAcquire`, `Acquire(wait, timeout)`, `Release` with **linearizable** semantics.
+- **Fencing token** on successful acquire: **use the etcd transaction commit revision** as the token.
+- **Watch/notify** to avoid polling (advisory; clients re-check state).
+- Optional: reentrancy (implemented in the client library, per-process).
+
+### Non-functional (single region)
+- Scale targets remain feasible: ~50k leases, ~5k keepalive writes/s, ~2k lock ops/s.
+- Availability target: **99.99%** (writes require quorum; safety over availability).
+- Durability: RPO=0 for committed entries; fast leader failover handled by etcd.
+
+---
+
+## Simplified Architecture
+
+```mermaid
+graph TB
+  subgraph Clients
+    A[Client Apps]
+    B[Lock Client Library<br/>lease keepalive, retries, watch-wait, fencing token]
+    A --> B
+  end
+
+  subgraph Etcd["etcd Cluster (3 nodes, single region)"]
+    E1[etcd]
+    E2[etcd]
+    E3[etcd]
+    E1 <--> E2
+    E2 <--> E3
+    E1 <--> E3
+  end
+
+  B --> Etcd
+```
+
+- No separate “lock service” binary.
+- No separate watch fanout service.
+- No dedicated load balancer required: clients use an endpoint list (DNS/SD) and retry.
+
+---
+
+## Merged Components
+
+All previous “server components” become either etcd internals or client-library behavior:
+
+- **Raft + WAL + snapshots** → provided by etcd.
+- **Replicated state machine** → etcd KV + leases.
+- **Lease/session manager** → etcd leases; keepalive in client library.
+- **Lock manager + fencing tokens** → etcd transactions; token = commit revision.
+- **Watch dispatcher** → etcd watch streams; backpressure handled by etcd + client resync logic.
+
+---
+
+## Data Model (etcd Keys)
+
+Use a single prefix namespace (per environment/tenant if needed):
+
+- Lock ownership (ephemeral):  
+  - Key: `/locks/<lock_name>/holder`  
+  - Value: `<lease_id>` (and optional metadata like client_id)  
+  - Attached to the session lease so it disappears on expiry.
+- Optional metadata (non-ephemeral):  
+  - Key: `/locks/<lock_name>/meta` (optional)  
+  - Value: debugging fields (owner info, timestamps), not required for correctness.
+- Optional membership/leader-election recipes (if needed):  
+  - Keys under `/members/<group>/<member_id>` attached to a lease.
+
+**Fencing token**: the `revision` returned by a successful acquire transaction (monotonic; downstream enforces `token` ordering).
+
+---
+
+## Core Operations (Library on top of etcd)
+
+### CreateSession (Lease)
+- Request a lease with `TTL` (default 30s).
+- Maintain a keepalive stream (default every ~10s with jitter).
+- If keepalive fails or lease expires: library emits a **lease-lost** signal; application must stop using locks and re-acquire.
+
+### TryAcquire(lock_name)
+Single etcd transaction:
+- Compare: `/locks/<name>/holder` does not exist
+- Then: Put `/locks/<name>/holder = <lease_id>` with the lease attached
+- On success: return `acquired=true`, `fencing_token = txn_header.revision`
+- On failure: `acquired=false`
+
+### Acquire(wait, timeout)
+- Same transaction as `TryAcquire`.
+- If not acquired and `wait=true`:
+  - Start a watch on `/locks/<name>/holder` from the current revision
+  - Retry acquisition on watch events with backoff + jitter until timeout
+- No server-side waiter queues.
+
+### Release(lock_name)
+Transaction:
+- Compare: `/locks/<name>/holder == <lease_id>`
+- Then: delete `/locks/<name>/holder`
+- Idempotent behavior: releasing a lock you don’t hold returns `released=false`.
+
+---
+
+## API Surface (Keep It Small)
+
+Expose a library API (per language), not a new network service:
+
+- `NewSession(ttl)`
+- `TryAcquire(session, lockName) -> (acquired, token)`
+- `Acquire(session, lockName, timeout) -> token`
+- `Release(session, lockName) -> released`
+- `WatchLock(lockName, fromRevision) -> events` (optional; mostly internal)
+
+If a centralized boundary is later required (multi-tenant auth, auditing), add a thin **Lock Gateway** in front of etcd—but don’t start there.
+
+---
+
+## Fencing Tokens (Downstream Enforcement)
+
+Downstream must reject stale work using the fencing token (etcd revision):
+
+- Database row guard: `UPDATE ... WHERE last_token < :token`
+- Scheduler/worker guard: accept only if `token >= last_seen_token`
+- Any write path: store and compare the last accepted token per resource
+
+Without downstream enforcement, a stalled/partitioned client can corrupt the resource after losing its lease.
+
+---
+
+## Scaling (Start Simple)
+
+- First scaling knob: **more etcd clusters / namespaces** (prod/staging/tenant prefixes), not sharding a single consensus group.
+- Avoid caches: lock correctness relies on linearizable transactions; watches are hints only.
+
+---
+
+## Operations (Minimal)
+
+Rely on etcd’s standard operational model:
+- 3 nodes across AZs, anti-affinity, fast SSD.
+- Monitor: leader changes, commit latency, db size, disk fsync latency, watch stream health.
+- Backups: periodic etcd snapshots; restore tested.
+
+Cross-region DR: snapshot shipping is enough for most cases; failover means clients create new sessions and re-acquire locks.
+
+---
+
+## Simplification Notes
+
+- Removed: custom Raft/WAL/snapshot/state-machine/watch-dispatcher implementations; acceptable because etcd already provides these with stronger maturity and lower on-call burden.
+- Removed: separate gRPC “Lock Service” and load balancer; acceptable because a library + etcd endpoints covers correctness and simplifies deployment.
+- Removed: per-lock token counters; acceptable because etcd transaction commit `revision` is already monotonic and works as a fencing token.
+- Merged: lease manager + lock manager + watch waiting into one client library module; acceptable because it deploys with the app and keeps behavior consistent.
+- Complexity that remains: a 3-node etcd quorum (necessary for linearizable locking) and downstream fencing enforcement (necessary for safety under stalls/partitions).
+```
+tokens used
+9,210
+```markdown
+---
+title: "Distributed Lock Service (Simplified)"
+category: "Foundational Infrastructure"
+difficulty: "Medium"
+tags: ["coordination", "distributed-systems", "consensus"]
+---
+
+## Overview
+
+Do not build a new lock service. Use an existing, proven consensus-backed KV store (**etcd**) and provide a small **client library** that exposes locks, sessions (leases), watches, and fencing tokens.
+
+This keeps the only “hard” part (consensus, linearizability, failover) in a battle-tested system, and keeps our code focused on ergonomics and guardrails.
+
+Core rule still applies: locks are only “safe” if **downstream systems enforce fencing tokens** (monotonic guard).
+
+---
+
+## Requirements (Kept, Trimmed)
+
+### Functional
+- **Sessions via leases**: create/renew, TTL-based expiry; automatic cleanup of ephemeral state.
+- **Locks**: `TryAcquire`, `Acquire(wait, timeout)`, `Release` with **linearizable** semantics.
+- **Fencing token** on successful acquire: **use the etcd transaction commit revision** as the token.
+- **Watch/notify** to avoid polling (advisory; clients re-check state).
+- Optional: reentrancy (implemented in the client library, per-process).
+
+### Non-functional (single region)
+- Scale targets remain feasible: ~50k leases, ~5k keepalive writes/s, ~2k lock ops/s.
+- Availability target: **99.99%** (writes require quorum; safety over availability).
+- Durability: RPO=0 for committed entries; fast leader failover handled by etcd.
+
+---
+
+## Simplified Architecture
+
+```mermaid
+graph TB
+  subgraph Clients
+    A[Client Apps]
+    B[Lock Client Library<br/>lease keepalive, retries, watch-wait, fencing token]
+    A --> B
+  end
+
+  subgraph Etcd["etcd Cluster (3 nodes, single region)"]
+    E1[etcd]
+    E2[etcd]
+    E3[etcd]
+    E1 <--> E2
+    E2 <--> E3
+    E1 <--> E3
+  end
+
+  B --> Etcd
+```
+
+- No separate “lock service” binary.
+- No separate watch fanout service.
+- No dedicated load balancer required: clients use an endpoint list (DNS/SD) and retry.
+
+---
+
+## Merged Components
+
+All previous “server components” become either etcd internals or client-library behavior:
+
+- **Raft + WAL + snapshots** → provided by etcd.
+- **Replicated state machine** → etcd KV + leases.
+- **Lease/session manager** → etcd leases; keepalive in client library.
+- **Lock manager + fencing tokens** → etcd transactions; token = commit revision.
+- **Watch dispatcher** → etcd watch streams; backpressure handled by etcd + client resync logic.
+
+---
+
+## Data Model (etcd Keys)
+
+Use a single prefix namespace (per environment/tenant if needed):
+
+- Lock ownership (ephemeral):  
+  - Key: `/locks/<lock_name>/holder`  
+  - Value: `<lease_id>` (and optional metadata like client_id)  
+  - Attached to the session lease so it disappears on expiry.
+- Optional metadata (non-ephemeral):  
+  - Key: `/locks/<lock_name>/meta` (optional)  
+  - Value: debugging fields (owner info, timestamps), not required for correctness.
+- Optional membership/leader-election recipes (if needed):  
+  - Keys under `/members/<group>/<member_id>` attached to a lease.
+
+**Fencing token**: the `revision` returned by a successful acquire transaction (monotonic; downstream enforces `token` ordering).
+
+---
+
+## Core Operations (Library on top of etcd)
+
+### CreateSession (Lease)
+- Request a lease with `TTL` (default 30s).
+- Maintain a keepalive stream (default every ~10s with jitter).
+- If keepalive fails or lease expires: library emits a **lease-lost** signal; application must stop using locks and re-acquire.
+
+### TryAcquire(lock_name)
+Single etcd transaction:
+- Compare: `/locks/<name>/holder` does not exist
+- Then: Put `/locks/<name>/holder = <lease_id>` with the lease attached
+- On success: return `acquired=true`, `fencing_token = txn_header.revision`
+- On failure: `acquired=false`
+
+### Acquire(wait, timeout)
+- Same transaction as `TryAcquire`.
+- If not acquired and `wait=true`:
+  - Start a watch on `/locks/<name>/holder` from the current revision
+  - Retry acquisition on watch events with backoff + jitter until timeout
+- No server-side waiter queues.
+
+### Release(lock_name)
+Transaction:
+- Compare: `/locks/<name>/holder == <lease_id>`
+- Then: delete `/locks/<name>/holder`
+- Idempotent behavior: releasing a lock you don’t hold returns `released=false`.
+
+---
+
+## API Surface (Keep It Small)
+
+Expose a library API (per language), not a new network service:
+
+- `NewSession(ttl)`
+- `TryAcquire(session, lockName) -> (acquired, token)`
+- `Acquire(session, lockName, timeout) -> token`
+- `Release(session, lockName) -> released`
+- `WatchLock(lockName, fromRevision) -> events` (optional; mostly internal)
+
+If a centralized boundary is later required (multi-tenant auth, auditing), add a thin **Lock Gateway** in front of etcd—but don’t start there.
+
+---
+
+## Fencing Tokens (Downstream Enforcement)
+
+Downstream must reject stale work using the fencing token (etcd revision):
+
+- Database row guard: `UPDATE ... WHERE last_token < :token`
+- Scheduler/worker guard: accept only if `token >= last_seen_token`
+- Any write path: store and compare the last accepted token per resource
+
+Without downstream enforcement, a stalled/partitioned client can corrupt the resource after losing its lease.
+
+---
+
+## Scaling (Start Simple)
+
+- First scaling knob: **more etcd clusters / namespaces** (prod/staging/tenant prefixes), not sharding a single consensus group.
+- Avoid caches: lock correctness relies on linearizable transactions; watches are hints only.
+
+---
+
+## Operations (Minimal)
+
+Rely on etcd’s standard operational model:
+- 3 nodes across AZs, anti-affinity, fast SSD.
+- Monitor: leader changes, commit latency, db size, disk fsync latency, watch stream health.
+- Backups: periodic etcd snapshots; restore tested.
+
+Cross-region DR: snapshot shipping is enough for most cases; failover means clients create new sessions and re-acquire locks.
+
+---
+
+## Simplification Notes
+
+- Removed: custom Raft/WAL/snapshot/state-machine/watch-dispatcher implementations; acceptable because etcd already provides these with stronger maturity and lower on-call burden.
+- Removed: separate gRPC “Lock Service” and load balancer; acceptable because a library + etcd endpoints covers correctness and simplifies deployment.
+- Removed: per-lock token counters; acceptable because etcd transaction commit `revision` is already monotonic and works as a fencing token.
+- Merged: lease manager + lock manager + watch waiting into one client library module; acceptable because it deploys with the app and keeps behavior consistent.
+- Complexity that remains: a 3-node etcd quorum (necessary for linearizable locking) and downstream fencing enforcement (necessary for safety under stalls/partitions).
+```
+
+[Pass 3/3] Final solution saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions/01-foundational-infrastructure/distributed-lock-service.md
+
+==========================================
+Completed: Distributed Lock Service
+==========================================

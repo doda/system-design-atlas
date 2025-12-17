@@ -1,0 +1,1466 @@
+==========================================
+Generating (v2): Data Lake Architecture
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2316-7300-9e2b-f35344e7096c
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Data Lake Architecture
+**Category**: Storage & Data Platforms
+
+**Problem Statement**:
+Design a system supporting table formats (Iceberg/Hudi), partition compaction, and governance over raw object storage.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+codex
+```markdown
+---
+title: "Data Lake Architecture"
+category: "Storage & Data Platforms"
+difficulty: "Hard"
+tags: ["data-lake", "lakehouse", "iceberg", "hudi", "governance", "object-storage", "compaction"]
+---
+
+## Overview
+
+This system is a governed “lakehouse on object storage” that supports modern table formats (Iceberg/Hudi) while treating raw object storage as an untrusted substrate. The key insight: **governance cannot be bolted on at the bucket level** once multiple engines (Spark, Trino, Flink, notebooks) touch the same data. Governance must be enforced through a **single control plane** (catalog + policy + credential vending) that all reads/writes traverse.
+
+The elegant move is to separate concerns: use object storage for durability and cost, table formats for correctness (ACID-ish semantics, schema/partition evolution), and a compact, centralized governance layer for access and audit. Everything else—ingestion, compaction, querying—stays boring and replaceable.
+
+## What Makes This Hard
+
+Naive lakes fail in two predictable ways. First, they confuse “files in a bucket” with “tables”, so every engine re-implements discovery, schema, and transactional behavior differently. That yields inconsistent reads, broken backfills, and silent data corruption when jobs partially overwrite partitions.
+
+Second, they try to enforce governance using only bucket/prefix permissions. That works until you need table-level grants, column masking, or to prevent analysts from bypassing the catalog and reading “raw” directly. Without a control plane that brokers access, you end up with compliance theater: policies exist, but cannot be proven or consistently enforced.
+
+## Requirements
+
+### Functional Requirements
+- Support **Iceberg and Hudi** tables on the same object storage account, readable by common engines (Spark/Trino/Flink).
+- Provide **ACID-like commit semantics** per table (no partial partition overwrites, snapshot-consistent reads).
+- Run **partition compaction** (small-file consolidation) without breaking concurrent readers/writers.
+- Enforce **table/column-level governance** and produce auditable access logs.
+- Prevent **direct raw-object access** from becoming the de facto API (catalog must be the gate).
+
+### Scale Targets
+- Storage: **1–5 PB** total, object store as system of record.
+- Tables: **1,000–5,000** tables, with **50k–200k partitions/day** across all tables (time-partitioned event data dominates).
+- Ingest: **5–20 TB/day** sustained; bursts of **5–10×** during backfills.
+- Query: **200–2,000 concurrent queries** in peak office hours, heavy fan-out on partition pruning.
+- File shape target: **256MB–1GB data files**; anything smaller becomes compaction pressure and metadata bloat.
+
+These numbers matter because they push you into a world where **metadata and small files** dominate costs and reliability, not raw throughput.
+
+## Key Design Decisions
+
+- **We chose:** A single, centralized **Catalog + Governance Control Plane** that issues short-lived credentials and is the only supported way to discover table locations.
+  - **We rejected:** “Just use S3/GCS IAM on prefixes” as the main control mechanism.
+  - **Why:** Prefix IAM can’t express table semantics (schemas, snapshots, column policies) and cannot stop catalog-bypass reads in practice.
+
+- **We chose:** **Iceberg and Hudi as first-class formats**, but with a shared operational contract: all writes go through format-native commits; all engines must read via the catalog.
+  - **We rejected:** Converting everything to one format up front.
+  - **Why:** Real orgs already have Hudi/Iceberg, and forced migrations stall adoption. The control plane makes heterogeneous formats operable.
+
+- **We chose:** A dedicated **Compaction Service** with explicit SLOs and backpressure, not “best effort” compaction embedded in ingestion jobs.
+  - **We rejected:** Letting every pipeline decide its own file sizing.
+  - **Why:** Compaction is a cross-cutting cost/risk lever; centralizing it prevents runaway spend and improves query stability.
+
+## Architecture
+
+```mermaid
+graph TD
+  P["Producers"] --> I["Ingest Jobs"]
+  I --> R["Raw Zone"]
+  I --> T["Tables Zone"]
+  C["Catalog & Policy"] --> I
+  C --> Q["Query Engines"]
+  T --> Q
+  S["Compaction Service"] --> T
+  O["Audit & Monitoring"] --> C
+  O --> S
+```
+
+### Components
+
+- **Raw Zone (object storage):** Immutable landing area. Write-only for ingestion. Retention is short but non-zero (enables reprocessing and forensic investigation).
+- **Tables Zone (object storage):** Managed table locations (Iceberg/Hudi). This is the durable, queryable layer. Direct human access is denied by default.
+- **Catalog & Policy (control plane):** Source of truth for table metadata (schemas, partitions, snapshots) and the policy engine for grants/masking. Also vends short-lived credentials scoped to table locations.
+- **Ingest Jobs (Spark/Flink):** Stateless compute that validates, normalizes, and commits to Iceberg/Hudi using native writers. No direct bucket browsing; it resolves locations via the catalog.
+- **Query Engines (Trino/Spark SQL):** Read tables via the catalog. Engines get table-scoped, time-bound credentials; they never need broad bucket access.
+- **Compaction Service:** Schedules and executes file rewrites (Iceberg rewriteDataFiles / Hudi clustering+compaction), and performs metadata hygiene (snapshot retention, manifest cleanup) under strict cost controls.
+- **Audit & Monitoring:** Aggregates catalog decisions (who accessed what) plus format-level commit history into a tamper-evident audit stream; exposes operational health metrics.
+
+## Deep Dive: Compaction Without Breaking Readers
+
+Compaction is deceptively hard because it’s not “merge files”; it’s **rewrite data while preserving snapshot semantics** and avoiding write amplification spirals.
+
+The core rule: **compaction must be a commit, not a side effect**. For Iceberg, the compactor reads a snapshot, plans rewrite groups (typically per partition), writes new data files, and atomically commits a new snapshot that swaps old file references for new ones. Readers stay correct because they read a consistent snapshot pointer; they either see the pre-compaction files or the post-compaction files—never a mix.
+
+For Hudi, compaction depends on table type:
+- **COW (Copy-on-Write):** clustering rewrites base files into larger ones; commits advance the timeline. Readers pick a consistent commit.
+- **MOR (Merge-on-Read):** compaction merges log files into base files; schedule is critical because excessive logs degrade query latency. The compactor advances the timeline; readers choose a commit instant.
+
+To keep this from becoming an unbounded cost center, the compaction service enforces three controls:
+1. **SLO-based triggers:** compact when small-file count or log-file depth crosses thresholds that correlate with query pain (not on a cron alone).
+2. **Rewrite budgeting:** cap rewritten bytes/day per dataset, and prioritize “hot” tables by query frequency and SLA impact.
+3. **Conflict-aware planning:** avoid compacting partitions actively being overwritten/upserted. For Iceberg, respect isolation and retry on commit conflicts; for Hudi, avoid clustering/compaction overlapping heavy upsert windows.
+
+The non-obvious win: once compaction is centralized and budgeted, you can size compute for steady-state and keep query engines stable even during backfills.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Strong governance guarantees | Some friction for ad-hoc raw access |
+| Operational simplicity via a single control plane | More responsibility placed on the catalog layer |
+| Stable query performance (file shape, metadata hygiene) | Extra compute spend for compaction/cleanup |
+| Multi-engine interoperability | Format-specific edge cases remain (Hudi MOR vs COW, Iceberg metadata growth) |
+
+## Failure Modes
+
+- **Catalog/policy outage**
+  - **What happens:** writers can’t resolve table locations or commit; queries may fail or run with stale metadata.
+  - **Detect:** elevated auth/catalog error rates, commit failures, query engine “table not found” spikes.
+  - **Recover:** run the catalog HA (multi-AZ), cache read-only metadata in query engines with short TTL, and provide a break-glass read-only path for critical tables with tightly scoped, time-limited credentials.
+
+- **Compaction runaway cost / write amplification**
+  - **What happens:** compaction rewrites too much data (especially during backfills), driving object-store PUT costs and compute spend; ingestion falls behind.
+  - **Detect:** rewritten-bytes/day vs ingested-bytes/day ratio, job queue growth, object-store request cost anomalies.
+  - **Recover:** enforce per-table budgets, pause low-priority compaction, and tighten file-size targets at ingestion to prevent small-file creation at the source.
+
+- **Governance bypass via direct object access**
+  - **What happens:** analysts or rogue jobs read raw/tables paths directly, bypassing grants/masking and destroying auditability.
+  - **Detect:** object-store access logs show reads from principals not minted by the control plane; mismatched audit vs storage logs.
+  - **Recover:** deny broad bucket access; require credential vending; continuously reconcile storage logs against catalog-issued session IDs and alert on drift.
+
+## What I'd Do Differently At...
+
+- **10x scale:** split the catalog into read-optimized metadata serving and write/commit coordination, and introduce dedicated metadata caching for high-QPS query engines; invest in automated metadata cleanup (Iceberg snapshot expiration, manifest rewriting; Hudi timeline archiving).
+- **100x scale:** treat metadata as the bottleneck: shard catalogs by domain, isolate “hot” tables onto dedicated prefixes/buckets for request-rate scaling, and move from batch compaction to continuous optimization for the top-tier datasets (especially Hudi MOR log management).
+
+## Operational Notes
+
+- Track and alert on **small-file counts**, **manifest/listing sizes**, and **Hudi log depth**; these are the leading indicators of future outages.
+- Enforce **schema evolution policy** (who can add columns, how types change) in the catalog, not in individual pipelines.
+- Run **retention and cleanup** as first-class jobs: snapshot expiration and orphan file deletion (Iceberg), timeline + archive management (Hudi). Without this, metadata grows until listing and planning dominate query time.
+- Make “raw” explicitly **not for querying**: write-only + short retention + separate encryption keys. If raw is queryable, it will be used—and governance will lose.
+- Audit must be **reconcilable**: catalog decision logs should be joinable with object-store access logs via session IDs to prove enforcement.
+```
+tokens used
+4,016
+```markdown
+---
+title: "Data Lake Architecture"
+category: "Storage & Data Platforms"
+difficulty: "Hard"
+tags: ["data-lake", "lakehouse", "iceberg", "hudi", "governance", "object-storage", "compaction"]
+---
+
+## Overview
+
+This system is a governed “lakehouse on object storage” that supports modern table formats (Iceberg/Hudi) while treating raw object storage as an untrusted substrate. The key insight: **governance cannot be bolted on at the bucket level** once multiple engines (Spark, Trino, Flink, notebooks) touch the same data. Governance must be enforced through a **single control plane** (catalog + policy + credential vending) that all reads/writes traverse.
+
+The elegant move is to separate concerns: use object storage for durability and cost, table formats for correctness (ACID-ish semantics, schema/partition evolution), and a compact, centralized governance layer for access and audit. Everything else—ingestion, compaction, querying—stays boring and replaceable.
+
+## What Makes This Hard
+
+Naive lakes fail in two predictable ways. First, they confuse “files in a bucket” with “tables”, so every engine re-implements discovery, schema, and transactional behavior differently. That yields inconsistent reads, broken backfills, and silent data corruption when jobs partially overwrite partitions.
+
+Second, they try to enforce governance using only bucket/prefix permissions. That works until you need table-level grants, column masking, or to prevent analysts from bypassing the catalog and reading “raw” directly. Without a control plane that brokers access, you end up with compliance theater: policies exist, but cannot be proven or consistently enforced.
+
+## Requirements
+
+### Functional Requirements
+- Support **Iceberg and Hudi** tables on the same object storage account, readable by common engines (Spark/Trino/Flink).
+- Provide **ACID-like commit semantics** per table (no partial partition overwrites, snapshot-consistent reads).
+- Run **partition compaction** (small-file consolidation) without breaking concurrent readers/writers.
+- Enforce **table/column-level governance** and produce auditable access logs.
+- Prevent **direct raw-object access** from becoming the de facto API (catalog must be the gate).
+
+### Scale Targets
+- Storage: **1–5 PB** total, object store as system of record.
+- Tables: **1,000–5,000** tables, with **50k–200k partitions/day** across all tables (time-partitioned event data dominates).
+- Ingest: **5–20 TB/day** sustained; bursts of **5–10×** during backfills.
+- Query: **200–2,000 concurrent queries** in peak office hours, heavy fan-out on partition pruning.
+- File shape target: **256MB–1GB data files**; anything smaller becomes compaction pressure and metadata bloat.
+
+These numbers matter because they push you into a world where **metadata and small files** dominate costs and reliability, not raw throughput.
+
+## Key Design Decisions
+
+- **We chose:** A single, centralized **Catalog + Governance Control Plane** that issues short-lived credentials and is the only supported way to discover table locations.
+  - **We rejected:** “Just use S3/GCS IAM on prefixes” as the main control mechanism.
+  - **Why:** Prefix IAM can’t express table semantics (schemas, snapshots, column policies) and cannot stop catalog-bypass reads in practice.
+
+- **We chose:** **Iceberg and Hudi as first-class formats**, but with a shared operational contract: all writes go through format-native commits; all engines must read via the catalog.
+  - **We rejected:** Converting everything to one format up front.
+  - **Why:** Real orgs already have Hudi/Iceberg, and forced migrations stall adoption. The control plane makes heterogeneous formats operable.
+
+- **We chose:** A dedicated **Compaction Service** with explicit SLOs and backpressure, not “best effort” compaction embedded in ingestion jobs.
+  - **We rejected:** Letting every pipeline decide its own file sizing.
+  - **Why:** Compaction is a cross-cutting cost/risk lever; centralizing it prevents runaway spend and improves query stability.
+
+## Architecture
+
+```mermaid
+graph TD
+  P["Producers"] --> I["Ingest Jobs"]
+  I --> R["Raw Zone"]
+  I --> T["Tables Zone"]
+  C["Catalog & Policy"] --> I
+  C --> Q["Query Engines"]
+  T --> Q
+  S["Compaction Service"] --> T
+  O["Audit & Monitoring"] --> C
+  O --> S
+```
+
+### Components
+
+- **Raw Zone (object storage):** Immutable landing area. Write-only for ingestion. Retention is short but non-zero (enables reprocessing and forensic investigation).
+- **Tables Zone (object storage):** Managed table locations (Iceberg/Hudi). This is the durable, queryable layer. Direct human access is denied by default.
+- **Catalog & Policy (control plane):** Source of truth for table metadata (schemas, partitions, snapshots) and the policy engine for grants/masking. Also vends short-lived credentials scoped to table locations.
+- **Ingest Jobs (Spark/Flink):** Stateless compute that validates, normalizes, and commits to Iceberg/Hudi using native writers. No direct bucket browsing; it resolves locations via the catalog.
+- **Query Engines (Trino/Spark SQL):** Read tables via the catalog. Engines get table-scoped, time-bound credentials; they never need broad bucket access.
+- **Compaction Service:** Schedules and executes file rewrites (Iceberg rewriteDataFiles / Hudi clustering+compaction), and performs metadata hygiene (snapshot retention, manifest cleanup) under strict cost controls.
+- **Audit & Monitoring:** Aggregates catalog decisions (who accessed what) plus format-level commit history into a tamper-evident audit stream; exposes operational health metrics.
+
+## Deep Dive: Compaction Without Breaking Readers
+
+Compaction is deceptively hard because it’s not “merge files”; it’s **rewrite data while preserving snapshot semantics** and avoiding write amplification spirals.
+
+The core rule: **compaction must be a commit, not a side effect**. For Iceberg, the compactor reads a snapshot, plans rewrite groups (typically per partition), writes new data files, and atomically commits a new snapshot that swaps old file references for new ones. Readers stay correct because they read a consistent snapshot pointer; they either see the pre-compaction files or the post-compaction files—never a mix.
+
+For Hudi, compaction depends on table type:
+- **COW (Copy-on-Write):** clustering rewrites base files into larger ones; commits advance the timeline. Readers pick a consistent commit.
+- **MOR (Merge-on-Read):** compaction merges log files into base files; schedule is critical because excessive logs degrade query latency. The compactor advances the timeline; readers choose a commit instant.
+
+To keep this from becoming an unbounded cost center, the compaction service enforces three controls:
+1. **SLO-based triggers:** compact when small-file count or log-file depth crosses thresholds that correlate with query pain (not on a cron alone).
+2. **Rewrite budgeting:** cap rewritten bytes/day per dataset, and prioritize “hot” tables by query frequency and SLA impact.
+3. **Conflict-aware planning:** avoid compacting partitions actively being overwritten/upserted. For Iceberg, respect isolation and retry on commit conflicts; for Hudi, avoid clustering/compaction overlapping heavy upsert windows.
+
+The non-obvious win: once compaction is centralized and budgeted, you can size compute for steady-state and keep query engines stable even during backfills.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Strong governance guarantees | Some friction for ad-hoc raw access |
+| Operational simplicity via a single control plane | More responsibility placed on the catalog layer |
+| Stable query performance (file shape, metadata hygiene) | Extra compute spend for compaction/cleanup |
+| Multi-engine interoperability | Format-specific edge cases remain (Hudi MOR vs COW, Iceberg metadata growth) |
+
+## Failure Modes
+
+- **Catalog/policy outage**
+  - **What happens:** writers can’t resolve table locations or commit; queries may fail or run with stale metadata.
+  - **Detect:** elevated auth/catalog error rates, commit failures, query engine “table not found” spikes.
+  - **Recover:** run the catalog HA (multi-AZ), cache read-only metadata in query engines with short TTL, and provide a break-glass read-only path for critical tables with tightly scoped, time-limited credentials.
+
+- **Compaction runaway cost / write amplification**
+  - **What happens:** compaction rewrites too much data (especially during backfills), driving object-store PUT costs and compute spend; ingestion falls behind.
+  - **Detect:** rewritten-bytes/day vs ingested-bytes/day ratio, job queue growth, object-store request cost anomalies.
+  - **Recover:** enforce per-table budgets, pause low-priority compaction, and tighten file-size targets at ingestion to prevent small-file creation at the source.
+
+- **Governance bypass via direct object access**
+  - **What happens:** analysts or rogue jobs read raw/tables paths directly, bypassing grants/masking and destroying auditability.
+  - **Detect:** object-store access logs show reads from principals not minted by the control plane; mismatched audit vs storage logs.
+  - **Recover:** deny broad bucket access; require credential vending; continuously reconcile storage logs against catalog-issued session IDs and alert on drift.
+
+## What I'd Do Differently At...
+
+- **10x scale:** split the catalog into read-optimized metadata serving and write/commit coordination, and introduce dedicated metadata caching for high-QPS query engines; invest in automated metadata cleanup (Iceberg snapshot expiration, manifest rewriting; Hudi timeline archiving).
+- **100x scale:** treat metadata as the bottleneck: shard catalogs by domain, isolate “hot” tables onto dedicated prefixes/buckets for request-rate scaling, and move from batch compaction to continuous optimization for the top-tier datasets (especially Hudi MOR log management).
+
+## Operational Notes
+
+- Track and alert on **small-file counts**, **manifest/listing sizes**, and **Hudi log depth**; these are the leading indicators of future outages.
+- Enforce **schema evolution policy** (who can add columns, how types change) in the catalog, not in individual pipelines.
+- Run **retention and cleanup** as first-class jobs: snapshot expiration and orphan file deletion (Iceberg), timeline + archive management (Hudi). Without this, metadata grows until listing and planning dominate query time.
+- Make “raw” explicitly **not for querying**: write-only + short retention + separate encryption keys. If raw is queryable, it will be used—and governance will lose.
+- Audit must be **reconcilable**: catalog decision logs should be joinable with object-store access logs via session IDs to prove enforcement.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/data-lake-architecture.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-2c7e-7ac1-a361-80d44e1caf14
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Data Lake Architecture"
+category: "Storage & Data Platforms"
+difficulty: "Hard"
+tags: ["data-lake", "lakehouse", "iceberg", "hudi", "governance", "object-storage", "compaction"]
+---
+
+## Overview
+
+This system is a governed “lakehouse on object storage” that supports modern table formats (Iceberg/Hudi) while treating raw object storage as an untrusted substrate. The key insight: **governance cannot be bolted on at the bucket level** once multiple engines (Spark, Trino, Flink, notebooks) touch the same data. Governance must be enforced through a **single control plane** (catalog + policy + credential vending) that all reads/writes traverse.
+
+The elegant move is to separate concerns: use object storage for durability and cost, table formats for correctness (ACID-ish semantics, schema/partition evolution), and a compact, centralized governance layer for access and audit. Everything else—ingestion, compaction, querying—stays boring and replaceable.
+
+## What Makes This Hard
+
+Naive lakes fail in two predictable ways. First, they confuse “files in a bucket” with “tables”, so every engine re-implements discovery, schema, and transactional behavior differently. That yields inconsistent reads, broken backfills, and silent data corruption when jobs partially overwrite partitions.
+
+Second, they try to enforce governance using only bucket/prefix permissions. That works until you need table-level grants, column masking, or to prevent analysts from bypassing the catalog and reading “raw” directly. Without a control plane that brokers access, you end up with compliance theater: policies exist, but cannot be proven or consistently enforced.
+
+## Requirements
+
+### Functional Requirements
+- Support **Iceberg and Hudi** tables on the same object storage account, readable by common engines (Spark/Trino/Flink).
+- Provide **ACID-like commit semantics** per table (no partial partition overwrites, snapshot-consistent reads).
+- Run **partition compaction** (small-file consolidation) without breaking concurrent readers/writers.
+- Enforce **table/column-level governance** and produce auditable access logs.
+- Prevent **direct raw-object access** from becoming the de facto API (catalog must be the gate).
+
+### Scale Targets
+- Storage: **1–5 PB** total, object store as system of record.
+- Tables: **1,000–5,000** tables, with **50k–200k partitions/day** across all tables (time-partitioned event data dominates).
+- Ingest: **5–20 TB/day** sustained; bursts of **5–10×** during backfills.
+- Query: **200–2,000 concurrent queries** in peak office hours, heavy fan-out on partition pruning.
+- File shape target: **256MB–1GB data files**; anything smaller becomes compaction pressure and metadata bloat.
+
+These numbers matter because they push you into a world where **metadata and small files** dominate costs and reliability, not raw throughput.
+
+## Key Design Decisions
+
+- **We chose:** A single, centralized **Catalog + Governance Control Plane** that issues short-lived credentials and is the only supported way to discover table locations.
+  - **We rejected:** “Just use S3/GCS IAM on prefixes” as the main control mechanism.
+  - **Why:** Prefix IAM can’t express table semantics (schemas, snapshots, column policies) and cannot stop catalog-bypass reads in practice.
+
+- **We chose:** **Iceberg and Hudi as first-class formats**, but with a shared operational contract: all writes go through format-native commits; all engines must read via the catalog.
+  - **We rejected:** Converting everything to one format up front.
+  - **Why:** Real orgs already have Hudi/Iceberg, and forced migrations stall adoption. The control plane makes heterogeneous formats operable.
+
+- **We chose:** A dedicated **Compaction Service** with explicit SLOs and backpressure, not “best effort” compaction embedded in ingestion jobs.
+  - **We rejected:** Letting every pipeline decide its own file sizing.
+  - **Why:** Compaction is a cross-cutting cost/risk lever; centralizing it prevents runaway spend and improves query stability.
+
+## Architecture
+
+```mermaid
+graph TD
+  P["Producers"] --> I["Ingest Jobs"]
+  I --> R["Raw Zone"]
+  I --> T["Tables Zone"]
+  C["Catalog & Policy"] --> I
+  C --> Q["Query Engines"]
+  T --> Q
+  S["Compaction Service"] --> T
+  O["Audit & Monitoring"] --> C
+  O --> S
+```
+
+### Components
+
+- **Raw Zone (object storage):** Immutable landing area. Write-only for ingestion. Retention is short but non-zero (enables reprocessing and forensic investigation).
+- **Tables Zone (object storage):** Managed table locations (Iceberg/Hudi). This is the durable, queryable layer. Direct human access is denied by default.
+- **Catalog & Policy (control plane):** Source of truth for table metadata (schemas, partitions, snapshots) and the policy engine for grants/masking. Also vends short-lived credentials scoped to table locations.
+- **Ingest Jobs (Spark/Flink):** Stateless compute that validates, normalizes, and commits to Iceberg/Hudi using native writers. No direct bucket browsing; it resolves locations via the catalog.
+- **Query Engines (Trino/Spark SQL):** Read tables via the catalog. Engines get table-scoped, time-bound credentials; they never need broad bucket access.
+- **Compaction Service:** Schedules and executes file rewrites (Iceberg rewriteDataFiles / Hudi clustering+compaction), and performs metadata hygiene (snapshot retention, manifest cleanup) under strict cost controls.
+- **Audit & Monitoring:** Aggregates catalog decisions (who accessed what) plus format-level commit history into a tamper-evident audit stream; exposes operational health metrics.
+
+## Deep Dive: Compaction Without Breaking Readers
+
+Compaction is deceptively hard because it’s not “merge files”; it’s **rewrite data while preserving snapshot semantics** and avoiding write amplification spirals.
+
+The core rule: **compaction must be a commit, not a side effect**. For Iceberg, the compactor reads a snapshot, plans rewrite groups (typically per partition), writes new data files, and atomically commits a new snapshot that swaps old file references for new ones. Readers stay correct because they read a consistent snapshot pointer; they either see the pre-compaction files or the post-compaction files—never a mix.
+
+For Hudi, compaction depends on table type:
+- **COW (Copy-on-Write):** clustering rewrites base files into larger ones; commits advance the timeline. Readers pick a consistent commit.
+- **MOR (Merge-on-Read):** compaction merges log files into base files; schedule is critical because excessive logs degrade query latency. The compactor advances the timeline; readers choose a commit instant.
+
+To keep this from becoming an unbounded cost center, the compaction service enforces three controls:
+1. **SLO-based triggers:** compact when small-file count or log-file depth crosses thresholds that correlate with query pain (not on a cron alone).
+2. **Rewrite budgeting:** cap rewritten bytes/day per dataset, and prioritize “hot” tables by query frequency and SLA impact.
+3. **Conflict-aware planning:** avoid compacting partitions actively being overwritten/upserted. For Iceberg, respect isolation and retry on commit conflicts; for Hudi, avoid clustering/compaction overlapping heavy upsert windows.
+
+The non-obvious win: once compaction is centralized and budgeted, you can size compute for steady-state and keep query engines stable even during backfills.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Strong governance guarantees | Some friction for ad-hoc raw access |
+| Operational simplicity via a single control plane | More responsibility placed on the catalog layer |
+| Stable query performance (file shape, metadata hygiene) | Extra compute spend for compaction/cleanup |
+| Multi-engine interoperability | Format-specific edge cases remain (Hudi MOR vs COW, Iceberg metadata growth) |
+
+## Failure Modes
+
+- **Catalog/policy outage**
+  - **What happens:** writers can’t resolve table locations or commit; queries may fail or run with stale metadata.
+  - **Detect:** elevated auth/catalog error rates, commit failures, query engine “table not found” spikes.
+  - **Recover:** run the catalog HA (multi-AZ), cache read-only metadata in query engines with short TTL, and provide a break-glass read-only path for critical tables with tightly scoped, time-limited credentials.
+
+- **Compaction runaway cost / write amplification**
+  - **What happens:** compaction rewrites too much data (especially during backfills), driving object-store PUT costs and compute spend; ingestion falls behind.
+  - **Detect:** rewritten-bytes/day vs ingested-bytes/day ratio, job queue growth, object-store request cost anomalies.
+  - **Recover:** enforce per-table budgets, pause low-priority compaction, and tighten file-size targets at ingestion to prevent small-file creation at the source.
+
+- **Governance bypass via direct object access**
+  - **What happens:** analysts or rogue jobs read raw/tables paths directly, bypassing grants/masking and destroying auditability.
+  - **Detect:** object-store access logs show reads from principals not minted by the control plane; mismatched audit vs storage logs.
+  - **Recover:** deny broad bucket access; require credential vending; continuously reconcile storage logs against catalog-issued session IDs and alert on drift.
+
+## What I'd Do Differently At...
+
+- **10x scale:** split the catalog into read-optimized metadata serving and write/commit coordination, and introduce dedicated metadata caching for high-QPS query engines; invest in automated metadata cleanup (Iceberg snapshot expiration, manifest rewriting; Hudi timeline archiving).
+- **100x scale:** treat metadata as the bottleneck: shard catalogs by domain, isolate “hot” tables onto dedicated prefixes/buckets for request-rate scaling, and move from batch compaction to continuous optimization for the top-tier datasets (especially Hudi MOR log management).
+
+## Operational Notes
+
+- Track and alert on **small-file counts**, **manifest/listing sizes**, and **Hudi log depth**; these are the leading indicators of future outages.
+- Enforce **schema evolution policy** (who can add columns, how types change) in the catalog, not in individual pipelines.
+- Run **retention and cleanup** as first-class jobs: snapshot expiration and orphan file deletion (Iceberg), timeline + archive management (Hudi). Without this, metadata grows until listing and planning dominate query time.
+- Make “raw” explicitly **not for querying**: write-only + short retention + separate encryption keys. If raw is queryable, it will be used—and governance will lose.
+- Audit must be **reconcilable**: catalog decision logs should be joinable with object-store access logs via session IDs to prove enforcement.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+thinking
+**Exploring data management solutions**
+
+I'm thinking about simplifying data management with managed services like AWS Lake Formation, Glue, and Databricks Unity Catalog. I’ll use credential vending through IAM roles and STS, along with existing open-source tools like Apache Ranger for policies. For compaction, I'll schedule format-native actions with Airflow, using queues like SQS or Kafka for tasks. Also, I need to consider preventing direct access to raw objects, which requires organization-wide controls to enforce data access effectively.
+thinking
+**Analyzing metadata scaling and management**
+
+I'm diving into metadata scaling with scenarios of 50k to 200k partitions per day, considering Iceberg manifests and file metrics. I need to think about optimizing partitions through clustering or bucketing, and possibly using Iceberg's partition evolution. It’s vital to address atomic commits and the necessity for a lock manager for multi-writer situations. I also want to stress test various factors, including object store throttling and compliance aspects like encryption and data retention, while keeping within budget guidelines.
+thinking
+**Outlining elegance in data management**
+
+I'm outlining a response with an elegance check focusing on a core insight regarding mandatory governance at the table and column levels. I’ll create tables for different components such as object storage, table formats, catalog, policy, and audit. For simplification, I can suggest using existing solutions like Unity Catalog or Lake Formation instead of custom catalogs, and utilize cloud-native services for credential vending. It’s essential to consider trade-offs, such as flexibility and real-time capabilities, as well as stress testing with various scenarios.
+thinking
+**Addressing potential outages and schema issues**
+
+I’m outlining how to handle various outages and design challenges. For an object store outage leading to throttling, I need to recommend strategies like retry logic, idempotency, and separating write and metadata processes. During a KMS/STS outage, credential vending could fail, so adding caching with safe TTL is crucial. I also need to address potential issues with schema evolution and metadata bloat, ensuring there's a proper schema registry, enforcement, and manageable partition sizes. Establishing clear policies for failure scenarios is essential for resilience.
+thinking
+**Evaluating data management strategies**
+
+I’m considering unifying around the Iceberg REST catalog while using tools like Ranger and OPA for governance. Incorporating a queue and ensuring multi-region support will be important. I also want to emphasize benefits like lineage tracking, data quality, and auto-tuning for cost management on a per-table basis. It's great to see effective practices like clear separation and thorough audit reconciliation in place. I want to make sure I convey all of this gently while highlighting trade-offs, especially for smaller teams.
+codex
+## Elegance Check
+
+### The Core Insight
+Governance and correctness only “stick” if *every engine* goes through a single control plane (catalog + policy + credential vending); bucket/prefix IAM alone can’t express table semantics or produce provable audit.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Object storage (Raw/Tables zones) | Cheapest durable substrate; zones make intent (immutable landing vs governed tables) explicit |
+| Iceberg/Hudi table formats | Provide snapshot/commit semantics and evolution on top of object storage |
+| Catalog & Policy + credential vending | The enforcement point that prevents catalog-bypass reads and enables column/table policy + audit |
+| Compaction/optimization | Small files + metadata bloat are the real reliability/cost bottlenecks at your scale targets |
+| Audit & monitoring | Only way to prove enforcement and catch drift between “policy said no” and “storage read happened” |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom “Catalog & Policy” as a single monolith | Adopt a proven catalog/policy stack (e.g., Iceberg REST catalog + Apache Ranger/OPA, or a managed catalog like Lake Formation/Unity Catalog) | Less bespoke control; possible vendor or product constraints |
+| Custom credential vending | Use cloud-native short-lived creds with session policies/tags (STS) and enforce with org-level guardrails (SCP/Org Policy) | Ties you to a cloud’s IAM model; still needs careful tag propagation across engines |
+| Dedicated always-on “Compaction Service” | Start with orchestrated format-native actions (Airflow/Argo + queue) and evolve to a service only if SLO-based scheduling/backpressure truly needs it | Less reactive; harder to do global budgeting/prioritization early |
+| “Tamper-evident audit stream” as bespoke pipeline | Use managed immutable logs (CloudTrail/ObjectLock/WORM, or Kafka + retention/ACL hardening) and join via session tags | Fewer custom pieces, but integration constraints and less control over schema |
+| “Prevent direct raw-object access” purely via design intent | Make it explicit as *org policy + network + IAM boundary* (no wildcard bucket grants, VPC endpoints/private access, break-glass role) | More governance coordination; stronger stance may slow ad-hoc workflows |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Object store throttling / partial outage (5–15 min of 503s, slow LIST/GET/PUT)**
+   - Design's answer: not addressed (only catalog outage is detailed)
+   - Recommendation: Strengthen (idempotent writers, exponential backoff, bounded retries, write backpressure, “commit is last step” discipline, and explicit SLOs for storage error budgets)
+
+2. **STS/KMS outage (credential vending or decrypt fails)**
+   - Design's answer: not addressed
+   - Recommendation: Strengthen (define fail-closed vs fail-open per persona; cache *read-only* auth decisions briefly; pre-provision break-glass with tight time bounds; ensure engines surface actionable errors)
+
+3. **Commit coordination conflicts at high concurrency (many writers, backfills, retries)**
+   - Design's answer: partially addressed (mentions Iceberg conflict retries; Hudi overlap avoidance)
+   - Recommendation: Strengthen (be explicit about the lock/coordination mechanism per format/catalog—e.g., Iceberg needs reliable optimistic commit + optional lock manager; define idempotency keys and exactly-once “job attempts” semantics)
+
+4. **Bad schema/policy deployment (masking bug, incompatible type change, overly broad grant)**
+   - Design's answer: not addressed
+   - Recommendation: Strengthen (staged rollout for policies, “policy lint/dry-run” against representative queries, schema evolution guardrails, and a fast rollback path that on-call can execute at 3am)
+
+5. **Compaction backlog during backfills (10× ingest burst creates small-file storm + metadata explosion)**
+   - Design's answer: addressed (budgeting + SLO triggers + prioritization)
+   - Recommendation: Acceptable, but add a “prevention first” lever: ingestion-time file sizing/partitioning standards and automated detection of partition explosion (it’s often cheaper than rewriting later)
+
+## Recommendations
+
+### Must Fix
+- Specify the *enforcement mechanism* that truly prevents bypass: org-level IAM boundaries + how session tags/IDs propagate into object-store logs across Spark/Trino/Flink.
+- Make commit coordination concrete: what provides mutual exclusion/optimistic concurrency safety for Iceberg/Hudi under multi-writer + retries, and how you guarantee idempotency.
+- Define fail modes for the control plane and auth: what continues in read-only, what halts, and what the break-glass procedure is (including audit guarantees).
+
+### Should Consider
+- Reduce custom surface area by adopting an existing catalog/policy foundation and keep your “interesting” work focused on governance integration + operational excellence (budgets, SLO-based optimization).
+- Treat partition explosion as a first-class failure mode (50k–200k partitions/day is as much a *modeling* problem as a systems problem): add guardrails on partition spec choices and automated alarms.
+- Add a clear “small team operability” story: how many moving parts on-call owns, and a single-button/single-runbook deploy + rollback for policy/catalog changes.
+
+### Nice to Have
+- Formalize per-table cost attribution (rewrite bytes, request costs, query scan bytes) to make budgeting enforceable and socially sustainable.
+- Add lineage/data quality hooks at the control plane boundary (even minimal “producer job → table snapshot” tracking goes far in incident response).
+
+## What's Working Well
+- The separation of concerns is clean: object storage for durability, table formats for correctness, and a single control plane for governance/audit.
+- Compaction framed as a *transactional commit* (not a side effect) is exactly the right mental model for keeping readers correct.
+- The design is honest about the real enemies at PB-scale (metadata + small files), and your budgeting/backpressure approach is a pragmatic way to keep costs and reliability bounded.
+tokens used
+5,722
+## Elegance Check
+
+### The Core Insight
+Governance and correctness only “stick” if *every engine* goes through a single control plane (catalog + policy + credential vending); bucket/prefix IAM alone can’t express table semantics or produce provable audit.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Object storage (Raw/Tables zones) | Cheapest durable substrate; zones make intent (immutable landing vs governed tables) explicit |
+| Iceberg/Hudi table formats | Provide snapshot/commit semantics and evolution on top of object storage |
+| Catalog & Policy + credential vending | The enforcement point that prevents catalog-bypass reads and enables column/table policy + audit |
+| Compaction/optimization | Small files + metadata bloat are the real reliability/cost bottlenecks at your scale targets |
+| Audit & monitoring | Only way to prove enforcement and catch drift between “policy said no” and “storage read happened” |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom “Catalog & Policy” as a single monolith | Adopt a proven catalog/policy stack (e.g., Iceberg REST catalog + Apache Ranger/OPA, or a managed catalog like Lake Formation/Unity Catalog) | Less bespoke control; possible vendor or product constraints |
+| Custom credential vending | Use cloud-native short-lived creds with session policies/tags (STS) and enforce with org-level guardrails (SCP/Org Policy) | Ties you to a cloud’s IAM model; still needs careful tag propagation across engines |
+| Dedicated always-on “Compaction Service” | Start with orchestrated format-native actions (Airflow/Argo + queue) and evolve to a service only if SLO-based scheduling/backpressure truly needs it | Less reactive; harder to do global budgeting/prioritization early |
+| “Tamper-evident audit stream” as bespoke pipeline | Use managed immutable logs (CloudTrail/ObjectLock/WORM, or Kafka + retention/ACL hardening) and join via session tags | Fewer custom pieces, but integration constraints and less control over schema |
+| “Prevent direct raw-object access” purely via design intent | Make it explicit as *org policy + network + IAM boundary* (no wildcard bucket grants, VPC endpoints/private access, break-glass role) | More governance coordination; stronger stance may slow ad-hoc workflows |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Object store throttling / partial outage (5–15 min of 503s, slow LIST/GET/PUT)**
+   - Design's answer: not addressed (only catalog outage is detailed)
+   - Recommendation: Strengthen (idempotent writers, exponential backoff, bounded retries, write backpressure, “commit is last step” discipline, and explicit SLOs for storage error budgets)
+
+2. **STS/KMS outage (credential vending or decrypt fails)**
+   - Design's answer: not addressed
+   - Recommendation: Strengthen (define fail-closed vs fail-open per persona; cache *read-only* auth decisions briefly; pre-provision break-glass with tight time bounds; ensure engines surface actionable errors)
+
+3. **Commit coordination conflicts at high concurrency (many writers, backfills, retries)**
+   - Design's answer: partially addressed (mentions Iceberg conflict retries; Hudi overlap avoidance)
+   - Recommendation: Strengthen (be explicit about the lock/coordination mechanism per format/catalog—e.g., Iceberg needs reliable optimistic commit + optional lock manager; define idempotency keys and exactly-once “job attempts” semantics)
+
+4. **Bad schema/policy deployment (masking bug, incompatible type change, overly broad grant)**
+   - Design's answer: not addressed
+   - Recommendation: Strengthen (staged rollout for policies, “policy lint/dry-run” against representative queries, schema evolution guardrails, and a fast rollback path that on-call can execute at 3am)
+
+5. **Compaction backlog during backfills (10× ingest burst creates small-file storm + metadata explosion)**
+   - Design's answer: addressed (budgeting + SLO triggers + prioritization)
+   - Recommendation: Acceptable, but add a “prevention first” lever: ingestion-time file sizing/partitioning standards and automated detection of partition explosion (it’s often cheaper than rewriting later)
+
+## Recommendations
+
+### Must Fix
+- Specify the *enforcement mechanism* that truly prevents bypass: org-level IAM boundaries + how session tags/IDs propagate into object-store logs across Spark/Trino/Flink.
+- Make commit coordination concrete: what provides mutual exclusion/optimistic concurrency safety for Iceberg/Hudi under multi-writer + retries, and how you guarantee idempotency.
+- Define fail modes for the control plane and auth: what continues in read-only, what halts, and what the break-glass procedure is (including audit guarantees).
+
+### Should Consider
+- Reduce custom surface area by adopting an existing catalog/policy foundation and keep your “interesting” work focused on governance integration + operational excellence (budgets, SLO-based optimization).
+- Treat partition explosion as a first-class failure mode (50k–200k partitions/day is as much a *modeling* problem as a systems problem): add guardrails on partition spec choices and automated alarms.
+- Add a clear “small team operability” story: how many moving parts on-call owns, and a single-button/single-runbook deploy + rollback for policy/catalog changes.
+
+### Nice to Have
+- Formalize per-table cost attribution (rewrite bytes, request costs, query scan bytes) to make budgeting enforceable and socially sustainable.
+- Add lineage/data quality hooks at the control plane boundary (even minimal “producer job → table snapshot” tracking goes far in incident response).
+
+## What's Working Well
+- The separation of concerns is clean: object storage for durability, table formats for correctness, and a single control plane for governance/audit.
+- Compaction framed as a *transactional commit* (not a side effect) is exactly the right mental model for keeping readers correct.
+- The design is honest about the real enemies at PB-scale (metadata + small files), and your budgeting/backpressure approach is a pragmatic way to keep costs and reliability bounded.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/data-lake-architecture.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afd-2836-78f2-b21b-d87977ed89db
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Data Lake Architecture"
+category: "Storage & Data Platforms"
+difficulty: "Hard"
+tags: ["data-lake", "lakehouse", "iceberg", "hudi", "governance", "object-storage", "compaction"]
+---
+
+## Overview
+
+This system is a governed “lakehouse on object storage” that supports modern table formats (Iceberg/Hudi) while treating raw object storage as an untrusted substrate. The key insight: **governance cannot be bolted on at the bucket level** once multiple engines (Spark, Trino, Flink, notebooks) touch the same data. Governance must be enforced through a **single control plane** (catalog + policy + credential vending) that all reads/writes traverse.
+
+The elegant move is to separate concerns: use object storage for durability and cost, table formats for correctness (ACID-ish semantics, schema/partition evolution), and a compact, centralized governance layer for access and audit. Everything else—ingestion, compaction, querying—stays boring and replaceable.
+
+## What Makes This Hard
+
+Naive lakes fail in two predictable ways. First, they confuse “files in a bucket” with “tables”, so every engine re-implements discovery, schema, and transactional behavior differently. That yields inconsistent reads, broken backfills, and silent data corruption when jobs partially overwrite partitions.
+
+Second, they try to enforce governance using only bucket/prefix permissions. That works until you need table-level grants, column masking, or to prevent analysts from bypassing the catalog and reading “raw” directly. Without a control plane that brokers access, you end up with compliance theater: policies exist, but cannot be proven or consistently enforced.
+
+## Requirements
+
+### Functional Requirements
+- Support **Iceberg and Hudi** tables on the same object storage account, readable by common engines (Spark/Trino/Flink).
+- Provide **ACID-like commit semantics** per table (no partial partition overwrites, snapshot-consistent reads).
+- Run **partition compaction** (small-file consolidation) without breaking concurrent readers/writers.
+- Enforce **table/column-level governance** and produce auditable access logs.
+- Prevent **direct raw-object access** from becoming the de facto API (catalog must be the gate).
+
+### Scale Targets
+- Storage: **1–5 PB** total, object store as system of record.
+- Tables: **1,000–5,000** tables, with **50k–200k partitions/day** across all tables (time-partitioned event data dominates).
+- Ingest: **5–20 TB/day** sustained; bursts of **5–10×** during backfills.
+- Query: **200–2,000 concurrent queries** in peak office hours, heavy fan-out on partition pruning.
+- File shape target: **256MB–1GB data files**; anything smaller becomes compaction pressure and metadata bloat.
+
+These numbers matter because they push you into a world where **metadata and small files** dominate costs and reliability, not raw throughput.
+
+## Key Design Decisions
+
+- **We chose:** A single, centralized **Catalog + Governance Control Plane** that issues short-lived credentials and is the only supported way to discover table locations.
+  - **We rejected:** “Just use S3/GCS IAM on prefixes” as the main control mechanism.
+  - **Why:** Prefix IAM can’t express table semantics (schemas, snapshots, column policies) and cannot stop catalog-bypass reads in practice.
+
+- **We chose:** **Iceberg and Hudi as first-class formats**, but with a shared operational contract: all writes go through format-native commits; all engines must read via the catalog.
+  - **We rejected:** Converting everything to one format up front.
+  - **Why:** Real orgs already have Hudi/Iceberg, and forced migrations stall adoption. The control plane makes heterogeneous formats operable.
+
+- **We chose:** A dedicated **Compaction Service** with explicit SLOs and backpressure, not “best effort” compaction embedded in ingestion jobs.
+  - **We rejected:** Letting every pipeline decide its own file sizing.
+  - **Why:** Compaction is a cross-cutting cost/risk lever; centralizing it prevents runaway spend and improves query stability.
+
+## Architecture
+
+```mermaid
+graph TD
+  P["Producers"] --> I["Ingest Jobs"]
+  I --> R["Raw Zone"]
+  I --> T["Tables Zone"]
+  C["Catalog & Policy"] --> I
+  C --> Q["Query Engines"]
+  T --> Q
+  S["Compaction Service"] --> T
+  O["Audit & Monitoring"] --> C
+  O --> S
+```
+
+### Components
+
+- **Raw Zone (object storage):** Immutable landing area. Write-only for ingestion. Retention is short but non-zero (enables reprocessing and forensic investigation).
+- **Tables Zone (object storage):** Managed table locations (Iceberg/Hudi). This is the durable, queryable layer. Direct human access is denied by default.
+- **Catalog & Policy (control plane):** Source of truth for table metadata (schemas, partitions, snapshots) and the policy engine for grants/masking. Also vends short-lived credentials scoped to table locations.
+- **Ingest Jobs (Spark/Flink):** Stateless compute that validates, normalizes, and commits to Iceberg/Hudi using native writers. No direct bucket browsing; it resolves locations via the catalog.
+- **Query Engines (Trino/Spark SQL):** Read tables via the catalog. Engines get table-scoped, time-bound credentials; they never need broad bucket access.
+- **Compaction Service:** Schedules and executes file rewrites (Iceberg rewriteDataFiles / Hudi clustering+compaction), and performs metadata hygiene (snapshot retention, manifest cleanup) under strict cost controls.
+- **Audit & Monitoring:** Aggregates catalog decisions (who accessed what) plus format-level commit history into a tamper-evident audit stream; exposes operational health metrics.
+
+## Deep Dive: Compaction Without Breaking Readers
+
+Compaction is deceptively hard because it’s not “merge files”; it’s **rewrite data while preserving snapshot semantics** and avoiding write amplification spirals.
+
+The core rule: **compaction must be a commit, not a side effect**. For Iceberg, the compactor reads a snapshot, plans rewrite groups (typically per partition), writes new data files, and atomically commits a new snapshot that swaps old file references for new ones. Readers stay correct because they read a consistent snapshot pointer; they either see the pre-compaction files or the post-compaction files—never a mix.
+
+For Hudi, compaction depends on table type:
+- **COW (Copy-on-Write):** clustering rewrites base files into larger ones; commits advance the timeline. Readers pick a consistent commit.
+- **MOR (Merge-on-Read):** compaction merges log files into base files; schedule is critical because excessive logs degrade query latency. The compactor advances the timeline; readers choose a commit instant.
+
+To keep this from becoming an unbounded cost center, the compaction service enforces three controls:
+1. **SLO-based triggers:** compact when small-file count or log-file depth crosses thresholds that correlate with query pain (not on a cron alone).
+2. **Rewrite budgeting:** cap rewritten bytes/day per dataset, and prioritize “hot” tables by query frequency and SLA impact.
+3. **Conflict-aware planning:** avoid compacting partitions actively being overwritten/upserted. For Iceberg, respect isolation and retry on commit conflicts; for Hudi, avoid clustering/compaction overlapping heavy upsert windows.
+
+The non-obvious win: once compaction is centralized and budgeted, you can size compute for steady-state and keep query engines stable even during backfills.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Strong governance guarantees | Some friction for ad-hoc raw access |
+| Operational simplicity via a single control plane | More responsibility placed on the catalog layer |
+| Stable query performance (file shape, metadata hygiene) | Extra compute spend for compaction/cleanup |
+| Multi-engine interoperability | Format-specific edge cases remain (Hudi MOR vs COW, Iceberg metadata growth) |
+
+## Failure Modes
+
+- **Catalog/policy outage**
+  - **What happens:** writers can’t resolve table locations or commit; queries may fail or run with stale metadata.
+  - **Detect:** elevated auth/catalog error rates, commit failures, query engine “table not found” spikes.
+  - **Recover:** run the catalog HA (multi-AZ), cache read-only metadata in query engines with short TTL, and provide a break-glass read-only path for critical tables with tightly scoped, time-limited credentials.
+
+- **Compaction runaway cost / write amplification**
+  - **What happens:** compaction rewrites too much data (especially during backfills), driving object-store PUT costs and compute spend; ingestion falls behind.
+  - **Detect:** rewritten-bytes/day vs ingested-bytes/day ratio, job queue growth, object-store request cost anomalies.
+  - **Recover:** enforce per-table budgets, pause low-priority compaction, and tighten file-size targets at ingestion to prevent small-file creation at the source.
+
+- **Governance bypass via direct object access**
+  - **What happens:** analysts or rogue jobs read raw/tables paths directly, bypassing grants/masking and destroying auditability.
+  - **Detect:** object-store access logs show reads from principals not minted by the control plane; mismatched audit vs storage logs.
+  - **Recover:** deny broad bucket access; require credential vending; continuously reconcile storage logs against catalog-issued session IDs and alert on drift.
+
+## What I'd Do Differently At...
+
+- **10x scale:** split the catalog into read-optimized metadata serving and write/commit coordination, and introduce dedicated metadata caching for high-QPS query engines; invest in automated metadata cleanup (Iceberg snapshot expiration, manifest rewriting; Hudi timeline archiving).
+- **100x scale:** treat metadata as the bottleneck: shard catalogs by domain, isolate “hot” tables onto dedicated prefixes/buckets for request-rate scaling, and move from batch compaction to continuous optimization for the top-tier datasets (especially Hudi MOR log management).
+
+## Operational Notes
+
+- Track and alert on **small-file counts**, **manifest/listing sizes**, and **Hudi log depth**; these are the leading indicators of future outages.
+- Enforce **schema evolution policy** (who can add columns, how types change) in the catalog, not in individual pipelines.
+- Run **retention and cleanup** as first-class jobs: snapshot expiration and orphan file deletion (Iceberg), timeline + archive management (Hudi). Without this, metadata grows until listing and planning dominate query time.
+- Make “raw” explicitly **not for querying**: write-only + short retention + separate encryption keys. If raw is queryable, it will be used—and governance will lose.
+- Audit must be **reconcilable**: catalog decision logs should be joinable with object-store access logs via session IDs to prove enforcement.
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Governance and correctness only “stick” if *every engine* goes through a single control plane (catalog + policy + credential vending); bucket/prefix IAM alone can’t express table semantics or produce provable audit.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Object storage (Raw/Tables zones) | Cheapest durable substrate; zones make intent (immutable landing vs governed tables) explicit |
+| Iceberg/Hudi table formats | Provide snapshot/commit semantics and evolution on top of object storage |
+| Catalog & Policy + credential vending | The enforcement point that prevents catalog-bypass reads and enables column/table policy + audit |
+| Compaction/optimization | Small files + metadata bloat are the real reliability/cost bottlenecks at your scale targets |
+| Audit & monitoring | Only way to prove enforcement and catch drift between “policy said no” and “storage read happened” |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom “Catalog & Policy” as a single monolith | Adopt a proven catalog/policy stack (e.g., Iceberg REST catalog + Apache Ranger/OPA, or a managed catalog like Lake Formation/Unity Catalog) | Less bespoke control; possible vendor or product constraints |
+| Custom credential vending | Use cloud-native short-lived creds with session policies/tags (STS) and enforce with org-level guardrails (SCP/Org Policy) | Ties you to a cloud’s IAM model; still needs careful tag propagation across engines |
+| Dedicated always-on “Compaction Service” | Start with orchestrated format-native actions (Airflow/Argo + queue) and evolve to a service only if SLO-based scheduling/backpressure truly needs it | Less reactive; harder to do global budgeting/prioritization early |
+| “Tamper-evident audit stream” as bespoke pipeline | Use managed immutable logs (CloudTrail/ObjectLock/WORM, or Kafka + retention/ACL hardening) and join via session tags | Fewer custom pieces, but integration constraints and less control over schema |
+| “Prevent direct raw-object access” purely via design intent | Make it explicit as *org policy + network + IAM boundary* (no wildcard bucket grants, VPC endpoints/private access, break-glass role) | More governance coordination; stronger stance may slow ad-hoc workflows |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Object store throttling / partial outage (5–15 min of 503s, slow LIST/GET/PUT)**
+   - Design's answer: not addressed (only catalog outage is detailed)
+   - Recommendation: Strengthen (idempotent writers, exponential backoff, bounded retries, write backpressure, “commit is last step” discipline, and explicit SLOs for storage error budgets)
+
+2. **STS/KMS outage (credential vending or decrypt fails)**
+   - Design's answer: not addressed
+   - Recommendation: Strengthen (define fail-closed vs fail-open per persona; cache *read-only* auth decisions briefly; pre-provision break-glass with tight time bounds; ensure engines surface actionable errors)
+
+3. **Commit coordination conflicts at high concurrency (many writers, backfills, retries)**
+   - Design's answer: partially addressed (mentions Iceberg conflict retries; Hudi overlap avoidance)
+   - Recommendation: Strengthen (be explicit about the lock/coordination mechanism per format/catalog—e.g., Iceberg needs reliable optimistic commit + optional lock manager; define idempotency keys and exactly-once “job attempts” semantics)
+
+4. **Bad schema/policy deployment (masking bug, incompatible type change, overly broad grant)**
+   - Design's answer: not addressed
+   - Recommendation: Strengthen (staged rollout for policies, “policy lint/dry-run” against representative queries, schema evolution guardrails, and a fast rollback path that on-call can execute at 3am)
+
+5. **Compaction backlog during backfills (10× ingest burst creates small-file storm + metadata explosion)**
+   - Design's answer: addressed (budgeting + SLO triggers + prioritization)
+   - Recommendation: Acceptable, but add a “prevention first” lever: ingestion-time file sizing/partitioning standards and automated detection of partition explosion (it’s often cheaper than rewriting later)
+
+## Recommendations
+
+### Must Fix
+- Specify the *enforcement mechanism* that truly prevents bypass: org-level IAM boundaries + how session tags/IDs propagate into object-store logs across Spark/Trino/Flink.
+- Make commit coordination concrete: what provides mutual exclusion/optimistic concurrency safety for Iceberg/Hudi under multi-writer + retries, and how you guarantee idempotency.
+- Define fail modes for the control plane and auth: what continues in read-only, what halts, and what the break-glass procedure is (including audit guarantees).
+
+### Should Consider
+- Reduce custom surface area by adopting an existing catalog/policy foundation and keep your “interesting” work focused on governance integration + operational excellence (budgets, SLO-based optimization).
+- Treat partition explosion as a first-class failure mode (50k–200k partitions/day is as much a *modeling* problem as a systems problem): add guardrails on partition spec choices and automated alarms.
+- Add a clear “small team operability” story: how many moving parts on-call owns, and a single-button/single-runbook deploy + rollback for policy/catalog changes.
+
+### Nice to Have
+- Formalize per-table cost attribution (rewrite bytes, request costs, query scan bytes) to make budgeting enforceable and socially sustainable.
+- Add lineage/data quality hooks at the control plane boundary (even minimal “producer job → table snapshot” tracking goes far in incident response).
+
+## What's Working Well
+- The separation of concerns is clean: object storage for durability, table formats for correctness, and a single control plane for governance/audit.
+- Compaction framed as a *transactional commit* (not a side effect) is exactly the right mental model for keeping readers correct.
+- The design is honest about the real enemies at PB-scale (metadata + small files), and your budgeting/backpressure approach is a pragmatic way to keep costs and reliability bounded.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+
+
+thinking
+**Refining cloud architecture**
+
+I'm considering how we can simplify our architecture by categorizing the service as "cloud IAM" instead of a custom service. I think removing the dedicated Compaction Service and replacing it with scheduled Maintenance Jobs would streamline things. I could merge this with Ingest Jobs under a broader definition of "Data Jobs" that includes both ingest and maintenance phases. I also need to clarify that the “Orchestrator” component might be unnecessary since the original design didn't mention it, so I'll keep reflections on using Spark/Flink for compaction without adding new services.
+thinking
+**Updating audit and monitoring strategy**
+
+For audit and monitoring, I’m thinking we can rely on existing cloud-native logs like CloudTrail and object-store access logs instead of creating a bespoke "tamper-evident audit stream." I’ll store these logs immutably in object storage with retention policies, keeping everything minimal without adding new components. I’ll address failure modes, like object store outages and commit conflicts, in the updated section. For compaction, I’ll clarify it as a table commit that runs as jobs, and I should condense the key design decisions to just a few and update the architecture diagram accordingly.
+thinking
+**Structuring data architecture**
+
+I’m planning a structure with Producers leading to Data Jobs, which then flow into Object Storage (both Raw and Tables) and Catalog/Policy leading to Jobs and Query engines. I'll keep Audit/Monitoring as part of the Catalog. I also have to establish an enforcement mechanism to prevent bypassing access using an org-level IAM boundary and network boundaries like VPC endpoints. I think it'll be simpler if we deny default access and only allow specific roles for compute engines, ensuring that only they authenticate via SSO and enforce table access with adequate object store policies.
+thinking
+**Addressing commit coordination**
+
+I'm thinking about coordination for Iceberg, and I can use a REST catalog with optimistic concurrency and an optional lock manager that could be backed by a database. However, adding a lock manager feels like introducing a new component. So, maybe I should just stick with the Iceberg REST catalog backed by a managed database like AWS Glue or DynamoDB. For a small team, a managed catalog with built-in concurrency seems best. I just need to ensure I'm not technically adding components but specifying the underlying catalog mechanics without violating original design intentions.
+thinking
+**Rethinking catalog and governance structure**
+
+I’m considering a simpler approach: stating, "The catalog provides commit coordination for both formats" and mentioning optimistic commits with idempotency keys without an explicit lock store. For policy deployment, I can integrate staged rollouts and dry runs into the catalog. I need to focus on the output by keeping the YAML front matter, removing critique sections, and renaming "What We Removed." It makes sense to keep supporting both Iceberg and Hudi while consolidating governance through a single catalog like AWS Glue, aiming for simplicity in engine choice and adherence to original requirements.
+thinking
+**Simplifying the architecture**
+
+I’m considering keeping it simple by focusing on Iceberg, which allows built-in row and column-level security. My goal is to rewrite the original document as a simplified design without modifying the title or difficulty. For a small team, I think we can go with one object storage solution (S3), one catalog (like AWS Glue for Iceberg), and one query engine (Trino with Spark). We won’t have a raw zone; data will be written directly to Iceberg tables. 
+
+I want to merge the compaction service into ingestion jobs and rely on cloud-native governance tools like Lake Formation. Additionally, I need to ensure that the Failure Modes section captures scenarios such as throttling and outages. I plan to summarize key design decisions, operational notes, and trade-offs concisely while creating a straightforward "What We Removed" section that keeps descriptions neutral and doesn't introduce unnecessary complexity. I'm focusing on providing clear justifications for each component that remains and will ensure that the final markdown document is organized appropriately.
+thinking
+**Finalizing the document structure**
+
+I’m thinking about keeping the raw zone as prefixes in a single bucket, so I’ll refer to it as “single bucket with `raw/` and `tables/` prefixes” instead of separate ones. I also want to address partition explosion by mentioning a guardrail in the Operational Notes section. 
+
+To follow the guidelines strictly, I’ll keep the original headers but can rename some sections. I’ll maintain headers like Overview, Requirements, Key Design Decisions, Architecture, Components, Deep Dive, Trade-offs, and Failure Modes, ensuring everything lines up. 
+
+I’ll revise the diagram to only include necessary nodes without a compaction service, and then I’ll produce a complete markdown document with front matter and concise sections. My goal is to ensure clarity while keeping it final and ready for use.
+codex
+```markdown
+---
+title: "Data Lake Architecture"
+category: "Storage & Data Platforms"
+difficulty: "Hard"
+tags: ["data-lake", "lakehouse", "iceberg", "hudi", "governance", "object-storage", "compaction"]
+---
+
+## Overview
+
+This is a governed lakehouse on object storage that supports Iceberg and Hudi with multiple compute engines. The system is intentionally simple: **object storage holds data**, **table formats provide commit/snapshot semantics**, and a **single control plane (catalog + policy)** is the only supported path for discovery and authorization. Auditability comes from joining control-plane decisions to object-store access logs via session identity.
+
+## What Makes This Hard
+
+Lakes fail when “files in a bucket” become the API: every engine interprets layouts differently, partial overwrites slip through, and governance becomes unenforceable. At PB scale, **small files + metadata growth** become the dominant reliability and cost problems, so maintenance must be treated as first-class table operations, not ad-hoc engine behavior.
+
+## Requirements
+
+### Functional Requirements
+- Support **Iceberg and Hudi** tables on the same object storage, readable by common engines.
+- Provide **snapshot-consistent reads** and **format-native commits** (no partial overwrites).
+- Run **compaction/optimization** and **metadata cleanup** without breaking concurrent readers/writers.
+- Enforce **table/column-level governance** with auditable access logs.
+- Make the **catalog the gate** for discovery and access (no catalog-bypass reads).
+
+### Scale Targets
+- Storage: **1–5 PB**; tables: **1,000–5,000**; ingest: **5–20 TB/day** (bursts during backfills).
+- Query: **200–2,000 concurrent**; partitions/day: **50k–200k**; target file sizes: **256MB–1GB**.
+
+## Key Design Decisions
+
+- **Single control plane:** A managed, highly available **Catalog & Policy** is the only supported way to resolve table locations and permissions.
+- **Fail-closed storage boundary:** The data bucket denies access by default; only requests carrying approved **short-lived IAM credentials + session tags/IDs** can read governed table paths.
+- **No dedicated compaction service:** Compaction and cleanup run as **scheduled jobs using the same compute engines** and format-native procedures, with explicit budgets and backpressure.
+- **Audit via managed logs:** Control-plane decision logs and object-store access logs are retained immutably and joined via the session ID to prove enforcement.
+
+## Architecture
+
+```mermaid
+graph TD
+  P["Producers"] --> J["Data Jobs (Ingest + Maintenance)"]
+  J --> S["Object Storage (raw/ + tables/)"]
+  C["Catalog & Policy"] --> J
+  C --> Q["Query Engines"]
+  S --> Q
+  A["Audit & Monitoring"] --> C
+  A --> J
+```
+
+### Components
+
+- **Object Storage (`raw/` + `tables/` prefixes):** Durable system of record; `raw/` is short-retention landing for reprocessing/forensics, `tables/` is governed Iceberg/Hudi data.
+- **Iceberg + Hudi tables:** Provide snapshot/commit semantics, schema/partition evolution, and standardized maintenance primitives.
+- **Catalog & Policy (managed control plane):** Single source of truth for metadata + policy; issues/validates table grants and mints the session identity used for enforcement and audit joins.
+- **Data Jobs (Ingest + Maintenance):** Stateless compute that writes through format-native commits and runs compaction/cleanup as table operations under budgets.
+- **Query Engines:** Read tables through the catalog and run with table-scoped, time-bound credentials; no broad bucket access.
+- **Audit & Monitoring (managed logs + metrics):** Captures policy decisions, job outcomes, and storage access logs; supports drift detection and on-call SLOs.
+
+## Deep Dive: Compaction Without Breaking Readers
+
+Compaction is always a **table commit**. Jobs read a consistent snapshot/instant, write new files, and atomically publish updated metadata so readers see either the old view or the new view.
+
+Maintenance stays bounded with three rules:
+1. **SLO triggers:** compact when small-file counts, manifest growth, or Hudi log depth cross thresholds tied to query pain.
+2. **Budgets:** cap rewritten bytes/day per dataset and prioritize by query criticality.
+3. **Conflict-aware execution:** avoid hot partitions; use idempotent job attempt IDs and safe retries on commit conflicts.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Provable governance and audit | Less ad-hoc direct object access |
+| Minimal custom code (managed control plane + logs) | Tighter coupling to the chosen cloud IAM/logging model |
+| Predictable performance via bounded maintenance | Ongoing compute spend for compaction/cleanup |
+| Multi-engine interoperability | Format-specific edge cases (Hudi MOR vs COW, Iceberg metadata growth) |
+
+## Failure Modes
+
+- **Object store throttling / partial outage**
+  - **What happens:** slow/failed GET/LIST/PUT; jobs stall and queries degrade.
+  - **Detect:** storage 4xx/5xx rates, elevated retries, rising job runtimes.
+  - **Recover:** exponential backoff + bounded retries, write backpressure, “commit is last step” discipline, pause maintenance first, re-run idempotent jobs after recovery.
+
+- **IAM/STS/KMS outage**
+  - **What happens:** sessions can’t be minted or data can’t be decrypted; access fails.
+  - **Detect:** auth/decrypt error spikes; widespread “access denied” from engines.
+  - **Recover:** fail closed by default; allow short-TTL **read-only** continuation via cached auth decisions where supported; break-glass role with tight time bounds and mandatory audit.
+
+- **Commit coordination conflicts (high write concurrency/backfills)**
+  - **What happens:** optimistic commit collisions and retries; partial progress without published metadata.
+  - **Detect:** commit conflict rates, repeated job attempts, growing ingestion lag.
+  - **Recover:** deterministic idempotency keys per write attempt, bounded retries with jitter, isolate backfills to controlled windows, and enforce per-table writer concurrency limits.
+
+- **Bad schema/policy deployment**
+  - **What happens:** masking bugs, incompatible schema changes, or overly broad grants.
+  - **Detect:** policy change events correlated with query failures or access expansions; anomaly alerts on newly exposed columns/tables.
+  - **Recover:** staged rollout with dry-run checks against representative queries, explicit rollback procedure, and “two-person rule” for high-impact policy changes.
+
+- **Maintenance backlog during ingest bursts**
+  - **What happens:** small-file storms and metadata bloat; query planning time dominates.
+  - **Detect:** small-file counts, manifest sizes, Hudi log depth, compaction queue age.
+  - **Recover:** enforce ingestion-time file sizing standards, alarm on partition explosion, cap backfill parallelism, and temporarily relax freshness for low-tier tables.
+
+## What We Removed
+
+- **Dedicated Compaction Service:** replaced by scheduled maintenance jobs (same engines) with budgets and triggers.
+- **Custom credential-vending service:** replaced by cloud-native short-lived credentials with session tags/IDs used for enforcement and audit joins.
+- **Bespoke tamper-evident audit pipeline:** replaced by immutable retention of managed control-plane logs and object-store access logs.
+- **Custom monolithic catalog/policy implementation:** replaced by a proven managed control plane that all engines integrate with.
+
+## Operational Notes
+
+- Enforce “no wildcard bucket grants” and require private access paths; storage policy requires approved session identity on every request.
+- Guardrails for partition specs and schema evolution live in the control plane; alert on partition explosion early.
+- Track small-file counts, Iceberg manifest/snapshot growth, Hudi log depth, and rewritten-bytes/day vs ingested-bytes/day.
+- Treat cleanup as mandatory: snapshot expiration, orphan file deletion, and Hudi timeline archiving are scheduled maintenance, not best-effort.
+```
+tokens used
+10,261
+```markdown
+---
+title: "Data Lake Architecture"
+category: "Storage & Data Platforms"
+difficulty: "Hard"
+tags: ["data-lake", "lakehouse", "iceberg", "hudi", "governance", "object-storage", "compaction"]
+---
+
+## Overview
+
+This is a governed lakehouse on object storage that supports Iceberg and Hudi with multiple compute engines. The system is intentionally simple: **object storage holds data**, **table formats provide commit/snapshot semantics**, and a **single control plane (catalog + policy)** is the only supported path for discovery and authorization. Auditability comes from joining control-plane decisions to object-store access logs via session identity.
+
+## What Makes This Hard
+
+Lakes fail when “files in a bucket” become the API: every engine interprets layouts differently, partial overwrites slip through, and governance becomes unenforceable. At PB scale, **small files + metadata growth** become the dominant reliability and cost problems, so maintenance must be treated as first-class table operations, not ad-hoc engine behavior.
+
+## Requirements
+
+### Functional Requirements
+- Support **Iceberg and Hudi** tables on the same object storage, readable by common engines.
+- Provide **snapshot-consistent reads** and **format-native commits** (no partial overwrites).
+- Run **compaction/optimization** and **metadata cleanup** without breaking concurrent readers/writers.
+- Enforce **table/column-level governance** with auditable access logs.
+- Make the **catalog the gate** for discovery and access (no catalog-bypass reads).
+
+### Scale Targets
+- Storage: **1–5 PB**; tables: **1,000–5,000**; ingest: **5–20 TB/day** (bursts during backfills).
+- Query: **200–2,000 concurrent**; partitions/day: **50k–200k**; target file sizes: **256MB–1GB**.
+
+## Key Design Decisions
+
+- **Single control plane:** A managed, highly available **Catalog & Policy** is the only supported way to resolve table locations and permissions.
+- **Fail-closed storage boundary:** The data bucket denies access by default; only requests carrying approved **short-lived IAM credentials + session tags/IDs** can read governed table paths.
+- **No dedicated compaction service:** Compaction and cleanup run as **scheduled jobs using the same compute engines** and format-native procedures, with explicit budgets and backpressure.
+- **Audit via managed logs:** Control-plane decision logs and object-store access logs are retained immutably and joined via the session ID to prove enforcement.
+
+## Architecture
+
+```mermaid
+graph TD
+  P["Producers"] --> J["Data Jobs (Ingest + Maintenance)"]
+  J --> S["Object Storage (raw/ + tables/)"]
+  C["Catalog & Policy"] --> J
+  C --> Q["Query Engines"]
+  S --> Q
+  A["Audit & Monitoring"] --> C
+  A --> J
+```
+
+### Components
+
+- **Object Storage (`raw/` + `tables/` prefixes):** Durable system of record; `raw/` is short-retention landing for reprocessing/forensics, `tables/` is governed Iceberg/Hudi data.
+- **Iceberg + Hudi tables:** Provide snapshot/commit semantics, schema/partition evolution, and standardized maintenance primitives.
+- **Catalog & Policy (managed control plane):** Single source of truth for metadata + policy; issues/validates table grants and mints the session identity used for enforcement and audit joins.
+- **Data Jobs (Ingest + Maintenance):** Stateless compute that writes through format-native commits and runs compaction/cleanup as table operations under budgets.
+- **Query Engines:** Read tables through the catalog and run with table-scoped, time-bound credentials; no broad bucket access.
+- **Audit & Monitoring (managed logs + metrics):** Captures policy decisions, job outcomes, and storage access logs; supports drift detection and on-call SLOs.
+
+## Deep Dive: Compaction Without Breaking Readers
+
+Compaction is always a **table commit**. Jobs read a consistent snapshot/instant, write new files, and atomically publish updated metadata so readers see either the old view or the new view.
+
+Maintenance stays bounded with three rules:
+1. **SLO triggers:** compact when small-file counts, manifest growth, or Hudi log depth cross thresholds tied to query pain.
+2. **Budgets:** cap rewritten bytes/day per dataset and prioritize by query criticality.
+3. **Conflict-aware execution:** avoid hot partitions; use idempotent job attempt IDs and safe retries on commit conflicts.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Provable governance and audit | Less ad-hoc direct object access |
+| Minimal custom code (managed control plane + logs) | Tighter coupling to the chosen cloud IAM/logging model |
+| Predictable performance via bounded maintenance | Ongoing compute spend for compaction/cleanup |
+| Multi-engine interoperability | Format-specific edge cases (Hudi MOR vs COW, Iceberg metadata growth) |
+
+## Failure Modes
+
+- **Object store throttling / partial outage**
+  - **What happens:** slow/failed GET/LIST/PUT; jobs stall and queries degrade.
+  - **Detect:** storage 4xx/5xx rates, elevated retries, rising job runtimes.
+  - **Recover:** exponential backoff + bounded retries, write backpressure, “commit is last step” discipline, pause maintenance first, re-run idempotent jobs after recovery.
+
+- **IAM/STS/KMS outage**
+  - **What happens:** sessions can’t be minted or data can’t be decrypted; access fails.
+  - **Detect:** auth/decrypt error spikes; widespread “access denied” from engines.
+  - **Recover:** fail closed by default; allow short-TTL **read-only** continuation via cached auth decisions where supported; break-glass role with tight time bounds and mandatory audit.
+
+- **Commit coordination conflicts (high write concurrency/backfills)**
+  - **What happens:** optimistic commit collisions and retries; partial progress without published metadata.
+  - **Detect:** commit conflict rates, repeated job attempts, growing ingestion lag.
+  - **Recover:** deterministic idempotency keys per write attempt, bounded retries with jitter, isolate backfills to controlled windows, and enforce per-table writer concurrency limits.
+
+- **Bad schema/policy deployment**
+  - **What happens:** masking bugs, incompatible schema changes, or overly broad grants.
+  - **Detect:** policy change events correlated with query failures or access expansions; anomaly alerts on newly exposed columns/tables.
+  - **Recover:** staged rollout with dry-run checks against representative queries, explicit rollback procedure, and “two-person rule” for high-impact policy changes.
+
+- **Maintenance backlog during ingest bursts**
+  - **What happens:** small-file storms and metadata bloat; query planning time dominates.
+  - **Detect:** small-file counts, manifest sizes, Hudi log depth, compaction queue age.
+  - **Recover:** enforce ingestion-time file sizing standards, alarm on partition explosion, cap backfill parallelism, and temporarily relax freshness for low-tier tables.
+
+## What We Removed
+
+- **Dedicated Compaction Service:** replaced by scheduled maintenance jobs (same engines) with budgets and triggers.
+- **Custom credential-vending service:** replaced by cloud-native short-lived credentials with session tags/IDs used for enforcement and audit joins.
+- **Bespoke tamper-evident audit pipeline:** replaced by immutable retention of managed control-plane logs and object-store access logs.
+- **Custom monolithic catalog/policy implementation:** replaced by a proven managed control plane that all engines integrate with.
+
+## Operational Notes
+
+- Enforce “no wildcard bucket grants” and require private access paths; storage policy requires approved session identity on every request.
+- Guardrails for partition specs and schema evolution live in the control plane; alert on partition explosion early.
+- Track small-file counts, Iceberg manifest/snapshot growth, Hudi log depth, and rewritten-bytes/day vs ingested-bytes/day.
+- Treat cleanup as mandatory: snapshot expiration, orphan file deletion, and Hudi timeline archiving are scheduled maintenance, not best-effort.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/02-storage-data-platforms/data-lake-architecture.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Data Lake Architecture
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/data-lake-architecture.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/data-lake-architecture.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/02-storage-data-platforms/data-lake-architecture.md

@@ -1,0 +1,2086 @@
+==========================================
+Generating (v2): Attribution Measurement System
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2e80-70d0-b4a6-d2956fe2366b
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Attribution Measurement System
+**Category**: Strategic Problems
+
+**Problem Statement**:
+Design a pipeline to correlate ad clicks with conversions enforcing privacy constraints (like Apples SKAdNetwork).
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+thinking
+**Analyzing SKAN Postbacks**
+
+I'm considering the lower number of SKAN postbacks per conversion. For instance, let’s say we have 1 billion clicks per day, 50 million conversions per day, and 30 million postbacks daily with 1,000 report queries per minute. I need to think about cardinality and potential failure modes, like delayed postbacks causing negative deltas, config drift, and replay duplicates. Also, I should follow writing guidelines and take a firm position on using Kafka, Flink, Iceberg, Trino, Postgres, and a managed KMS. It's important to implement a separate privacy aggregator service as well.
+codex
+```markdown
+---
+title: "Attribution Measurement System"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["ads", "attribution", "privacy", "skadnetwork", "data-pipeline", "analytics"]
+---
+
+## Overview
+
+This system measures ad performance by correlating clicks with conversions while respecting platform privacy constraints modeled after Apple’s SKAdNetwork (delayed, lossy, and explicitly anti-user-level attribution). The elegant move is to stop fighting that constraint: we treat *aggregate truth* as the product, and we build a pipeline whose “unit of work” is a privacy-safe cohort (campaign × time bucket × coarse geo × placement), not a user.
+
+The architecture is a boring event pipeline (Kafka → stream processing → lakehouse → SQL) wrapped in a strict “privacy firewall”: raw events are ingested for debugging and model calibration, but only thresholded/noised aggregates ever become queryable metrics. This keeps the system operable by a small team and makes privacy guarantees enforceable in code, not policy docs.
+
+## What Makes This Hard
+
+Naive implementations try to reconstruct per-user journeys (click-id joins, device graphs, fingerprinting). That fails under SKAdNetwork-like constraints because the signal is delayed, sparse, and intentionally ambiguous—and attempts to “fill in the gaps” reliably drift into privacy violations.
+
+The real trap is metric volatility: late postbacks and changing campaign metadata produce retroactive attribution shifts. Teams ship dashboards that rewrite history hourly, lose trust, and then bolt on more complexity. The correct approach is to design *time semantics* (event time vs processing time), *immutability*, and *controlled recomputation* from day one.
+
+## Requirements
+
+### Functional Requirements
+- Ingest three immutable streams: `click`, `conversion`, and `platform_postback` (SKAN-like).
+- Attribute conversions to campaigns at cohort granularity; no user-level reporting.
+- Support dimensions that don’t enable fingerprinting: campaign/adset/creative, day, coarse geo, placement, device class.
+- Enforce privacy constraints in the reporting path: k-anonymity thresholds, suppression, and calibrated noise.
+- Handle late and duplicated postbacks deterministically; support reproducible backfills.
+- Provide advertiser-facing metrics with stable revision semantics (explicit “data finalized” markers).
+
+### Scale Targets
+- **Ingest:** 1B clicks/day (~12k/s avg, 120k/s peak), 50M conversions/day, 30M postbacks/day.
+- **Freshness:** preliminary aggregates in <15 minutes; daily “final” aggregates within 24–48 hours to absorb platform delays.
+- **Cardinality:** up to 5M active campaigns/month; reporting granularity capped to keep cohorts large (privacy) and queries fast (cost).
+- **Queries:** 200 QPS peak on reporting API, 1–5s p95 for common dashboards.
+
+## Key Design Decisions
+
+- **We chose:** Cohort-based attribution as the primary product (aggregate metrics only).
+  - **We rejected:** User-level joins with click IDs as the “source of truth”.
+  - **Why:** It aligns with SKAN-like constraints, makes privacy enforceable, and avoids a permanent whack-a-mole with fingerprinting vectors.
+
+- **We chose:** An immutable log + recomputation model (append-only raw, derived aggregates rebuilt by version).
+  - **We rejected:** Mutable “running totals” updated in place.
+  - **Why:** Late postbacks are normal; recomputation gives correctness and auditability without corrupting state.
+
+- **We chose:** A hard “privacy firewall” service that is the only path from raw data to queryable metrics.
+  - **We rejected:** Letting every analyst/job “remember to apply” thresholds/noise.
+  - **Why:** Privacy guarantees must be centralized, testable, and reviewable like any other critical business logic.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[App / Web SDK] --> B[Event Gateway]
+  B --> C[Kafka]
+  D[SKAN Postback API] --> C
+  E[Campaign Config] --> F[Attribution + Privacy]
+  C --> F
+  F --> G[Lakehouse Tables]
+  G --> H[Reporting API]
+```
+
+### Components
+
+- **App / Web SDK**: Emits clicks and conversions where allowed; strictly avoids stable device identifiers in privacy-restricted contexts.
+- **Event Gateway**: Authenticates sources, enforces schemas, assigns event-time, and writes to Kafka; this is the “front door” for data quality.
+- **SKAN Postback API**: Receives platform postbacks (signed payloads), validates signatures, deduplicates by postback ID, and normalizes into the same event model.
+- **Kafka**: Buffering and backpressure so ingestion survives spikes and downstream deploys.
+- **Campaign Config**: Postgres for campaign metadata and time-versioned mappings (campaign ↔ adset ↔ creative ↔ placements), because attribution depends on *what was true at the time*.
+- **Attribution + Privacy**: A Flink job (or equivalent) that performs cohort attribution, applies k-anonymity + noise, and emits versioned aggregates.
+- **Lakehouse Tables**: Object storage + Iceberg/Parquet for immutable raw + derived datasets; supports cheap backfills and consistent query behavior.
+- **Reporting API**: Serves only privacy-cleared aggregates, with explicit dataset versioning and “finalized through date” watermarks.
+
+## Deep Dive: Privacy-Preserving Attribution Under SKAN-Like Constraints
+
+The hardest part is turning delayed, lossy postbacks into stable metrics *without reintroducing user identity*. The system treats every incoming signal as an update to a cohort-level ledger.
+
+1) **Time semantics and stabilization**
+- Every record carries `event_time` (when it happened) and `ingest_time` (when we learned about it).
+- Aggregates are computed in event-time windows (e.g., per UTC day) and published as *versioned snapshots*.
+- The Reporting API exposes two states: `preliminary` (fast, may change) and `final` (frozen after the postback delay horizon). This prevents “rewriting history” from looking like bugs.
+
+2) **Attribution logic that matches the privacy model**
+- For SKAN-like postbacks, attribution is already platform-decided (campaign ID + coarse metadata + conversion value). We do not attempt to “improve” it.
+- For non-SKAN clicks/conversions, we still collapse into the same cohort keys and apply the same privacy rules, so the product behaves consistently across channels.
+
+3) **Privacy firewall: k-anonymity + noise**
+- The firewall defines the maximum reporting granularity (e.g., `campaign_id, day, country, placement`) and rejects queries/exports outside it.
+- Before publishing an aggregate row, we enforce `k` (e.g., 50 conversions) per cohort. Below `k`, we suppress and roll up to a coarser cohort (e.g., remove placement, then geo).
+- After thresholding, we add calibrated noise (Laplace/Gaussian) to counts and value metrics at publish time, tracked by a privacy ledger per dimension set. This blocks differencing attacks across repeated pulls.
+
+4) **Deduplication and idempotency**
+- SKAN-like postbacks are deduped using platform-provided unique IDs + signature validation; duplicates become no-ops.
+- All derived tables are written with deterministic keys (`cohort_key`, `day`, `metric`, `version`) so backfills are repeatable and safe.
+
+This approach teaches a non-obvious lesson: under strong privacy constraints, the “correctness” you can deliver is mostly about *time/version semantics and attack-resistant aggregation*, not about clever matching.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Enforceable privacy guarantees | User-level attribution and path analysis |
+| Stable, auditable metrics | Real-time “perfect” numbers |
+| Simple, operable pipeline | Maximum granularity in reporting |
+| Deterministic recomputation | Some additional storage/compute cost |
+
+## Failure Modes
+
+- **Late postback surge**
+  - **What happens:** Yesterday’s numbers jump; dashboards look inconsistent.
+  - **Detect:** Monitor “delta to prior publish” per cohort/day and the share of late-arriving postbacks.
+  - **Recover:** Keep preliminary vs final separation, publish daily finalized snapshots, and expose “finalized through” watermark.
+
+- **Config drift (campaign mapping changed retroactively)**
+  - **What happens:** Attribution appears to move between campaigns/adsets after edits.
+  - **Detect:** Validate config changes as time-versioned; alert on retroactive edits beyond an allowed window.
+  - **Recover:** Treat config as immutable by effective date; rebuild aggregates for impacted windows with a new version and keep prior versions for audit.
+
+- **Privacy leakage via small cohorts**
+  - **What happens:** An advertiser infers user actions by slicing thinly or differencing pulls.
+  - **Detect:** Enforce query shape limits; log and rate-limit repeated near-identical queries; track privacy budget consumption.
+  - **Recover:** Force roll-ups, increase `k`, add more noise, and freeze cohorts that repeatedly hit the threshold boundary.
+
+## What I’d Do Differently At...
+
+- **10x scale:** Move more aggregation upstream (stream-only for daily cohorts), keep raw in cheaper storage tiers, and partition Iceberg tables aggressively by day and campaign hash to control query cost.
+- **100x scale:** Split ingestion domains (SKAN vs non-SKAN), introduce dedicated “metrics serving” storage (precomputed cubes keyed by allowed dimensions), and formalize a privacy budget service with automated enforcement and reviewer workflows.
+
+## Operational Notes
+
+- The only supported metric source for external consumers is the privacy-cleared aggregate tables; raw is restricted to a break-glass path with audit logging.
+- Expect postback delays to dominate correctness; publish explicit SLAs: “preliminary updates every 15 min, final after 48h”.
+- Backfills are normal: run them as versioned rebuilds, never in-place edits; the Reporting API must allow selecting “latest” or a pinned version for reproducibility.
+- Monitor schema drift and event loss at the gateway (drop rates, invalid signatures, unexpected nulls) before they become “mystery revenue drops” in dashboards.
+```
+tokens used
+3,423
+```markdown
+---
+title: "Attribution Measurement System"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["ads", "attribution", "privacy", "skadnetwork", "data-pipeline", "analytics"]
+---
+
+## Overview
+
+This system measures ad performance by correlating clicks with conversions while respecting platform privacy constraints modeled after Apple’s SKAdNetwork (delayed, lossy, and explicitly anti-user-level attribution). The elegant move is to stop fighting that constraint: we treat *aggregate truth* as the product, and we build a pipeline whose “unit of work” is a privacy-safe cohort (campaign × time bucket × coarse geo × placement), not a user.
+
+The architecture is a boring event pipeline (Kafka → stream processing → lakehouse → SQL) wrapped in a strict “privacy firewall”: raw events are ingested for debugging and model calibration, but only thresholded/noised aggregates ever become queryable metrics. This keeps the system operable by a small team and makes privacy guarantees enforceable in code, not policy docs.
+
+## What Makes This Hard
+
+Naive implementations try to reconstruct per-user journeys (click-id joins, device graphs, fingerprinting). That fails under SKAdNetwork-like constraints because the signal is delayed, sparse, and intentionally ambiguous—and attempts to “fill in the gaps” reliably drift into privacy violations.
+
+The real trap is metric volatility: late postbacks and changing campaign metadata produce retroactive attribution shifts. Teams ship dashboards that rewrite history hourly, lose trust, and then bolt on more complexity. The correct approach is to design *time semantics* (event time vs processing time), *immutability*, and *controlled recomputation* from day one.
+
+## Requirements
+
+### Functional Requirements
+- Ingest three immutable streams: `click`, `conversion`, and `platform_postback` (SKAN-like).
+- Attribute conversions to campaigns at cohort granularity; no user-level reporting.
+- Support dimensions that don’t enable fingerprinting: campaign/adset/creative, day, coarse geo, placement, device class.
+- Enforce privacy constraints in the reporting path: k-anonymity thresholds, suppression, and calibrated noise.
+- Handle late and duplicated postbacks deterministically; support reproducible backfills.
+- Provide advertiser-facing metrics with stable revision semantics (explicit “data finalized” markers).
+
+### Scale Targets
+- **Ingest:** 1B clicks/day (~12k/s avg, 120k/s peak), 50M conversions/day, 30M postbacks/day.
+- **Freshness:** preliminary aggregates in <15 minutes; daily “final” aggregates within 24–48 hours to absorb platform delays.
+- **Cardinality:** up to 5M active campaigns/month; reporting granularity capped to keep cohorts large (privacy) and queries fast (cost).
+- **Queries:** 200 QPS peak on reporting API, 1–5s p95 for common dashboards.
+
+## Key Design Decisions
+
+- **We chose:** Cohort-based attribution as the primary product (aggregate metrics only).
+  - **We rejected:** User-level joins with click IDs as the “source of truth”.
+  - **Why:** It aligns with SKAN-like constraints, makes privacy enforceable, and avoids a permanent whack-a-mole with fingerprinting vectors.
+
+- **We chose:** An immutable log + recomputation model (append-only raw, derived aggregates rebuilt by version).
+  - **We rejected:** Mutable “running totals” updated in place.
+  - **Why:** Late postbacks are normal; recomputation gives correctness and auditability without corrupting state.
+
+- **We chose:** A hard “privacy firewall” service that is the only path from raw data to queryable metrics.
+  - **We rejected:** Letting every analyst/job “remember to apply” thresholds/noise.
+  - **Why:** Privacy guarantees must be centralized, testable, and reviewable like any other critical business logic.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[App / Web SDK] --> B[Event Gateway]
+  B --> C[Kafka]
+  D[SKAN Postback API] --> C
+  E[Campaign Config] --> F[Attribution + Privacy]
+  C --> F
+  F --> G[Lakehouse Tables]
+  G --> H[Reporting API]
+```
+
+### Components
+
+- **App / Web SDK**: Emits clicks and conversions where allowed; strictly avoids stable device identifiers in privacy-restricted contexts.
+- **Event Gateway**: Authenticates sources, enforces schemas, assigns event-time, and writes to Kafka; this is the “front door” for data quality.
+- **SKAN Postback API**: Receives platform postbacks (signed payloads), validates signatures, deduplicates by postback ID, and normalizes into the same event model.
+- **Kafka**: Buffering and backpressure so ingestion survives spikes and downstream deploys.
+- **Campaign Config**: Postgres for campaign metadata and time-versioned mappings (campaign ↔ adset ↔ creative ↔ placements), because attribution depends on *what was true at the time*.
+- **Attribution + Privacy**: A Flink job (or equivalent) that performs cohort attribution, applies k-anonymity + noise, and emits versioned aggregates.
+- **Lakehouse Tables**: Object storage + Iceberg/Parquet for immutable raw + derived datasets; supports cheap backfills and consistent query behavior.
+- **Reporting API**: Serves only privacy-cleared aggregates, with explicit dataset versioning and “finalized through date” watermarks.
+
+## Deep Dive: Privacy-Preserving Attribution Under SKAN-Like Constraints
+
+The hardest part is turning delayed, lossy postbacks into stable metrics *without reintroducing user identity*. The system treats every incoming signal as an update to a cohort-level ledger.
+
+1) **Time semantics and stabilization**
+- Every record carries `event_time` (when it happened) and `ingest_time` (when we learned about it).
+- Aggregates are computed in event-time windows (e.g., per UTC day) and published as *versioned snapshots*.
+- The Reporting API exposes two states: `preliminary` (fast, may change) and `final` (frozen after the postback delay horizon). This prevents “rewriting history” from looking like bugs.
+
+2) **Attribution logic that matches the privacy model**
+- For SKAN-like postbacks, attribution is already platform-decided (campaign ID + coarse metadata + conversion value). We do not attempt to “improve” it.
+- For non-SKAN clicks/conversions, we still collapse into the same cohort keys and apply the same privacy rules, so the product behaves consistently across channels.
+
+3) **Privacy firewall: k-anonymity + noise**
+- The firewall defines the maximum reporting granularity (e.g., `campaign_id, day, country, placement`) and rejects queries/exports outside it.
+- Before publishing an aggregate row, we enforce `k` (e.g., 50 conversions) per cohort. Below `k`, we suppress and roll up to a coarser cohort (e.g., remove placement, then geo).
+- After thresholding, we add calibrated noise (Laplace/Gaussian) to counts and value metrics at publish time, tracked by a privacy ledger per dimension set. This blocks differencing attacks across repeated pulls.
+
+4) **Deduplication and idempotency**
+- SKAN-like postbacks are deduped using platform-provided unique IDs + signature validation; duplicates become no-ops.
+- All derived tables are written with deterministic keys (`cohort_key`, `day`, `metric`, `version`) so backfills are repeatable and safe.
+
+This approach teaches a non-obvious lesson: under strong privacy constraints, the “correctness” you can deliver is mostly about *time/version semantics and attack-resistant aggregation*, not about clever matching.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Enforceable privacy guarantees | User-level attribution and path analysis |
+| Stable, auditable metrics | Real-time “perfect” numbers |
+| Simple, operable pipeline | Maximum granularity in reporting |
+| Deterministic recomputation | Some additional storage/compute cost |
+
+## Failure Modes
+
+- **Late postback surge**
+  - **What happens:** Yesterday’s numbers jump; dashboards look inconsistent.
+  - **Detect:** Monitor “delta to prior publish” per cohort/day and the share of late-arriving postbacks.
+  - **Recover:** Keep preliminary vs final separation, publish daily finalized snapshots, and expose “finalized through” watermark.
+
+- **Config drift (campaign mapping changed retroactively)**
+  - **What happens:** Attribution appears to move between campaigns/adsets after edits.
+  - **Detect:** Validate config changes as time-versioned; alert on retroactive edits beyond an allowed window.
+  - **Recover:** Treat config as immutable by effective date; rebuild aggregates for impacted windows with a new version and keep prior versions for audit.
+
+- **Privacy leakage via small cohorts**
+  - **What happens:** An advertiser infers user actions by slicing thinly or differencing pulls.
+  - **Detect:** Enforce query shape limits; log and rate-limit repeated near-identical queries; track privacy budget consumption.
+  - **Recover:** Force roll-ups, increase `k`, add more noise, and freeze cohorts that repeatedly hit the threshold boundary.
+
+## What I’d Do Differently At...
+
+- **10x scale:** Move more aggregation upstream (stream-only for daily cohorts), keep raw in cheaper storage tiers, and partition Iceberg tables aggressively by day and campaign hash to control query cost.
+- **100x scale:** Split ingestion domains (SKAN vs non-SKAN), introduce dedicated “metrics serving” storage (precomputed cubes keyed by allowed dimensions), and formalize a privacy budget service with automated enforcement and reviewer workflows.
+
+## Operational Notes
+
+- The only supported metric source for external consumers is the privacy-cleared aggregate tables; raw is restricted to a break-glass path with audit logging.
+- Expect postback delays to dominate correctness; publish explicit SLAs: “preliminary updates every 15 min, final after 48h”.
+- Backfills are normal: run them as versioned rebuilds, never in-place edits; the Reporting API must allow selecting “latest” or a pinned version for reproducibility.
+- Monitor schema drift and event loss at the gateway (drop rates, invalid signatures, unexpected nulls) before they become “mystery revenue drops” in dashboards.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/attribution-measurement-system.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-91d9-7881-bf8c-1ec5eafc1cf0
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Attribution Measurement System"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["ads", "attribution", "privacy", "skadnetwork", "data-pipeline", "analytics"]
+---
+
+## Overview
+
+This system measures ad performance by correlating clicks with conversions while respecting platform privacy constraints modeled after Apple’s SKAdNetwork (delayed, lossy, and explicitly anti-user-level attribution). The elegant move is to stop fighting that constraint: we treat *aggregate truth* as the product, and we build a pipeline whose “unit of work” is a privacy-safe cohort (campaign × time bucket × coarse geo × placement), not a user.
+
+The architecture is a boring event pipeline (Kafka → stream processing → lakehouse → SQL) wrapped in a strict “privacy firewall”: raw events are ingested for debugging and model calibration, but only thresholded/noised aggregates ever become queryable metrics. This keeps the system operable by a small team and makes privacy guarantees enforceable in code, not policy docs.
+
+## What Makes This Hard
+
+Naive implementations try to reconstruct per-user journeys (click-id joins, device graphs, fingerprinting). That fails under SKAdNetwork-like constraints because the signal is delayed, sparse, and intentionally ambiguous—and attempts to “fill in the gaps” reliably drift into privacy violations.
+
+The real trap is metric volatility: late postbacks and changing campaign metadata produce retroactive attribution shifts. Teams ship dashboards that rewrite history hourly, lose trust, and then bolt on more complexity. The correct approach is to design *time semantics* (event time vs processing time), *immutability*, and *controlled recomputation* from day one.
+
+## Requirements
+
+### Functional Requirements
+- Ingest three immutable streams: `click`, `conversion`, and `platform_postback` (SKAN-like).
+- Attribute conversions to campaigns at cohort granularity; no user-level reporting.
+- Support dimensions that don’t enable fingerprinting: campaign/adset/creative, day, coarse geo, placement, device class.
+- Enforce privacy constraints in the reporting path: k-anonymity thresholds, suppression, and calibrated noise.
+- Handle late and duplicated postbacks deterministically; support reproducible backfills.
+- Provide advertiser-facing metrics with stable revision semantics (explicit “data finalized” markers).
+
+### Scale Targets
+- **Ingest:** 1B clicks/day (~12k/s avg, 120k/s peak), 50M conversions/day, 30M postbacks/day.
+- **Freshness:** preliminary aggregates in <15 minutes; daily “final” aggregates within 24–48 hours to absorb platform delays.
+- **Cardinality:** up to 5M active campaigns/month; reporting granularity capped to keep cohorts large (privacy) and queries fast (cost).
+- **Queries:** 200 QPS peak on reporting API, 1–5s p95 for common dashboards.
+
+## Key Design Decisions
+
+- **We chose:** Cohort-based attribution as the primary product (aggregate metrics only).
+  - **We rejected:** User-level joins with click IDs as the “source of truth”.
+  - **Why:** It aligns with SKAN-like constraints, makes privacy enforceable, and avoids a permanent whack-a-mole with fingerprinting vectors.
+
+- **We chose:** An immutable log + recomputation model (append-only raw, derived aggregates rebuilt by version).
+  - **We rejected:** Mutable “running totals” updated in place.
+  - **Why:** Late postbacks are normal; recomputation gives correctness and auditability without corrupting state.
+
+- **We chose:** A hard “privacy firewall” service that is the only path from raw data to queryable metrics.
+  - **We rejected:** Letting every analyst/job “remember to apply” thresholds/noise.
+  - **Why:** Privacy guarantees must be centralized, testable, and reviewable like any other critical business logic.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[App / Web SDK] --> B[Event Gateway]
+  B --> C[Kafka]
+  D[SKAN Postback API] --> C
+  E[Campaign Config] --> F[Attribution + Privacy]
+  C --> F
+  F --> G[Lakehouse Tables]
+  G --> H[Reporting API]
+```
+
+### Components
+
+- **App / Web SDK**: Emits clicks and conversions where allowed; strictly avoids stable device identifiers in privacy-restricted contexts.
+- **Event Gateway**: Authenticates sources, enforces schemas, assigns event-time, and writes to Kafka; this is the “front door” for data quality.
+- **SKAN Postback API**: Receives platform postbacks (signed payloads), validates signatures, deduplicates by postback ID, and normalizes into the same event model.
+- **Kafka**: Buffering and backpressure so ingestion survives spikes and downstream deploys.
+- **Campaign Config**: Postgres for campaign metadata and time-versioned mappings (campaign ↔ adset ↔ creative ↔ placements), because attribution depends on *what was true at the time*.
+- **Attribution + Privacy**: A Flink job (or equivalent) that performs cohort attribution, applies k-anonymity + noise, and emits versioned aggregates.
+- **Lakehouse Tables**: Object storage + Iceberg/Parquet for immutable raw + derived datasets; supports cheap backfills and consistent query behavior.
+- **Reporting API**: Serves only privacy-cleared aggregates, with explicit dataset versioning and “finalized through date” watermarks.
+
+## Deep Dive: Privacy-Preserving Attribution Under SKAN-Like Constraints
+
+The hardest part is turning delayed, lossy postbacks into stable metrics *without reintroducing user identity*. The system treats every incoming signal as an update to a cohort-level ledger.
+
+1) **Time semantics and stabilization**
+- Every record carries `event_time` (when it happened) and `ingest_time` (when we learned about it).
+- Aggregates are computed in event-time windows (e.g., per UTC day) and published as *versioned snapshots*.
+- The Reporting API exposes two states: `preliminary` (fast, may change) and `final` (frozen after the postback delay horizon). This prevents “rewriting history” from looking like bugs.
+
+2) **Attribution logic that matches the privacy model**
+- For SKAN-like postbacks, attribution is already platform-decided (campaign ID + coarse metadata + conversion value). We do not attempt to “improve” it.
+- For non-SKAN clicks/conversions, we still collapse into the same cohort keys and apply the same privacy rules, so the product behaves consistently across channels.
+
+3) **Privacy firewall: k-anonymity + noise**
+- The firewall defines the maximum reporting granularity (e.g., `campaign_id, day, country, placement`) and rejects queries/exports outside it.
+- Before publishing an aggregate row, we enforce `k` (e.g., 50 conversions) per cohort. Below `k`, we suppress and roll up to a coarser cohort (e.g., remove placement, then geo).
+- After thresholding, we add calibrated noise (Laplace/Gaussian) to counts and value metrics at publish time, tracked by a privacy ledger per dimension set. This blocks differencing attacks across repeated pulls.
+
+4) **Deduplication and idempotency**
+- SKAN-like postbacks are deduped using platform-provided unique IDs + signature validation; duplicates become no-ops.
+- All derived tables are written with deterministic keys (`cohort_key`, `day`, `metric`, `version`) so backfills are repeatable and safe.
+
+This approach teaches a non-obvious lesson: under strong privacy constraints, the “correctness” you can deliver is mostly about *time/version semantics and attack-resistant aggregation*, not about clever matching.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Enforceable privacy guarantees | User-level attribution and path analysis |
+| Stable, auditable metrics | Real-time “perfect” numbers |
+| Simple, operable pipeline | Maximum granularity in reporting |
+| Deterministic recomputation | Some additional storage/compute cost |
+
+## Failure Modes
+
+- **Late postback surge**
+  - **What happens:** Yesterday’s numbers jump; dashboards look inconsistent.
+  - **Detect:** Monitor “delta to prior publish” per cohort/day and the share of late-arriving postbacks.
+  - **Recover:** Keep preliminary vs final separation, publish daily finalized snapshots, and expose “finalized through” watermark.
+
+- **Config drift (campaign mapping changed retroactively)**
+  - **What happens:** Attribution appears to move between campaigns/adsets after edits.
+  - **Detect:** Validate config changes as time-versioned; alert on retroactive edits beyond an allowed window.
+  - **Recover:** Treat config as immutable by effective date; rebuild aggregates for impacted windows with a new version and keep prior versions for audit.
+
+- **Privacy leakage via small cohorts**
+  - **What happens:** An advertiser infers user actions by slicing thinly or differencing pulls.
+  - **Detect:** Enforce query shape limits; log and rate-limit repeated near-identical queries; track privacy budget consumption.
+  - **Recover:** Force roll-ups, increase `k`, add more noise, and freeze cohorts that repeatedly hit the threshold boundary.
+
+## What I’d Do Differently At...
+
+- **10x scale:** Move more aggregation upstream (stream-only for daily cohorts), keep raw in cheaper storage tiers, and partition Iceberg tables aggressively by day and campaign hash to control query cost.
+- **100x scale:** Split ingestion domains (SKAN vs non-SKAN), introduce dedicated “metrics serving” storage (precomputed cubes keyed by allowed dimensions), and formalize a privacy budget service with automated enforcement and reviewer workflows.
+
+## Operational Notes
+
+- The only supported metric source for external consumers is the privacy-cleared aggregate tables; raw is restricted to a break-glass path with audit logging.
+- Expect postback delays to dominate correctness; publish explicit SLAs: “preliminary updates every 15 min, final after 48h”.
+- Backfills are normal: run them as versioned rebuilds, never in-place edits; the Reporting API must allow selecting “latest” or a pinned version for reproducibility.
+- Monitor schema drift and event loss at the gateway (drop rates, invalid signatures, unexpected nulls) before they become “mystery revenue drops” in dashboards.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+thinking
+**Planning Data Management Strategy**
+
+I'm thinking about the need to use schema registry and add contract tests for a solid data contract. I should implement a finalization watermark store and leverage a transaction log for version control to ensure auditability. Additionally, using precomputed cubes, materialized views, and including cost controls would be beneficial. I also need to keep in mind the operational complexity with a small team managing multiple services. Using managed services like Confluent or AWS MSK might work, but I'll need to check on that. Time to craft a structured response with markdown headings and tables!
+Reconnecting... 1/5
+
+
+
+thinking
+**Structuring Critique Suggestions**
+
+I need to structure my critique in markdown format. I won't use repository tools, but I should provide clear sections. I want to mention alternatives like Postgres and Redis without being overly critical.
+
+I'm thinking of identifying key components like privacy firewalls and attribution jobs. For simplification, could Postgres with materialized views be a solution? For a larger scale—like handling a billion clicks a day—Kafka and Flink would probably be necessary. 
+
+However, I could still suggest unifying gateways and APIs, using a schema registry, and implementing a lakehouse with a query engine. Instead of a custom privacy budget ledger, open-source solutions like OpenDP or Google’s DP library might be better. I need to stress test the system under various failures and fix essential privacy budgeting details.
+thinking
+**Discussing Privacy and Data Management**
+
+I want to cover k-anonymity and consider whether adding noise is sufficient. I also need to differentiate across versions and specify immutable snapshots to ensure updates are finalized properly.
+
+I should establish a privacy ledger that distinguishes between per-release and per-query data and results caching. It’s crucial to ensure the campaign configuration is time-versioned, handling late updates and treating it as a slowly changing dimension.
+
+For data quality, I need to manipulate event_time assignments by comparing server receive time and client time. Simplification could involve using Postgres for low-volume campaign config, along with Kafka and Schema Registry, or opting for managed services. ClickHouse might work for serving data too. I’ll aim for concise yet thorough output with structured sections and failure scenarios.
+thinking
+**Exploring Simplification Opportunities**
+
+I want to create a table to highlight simplification opportunities, such as using an Event Gateway alongside the SKAN API, and considering whether to use a Reporting API or precomputed cubes. I should look into integrating a privacy firewall as a library within the query layer. 
+
+Given the architecture’s lakehouse tables, using dbt or Spark with scheduled jobs might be better than Flink, especially when freshness is around 15 minutes. But with 1 billion events per day, streaming data may be necessary. I need to clarify privacy budgets per advertiser, tenant, or metric. It's also vital to unify SKAN with non-SKAN models while treating cohorts as distinct units.
+codex
+```markdown
+## Elegance Check
+
+### The Core Insight
+You stop treating “truth” as a user-journey join problem and instead make the *cohort ledger with explicit time/version semantics* the product. That aligns incentives: correctness becomes “stable, attack-resistant aggregates” rather than “clever matching”.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Immutable raw + versioned derived datasets | Late/duplicate postbacks + backfills demand reproducibility and auditability. |
+| Time-versioned Campaign Config (SCD2) | Attribution depends on “what mapping was true then”, not “what it is now”. |
+| Privacy firewall (single enforcement point) | Centralizes k-thresholds, rollups, and noise so privacy isn’t “best effort”. |
+| Streaming/batch compute (Flink/Spark) | Needed to hit <15 min prelim while handling 1B/day ingest + late arrivals deterministically. |
+| “Preliminary vs Final” semantics in API | Prevents trust erosion from constant history rewrites; makes volatility explicit and bounded. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Separate “Event Gateway” + “SKAN Postback API” services | One ingestion service with pluggable validators (SDK events vs signed postbacks) + shared schema registry | Less isolation, but fewer deployables and one place for QoS/backpressure/auth. |
+| “Privacy firewall” as a bespoke service | Make it a *library + policy bundle* used by (a) the aggregator job at publish time and (b) the query layer as a hard guardrail | Still centralized logic, fewer network hops; requires strong release discipline to avoid divergence. |
+| Flink for everything | Stream for prelim; batch SQL (Spark/dbt) for daily final snapshots | Two pipelines to operate, but batch final becomes simpler and more explainable/auditable. |
+| Custom privacy ledger | Adopt an established DP accounting approach/library (e.g., OpenDP / Google DP primitives) with a minimal in-house wrapper | Some integration effort; reduces “we invented DP” risk and makes guarantees easier to review. |
+| Serving via bespoke Reporting API on lakehouse | Use a dedicated serving store (ClickHouse/Druid/Pinot) for *only allowed cubes*; keep lakehouse as system of record | Another dependency, but far simpler/cheaper to hit 200 QPS with consistent latency. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres (Campaign Config) is down for 5 minutes**
+   - Design's answer: not addressed
+   - Recommendation: Strengthen  
+   Add a local cache + versioned config snapshots in the lakehouse; aggregator should continue using “last known good” and mark output with the config version used.
+
+2. **Network partition: Gateway can’t reach Kafka (or Kafka is degraded but not down)**
+   - Design's answer: partially addressed (Kafka as buffer/backpressure)
+   - Recommendation: Strengthen  
+   Define explicit client-side behavior: bounded local queue, shedding policy, and a “data loss budget” metric. Also decide whether you prefer dropping clicks vs blocking SDK calls.
+
+3. **Bad config deploy retroactively changes mappings (human error at 3am)**
+   - Design's answer: addressed (time-versioned config + alert on retroactive edits)
+   - Recommendation: Strengthen  
+   Require “effective_at” + “entered_by” + approval workflow for retroactive changes, and make rebuilds automatic but gated (dry-run diff of top-line deltas before publish).
+
+4. **Differencing attack across versions / repeated pulls**
+   - Design's answer: partially addressed (noise + privacy ledger, query logging/rate limiting)
+   - Recommendation: Strengthen  
+   Be explicit about *where* noise is added and what is protected:  
+   - If noise-at-publish with multiple versions, version-to-version diffs can leak.  
+   - If noise-at-query, you need strict per-tenant privacy budgeting + caching of identical queries.  
+   Pick one model, document it, and test it with adversarial query patterns.
+
+5. **10x traffic spike and a slow downstream (Flink checkpoints lag, lakehouse writes slow)**
+   - Design's answer: not addressed
+   - Recommendation: Acceptable if you add guardrails  
+   Define SLO-based degradation: keep ingest (Kafka) healthy, allow prelim freshness to slip, and guarantee “final daily” correctness. Add “compute lag” and “checkpoint duration” alerts with a clear playbook.
+
+## Recommendations
+
+### Must Fix
+- Specify the privacy model precisely: tenant scoping, budget accounting, and whether noise is applied at publish-time or query-time (and how you prevent differencing across versions).
+- Define deterministic roll-up rules (placement→geo→day, etc.) so suppression/rollups are stable across recomputations and can’t be gamed.
+- Harden event-time semantics: don’t trust client timestamps; use server receive time with bounded skew and document how late events are handled.
+- Add an explicit “config version used” field to every published aggregate so audits/rebuilds are unambiguous.
+
+### Should Consider
+- Split “prelim vs final” compute paths: stream for fast prelim, batch SQL for final snapshots (simpler mental model, easier backfill verification).
+- Serve metrics from a purpose-built OLAP store containing only allowed cubes; keep lakehouse for recompute/audit to reduce query cost/latency variance.
+- Consolidate ingestion services to reduce operational surface area while keeping validator modules separate.
+
+### Nice to Have
+- Publish a “revisions” endpoint: show why numbers changed (late postbacks vs config rebuild vs dedupe) to improve advertiser trust.
+- Add automated “delta sanity checks” before promoting a new version (guard against accidental large swings).
+- Formalize break-glass raw access with short retention + strong audit (who/why/what query).
+
+## What's Working Well
+- The cohort-as-unit framing is the right abstraction for SKAN-like constraints and keeps the design honest.
+- Versioned snapshots + preliminary/final semantics directly address the biggest trust-killer in attribution systems.
+- Treating campaign config as time-versioned (not mutable state) is a strong correctness move that many designs miss.
+- The “privacy firewall” concept (enforced in code, not policy) is the right place to be strict—this is where elegance and safety align.
+```
+tokens used
+2,121
+```markdown
+## Elegance Check
+
+### The Core Insight
+You stop treating “truth” as a user-journey join problem and instead make the *cohort ledger with explicit time/version semantics* the product. That aligns incentives: correctness becomes “stable, attack-resistant aggregates” rather than “clever matching”.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Immutable raw + versioned derived datasets | Late/duplicate postbacks + backfills demand reproducibility and auditability. |
+| Time-versioned Campaign Config (SCD2) | Attribution depends on “what mapping was true then”, not “what it is now”. |
+| Privacy firewall (single enforcement point) | Centralizes k-thresholds, rollups, and noise so privacy isn’t “best effort”. |
+| Streaming/batch compute (Flink/Spark) | Needed to hit <15 min prelim while handling 1B/day ingest + late arrivals deterministically. |
+| “Preliminary vs Final” semantics in API | Prevents trust erosion from constant history rewrites; makes volatility explicit and bounded. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Separate “Event Gateway” + “SKAN Postback API” services | One ingestion service with pluggable validators (SDK events vs signed postbacks) + shared schema registry | Less isolation, but fewer deployables and one place for QoS/backpressure/auth. |
+| “Privacy firewall” as a bespoke service | Make it a *library + policy bundle* used by (a) the aggregator job at publish time and (b) the query layer as a hard guardrail | Still centralized logic, fewer network hops; requires strong release discipline to avoid divergence. |
+| Flink for everything | Stream for prelim; batch SQL (Spark/dbt) for daily final snapshots | Two pipelines to operate, but batch final becomes simpler and more explainable/auditable. |
+| Custom privacy ledger | Adopt an established DP accounting approach/library (e.g., OpenDP / Google DP primitives) with a minimal in-house wrapper | Some integration effort; reduces “we invented DP” risk and makes guarantees easier to review. |
+| Serving via bespoke Reporting API on lakehouse | Use a dedicated serving store (ClickHouse/Druid/Pinot) for *only allowed cubes*; keep lakehouse as system of record | Another dependency, but far simpler/cheaper to hit 200 QPS with consistent latency. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres (Campaign Config) is down for 5 minutes**
+   - Design's answer: not addressed
+   - Recommendation: Strengthen  
+   Add a local cache + versioned config snapshots in the lakehouse; aggregator should continue using “last known good” and mark output with the config version used.
+
+2. **Network partition: Gateway can’t reach Kafka (or Kafka is degraded but not down)**
+   - Design's answer: partially addressed (Kafka as buffer/backpressure)
+   - Recommendation: Strengthen  
+   Define explicit client-side behavior: bounded local queue, shedding policy, and a “data loss budget” metric. Also decide whether you prefer dropping clicks vs blocking SDK calls.
+
+3. **Bad config deploy retroactively changes mappings (human error at 3am)**
+   - Design's answer: addressed (time-versioned config + alert on retroactive edits)
+   - Recommendation: Strengthen  
+   Require “effective_at” + “entered_by” + approval workflow for retroactive changes, and make rebuilds automatic but gated (dry-run diff of top-line deltas before publish).
+
+4. **Differencing attack across versions / repeated pulls**
+   - Design's answer: partially addressed (noise + privacy ledger, query logging/rate limiting)
+   - Recommendation: Strengthen  
+   Be explicit about *where* noise is added and what is protected:  
+   - If noise-at-publish with multiple versions, version-to-version diffs can leak.  
+   - If noise-at-query, you need strict per-tenant privacy budgeting + caching of identical queries.  
+   Pick one model, document it, and test it with adversarial query patterns.
+
+5. **10x traffic spike and a slow downstream (Flink checkpoints lag, lakehouse writes slow)**
+   - Design's answer: not addressed
+   - Recommendation: Acceptable if you add guardrails  
+   Define SLO-based degradation: keep ingest (Kafka) healthy, allow prelim freshness to slip, and guarantee “final daily” correctness. Add “compute lag” and “checkpoint duration” alerts with a clear playbook.
+
+## Recommendations
+
+### Must Fix
+- Specify the privacy model precisely: tenant scoping, budget accounting, and whether noise is applied at publish-time or query-time (and how you prevent differencing across versions).
+- Define deterministic roll-up rules (placement→geo→day, etc.) so suppression/rollups are stable across recomputations and can’t be gamed.
+- Harden event-time semantics: don’t trust client timestamps; use server receive time with bounded skew and document how late events are handled.
+- Add an explicit “config version used” field to every published aggregate so audits/rebuilds are unambiguous.
+
+### Should Consider
+- Split “prelim vs final” compute paths: stream for fast prelim, batch SQL for final snapshots (simpler mental model, easier backfill verification).
+- Serve metrics from a purpose-built OLAP store containing only allowed cubes; keep lakehouse for recompute/audit to reduce query cost/latency variance.
+- Consolidate ingestion services to reduce operational surface area while keeping validator modules separate.
+
+### Nice to Have
+- Publish a “revisions” endpoint: show why numbers changed (late postbacks vs config rebuild vs dedupe) to improve advertiser trust.
+- Add automated “delta sanity checks” before promoting a new version (guard against accidental large swings).
+- Formalize break-glass raw access with short retention + strong audit (who/why/what query).
+
+## What's Working Well
+- The cohort-as-unit framing is the right abstraction for SKAN-like constraints and keeps the design honest.
+- Versioned snapshots + preliminary/final semantics directly address the biggest trust-killer in attribution systems.
+- Treating campaign config as time-versioned (not mutable state) is a strong correctness move that many designs miss.
+- The “privacy firewall” concept (enforced in code, not policy) is the right place to be strict—this is where elegance and safety align.
+```
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/attribution-measurement-system.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afc-be3c-7f01-836d-0196056d2bda
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Attribution Measurement System"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["ads", "attribution", "privacy", "skadnetwork", "data-pipeline", "analytics"]
+---
+
+## Overview
+
+This system measures ad performance by correlating clicks with conversions while respecting platform privacy constraints modeled after Apple’s SKAdNetwork (delayed, lossy, and explicitly anti-user-level attribution). The elegant move is to stop fighting that constraint: we treat *aggregate truth* as the product, and we build a pipeline whose “unit of work” is a privacy-safe cohort (campaign × time bucket × coarse geo × placement), not a user.
+
+The architecture is a boring event pipeline (Kafka → stream processing → lakehouse → SQL) wrapped in a strict “privacy firewall”: raw events are ingested for debugging and model calibration, but only thresholded/noised aggregates ever become queryable metrics. This keeps the system operable by a small team and makes privacy guarantees enforceable in code, not policy docs.
+
+## What Makes This Hard
+
+Naive implementations try to reconstruct per-user journeys (click-id joins, device graphs, fingerprinting). That fails under SKAdNetwork-like constraints because the signal is delayed, sparse, and intentionally ambiguous—and attempts to “fill in the gaps” reliably drift into privacy violations.
+
+The real trap is metric volatility: late postbacks and changing campaign metadata produce retroactive attribution shifts. Teams ship dashboards that rewrite history hourly, lose trust, and then bolt on more complexity. The correct approach is to design *time semantics* (event time vs processing time), *immutability*, and *controlled recomputation* from day one.
+
+## Requirements
+
+### Functional Requirements
+- Ingest three immutable streams: `click`, `conversion`, and `platform_postback` (SKAN-like).
+- Attribute conversions to campaigns at cohort granularity; no user-level reporting.
+- Support dimensions that don’t enable fingerprinting: campaign/adset/creative, day, coarse geo, placement, device class.
+- Enforce privacy constraints in the reporting path: k-anonymity thresholds, suppression, and calibrated noise.
+- Handle late and duplicated postbacks deterministically; support reproducible backfills.
+- Provide advertiser-facing metrics with stable revision semantics (explicit “data finalized” markers).
+
+### Scale Targets
+- **Ingest:** 1B clicks/day (~12k/s avg, 120k/s peak), 50M conversions/day, 30M postbacks/day.
+- **Freshness:** preliminary aggregates in <15 minutes; daily “final” aggregates within 24–48 hours to absorb platform delays.
+- **Cardinality:** up to 5M active campaigns/month; reporting granularity capped to keep cohorts large (privacy) and queries fast (cost).
+- **Queries:** 200 QPS peak on reporting API, 1–5s p95 for common dashboards.
+
+## Key Design Decisions
+
+- **We chose:** Cohort-based attribution as the primary product (aggregate metrics only).
+  - **We rejected:** User-level joins with click IDs as the “source of truth”.
+  - **Why:** It aligns with SKAN-like constraints, makes privacy enforceable, and avoids a permanent whack-a-mole with fingerprinting vectors.
+
+- **We chose:** An immutable log + recomputation model (append-only raw, derived aggregates rebuilt by version).
+  - **We rejected:** Mutable “running totals” updated in place.
+  - **Why:** Late postbacks are normal; recomputation gives correctness and auditability without corrupting state.
+
+- **We chose:** A hard “privacy firewall” service that is the only path from raw data to queryable metrics.
+  - **We rejected:** Letting every analyst/job “remember to apply” thresholds/noise.
+  - **Why:** Privacy guarantees must be centralized, testable, and reviewable like any other critical business logic.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[App / Web SDK] --> B[Event Gateway]
+  B --> C[Kafka]
+  D[SKAN Postback API] --> C
+  E[Campaign Config] --> F[Attribution + Privacy]
+  C --> F
+  F --> G[Lakehouse Tables]
+  G --> H[Reporting API]
+```
+
+### Components
+
+- **App / Web SDK**: Emits clicks and conversions where allowed; strictly avoids stable device identifiers in privacy-restricted contexts.
+- **Event Gateway**: Authenticates sources, enforces schemas, assigns event-time, and writes to Kafka; this is the “front door” for data quality.
+- **SKAN Postback API**: Receives platform postbacks (signed payloads), validates signatures, deduplicates by postback ID, and normalizes into the same event model.
+- **Kafka**: Buffering and backpressure so ingestion survives spikes and downstream deploys.
+- **Campaign Config**: Postgres for campaign metadata and time-versioned mappings (campaign ↔ adset ↔ creative ↔ placements), because attribution depends on *what was true at the time*.
+- **Attribution + Privacy**: A Flink job (or equivalent) that performs cohort attribution, applies k-anonymity + noise, and emits versioned aggregates.
+- **Lakehouse Tables**: Object storage + Iceberg/Parquet for immutable raw + derived datasets; supports cheap backfills and consistent query behavior.
+- **Reporting API**: Serves only privacy-cleared aggregates, with explicit dataset versioning and “finalized through date” watermarks.
+
+## Deep Dive: Privacy-Preserving Attribution Under SKAN-Like Constraints
+
+The hardest part is turning delayed, lossy postbacks into stable metrics *without reintroducing user identity*. The system treats every incoming signal as an update to a cohort-level ledger.
+
+1) **Time semantics and stabilization**
+- Every record carries `event_time` (when it happened) and `ingest_time` (when we learned about it).
+- Aggregates are computed in event-time windows (e.g., per UTC day) and published as *versioned snapshots*.
+- The Reporting API exposes two states: `preliminary` (fast, may change) and `final` (frozen after the postback delay horizon). This prevents “rewriting history” from looking like bugs.
+
+2) **Attribution logic that matches the privacy model**
+- For SKAN-like postbacks, attribution is already platform-decided (campaign ID + coarse metadata + conversion value). We do not attempt to “improve” it.
+- For non-SKAN clicks/conversions, we still collapse into the same cohort keys and apply the same privacy rules, so the product behaves consistently across channels.
+
+3) **Privacy firewall: k-anonymity + noise**
+- The firewall defines the maximum reporting granularity (e.g., `campaign_id, day, country, placement`) and rejects queries/exports outside it.
+- Before publishing an aggregate row, we enforce `k` (e.g., 50 conversions) per cohort. Below `k`, we suppress and roll up to a coarser cohort (e.g., remove placement, then geo).
+- After thresholding, we add calibrated noise (Laplace/Gaussian) to counts and value metrics at publish time, tracked by a privacy ledger per dimension set. This blocks differencing attacks across repeated pulls.
+
+4) **Deduplication and idempotency**
+- SKAN-like postbacks are deduped using platform-provided unique IDs + signature validation; duplicates become no-ops.
+- All derived tables are written with deterministic keys (`cohort_key`, `day`, `metric`, `version`) so backfills are repeatable and safe.
+
+This approach teaches a non-obvious lesson: under strong privacy constraints, the “correctness” you can deliver is mostly about *time/version semantics and attack-resistant aggregation*, not about clever matching.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Enforceable privacy guarantees | User-level attribution and path analysis |
+| Stable, auditable metrics | Real-time “perfect” numbers |
+| Simple, operable pipeline | Maximum granularity in reporting |
+| Deterministic recomputation | Some additional storage/compute cost |
+
+## Failure Modes
+
+- **Late postback surge**
+  - **What happens:** Yesterday’s numbers jump; dashboards look inconsistent.
+  - **Detect:** Monitor “delta to prior publish” per cohort/day and the share of late-arriving postbacks.
+  - **Recover:** Keep preliminary vs final separation, publish daily finalized snapshots, and expose “finalized through” watermark.
+
+- **Config drift (campaign mapping changed retroactively)**
+  - **What happens:** Attribution appears to move between campaigns/adsets after edits.
+  - **Detect:** Validate config changes as time-versioned; alert on retroactive edits beyond an allowed window.
+  - **Recover:** Treat config as immutable by effective date; rebuild aggregates for impacted windows with a new version and keep prior versions for audit.
+
+- **Privacy leakage via small cohorts**
+  - **What happens:** An advertiser infers user actions by slicing thinly or differencing pulls.
+  - **Detect:** Enforce query shape limits; log and rate-limit repeated near-identical queries; track privacy budget consumption.
+  - **Recover:** Force roll-ups, increase `k`, add more noise, and freeze cohorts that repeatedly hit the threshold boundary.
+
+## What I’d Do Differently At...
+
+- **10x scale:** Move more aggregation upstream (stream-only for daily cohorts), keep raw in cheaper storage tiers, and partition Iceberg tables aggressively by day and campaign hash to control query cost.
+- **100x scale:** Split ingestion domains (SKAN vs non-SKAN), introduce dedicated “metrics serving” storage (precomputed cubes keyed by allowed dimensions), and formalize a privacy budget service with automated enforcement and reviewer workflows.
+
+## Operational Notes
+
+- The only supported metric source for external consumers is the privacy-cleared aggregate tables; raw is restricted to a break-glass path with audit logging.
+- Expect postback delays to dominate correctness; publish explicit SLAs: “preliminary updates every 15 min, final after 48h”.
+- Backfills are normal: run them as versioned rebuilds, never in-place edits; the Reporting API must allow selecting “latest” or a pinned version for reproducibility.
+- Monitor schema drift and event loss at the gateway (drop rates, invalid signatures, unexpected nulls) before they become “mystery revenue drops” in dashboards.
+```
+
+---
+
+## Critique to Address
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+You stop treating “truth” as a user-journey join problem and instead make the *cohort ledger with explicit time/version semantics* the product. That aligns incentives: correctness becomes “stable, attack-resistant aggregates” rather than “clever matching”.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Immutable raw + versioned derived datasets | Late/duplicate postbacks + backfills demand reproducibility and auditability. |
+| Time-versioned Campaign Config (SCD2) | Attribution depends on “what mapping was true then”, not “what it is now”. |
+| Privacy firewall (single enforcement point) | Centralizes k-thresholds, rollups, and noise so privacy isn’t “best effort”. |
+| Streaming/batch compute (Flink/Spark) | Needed to hit <15 min prelim while handling 1B/day ingest + late arrivals deterministically. |
+| “Preliminary vs Final” semantics in API | Prevents trust erosion from constant history rewrites; makes volatility explicit and bounded. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Separate “Event Gateway” + “SKAN Postback API” services | One ingestion service with pluggable validators (SDK events vs signed postbacks) + shared schema registry | Less isolation, but fewer deployables and one place for QoS/backpressure/auth. |
+| “Privacy firewall” as a bespoke service | Make it a *library + policy bundle* used by (a) the aggregator job at publish time and (b) the query layer as a hard guardrail | Still centralized logic, fewer network hops; requires strong release discipline to avoid divergence. |
+| Flink for everything | Stream for prelim; batch SQL (Spark/dbt) for daily final snapshots | Two pipelines to operate, but batch final becomes simpler and more explainable/auditable. |
+| Custom privacy ledger | Adopt an established DP accounting approach/library (e.g., OpenDP / Google DP primitives) with a minimal in-house wrapper | Some integration effort; reduces “we invented DP” risk and makes guarantees easier to review. |
+| Serving via bespoke Reporting API on lakehouse | Use a dedicated serving store (ClickHouse/Druid/Pinot) for *only allowed cubes*; keep lakehouse as system of record | Another dependency, but far simpler/cheaper to hit 200 QPS with consistent latency. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres (Campaign Config) is down for 5 minutes**
+   - Design's answer: not addressed
+   - Recommendation: Strengthen  
+   Add a local cache + versioned config snapshots in the lakehouse; aggregator should continue using “last known good” and mark output with the config version used.
+
+2. **Network partition: Gateway can’t reach Kafka (or Kafka is degraded but not down)**
+   - Design's answer: partially addressed (Kafka as buffer/backpressure)
+   - Recommendation: Strengthen  
+   Define explicit client-side behavior: bounded local queue, shedding policy, and a “data loss budget” metric. Also decide whether you prefer dropping clicks vs blocking SDK calls.
+
+3. **Bad config deploy retroactively changes mappings (human error at 3am)**
+   - Design's answer: addressed (time-versioned config + alert on retroactive edits)
+   - Recommendation: Strengthen  
+   Require “effective_at” + “entered_by” + approval workflow for retroactive changes, and make rebuilds automatic but gated (dry-run diff of top-line deltas before publish).
+
+4. **Differencing attack across versions / repeated pulls**
+   - Design's answer: partially addressed (noise + privacy ledger, query logging/rate limiting)
+   - Recommendation: Strengthen  
+   Be explicit about *where* noise is added and what is protected:  
+   - If noise-at-publish with multiple versions, version-to-version diffs can leak.  
+   - If noise-at-query, you need strict per-tenant privacy budgeting + caching of identical queries.  
+   Pick one model, document it, and test it with adversarial query patterns.
+
+5. **10x traffic spike and a slow downstream (Flink checkpoints lag, lakehouse writes slow)**
+   - Design's answer: not addressed
+   - Recommendation: Acceptable if you add guardrails  
+   Define SLO-based degradation: keep ingest (Kafka) healthy, allow prelim freshness to slip, and guarantee “final daily” correctness. Add “compute lag” and “checkpoint duration” alerts with a clear playbook.
+
+## Recommendations
+
+### Must Fix
+- Specify the privacy model precisely: tenant scoping, budget accounting, and whether noise is applied at publish-time or query-time (and how you prevent differencing across versions).
+- Define deterministic roll-up rules (placement→geo→day, etc.) so suppression/rollups are stable across recomputations and can’t be gamed.
+- Harden event-time semantics: don’t trust client timestamps; use server receive time with bounded skew and document how late events are handled.
+- Add an explicit “config version used” field to every published aggregate so audits/rebuilds are unambiguous.
+
+### Should Consider
+- Split “prelim vs final” compute paths: stream for fast prelim, batch SQL for final snapshots (simpler mental model, easier backfill verification).
+- Serve metrics from a purpose-built OLAP store containing only allowed cubes; keep lakehouse for recompute/audit to reduce query cost/latency variance.
+- Consolidate ingestion services to reduce operational surface area while keeping validator modules separate.
+
+### Nice to Have
+- Publish a “revisions” endpoint: show why numbers changed (late postbacks vs config rebuild vs dedupe) to improve advertiser trust.
+- Add automated “delta sanity checks” before promoting a new version (guard against accidental large swings).
+- Formalize break-glass raw access with short retention + strong audit (who/why/what query).
+
+## What's Working Well
+- The cohort-as-unit framing is the right abstraction for SKAN-like constraints and keeps the design honest.
+- Versioned snapshots + preliminary/final semantics directly address the biggest trust-killer in attribution systems.
+- Treating campaign config as time-versioned (not mutable state) is a strong correctness move that many designs miss.
+- The “privacy firewall” concept (enforced in code, not policy) is the right place to be strict—this is where elegance and safety align.
+```
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+thinking
+**Considering noise publication strategy**
+
+I'm contemplating a way to publish time-based noise that is deterministic for each tenant, cohort, and metric using a stable PRNG seed. This makes recomputation yield the same noise under a given version. But if the version changes, that could lead to different noise. I could fix this by deriving the noise seed from cohort identity and a fixed secret. But, if the noise is the same across versions, difference reveals true deltas, which might lead to leakage. I’m exploring approaches to minimize risks from small changes and consider cumulative ledger updates instead.
+thinking
+**Exploring noise and data thresholds**
+
+I'm considering the idea of using a fixed seed for publish-time noise that's specific to each cohort, day, and metric. This would help ensure we only show the latest snapshot and keep both prelim and final data deterministic. I think enforcing a minimum delta publish threshold could add complexity. Instead, I could apply privacy at publish time with k enforcement and deterministic rollups. It seems acceptable to keep prelim data accessible, even if it means accepting some volatility in earlier data for advertiser metrics.
+thinking
+**Considering privacy and noise strategies**
+
+I need to ensure that privacy is maintained while keeping data aggregated with k and noise. If a cohort remains above the k threshold, an attacker could detect updates, which can be problematic. If the noise is deterministic, even a small change could be exposed, whereas random noise reduces visibility with repeated pulls. To strengthen privacy, I could apply noise at query time, potentially integrating budget accounting within the existing Reporting API and Postgres structure. This way, I could create a privacy ledger without introducing a completely new system.
+thinking
+**Designing privacy with data processing**
+
+I’m considering using a minimal differential privacy (DP) library, which feels like an addition, but it's really just a library without adding new components. The simplest solution might be to apply noise at query time in the Reporting API, storing a per-tenant privacy budget in Postgres. By caching identical queries, I can avoid re-noising. The aggregator will enforce k and rollup rules and publish true counts without noise. Additionally, I'll establish deterministic roll-up rules and assign event timing based on minimum timestamps, adjusting for late events efficiently.
+thinking
+**Simplifying documentation structure**
+
+I’m juggling the need to streamline a complex workflow while ensuring I don’t add new components. It seems that I can consolidate processes into a single SQL batch job, using stream processing for prelims and nightly batch SQL for finals. I need to remove unnecessary services and maintain essential sections of the document while sticking to the original title. It feels tricky with conflicting instructions about sections and justifications, so I’ll repurpose existing ones to meet the output format while keeping things clear. Ultimately, I’ll neatly present failure scenarios, roll-up rules, and privacy models, ensuring everything is coherent.
+codex
+```markdown
+---
+title: "Attribution Measurement System"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["ads", "attribution", "privacy", "skadnetwork", "data-pipeline", "analytics"]
+---
+
+## Overview
+
+This system measures ad performance under SKAdNetwork-like constraints by treating *cohort-level aggregates* as the product. The unit of work is a privacy-safe cohort (campaign × day × coarse geo × placement × device class), not a user journey.
+
+Raw events exist for audit/debug/backfills, but the only externally queryable surface is privacy-cleared cohort aggregates with explicit time/version semantics (`preliminary` vs `final`). Correctness is “stable, reproducible aggregates,” not “perfect matching.”
+
+## What Makes This Hard
+
+SKAN-like signals are delayed, sparse, and intentionally ambiguous, so user-level reconstruction fails and drifts into privacy violations.
+
+The trust-killer is volatility: late postbacks and retroactive config edits rewrite history unless the system is built around event-time windows, immutable datasets, controlled recomputation, and explicit finalization.
+
+## Requirements
+
+### Functional Requirements
+- Ingest three immutable streams: `click`, `conversion`, and `platform_postback` (SKAN-like).
+- Attribute conversions to campaigns at cohort granularity; no user-level reporting.
+- Support dimensions that don’t enable fingerprinting: campaign/adset/creative, day, coarse geo, placement, device class.
+- Enforce privacy constraints in the reporting path: k-anonymity thresholds, suppression/rollups, and calibrated noise.
+- Handle late and duplicated postbacks deterministically; support reproducible backfills.
+- Provide advertiser-facing metrics with stable revision semantics (explicit “data finalized” markers).
+
+### Scale Targets
+- **Ingest:** 1B clicks/day (~12k/s avg, 120k/s peak), 50M conversions/day, 30M postbacks/day.
+- **Freshness:** preliminary aggregates in <15 minutes; daily “final” aggregates within 24–48 hours to absorb platform delays.
+- **Cardinality:** up to 5M active campaigns/month; reporting granularity capped to keep cohorts large (privacy) and queries fast (cost).
+- **Queries:** 200 QPS peak on reporting API, 1–5s p95 for common dashboards.
+
+## What We Removed
+
+- Separate “Event Gateway” and “SKAN Postback API”: replaced with one ingestion service with pluggable validators and a single schema/QoS surface.
+- “Privacy firewall” as a network service: replaced with one shared policy bundle used (a) at publish time for k-thresholding + deterministic rollups and (b) in the Reporting API as a hard query guardrail.
+- “Noise everywhere” ambiguity: noise is applied only in the Reporting API with per-tenant accounting and query-result memoization; aggregates stored in the lakehouse stay deterministic for backfills/audits.
+- “Flink for everything”: prelim is streaming aggregation; final is a daily batch snapshot over the same raw/derived tables to make recomputation and verification boring.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[App / Web SDK] --> B[Ingestion Service]
+  D[SKAN Postback API] --> B
+  B --> C[Kafka]
+  C --> F[Attribution Aggregation]
+  E[Campaign Config (Postgres)] --> F
+  F --> G[Lakehouse Tables]
+  G --> H[Reporting API]
+  E --> H
+```
+
+### Components
+
+- **App / Web SDK**: Emits clicks and conversions where allowed; avoids stable device identifiers in privacy-restricted contexts.
+  - **Justification:** Only source of first-party event signals.
+
+- **Ingestion Service**: Single front door for SDK events and signed postbacks; authenticates, validates schemas/signatures, assigns event-time, and writes to Kafka with explicit shedding/backpressure behavior.
+  - **Justification:** One place to guarantee data quality, idempotency keys, and predictable ingest behavior under spikes.
+
+- **Kafka**: Buffering and backpressure so ingest survives spikes and downstream deploys; topics are immutable logs.
+  - **Justification:** Absorbs peak traffic and isolates ingestion from compute/storage hiccups.
+
+- **Campaign Config (Postgres)**: Time-versioned (SCD2) campaign/adset/creative/placement mappings with `effective_at` and immutable history.
+  - **Justification:** Attribution depends on “what was true then,” and audits require replaying the exact mapping.
+
+- **Attribution Aggregation**: Streaming job for <15 min prelim cohort aggregates + daily batch job for final snapshots; deterministic dedupe and recomputation keyed by (cohort, day).
+  - **Justification:** Minimal compute needed to produce stable cohort ledgers from immutable logs.
+
+- **Lakehouse Tables**: Object storage + Iceberg/Parquet for append-only raw and versioned derived datasets (prelim snapshots + final snapshots).
+  - **Justification:** Cheap, reproducible backfills and auditable history without mutable state.
+
+- **Reporting API**: The only external read path; enforces allowed query shapes, applies calibrated noise with per-tenant accounting, and exposes `preliminary` vs `final` with “finalized through” watermarks.
+  - **Justification:** Central enforcement point for privacy + stability semantics at serving time.
+
+## Deep Dive: Privacy-Preserving Attribution Under SKAN-Like Constraints
+
+1) **Event-time semantics**
+- Ingestion assigns `event_time` using client timestamp with a bounded skew window; outside the window it falls back to server receive time.
+- Every record also carries `ingest_time`. Aggregation windows are event-time (e.g., UTC day).
+
+2) **Deterministic cohort ledger**
+- All inputs collapse into the same cohort key (campaign/adset/creative, day, coarse geo, placement, device class).
+- SKAN postbacks are treated as platform-decided attribution; the system does not attempt user-level “improvements.”
+- Dedupe is deterministic (platform postback ID + signature; SDK events by event ID). Derived rows use stable keys so recomputation is repeatable.
+
+3) **Privacy enforcement model (simple and testable)**
+- Publish-time enforcement: deterministic rollups + k-thresholding per cohort using a fixed rollup order (e.g., drop placement → drop geo → roll to campaign-only) so suppression is stable and not gameable.
+- Query-time protection: the Reporting API adds calibrated noise using a standard DP primitive library and tracks a per-tenant privacy ledger; identical normalized queries are memoized to prevent repeated re-noising.
+
+4) **Preliminary vs Final**
+- `preliminary`: streaming-updated aggregates; may change due to late arrivals/dedup/config fixes.
+- `final`: daily snapshots frozen after the postback horizon (e.g., 48h) with an explicit “finalized through date” watermark.
+- Every published row includes `dataset_version` and `config_version_used` so audits and rebuilds are unambiguous.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Enforceable privacy guarantees | User-level attribution and path analysis |
+| Stable, auditable metrics | Real-time “perfect” numbers |
+| Small-team operability | Maximum reporting granularity |
+| Reproducible recomputation | Some storage/compute overhead |
+
+## Failure Modes
+
+- **Postgres (Campaign Config) down**
+  - **What happens:** Aggregation can’t fetch config updates; serving can’t resolve metadata.
+  - **Detect:** Config read errors, stale config watermark.
+  - **Recover:** Aggregation and Reporting API use last-known-good config snapshot and continue; outputs are tagged with `config_version_used` until Postgres recovers.
+
+- **Ingestion can’t reach Kafka / Kafka degraded**
+  - **What happens:** Ingestion backlog grows; risk of lost events.
+  - **Detect:** Producer error rate, local queue depth, shed rate.
+  - **Recover:** Ingestion uses a bounded local queue and a clear shedding policy (drop lowest-value events first, record loss counters); SDK calls do not block indefinitely.
+
+- **Bad retroactive config change**
+  - **What happens:** Attribution shifts across campaigns/adsets after edits.
+  - **Detect:** Retroactive effective_at edits, large version-to-version deltas.
+  - **Recover:** Config is immutable by effective date; retroactive changes require approval metadata; rebuild produces a new `dataset_version` and keeps prior versions for audit.
+
+- **Differencing attack across versions / repeated pulls**
+  - **What happens:** An advertiser tries to infer small cohort changes by repeated queries.
+  - **Detect:** Repeated near-identical queries, budget depletion spikes.
+  - **Recover:** Reporting API enforces allowed query shapes, memoizes identical queries, charges privacy budget on cache misses, and rate-limits adversarial patterns.
+
+- **Traffic spike + slow downstream (compute lag / lakehouse writes slow)**
+  - **What happens:** Preliminary freshness slips; backpressure builds.
+  - **Detect:** Kafka consumer lag, checkpoint duration, write latency.
+  - **Recover:** Keep ingestion healthy (Kafka), allow prelim SLO to degrade, and preserve final daily correctness; alert on lag with an explicit playbook.
+
+## What I’d Do Differently At...
+
+- **10x scale:** Partition lakehouse tables aggressively by day and campaign hash; push more aggregation into streaming for daily cohorts; keep final snapshots as the contract.
+- **100x scale:** Split ingestion domains (SKAN vs non-SKAN) only if operationally forced; otherwise keep the same surfaces and scale horizontally.
+
+## Operational Notes
+
+- The only supported metric surface for external consumers is the Reporting API over privacy-cleared aggregates; raw access is break-glass with audit logging.
+- Publish explicit SLAs: preliminary updates every 15 min; final after the postback horizon with a visible “finalized through” watermark.
+- Backfills are versioned rebuilds; the API supports “latest” or pinned `dataset_version` for reproducibility.
+- Monitor schema drift, signature failures, and ingest shedding before they show up as “mystery revenue drops.”
+```
+tokens used
+8,390
+```markdown
+---
+title: "Attribution Measurement System"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["ads", "attribution", "privacy", "skadnetwork", "data-pipeline", "analytics"]
+---
+
+## Overview
+
+This system measures ad performance under SKAdNetwork-like constraints by treating *cohort-level aggregates* as the product. The unit of work is a privacy-safe cohort (campaign × day × coarse geo × placement × device class), not a user journey.
+
+Raw events exist for audit/debug/backfills, but the only externally queryable surface is privacy-cleared cohort aggregates with explicit time/version semantics (`preliminary` vs `final`). Correctness is “stable, reproducible aggregates,” not “perfect matching.”
+
+## What Makes This Hard
+
+SKAN-like signals are delayed, sparse, and intentionally ambiguous, so user-level reconstruction fails and drifts into privacy violations.
+
+The trust-killer is volatility: late postbacks and retroactive config edits rewrite history unless the system is built around event-time windows, immutable datasets, controlled recomputation, and explicit finalization.
+
+## Requirements
+
+### Functional Requirements
+- Ingest three immutable streams: `click`, `conversion`, and `platform_postback` (SKAN-like).
+- Attribute conversions to campaigns at cohort granularity; no user-level reporting.
+- Support dimensions that don’t enable fingerprinting: campaign/adset/creative, day, coarse geo, placement, device class.
+- Enforce privacy constraints in the reporting path: k-anonymity thresholds, suppression/rollups, and calibrated noise.
+- Handle late and duplicated postbacks deterministically; support reproducible backfills.
+- Provide advertiser-facing metrics with stable revision semantics (explicit “data finalized” markers).
+
+### Scale Targets
+- **Ingest:** 1B clicks/day (~12k/s avg, 120k/s peak), 50M conversions/day, 30M postbacks/day.
+- **Freshness:** preliminary aggregates in <15 minutes; daily “final” aggregates within 24–48 hours to absorb platform delays.
+- **Cardinality:** up to 5M active campaigns/month; reporting granularity capped to keep cohorts large (privacy) and queries fast (cost).
+- **Queries:** 200 QPS peak on reporting API, 1–5s p95 for common dashboards.
+
+## What We Removed
+
+- Separate “Event Gateway” and “SKAN Postback API”: replaced with one ingestion service with pluggable validators and a single schema/QoS surface.
+- “Privacy firewall” as a network service: replaced with one shared policy bundle used (a) at publish time for k-thresholding + deterministic rollups and (b) in the Reporting API as a hard query guardrail.
+- “Noise everywhere” ambiguity: noise is applied only in the Reporting API with per-tenant accounting and query-result memoization; aggregates stored in the lakehouse stay deterministic for backfills/audits.
+- “Flink for everything”: prelim is streaming aggregation; final is a daily batch snapshot over the same raw/derived tables to make recomputation and verification boring.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[App / Web SDK] --> B[Ingestion Service]
+  D[SKAN Postback API] --> B
+  B --> C[Kafka]
+  C --> F[Attribution Aggregation]
+  E[Campaign Config (Postgres)] --> F
+  F --> G[Lakehouse Tables]
+  G --> H[Reporting API]
+  E --> H
+```
+
+### Components
+
+- **App / Web SDK**: Emits clicks and conversions where allowed; avoids stable device identifiers in privacy-restricted contexts.
+  - **Justification:** Only source of first-party event signals.
+
+- **Ingestion Service**: Single front door for SDK events and signed postbacks; authenticates, validates schemas/signatures, assigns event-time, and writes to Kafka with explicit shedding/backpressure behavior.
+  - **Justification:** One place to guarantee data quality, idempotency keys, and predictable ingest behavior under spikes.
+
+- **Kafka**: Buffering and backpressure so ingest survives spikes and downstream deploys; topics are immutable logs.
+  - **Justification:** Absorbs peak traffic and isolates ingestion from compute/storage hiccups.
+
+- **Campaign Config (Postgres)**: Time-versioned (SCD2) campaign/adset/creative/placement mappings with `effective_at` and immutable history.
+  - **Justification:** Attribution depends on “what was true then,” and audits require replaying the exact mapping.
+
+- **Attribution Aggregation**: Streaming job for <15 min prelim cohort aggregates + daily batch job for final snapshots; deterministic dedupe and recomputation keyed by (cohort, day).
+  - **Justification:** Minimal compute needed to produce stable cohort ledgers from immutable logs.
+
+- **Lakehouse Tables**: Object storage + Iceberg/Parquet for append-only raw and versioned derived datasets (prelim snapshots + final snapshots).
+  - **Justification:** Cheap, reproducible backfills and auditable history without mutable state.
+
+- **Reporting API**: The only external read path; enforces allowed query shapes, applies calibrated noise with per-tenant accounting, and exposes `preliminary` vs `final` with “finalized through” watermarks.
+  - **Justification:** Central enforcement point for privacy + stability semantics at serving time.
+
+## Deep Dive: Privacy-Preserving Attribution Under SKAN-Like Constraints
+
+1) **Event-time semantics**
+- Ingestion assigns `event_time` using client timestamp with a bounded skew window; outside the window it falls back to server receive time.
+- Every record also carries `ingest_time`. Aggregation windows are event-time (e.g., UTC day).
+
+2) **Deterministic cohort ledger**
+- All inputs collapse into the same cohort key (campaign/adset/creative, day, coarse geo, placement, device class).
+- SKAN postbacks are treated as platform-decided attribution; the system does not attempt user-level “improvements.”
+- Dedupe is deterministic (platform postback ID + signature; SDK events by event ID). Derived rows use stable keys so recomputation is repeatable.
+
+3) **Privacy enforcement model (simple and testable)**
+- Publish-time enforcement: deterministic rollups + k-thresholding per cohort using a fixed rollup order (e.g., drop placement → drop geo → roll to campaign-only) so suppression is stable and not gameable.
+- Query-time protection: the Reporting API adds calibrated noise using a standard DP primitive library and tracks a per-tenant privacy ledger; identical normalized queries are memoized to prevent repeated re-noising.
+
+4) **Preliminary vs Final**
+- `preliminary`: streaming-updated aggregates; may change due to late arrivals/dedup/config fixes.
+- `final`: daily snapshots frozen after the postback horizon (e.g., 48h) with an explicit “finalized through date” watermark.
+- Every published row includes `dataset_version` and `config_version_used` so audits and rebuilds are unambiguous.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Enforceable privacy guarantees | User-level attribution and path analysis |
+| Stable, auditable metrics | Real-time “perfect” numbers |
+| Small-team operability | Maximum reporting granularity |
+| Reproducible recomputation | Some storage/compute overhead |
+
+## Failure Modes
+
+- **Postgres (Campaign Config) down**
+  - **What happens:** Aggregation can’t fetch config updates; serving can’t resolve metadata.
+  - **Detect:** Config read errors, stale config watermark.
+  - **Recover:** Aggregation and Reporting API use last-known-good config snapshot and continue; outputs are tagged with `config_version_used` until Postgres recovers.
+
+- **Ingestion can’t reach Kafka / Kafka degraded**
+  - **What happens:** Ingestion backlog grows; risk of lost events.
+  - **Detect:** Producer error rate, local queue depth, shed rate.
+  - **Recover:** Ingestion uses a bounded local queue and a clear shedding policy (drop lowest-value events first, record loss counters); SDK calls do not block indefinitely.
+
+- **Bad retroactive config change**
+  - **What happens:** Attribution shifts across campaigns/adsets after edits.
+  - **Detect:** Retroactive effective_at edits, large version-to-version deltas.
+  - **Recover:** Config is immutable by effective date; retroactive changes require approval metadata; rebuild produces a new `dataset_version` and keeps prior versions for audit.
+
+- **Differencing attack across versions / repeated pulls**
+  - **What happens:** An advertiser tries to infer small cohort changes by repeated queries.
+  - **Detect:** Repeated near-identical queries, budget depletion spikes.
+  - **Recover:** Reporting API enforces allowed query shapes, memoizes identical queries, charges privacy budget on cache misses, and rate-limits adversarial patterns.
+
+- **Traffic spike + slow downstream (compute lag / lakehouse writes slow)**
+  - **What happens:** Preliminary freshness slips; backpressure builds.
+  - **Detect:** Kafka consumer lag, checkpoint duration, write latency.
+  - **Recover:** Keep ingestion healthy (Kafka), allow prelim SLO to degrade, and preserve final daily correctness; alert on lag with an explicit playbook.
+
+## What I’d Do Differently At...
+
+- **10x scale:** Partition lakehouse tables aggressively by day and campaign hash; push more aggregation into streaming for daily cohorts; keep final snapshots as the contract.
+- **100x scale:** Split ingestion domains (SKAN vs non-SKAN) only if operationally forced; otherwise keep the same surfaces and scale horizontally.
+
+## Operational Notes
+
+- The only supported metric surface for external consumers is the Reporting API over privacy-cleared aggregates; raw access is break-glass with audit logging.
+- Publish explicit SLAs: preliminary updates every 15 min; final after the postback horizon with a visible “finalized through” watermark.
+- Backfills are versioned rebuilds; the API supports “latest” or pinned `dataset_version` for reproducibility.
+- Monitor schema drift, signature failures, and ingest shedding before they show up as “mystery revenue drops.”
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/10-strategic-problems/attribution-measurement-system.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+Found invalid Mermaid diagrams, fixing...
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afe-18b8-7a61-a201-83514b533b53
+--------
+user
+Fix these Mermaid syntax errors:
+
+
+--- Block 1 ---
+flowchart LR
+  A[App / Web SDK] --> B[Ingestion Service]
+  D[SKAN Postback API] --> B
+  B --> C[Kafka]
+  C --> F[Attribution Aggregation]
+  E[Campaign Config (Postgres)] --> F
+  F --> G[Lakehouse Tables]
+  G --> H[Reporting API]
+  E --> H
+--- Error ---
+Generating single mermaid chart
+
+Error: Parse error on line 6:
+
+
+Common fixes:
+- Quote labels with special characters: A["Label (with parens)"]
+- Use short labels (2-4 words max)
+- Remove HTML tags
+- Keep diagrams simple (max 8 nodes)
+
+Output the complete fixed document.
+
+---
+
+```markdown
+---
+title: "Attribution Measurement System"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["ads", "attribution", "privacy", "skadnetwork", "data-pipeline", "analytics"]
+---
+
+## Overview
+
+This system measures ad performance under SKAdNetwork-like constraints by treating *cohort-level aggregates* as the product. The unit of work is a privacy-safe cohort (campaign × day × coarse geo × placement × device class), not a user journey.
+
+Raw events exist for audit/debug/backfills, but the only externally queryable surface is privacy-cleared cohort aggregates with explicit time/version semantics (`preliminary` vs `final`). Correctness is “stable, reproducible aggregates,” not “perfect matching.”
+
+## What Makes This Hard
+
+SKAN-like signals are delayed, sparse, and intentionally ambiguous, so user-level reconstruction fails and drifts into privacy violations.
+
+The trust-killer is volatility: late postbacks and retroactive config edits rewrite history unless the system is built around event-time windows, immutable datasets, controlled recomputation, and explicit finalization.
+
+## Requirements
+
+### Functional Requirements
+- Ingest three immutable streams: `click`, `conversion`, and `platform_postback` (SKAN-like).
+- Attribute conversions to campaigns at cohort granularity; no user-level reporting.
+- Support dimensions that don’t enable fingerprinting: campaign/adset/creative, day, coarse geo, placement, device class.
+- Enforce privacy constraints in the reporting path: k-anonymity thresholds, suppression/rollups, and calibrated noise.
+- Handle late and duplicated postbacks deterministically; support reproducible backfills.
+- Provide advertiser-facing metrics with stable revision semantics (explicit “data finalized” markers).
+
+### Scale Targets
+- **Ingest:** 1B clicks/day (~12k/s avg, 120k/s peak), 50M conversions/day, 30M postbacks/day.
+- **Freshness:** preliminary aggregates in <15 minutes; daily “final” aggregates within 24–48 hours to absorb platform delays.
+- **Cardinality:** up to 5M active campaigns/month; reporting granularity capped to keep cohorts large (privacy) and queries fast (cost).
+- **Queries:** 200 QPS peak on reporting API, 1–5s p95 for common dashboards.
+
+## What We Removed
+
+- Separate “Event Gateway” and “SKAN Postback API”: replaced with one ingestion service with pluggable validators and a single schema/QoS surface.
+- “Privacy firewall” as a network service: replaced with one shared policy bundle used (a) at publish time for k-thresholding + deterministic rollups and (b) in the Reporting API as a hard query guardrail.
+- “Noise everywhere” ambiguity: noise is applied only in the Reporting API with per-tenant accounting and query-result memoization; aggregates stored in the lakehouse stay deterministic for backfills/audits.
+- “Flink for everything”: prelim is streaming aggregation; final is a daily batch snapshot over the same raw/derived tables to make recomputation and verification boring.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[App / Web SDK] --> B[Ingestion Service]
+  D[SKAN Postback API] --> B
+  B --> C[Kafka]
+  C --> F[Attribution Aggregation]
+  E[Campaign Config (Postgres)] --> F
+  F --> G[Lakehouse Tables]
+  G --> H[Reporting API]
+  E --> H
+```
+
+### Components
+
+- **App / Web SDK**: Emits clicks and conversions where allowed; avoids stable device identifiers in privacy-restricted contexts.
+  - **Justification:** Only source of first-party event signals.
+
+- **Ingestion Service**: Single front door for SDK events and signed postbacks; authenticates, validates schemas/signatures, assigns event-time, and writes to Kafka with explicit shedding/backpressure behavior.
+  - **Justification:** One place to guarantee data quality, idempotency keys, and predictable ingest behavior under spikes.
+
+- **Kafka**: Buffering and backpressure so ingest survives spikes and downstream deploys; topics are immutable logs.
+  - **Justification:** Absorbs peak traffic and isolates ingestion from compute/storage hiccups.
+
+- **Campaign Config (Postgres)**: Time-versioned (SCD2) campaign/adset/creative/placement mappings with `effective_at` and immutable history.
+  - **Justification:** Attribution depends on “what was true then,” and audits require replaying the exact mapping.
+
+- **Attribution Aggregation**: Streaming job for <15 min prelim cohort aggregates + daily batch job for final snapshots; deterministic dedupe and recomputation keyed by (cohort, day).
+  - **Justification:** Minimal compute needed to produce stable cohort ledgers from immutable logs.
+
+- **Lakehouse Tables**: Object storage + Iceberg/Parquet for append-only raw and versioned derived datasets (prelim snapshots + final snapshots).
+  - **Justification:** Cheap, reproducible backfills and auditable history without mutable state.
+
+- **Reporting API**: The only external read path; enforces allowed query shapes, applies calibrated noise with per-tenant accounting, and exposes `preliminary` vs `final` with “finalized through” watermarks.
+  - **Justification:** Central enforcement point for privacy + stability semantics at serving time.
+
+## Deep Dive: Privacy-Preserving Attribution Under SKAN-Like Constraints
+
+1) **Event-time semantics**
+- Ingestion assigns `event_time` using client timestamp with a bounded skew window; outside the window it falls back to server receive time.
+- Every record also carries `ingest_time`. Aggregation windows are event-time (e.g., UTC day).
+
+2) **Deterministic cohort ledger**
+- All inputs collapse into the same cohort key (campaign/adset/creative, day, coarse geo, placement, device class).
+- SKAN postbacks are treated as platform-decided attribution; the system does not attempt user-level “improvements.”
+- Dedupe is deterministic (platform postback ID + signature; SDK events by event ID). Derived rows use stable keys so recomputation is repeatable.
+
+3) **Privacy enforcement model (simple and testable)**
+- Publish-time enforcement: deterministic rollups + k-thresholding per cohort using a fixed rollup order (e.g., drop placement → drop geo → roll to campaign-only) so suppression is stable and not gameable.
+- Query-time protection: the Reporting API adds calibrated noise using a standard DP primitive library and tracks a per-tenant privacy ledger; identical normalized queries are memoized to prevent repeated re-noising.
+
+4) **Preliminary vs Final**
+- `preliminary`: streaming-updated aggregates; may change due to late arrivals/dedup/config fixes.
+- `final`: daily snapshots frozen after the postback horizon (e.g., 48h) with an explicit “finalized through date” watermark.
+- Every published row includes `dataset_version` and `config_version_used` so audits and rebuilds are unambiguous.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Enforceable privacy guarantees | User-level attribution and path analysis |
+| Stable, auditable metrics | Real-time “perfect” numbers |
+| Small-team operability | Maximum reporting granularity |
+| Reproducible recomputation | Some storage/compute overhead |
+
+## Failure Modes
+
+- **Postgres (Campaign Config) down**
+  - **What happens:** Aggregation can’t fetch config updates; serving can’t resolve metadata.
+  - **Detect:** Config read errors, stale config watermark.
+  - **Recover:** Aggregation and Reporting API use last-known-good config snapshot and continue; outputs are tagged with `config_version_used` until Postgres recovers.
+
+- **Ingestion can’t reach Kafka / Kafka degraded**
+  - **What happens:** Ingestion backlog grows; risk of lost events.
+  - **Detect:** Producer error rate, local queue depth, shed rate.
+  - **Recover:** Ingestion uses a bounded local queue and a clear shedding policy (drop lowest-value events first, record loss counters); SDK calls do not block indefinitely.
+
+- **Bad retroactive config change**
+  - **What happens:** Attribution shifts across campaigns/adsets after edits.
+  - **Detect:** Retroactive effective_at edits, large version-to-version deltas.
+  - **Recover:** Config is immutable by effective date; retroactive changes require approval metadata; rebuild produces a new `dataset_version` and keeps prior versions for audit.
+
+- **Differencing attack across versions / repeated pulls**
+  - **What happens:** An advertiser tries to infer small cohort changes by repeated queries.
+  - **Detect:** Repeated near-identical queries, budget depletion spikes.
+  - **Recover:** Reporting API enforces allowed query shapes, memoizes identical queries, charges privacy budget on cache misses, and rate-limits adversarial patterns.
+
+- **Traffic spike + slow downstream (compute lag / lakehouse writes slow)**
+  - **What happens:** Preliminary freshness slips; backpressure builds.
+  - **Detect:** Kafka consumer lag, checkpoint duration, write latency.
+  - **Recover:** Keep ingestion healthy (Kafka), allow prelim SLO to degrade, and preserve final daily correctness; alert on lag with an explicit playbook.
+
+## What I’d Do Differently At...
+
+- **10x scale:** Partition lakehouse tables aggressively by day and campaign hash; push more aggregation into streaming for daily cohorts; keep final snapshots as the contract.
+- **100x scale:** Split ingestion domains (SKAN vs non-SKAN) only if operationally forced; otherwise keep the same surfaces and scale horizontally.
+
+## Operational Notes
+
+- The only supported metric surface for external consumers is the Reporting API over privacy-cleared aggregates; raw access is break-glass with audit logging.
+- Publish explicit SLAs: preliminary updates every 15 min; final after the postback horizon with a visible “finalized through” watermark.
+- Backfills are versioned rebuilds; the API supports “latest” or pinned `dataset_version` for reproducibility.
+- Monitor schema drift, signature failures, and ingest shedding before they show up as “mystery revenue drops.”
+```
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+thinking
+**Fixing Mermaid Syntax Errors**
+
+I need to fix Mermaid syntax errors, particularly a parse error on line 6 with the label `E[Campaign Config (Postgres)] --> F`. While Mermaid typically allows parentheses in square brackets, it seems like an issue here. I may need to use quotes around the label, so it becomes `E["Campaign Config (Postgres)"]`. I'll also ensure to quote any labels with special characters, like `A["App / Web SDK"]`. Since the user requested the completed document, I’ll include that next.
+thinking
+**Adjusting Mermaid Block**
+
+I'm focusing on making changes only in the Mermaid block. It might be good to quote other labels like `G["Lakehouse Tables"]`, just to be safe. But I don’t want to change too much and cause confusion. Here’s the updated chart code:
+
+```
+flowchart LR
+  A["App / Web SDK"] --> B["Ingestion Service"]
+  D["SKAN Postback API"] --> B
+  B --> C["Kafka"]
+  C --> F["Attribution Aggregation"]
+  E["Campaign Config (Postgres)"] --> F
+  F --> G["Lakehouse Tables"]
+  G --> H["Reporting API"]
+  E --> H
+```
+
+I'll return the full markdown as it is!
+codex
+```markdown
+---
+title: "Attribution Measurement System"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["ads", "attribution", "privacy", "skadnetwork", "data-pipeline", "analytics"]
+---
+
+## Overview
+
+This system measures ad performance under SKAdNetwork-like constraints by treating *cohort-level aggregates* as the product. The unit of work is a privacy-safe cohort (campaign × day × coarse geo × placement × device class), not a user journey.
+
+Raw events exist for audit/debug/backfills, but the only externally queryable surface is privacy-cleared cohort aggregates with explicit time/version semantics (`preliminary` vs `final`). Correctness is “stable, reproducible aggregates,” not “perfect matching.”
+
+## What Makes This Hard
+
+SKAN-like signals are delayed, sparse, and intentionally ambiguous, so user-level reconstruction fails and drifts into privacy violations.
+
+The trust-killer is volatility: late postbacks and retroactive config edits rewrite history unless the system is built around event-time windows, immutable datasets, controlled recomputation, and explicit finalization.
+
+## Requirements
+
+### Functional Requirements
+- Ingest three immutable streams: `click`, `conversion`, and `platform_postback` (SKAN-like).
+- Attribute conversions to campaigns at cohort granularity; no user-level reporting.
+- Support dimensions that don’t enable fingerprinting: campaign/adset/creative, day, coarse geo, placement, device class.
+- Enforce privacy constraints in the reporting path: k-anonymity thresholds, suppression/rollups, and calibrated noise.
+- Handle late and duplicated postbacks deterministically; support reproducible backfills.
+- Provide advertiser-facing metrics with stable revision semantics (explicit “data finalized” markers).
+
+### Scale Targets
+- **Ingest:** 1B clicks/day (~12k/s avg, 120k/s peak), 50M conversions/day, 30M postbacks/day.
+- **Freshness:** preliminary aggregates in <15 minutes; daily “final” aggregates within 24–48 hours to absorb platform delays.
+- **Cardinality:** up to 5M active campaigns/month; reporting granularity capped to keep cohorts large (privacy) and queries fast (cost).
+- **Queries:** 200 QPS peak on reporting API, 1–5s p95 for common dashboards.
+
+## What We Removed
+
+- Separate “Event Gateway” and “SKAN Postback API”: replaced with one ingestion service with pluggable validators and a single schema/QoS surface.
+- “Privacy firewall” as a network service: replaced with one shared policy bundle used (a) at publish time for k-thresholding + deterministic rollups and (b) in the Reporting API as a hard query guardrail.
+- “Noise everywhere” ambiguity: noise is applied only in the Reporting API with per-tenant accounting and query-result memoization; aggregates stored in the lakehouse stay deterministic for backfills/audits.
+- “Flink for everything”: prelim is streaming aggregation; final is a daily batch snapshot over the same raw/derived tables to make recomputation and verification boring.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["App / Web SDK"] --> B["Ingestion Service"]
+  D["SKAN Postback API"] --> B
+  B --> C["Kafka"]
+  C --> F["Attribution Aggregation"]
+  E["Campaign Config (Postgres)"] --> F
+  F --> G["Lakehouse Tables"]
+  G --> H["Reporting API"]
+  E --> H
+```
+
+### Components
+
+- **App / Web SDK**: Emits clicks and conversions where allowed; avoids stable device identifiers in privacy-restricted contexts.
+  - **Justification:** Only source of first-party event signals.
+
+- **Ingestion Service**: Single front door for SDK events and signed postbacks; authenticates, validates schemas/signatures, assigns event-time, and writes to Kafka with explicit shedding/backpressure behavior.
+  - **Justification:** One place to guarantee data quality, idempotency keys, and predictable ingest behavior under spikes.
+
+- **Kafka**: Buffering and backpressure so ingest survives spikes and downstream deploys; topics are immutable logs.
+  - **Justification:** Absorbs peak traffic and isolates ingestion from compute/storage hiccups.
+
+- **Campaign Config (Postgres)**: Time-versioned (SCD2) campaign/adset/creative/placement mappings with `effective_at` and immutable history.
+  - **Justification:** Attribution depends on “what was true then,” and audits require replaying the exact mapping.
+
+- **Attribution Aggregation**: Streaming job for <15 min prelim cohort aggregates + daily batch job for final snapshots; deterministic dedupe and recomputation keyed by (cohort, day).
+  - **Justification:** Minimal compute needed to produce stable cohort ledgers from immutable logs.
+
+- **Lakehouse Tables**: Object storage + Iceberg/Parquet for append-only raw and versioned derived datasets (prelim snapshots + final snapshots).
+  - **Justification:** Cheap, reproducible backfills and auditable history without mutable state.
+
+- **Reporting API**: The only external read path; enforces allowed query shapes, applies calibrated noise with per-tenant accounting, and exposes `preliminary` vs `final` with “finalized through” watermarks.
+  - **Justification:** Central enforcement point for privacy + stability semantics at serving time.
+
+## Deep Dive: Privacy-Preserving Attribution Under SKAN-Like Constraints
+
+1) **Event-time semantics**
+- Ingestion assigns `event_time` using client timestamp with a bounded skew window; outside the window it falls back to server receive time.
+- Every record also carries `ingest_time`. Aggregation windows are event-time (e.g., UTC day).
+
+2) **Deterministic cohort ledger**
+- All inputs collapse into the same cohort key (campaign/adset/creative, day, coarse geo, placement, device class).
+- SKAN postbacks are treated as platform-decided attribution; the system does not attempt user-level “improvements.”
+- Dedupe is deterministic (platform postback ID + signature; SDK events by event ID). Derived rows use stable keys so recomputation is repeatable.
+
+3) **Privacy enforcement model (simple and testable)**
+- Publish-time enforcement: deterministic rollups + k-thresholding per cohort using a fixed rollup order (e.g., drop placement → drop geo → roll to campaign-only) so suppression is stable and not gameable.
+- Query-time protection: the Reporting API adds calibrated noise using a standard DP primitive library and tracks a per-tenant privacy ledger; identical normalized queries are memoized to prevent repeated re-noising.
+
+4) **Preliminary vs Final**
+- `preliminary`: streaming-updated aggregates; may change due to late arrivals/dedup/config fixes.
+- `final`: daily snapshots frozen after the postback horizon (e.g., 48h) with an explicit “finalized through date” watermark.
+- Every published row includes `dataset_version` and `config_version_used` so audits and rebuilds are unambiguous.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Enforceable privacy guarantees | User-level attribution and path analysis |
+| Stable, auditable metrics | Real-time “perfect” numbers |
+| Small-team operability | Maximum reporting granularity |
+| Reproducible recomputation | Some storage/compute overhead |
+
+## Failure Modes
+
+- **Postgres (Campaign Config) down**
+  - **What happens:** Aggregation can’t fetch config updates; serving can’t resolve metadata.
+  - **Detect:** Config read errors, stale config watermark.
+  - **Recover:** Aggregation and Reporting API use last-known-good config snapshot and continue; outputs are tagged with `config_version_used` until Postgres recovers.
+
+- **Ingestion can’t reach Kafka / Kafka degraded**
+  - **What happens:** Ingestion backlog grows; risk of lost events.
+  - **Detect:** Producer error rate, local queue depth, shed rate.
+  - **Recover:** Ingestion uses a bounded local queue and a clear shedding policy (drop lowest-value events first, record loss counters); SDK calls do not block indefinitely.
+
+- **Bad retroactive config change**
+  - **What happens:** Attribution shifts across campaigns/adsets after edits.
+  - **Detect:** Retroactive effective_at edits, large version-to-version deltas.
+  - **Recover:** Config is immutable by effective date; retroactive changes require approval metadata; rebuild produces a new `dataset_version` and keeps prior versions for audit.
+
+- **Differencing attack across versions / repeated pulls**
+  - **What happens:** An advertiser tries to infer small cohort changes by repeated queries.
+  - **Detect:** Repeated near-identical queries, budget depletion spikes.
+  - **Recover:** Reporting API enforces allowed query shapes, memoizes identical queries, charges privacy budget on cache misses, and rate-limits adversarial patterns.
+
+- **Traffic spike + slow downstream (compute lag / lakehouse writes slow)**
+  - **What happens:** Preliminary freshness slips; backpressure builds.
+  - **Detect:** Kafka consumer lag, checkpoint duration, write latency.
+  - **Recover:** Keep ingestion healthy (Kafka), allow prelim SLO to degrade, and preserve final daily correctness; alert on lag with an explicit playbook.
+
+## What I’d Do Differently At...
+
+- **10x scale:** Partition lakehouse tables aggressively by day and campaign hash; push more aggregation into streaming for daily cohorts; keep final snapshots as the contract.
+- **100x scale:** Split ingestion domains (SKAN vs non-SKAN) only if operationally forced; otherwise keep the same surfaces and scale horizontally.
+
+## Operational Notes
+
+- The only supported metric surface for external consumers is the Reporting API over privacy-cleared aggregates; raw access is break-glass with audit logging.
+- Publish explicit SLAs: preliminary updates every 15 min; final after the postback horizon with a visible “finalized through” watermark.
+- Backfills are versioned rebuilds; the API supports “latest” or pinned `dataset_version` for reproducibility.
+- Monitor schema drift, signature failures, and ingest shedding before they show up as “mystery revenue drops.”
+```
+tokens used
+4,961
+```markdown
+---
+title: "Attribution Measurement System"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["ads", "attribution", "privacy", "skadnetwork", "data-pipeline", "analytics"]
+---
+
+## Overview
+
+This system measures ad performance under SKAdNetwork-like constraints by treating *cohort-level aggregates* as the product. The unit of work is a privacy-safe cohort (campaign × day × coarse geo × placement × device class), not a user journey.
+
+Raw events exist for audit/debug/backfills, but the only externally queryable surface is privacy-cleared cohort aggregates with explicit time/version semantics (`preliminary` vs `final`). Correctness is “stable, reproducible aggregates,” not “perfect matching.”
+
+## What Makes This Hard
+
+SKAN-like signals are delayed, sparse, and intentionally ambiguous, so user-level reconstruction fails and drifts into privacy violations.
+
+The trust-killer is volatility: late postbacks and retroactive config edits rewrite history unless the system is built around event-time windows, immutable datasets, controlled recomputation, and explicit finalization.
+
+## Requirements
+
+### Functional Requirements
+- Ingest three immutable streams: `click`, `conversion`, and `platform_postback` (SKAN-like).
+- Attribute conversions to campaigns at cohort granularity; no user-level reporting.
+- Support dimensions that don’t enable fingerprinting: campaign/adset/creative, day, coarse geo, placement, device class.
+- Enforce privacy constraints in the reporting path: k-anonymity thresholds, suppression/rollups, and calibrated noise.
+- Handle late and duplicated postbacks deterministically; support reproducible backfills.
+- Provide advertiser-facing metrics with stable revision semantics (explicit “data finalized” markers).
+
+### Scale Targets
+- **Ingest:** 1B clicks/day (~12k/s avg, 120k/s peak), 50M conversions/day, 30M postbacks/day.
+- **Freshness:** preliminary aggregates in <15 minutes; daily “final” aggregates within 24–48 hours to absorb platform delays.
+- **Cardinality:** up to 5M active campaigns/month; reporting granularity capped to keep cohorts large (privacy) and queries fast (cost).
+- **Queries:** 200 QPS peak on reporting API, 1–5s p95 for common dashboards.
+
+## What We Removed
+
+- Separate “Event Gateway” and “SKAN Postback API”: replaced with one ingestion service with pluggable validators and a single schema/QoS surface.
+- “Privacy firewall” as a network service: replaced with one shared policy bundle used (a) at publish time for k-thresholding + deterministic rollups and (b) in the Reporting API as a hard query guardrail.
+- “Noise everywhere” ambiguity: noise is applied only in the Reporting API with per-tenant accounting and query-result memoization; aggregates stored in the lakehouse stay deterministic for backfills/audits.
+- “Flink for everything”: prelim is streaming aggregation; final is a daily batch snapshot over the same raw/derived tables to make recomputation and verification boring.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["App / Web SDK"] --> B["Ingestion Service"]
+  D["SKAN Postback API"] --> B
+  B --> C["Kafka"]
+  C --> F["Attribution Aggregation"]
+  E["Campaign Config (Postgres)"] --> F
+  F --> G["Lakehouse Tables"]
+  G --> H["Reporting API"]
+  E --> H
+```
+
+### Components
+
+- **App / Web SDK**: Emits clicks and conversions where allowed; avoids stable device identifiers in privacy-restricted contexts.
+  - **Justification:** Only source of first-party event signals.
+
+- **Ingestion Service**: Single front door for SDK events and signed postbacks; authenticates, validates schemas/signatures, assigns event-time, and writes to Kafka with explicit shedding/backpressure behavior.
+  - **Justification:** One place to guarantee data quality, idempotency keys, and predictable ingest behavior under spikes.
+
+- **Kafka**: Buffering and backpressure so ingest survives spikes and downstream deploys; topics are immutable logs.
+  - **Justification:** Absorbs peak traffic and isolates ingestion from compute/storage hiccups.
+
+- **Campaign Config (Postgres)**: Time-versioned (SCD2) campaign/adset/creative/placement mappings with `effective_at` and immutable history.
+  - **Justification:** Attribution depends on “what was true then,” and audits require replaying the exact mapping.
+
+- **Attribution Aggregation**: Streaming job for <15 min prelim cohort aggregates + daily batch job for final snapshots; deterministic dedupe and recomputation keyed by (cohort, day).
+  - **Justification:** Minimal compute needed to produce stable cohort ledgers from immutable logs.
+
+- **Lakehouse Tables**: Object storage + Iceberg/Parquet for append-only raw and versioned derived datasets (prelim snapshots + final snapshots).
+  - **Justification:** Cheap, reproducible backfills and auditable history without mutable state.
+
+- **Reporting API**: The only external read path; enforces allowed query shapes, applies calibrated noise with per-tenant accounting, and exposes `preliminary` vs `final` with “finalized through” watermarks.
+  - **Justification:** Central enforcement point for privacy + stability semantics at serving time.
+
+## Deep Dive: Privacy-Preserving Attribution Under SKAN-Like Constraints
+
+1) **Event-time semantics**
+- Ingestion assigns `event_time` using client timestamp with a bounded skew window; outside the window it falls back to server receive time.
+- Every record also carries `ingest_time`. Aggregation windows are event-time (e.g., UTC day).
+
+2) **Deterministic cohort ledger**
+- All inputs collapse into the same cohort key (campaign/adset/creative, day, coarse geo, placement, device class).
+- SKAN postbacks are treated as platform-decided attribution; the system does not attempt user-level “improvements.”
+- Dedupe is deterministic (platform postback ID + signature; SDK events by event ID). Derived rows use stable keys so recomputation is repeatable.
+
+3) **Privacy enforcement model (simple and testable)**
+- Publish-time enforcement: deterministic rollups + k-thresholding per cohort using a fixed rollup order (e.g., drop placement → drop geo → roll to campaign-only) so suppression is stable and not gameable.
+- Query-time protection: the Reporting API adds calibrated noise using a standard DP primitive library and tracks a per-tenant privacy ledger; identical normalized queries are memoized to prevent repeated re-noising.
+
+4) **Preliminary vs Final**
+- `preliminary`: streaming-updated aggregates; may change due to late arrivals/dedup/config fixes.
+- `final`: daily snapshots frozen after the postback horizon (e.g., 48h) with an explicit “finalized through date” watermark.
+- Every published row includes `dataset_version` and `config_version_used` so audits and rebuilds are unambiguous.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Enforceable privacy guarantees | User-level attribution and path analysis |
+| Stable, auditable metrics | Real-time “perfect” numbers |
+| Small-team operability | Maximum reporting granularity |
+| Reproducible recomputation | Some storage/compute overhead |
+
+## Failure Modes
+
+- **Postgres (Campaign Config) down**
+  - **What happens:** Aggregation can’t fetch config updates; serving can’t resolve metadata.
+  - **Detect:** Config read errors, stale config watermark.
+  - **Recover:** Aggregation and Reporting API use last-known-good config snapshot and continue; outputs are tagged with `config_version_used` until Postgres recovers.
+
+- **Ingestion can’t reach Kafka / Kafka degraded**
+  - **What happens:** Ingestion backlog grows; risk of lost events.
+  - **Detect:** Producer error rate, local queue depth, shed rate.
+  - **Recover:** Ingestion uses a bounded local queue and a clear shedding policy (drop lowest-value events first, record loss counters); SDK calls do not block indefinitely.
+
+- **Bad retroactive config change**
+  - **What happens:** Attribution shifts across campaigns/adsets after edits.
+  - **Detect:** Retroactive effective_at edits, large version-to-version deltas.
+  - **Recover:** Config is immutable by effective date; retroactive changes require approval metadata; rebuild produces a new `dataset_version` and keeps prior versions for audit.
+
+- **Differencing attack across versions / repeated pulls**
+  - **What happens:** An advertiser tries to infer small cohort changes by repeated queries.
+  - **Detect:** Repeated near-identical queries, budget depletion spikes.
+  - **Recover:** Reporting API enforces allowed query shapes, memoizes identical queries, charges privacy budget on cache misses, and rate-limits adversarial patterns.
+
+- **Traffic spike + slow downstream (compute lag / lakehouse writes slow)**
+  - **What happens:** Preliminary freshness slips; backpressure builds.
+  - **Detect:** Kafka consumer lag, checkpoint duration, write latency.
+  - **Recover:** Keep ingestion healthy (Kafka), allow prelim SLO to degrade, and preserve final daily correctness; alert on lag with an explicit playbook.
+
+## What I’d Do Differently At...
+
+- **10x scale:** Partition lakehouse tables aggressively by day and campaign hash; push more aggregation into streaming for daily cohorts; keep final snapshots as the contract.
+- **100x scale:** Split ingestion domains (SKAN vs non-SKAN) only if operationally forced; otherwise keep the same surfaces and scale horizontally.
+
+## Operational Notes
+
+- The only supported metric surface for external consumers is the Reporting API over privacy-cleared aggregates; raw access is break-glass with audit logging.
+- Publish explicit SLAs: preliminary updates every 15 min; final after the postback horizon with a visible “finalized through” watermark.
+- Backfills are versioned rebuilds; the API supports “latest” or pinned `dataset_version` for reproducibility.
+- Monitor schema drift, signature failures, and ingest shedding before they show up as “mystery revenue drops.”
+```
+[Pass 4/4] Mermaid diagrams fixed
+
+==========================================
+Completed (v2): Attribution Measurement System
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/attribution-measurement-system.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/attribution-measurement-system.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/10-strategic-problems/attribution-measurement-system.md

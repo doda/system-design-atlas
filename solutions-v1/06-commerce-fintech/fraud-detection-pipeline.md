@@ -1,0 +1,381 @@
+---
+title: "Fraud Detection Pipeline"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["fraud-detection", "streaming", "ml-inference", "feature-store", "rules-engine", "kafka", "flink"]
+---
+
+# Fraud Detection Pipeline
+
+## Overview
+
+This system scores card and account-to-account transactions in real time and returns a deterministic decision (`ALLOW | CHALLENGE | DENY`), a `risk_score` in `[0,1]`, and explainable `reason_codes`. The design prioritizes tail latency, auditability, safe rollouts for rules/models, and resilience when dependencies degrade.
+
+The architecture uses a single online service for scoring plus a small set of supporting data stores and background workers for feature maintenance, exports, and learning workflows. Online decisioning stays region-affine to meet latency SLOs; asynchronous processing improves decision quality without impacting the fast path.
+
+---
+
+## Requirements
+
+### Functional
+- Real-time scoring for every transaction:
+  - `decision` ∈ `ALLOW | CHALLENGE | DENY`
+  - `risk_score` ∈ `[0, 1]`
+  - `reason_codes` (human/actionable)
+- Versioned rules:
+  - authoring, unit tests, backtests, staged rollout, audit trail, instant rollback
+- Near-real-time features:
+  - velocity (spend/count), device reputation, merchant risk, geo anomalies (incrementally expanded)
+- Online ML inference:
+  - model versioning, shadow evaluation, A/B routing, fast rollback
+- Durable decision audit record:
+  - decision, score, reasons, rule/model versions, feature schema version, feature digest
+- Case management hooks:
+  - queue suspicious decisions, analyst annotations, outcomes
+- Labels ingestion:
+  - chargebacks, confirmed fraud, manual review outcomes
+- Monitoring and alerting:
+  - latency, availability, dependency health, drift, feature freshness, rollout safety
+
+### Non-Functional (SLOs)
+- **Traffic:** steady 5,000 TPS; burst 50,000 TPS for 5–10 minutes
+- **Latency (client → decision):** P50 < 30ms; P99 < 120ms
+- **Availability:** Scoring API 99.99% monthly (multi-AZ per region)
+- **Durability/Audit:** decision record RPO ≤ 1 minute, RTO ≤ 30 minutes
+- **Consistency:** strong consistency per region for idempotency + decision persistence
+- **Security/Compliance:** tokenized PAN only; encrypt PII; strict RBAC/ABAC; audited access; deterministic explainability
+
+### Constraints
+- Two regions, multi-AZ per region
+- Region-affine scoring (no cross-region calls on the online path)
+- Third-party risk providers are optional enrichments and never required inline
+- Team size 6–10 engineers; prefer low operational surface and safe iteration
+
+---
+
+## Simplified Architecture
+
+### Design Principles
+- Hard latency budgets with per-dependency timeouts and circuit breakers
+- Deterministic decisioning: same inputs + same versions → same output
+- Audit-first: persist exactly what was decided and why
+- Control-plane changes (rules/models) are isolated from request processing via signed/versioned artifacts
+- Replayable async processing via a DB-backed outbox
+
+### High-Level Diagram
+
+```mermaid
+flowchart TB
+  C[Client / Processor] --> E[Edge + Auth]
+  E --> F[Fraud API]
+  F --> R[(Redis Counters)]
+  F --> P[(Postgres)]
+  F --> O[Object Storage]
+
+  P --> W[Background Workers]
+  W --> R
+  W --> O
+  W --> P
+```
+
+**What each node does**
+- **Fraud API:** synchronous scoring (rules + ML), feature reads, idempotency, audit writes
+- **Redis Counters:** hot velocity counters and short-lived signals
+- **Postgres:** source of truth for decisions, idempotency, rules/models metadata, outbox, labels, cases
+- **Background Workers:** publish/export outbox, maintain derived signals, run backtests, feed training datasets
+- **Object Storage:** immutable artifacts (rules/model bundles) and append-only exports for analytics/training
+
+---
+
+## Online Request Lifecycle (Fast Path)
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant E as Edge/Auth
+  participant F as Fraud API
+  participant R as Redis
+  participant P as Postgres
+
+  C->>E: POST /v1/score (Idempotency-Key)
+  E->>F: Forward request
+  F->>P: Upsert idempotency (key + payload_hash)
+  alt Duplicate retry (same payload)
+    P-->>F: Stored response
+    F-->>C: Return stored response
+  else First time
+    F->>R: Read feature counters (batched)
+    F->>F: Evaluate rules + run model (local)
+    F->>P: Insert decision (immutable audit row)
+    F->>P: Insert outbox event (same DB txn)
+    F->>R: Update counters (non-blocking, bounded)
+    F-->>C: decision + score + reasons + versions
+  end
+```
+
+**Latency budgeting (P99 target < 120ms)**
+- Redis reads (batched): 10–25ms
+- Rules + model (local): 5–25ms (model-dependent)
+- Postgres write (idempotency + decision + outbox): 10–30ms
+- Remaining budget: edge/auth, serialization, headroom
+
+---
+
+## Async Feature & Learning Flow
+
+```mermaid
+flowchart LR
+  P[(Postgres Outbox)] --> W[Workers]
+  W --> O[(Object Storage)]
+  O --> T[Training/Backtests]
+  T --> B[Signed Bundle]
+  B --> F[Fraud API]
+```
+
+- Workers export `txn.scored` and label streams to object storage in periodic batches (e.g., 1–5 minutes) for training and audits.
+- Rules and models are published as **versioned, signed bundles** that the Fraud API hot-reloads safely.
+
+---
+
+## Core Components
+
+### Edge + Auth
+**Responsibilities**
+- Authentication/authorization (mTLS for internal, OAuth/JWT for partners)
+- Rate limiting and abuse protection
+- Request schema validation and normalization
+
+**Key decisions**
+- Validate early to protect downstream latency
+- Per-tenant quotas with burst controls
+
+---
+
+### Fraud API (Scoring + Rules + Model + Admin)
+A single service with modular components:
+- **Scoring (data plane):** handles `/v1/score`, budgets, dependency timeouts, deterministic decisioning
+- **Rules engine:** local evaluation of a signed rules bundle, returns matched rule IDs and `reason_codes`
+- **Model inference:** local inference for a fast, bounded model (e.g., GBDT via ONNX/Treelite); loaded by version
+- **Admin/control endpoints:** rulesets, model versions, rollout routing, backtests (invokes workers)
+
+**Key decisions**
+- **Idempotency:** unique key `(tenant_id, transaction_id, idempotency_key)` with `payload_hash`
+- **Determinism:** decision record includes `rules_version`, `model_version`, `feature_schema_version`, `features_digest`
+- **Degradation policy:** tenant-configurable fail-open vs fail-closed when Redis/Postgres/model load degrades
+
+---
+
+### Redis Counters (Online Feature Store)
+**Responsibilities**
+- Ultra-low-latency velocity counters and short-lived risk signals:
+  - counts/amounts per entity (account, card, device, merchant, IP) for rolling windows
+
+**Key decisions**
+- Batched multi-get reads to avoid N+1
+- TTL aligned to window + buffer (e.g., 24h window → TTL 30h)
+- Writes are bounded and non-blocking in the online path (timeouts + fallbacks)
+
+---
+
+### Postgres (System of Record)
+**Responsibilities**
+- Strong consistency per region for:
+  - idempotency keys and stored responses
+  - immutable decision records (audit)
+  - outbox events for async processing
+  - rules/model metadata, rollouts, labels, case records
+
+**Key decisions**
+- Multi-AZ deployment per region with PITR
+- Partitioning strategy for high write volumes (by time and/or tenant) as volume grows
+- Read replicas for analytics/lookups to protect the write path
+
+---
+
+### Background Workers
+**Responsibilities**
+- Outbox processing:
+  - export scored events and labels to object storage
+  - trigger case hooks
+- Derived signals maintenance:
+  - periodic reconciliation for critical counters/signals
+- Backtests:
+  - run rules/model backtests over exported datasets
+- Training pipeline orchestration:
+  - generate datasets, run training, publish signed bundles
+
+**Correctness model**
+- At-least-once processing with idempotent handlers keyed by `event_id`
+- Replay from outbox for recovery and backfills
+
+---
+
+### Object Storage (Artifacts + Exports)
+**Responsibilities**
+- Versioned artifacts:
+  - signed rules bundles, model bundles, feature schema manifests
+- Append-only exports for audits/training:
+  - periodic parquet/ndjson snapshots of `txn.scored` and labels
+
+---
+
+## Data Model (Postgres)
+
+### Tables (illustrative)
+
+- `idempotency_keys`
+  - `tenant_id`, `transaction_id`, `idempotency_key`
+  - `payload_hash`
+  - `decision_id`
+  - `response_json` (optional, exact replay)
+  - `created_at`
+  - Unique: `(tenant_id, transaction_id, idempotency_key)`
+
+- `decisions` (immutable)
+  - `decision_id` (UUID PK)
+  - `tenant_id`, `transaction_id`, `created_at`
+  - `decision`, `risk_score`, `reason_codes`
+  - `rules_version`, `model_version` (nullable), `feature_schema_version`
+  - `features_digest`
+  - `latency_ms`, `degradation_flags`
+  - Index: `(tenant_id, transaction_id)`, `(created_at)`
+
+- `outbox_events`
+  - `event_id` (UUID PK)
+  - `event_type` (e.g., `txn.scored.v1`)
+  - `aggregate_key` (e.g., `transaction_id`)
+  - `payload` (jsonb or bytes)
+  - `created_at`, `published_at` (nullable)
+
+- `rulesets`
+  - `rules_version` (PK)
+  - `status` (DRAFT/SHADOW/CANARY/ACTIVE/ROLLED_BACK)
+  - `bundle_uri`
+  - `created_by`, `created_at`, `change_summary`
+
+- `models`
+  - `model_version` (PK)
+  - `bundle_uri`
+  - `feature_schema_version`
+  - `metrics_json`
+  - `status` (STAGED/ACTIVE/ROLLED_BACK)
+  - `created_at`, `created_by`
+
+- `labels`
+  - `tenant_id`, `transaction_id`, `label`, `source`
+  - `occurred_at`, `created_at`
+  - Unique: `(tenant_id, transaction_id, label, source)`
+
+- `cases` (optional)
+  - `case_id` (UUID PK)
+  - `tenant_id`, `transaction_id`
+  - `status`, `assignee`, `notes`
+  - `created_at`, `updated_at`
+
+---
+
+## API Design
+
+### Online Scoring
+**POST `/v1/score`**
+- Headers: `Idempotency-Key: <uuid>`
+- Request and response shape follow the input document (decision + versions + reason codes).
+
+**Errors**
+- `400` invalid payload
+- `401/403` auth failures
+- `409` idempotency conflict (same key, different payload hash)
+- `429` rate limited
+- `503` scoring unavailable (tenant policy fail-closed with no safe fallback)
+
+### Decision Lookup
+**GET `/v1/decisions/{decision_id}`**
+- Returns the stored decision and audit metadata (PII minimized).
+
+### Labels Ingestion
+**POST `/v1/labels`**
+- Idempotent on `(tenant_id, transaction_id, label, source)`.
+
+### Rules Management (Admin)
+- **POST `/v1/rulesets`** create version metadata + upload reference
+- **POST `/v1/rulesets/{version}/backtest`** triggers worker backtest job over exported datasets
+- **POST `/v1/rulesets/{version}/rollout`** sets stage/traffic %
+- **POST `/v1/rulesets/{version}/rollback`** reactivates last known good version
+
+### Model Management (Admin)
+- **POST `/v1/models`** registers a new model bundle version and metadata
+- **POST `/v1/models/{version}/rollout`** staged routing/shadow/active
+- **POST `/v1/models/{version}/rollback`** immediate routing rollback
+
+---
+
+## Scaling & Performance
+
+### Throughput
+- **Fraud API:** stateless horizontal scale; autoscale on in-flight concurrency and tail latency
+- **Redis:** shard/cluster as needed; keys designed for even distribution across entities
+- **Postgres:** multi-AZ primary for writes; read replicas for lookups and analytics; partitions for high-volume tables as growth dictates
+- **Workers:** scale independently for export/backtest/training throughput without impacting scoring
+
+### Hot paths
+- Keep feature access to **bounded, batched Redis reads**
+- Keep inference local with predictable compute and memory footprint
+- Keep online database work to **one idempotency check and one immutable decision write**, plus an outbox row in the same transaction
+
+---
+
+## Failure Modes & Mitigations
+
+### Redis degraded
+- Detection: read P99, error rate, missing-counter rate, evictions
+- Mitigation: strict timeouts, partial feature vectors, conservative decision policy, record degradation flags
+
+### Postgres degraded
+- Detection: write latency, pool exhaustion, replication lag/failover events
+- Mitigation: admission control, priority for idempotency+decision writes, multi-AZ failover, tenant fail-open/closed policy
+
+### Model bundle load failure
+- Detection: version load errors, checksum/signature failures
+- Mitigation: pin last-known-good model version, block promotion, fast rollback routing
+
+### Worker backlog / export delay
+- Detection: outbox lag, export freshness SLA
+- Mitigation: scale workers, replay from outbox, isolate high-priority exports (e.g., `txn.scored`)
+
+---
+
+## Operational Considerations
+
+### Observability
+- Scoring: request rate, P50/P99 latency, error rate, dependency timeouts, degradation flag rates
+- Decision quality: decision distribution shifts per tenant/segment, approval/chargeback rates, manual review overturn rate
+- Redis: latency, errors, evictions, memory pressure
+- Postgres: write latency, locks, replication lag, failover metrics
+- Workers: outbox lag, export freshness, job failure rates
+- Drift: feature distribution checks and shadow model deltas based on exported data
+
+### Security & Compliance
+- Tokenized PAN only; never log raw PAN
+- Encrypt PII at rest/in transit; KMS-backed keys
+- Strict RBAC/ABAC for admin endpoints; audited access to rules/model changes and decision lookups
+- Signed bundles for rules/models with verification on load
+
+### Runbooks (minimum)
+- Postgres stress: enable admission control; confirm idempotency correctness; failover if needed
+- Redis stress: reduce optional features; confirm conservative mode; address eviction/memory pressure
+- Bad rollout: rollback rules/model routing; verify decision distribution and key business KPIs
+- Worker lag: scale workers; verify outbox replay; confirm export freshness recovery
+
+---
+
+## Simplification Notes
+
+- **Removed:** dedicated event bus + stream processing layer; async processing uses Postgres outbox + workers with replayable, idempotent handlers, which preserves durability and recovery semantics while keeping operations compact.
+- **Removed:** separate inference service; online inference runs locally in the Fraud API using a versioned model bundle, keeping latency predictable and reducing service-to-service dependencies.
+- **Removed:** multi-tier online feature store (hot Redis + separate durable KV); the online path uses Redis for velocity/hot signals and Postgres for durable metadata, keeping the feature surface area intentionally small.
+- **Removed:** lakehouse-specific infrastructure; exports to object storage provide immutable datasets for training/backtesting and audits with a single storage primitive.
+
+- **Merged:** scoring, rules evaluation, model inference, and control-plane APIs into one Fraud API with modular boundaries, enabling consistent rollouts and a single operational on-call surface.
+- **Merged:** feature computation and exports into background workers driven by the same outbox stream, ensuring consistent replay and a single correctness model.
+
+- **Complexity retained:** multi-region/multi-AZ deployments, strong per-region consistency for idempotency/audit, signed versioned artifacts for safe rollouts, and an outbox-based async pipeline for replayability—each is required to meet the stated availability, audit, and rollback requirements.

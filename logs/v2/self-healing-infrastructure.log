@@ -1,0 +1,1641 @@
+==========================================
+Generating (v2): Self-Healing Infrastructure
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2e5e-72f2-937e-22f95719c2d4
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Self-Healing Infrastructure
+**Category**: Strategic Problems
+
+**Problem Statement**:
+Design a control loop that detects zombie processes or memory leaks and recycles instances without dropping traffic.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+thinking
+**Designing cloud-native solutions**
+
+I’m planning to keep things mostly cloud-native with Kubernetes and a few strategies like PodDisruptionBudgets, readiness gating, and preStop hooks. The term "instances" is vague; it could refer to nodes or application instances, so I’ll design for a fleet behind a Layer 7 load balancer. A key insight is to separate detection from remediation and treat remediation as a safe state transition. I’ll use a controller with key signals to ensure efficient recycling of resources.
+thinking
+**Proposing remediation strategies**
+
+I’m considering focusing on detecting symptoms rather than root causes, as stuck zombie processes can fill the PID table and indicate an app bug. The remediation would involve restarting the pod after a graceful drain. For VMs, we would recycle them as needed. I’ll include a mermaid diagram with up to eight nodes, illustrating the flow from clients through the control plane to the instances. There will be sections detailing "Safe recycling with zero drop" and outlining trade-offs and failure modes.
+codex
+```markdown
+---
+title: "Self-Healing Infrastructure"
+category: "Strategic Problems"
+difficulty: "Medium"
+tags: ["control-loop", "sre", "kubernetes", "traffic-draining", "reliability"]
+---
+
+## Overview
+
+This system is a control loop that detects *degrading instances* (zombie accumulation, runaway memory growth) and recycles them without dropping traffic. The key insight is that **recycling is the easy part**—the elegant design is making recycling *safe*: explicit draining, bounded disruption, and anti-flap hysteresis.
+
+The architecture separates concerns: a **local signal layer** (what’s happening on the box/container) and a **global remediation layer** (what actions are safe right now). Detection produces a small set of high-confidence “actionable” conditions; remediation is an idempotent state machine that moves an instance through *in-service → draining → terminated → replaced* under strict budgets.
+
+This keeps the system boring: Prometheus for signals, Kubernetes (or an ASG equivalent) for replacement, and Envoy/LB semantics for draining. The only custom logic is the policy and state machine—which is exactly where the differentiation belongs.
+
+## What Makes This Hard
+
+Naive implementations confuse “unhealthy” with “kill it now”. That drops traffic because load balancers and clients are still using the instance, long-lived connections get severed, and retries amplify load (self-inflicted DDoS). The real trap is **flapping**: transient spikes trigger restarts, restarts cause warmup latency and cache misses, which trigger more restarts.
+
+The second trap is relying on a single symptom. Zombies and leaks rarely fail cleanly; they degrade. If you only act on OOMKills, you recycle too late. If you act on raw RSS, you recycle too early. The design needs **trend-based signals + gating + disruption budgets**.
+
+## Requirements
+
+### Functional Requirements
+- Detect and remediate:
+  - Zombie process accumulation (increasing `process_state{state="Z"}` or rising “unreaped children” indicators)
+  - Memory leaks (monotonic RSS/heap growth over time under steady load)
+- Recycle instances without dropping traffic:
+  - Stop sending *new* requests before termination
+  - Allow in-flight requests to complete up to a bounded drain timeout
+- Prevent self-harm:
+  - Global disruption budget per service/cluster
+  - Cooldowns and hysteresis to avoid flapping
+  - Safe-mode when signals are stale or control plane is impaired
+- Provide auditability:
+  - Every recycle decision is explainable from recorded signals and policy
+
+### Scale Targets
+- Fleet: 5,000 instances across 50 services (typical mid-large platform)
+- Detection latency: 15–30s (fast enough to catch runaway, slow enough to smooth noise)
+- Remediation rate limit: max 1% of a service per 10 minutes (prevents brownouts)
+- SLO constraint: recycling must not increase 5xx beyond 0.01% during steady state (forces real draining, not “best effort”)
+
+## Key Design Decisions
+
+- **Chose:** Explicit *instance lifecycle state machine* (InService → Draining → Recycled)
+  - **Rejected:** “Restart on alert” scripts
+  - **Why:** Safe recycling requires ordered steps, timeouts, and idempotency; scripts become untestable spaghetti under real failures.
+
+- **Chose:** Trend + gating signals (rate-of-change, persistence windows) over single thresholds
+  - **Rejected:** One-shot “RSS > X” or “zombies > Y” triggers
+  - **Why:** Leaks and zombie accumulation are *slopes*, not points; gating eliminates noise and flapping.
+
+- **Chose:** Enforced disruption budgets (PDB-style) as a hard constraint
+  - **Rejected:** “Trust the controller to be careful”
+  - **Why:** Budgeting is the only reliable way to keep remediation from becoming the outage.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Clients] --> LB["L7 Load Balancer"]
+  LB --> I["Service Instances"]
+
+  I --> A["Node/Pod Agent"]
+  A --> P["Prometheus"]
+  P --> H["Healer Controller"]
+  H --> O["Orchestrator API"]
+  O --> I
+```
+
+### Components
+
+- **Service Instances**: The units we recycle (pods/VMs). They expose readiness, drain hooks, and basic health endpoints.
+- **L7 Load Balancer**: The traffic gate. It must support removing endpoints quickly (readiness/health) and respecting connection draining.
+- **Node/Pod Agent**: A small daemon that emits *actionable* signals: zombie count, process count, RSS/heap, OOM events, restart loops. This is the only place that touches `/proc` and cgroups.
+- **Prometheus**: The truth source for time-series trends and persistence windows. Also stores “why did we recycle this” evidence.
+- **Healer Controller**: The policy engine + state machine. It decides *when* recycling is safe and executes the drain/recycle sequence.
+- **Orchestrator API**: Kubernetes/ASG interface that cordons/drains/replaces instances. We use standard primitives (readiness gates, PDBs, rollouts).
+
+## Deep Dive: Safe Recycling Without Dropping Traffic
+
+The hardest part is turning “this instance is sick” into “this instance is gone” without interrupting real user traffic. The controller treats recycling as a **transaction with invariants**:
+
+1. **Acquire permission (budget + safety gates)**
+   - Check disruption budget: e.g., at least `N` healthy instances remain and max `K` concurrent drains for this service.
+   - Check signal freshness: Prometheus scrape age < 2 intervals; otherwise, enter safe-mode (no action).
+   - Check service health: if error rate is already elevated, pause recycling (don’t worsen an incident).
+
+2. **Enter Draining (stop new traffic first)**
+   - Flip instance to **NotReady** (Kubernetes readiness gate) so it is removed from LB/service discovery.
+   - Wait for propagation: confirm endpoint removal via control-plane observation (e.g., endpoints list no longer includes it).
+   - Start a drain timer.
+
+3. **Grace period for in-flight work**
+   - For HTTP: rely on Envoy/LB connection draining + server-side graceful shutdown.
+   - For async workers: stop fetching new jobs, finish current lease, and extend visibility timeouts accordingly.
+   - Enforce a hard deadline: draining is bounded (e.g., 60–120s). Past that, terminate anyway to avoid “immortal drains”.
+
+4. **Recycle (idempotent)**
+   - Terminate the instance (delete pod / terminate VM).
+   - Replacement is handled by the orchestrator’s normal reconciliation (ReplicaSet/ASG).
+   - Record an event with the precise trigger window (zombie slope, memory slope, persistence duration).
+
+5. **Post-check and cooldown**
+   - Observe service error rate and latency for a short window.
+   - Apply cooldown per service to avoid synchronized churn (the classic “everyone leaked at the same time” scenario).
+
+### Detection that’s actually actionable
+
+Two examples of signals that work in practice:
+
+- **Zombie accumulation**
+  - Trigger on *sustained growth* in zombies, not absolute count:
+    - `zombie_slope = deriv(process_state{state="Z"}[10m])`
+    - Action when `zombie_slope > 0` for 10m **and** total zombies exceeds a small floor (filters noise).
+  - Rationale: one-off zombies happen; monotonically increasing zombies means something isn’t reaping and will eventually hit PID/resource limits.
+
+- **Memory leak**
+  - Use a trend with workload normalization:
+    - `rss_slope = deriv(container_memory_rss[30m])`
+    - Gate on stable request rate (avoid mistaking load spikes for leaks).
+  - Act *before* OOM: once OOM happens, you’ve already impacted latency and retry storms.
+
+The controller doesn’t pretend to “fix” the leak; it restores a healthy steady state while surfacing a crisp, debuggable signal to engineers.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Zero-drop recycling via draining | Faster “kill it now” remediation |
+| Bounded disruption with budgets | Maximum remediation throughput |
+| High-confidence, trend-based triggers | Detecting extremely rare edge cases quickly |
+| Simple primitives (readiness, PDB, drain) | “Smart” in-process self-repair magic |
+
+## Failure Modes
+
+- **False positives cause churn**
+  - *What happens:* Instances recycle unnecessarily; warmups and cache misses degrade p95.
+  - *Detect:* Spike in recycle rate, elevated cold-start latency, stable error rate but rising latency.
+  - *Recover:* Tighten persistence windows, add workload-stability gates, reduce budget temporarily; ship a “no recycle during incident” guardrail.
+
+- **Drain gets stuck (hung connections / stuck workers)**
+  - *What happens:* Instances remain in Draining; capacity shrinks.
+  - *Detect:* Draining duration exceeds SLA; concurrent drains hits budget ceiling.
+  - *Recover:* Enforce hard drain timeout; terminate after deadline; require services to implement graceful shutdown correctly.
+
+- **Control plane / metrics outage**
+  - *What happens:* Stale signals lead to bad decisions—or no decisions when needed.
+  - *Detect:* Scrape age alarms, controller can’t observe endpoints, API errors.
+  - *Recover:* Fail closed: stop initiating new recycling; allow only local protections (OOMKill, liveness) until signals recover.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move from per-instance decisions to *cohort* decisions (batch draining with jitter), shard the controller by service, and add per-service “risk budgets” that vary by criticality.
+- **100x scale:** Treat remediation as a first-class platform product: dedicated remediation pipeline, stronger dependency-aware constraints (don’t recycle all of a tier across AZs), and richer signal attribution (eBPF profiles, heap sampling) to reduce false positives.
+
+## Operational Notes
+
+- The controller must be boring and predictable: **rate limits, budgets, and clear state transitions** matter more than clever detection.
+- Enforce “drain correctness” as a platform contract: readiness must cut off new traffic quickly, and shutdown must be graceful within the drain timeout.
+- Alert on *trends in remediation*: recycling rate and time-in-drain are leading indicators of systemic issues (leaks, deploy regressions, traffic shifts).
+- Always log the “why” with the “what”: remediation without explainability becomes un-debuggable and will get turned off during the first incident.
+```
+tokens used
+3,061
+```markdown
+---
+title: "Self-Healing Infrastructure"
+category: "Strategic Problems"
+difficulty: "Medium"
+tags: ["control-loop", "sre", "kubernetes", "traffic-draining", "reliability"]
+---
+
+## Overview
+
+This system is a control loop that detects *degrading instances* (zombie accumulation, runaway memory growth) and recycles them without dropping traffic. The key insight is that **recycling is the easy part**—the elegant design is making recycling *safe*: explicit draining, bounded disruption, and anti-flap hysteresis.
+
+The architecture separates concerns: a **local signal layer** (what’s happening on the box/container) and a **global remediation layer** (what actions are safe right now). Detection produces a small set of high-confidence “actionable” conditions; remediation is an idempotent state machine that moves an instance through *in-service → draining → terminated → replaced* under strict budgets.
+
+This keeps the system boring: Prometheus for signals, Kubernetes (or an ASG equivalent) for replacement, and Envoy/LB semantics for draining. The only custom logic is the policy and state machine—which is exactly where the differentiation belongs.
+
+## What Makes This Hard
+
+Naive implementations confuse “unhealthy” with “kill it now”. That drops traffic because load balancers and clients are still using the instance, long-lived connections get severed, and retries amplify load (self-inflicted DDoS). The real trap is **flapping**: transient spikes trigger restarts, restarts cause warmup latency and cache misses, which trigger more restarts.
+
+The second trap is relying on a single symptom. Zombies and leaks rarely fail cleanly; they degrade. If you only act on OOMKills, you recycle too late. If you act on raw RSS, you recycle too early. The design needs **trend-based signals + gating + disruption budgets**.
+
+## Requirements
+
+### Functional Requirements
+- Detect and remediate:
+  - Zombie process accumulation (increasing `process_state{state="Z"}` or rising “unreaped children” indicators)
+  - Memory leaks (monotonic RSS/heap growth over time under steady load)
+- Recycle instances without dropping traffic:
+  - Stop sending *new* requests before termination
+  - Allow in-flight requests to complete up to a bounded drain timeout
+- Prevent self-harm:
+  - Global disruption budget per service/cluster
+  - Cooldowns and hysteresis to avoid flapping
+  - Safe-mode when signals are stale or control plane is impaired
+- Provide auditability:
+  - Every recycle decision is explainable from recorded signals and policy
+
+### Scale Targets
+- Fleet: 5,000 instances across 50 services (typical mid-large platform)
+- Detection latency: 15–30s (fast enough to catch runaway, slow enough to smooth noise)
+- Remediation rate limit: max 1% of a service per 10 minutes (prevents brownouts)
+- SLO constraint: recycling must not increase 5xx beyond 0.01% during steady state (forces real draining, not “best effort”)
+
+## Key Design Decisions
+
+- **Chose:** Explicit *instance lifecycle state machine* (InService → Draining → Recycled)
+  - **Rejected:** “Restart on alert” scripts
+  - **Why:** Safe recycling requires ordered steps, timeouts, and idempotency; scripts become untestable spaghetti under real failures.
+
+- **Chose:** Trend + gating signals (rate-of-change, persistence windows) over single thresholds
+  - **Rejected:** One-shot “RSS > X” or “zombies > Y” triggers
+  - **Why:** Leaks and zombie accumulation are *slopes*, not points; gating eliminates noise and flapping.
+
+- **Chose:** Enforced disruption budgets (PDB-style) as a hard constraint
+  - **Rejected:** “Trust the controller to be careful”
+  - **Why:** Budgeting is the only reliable way to keep remediation from becoming the outage.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Clients] --> LB["L7 Load Balancer"]
+  LB --> I["Service Instances"]
+
+  I --> A["Node/Pod Agent"]
+  A --> P["Prometheus"]
+  P --> H["Healer Controller"]
+  H --> O["Orchestrator API"]
+  O --> I
+```
+
+### Components
+
+- **Service Instances**: The units we recycle (pods/VMs). They expose readiness, drain hooks, and basic health endpoints.
+- **L7 Load Balancer**: The traffic gate. It must support removing endpoints quickly (readiness/health) and respecting connection draining.
+- **Node/Pod Agent**: A small daemon that emits *actionable* signals: zombie count, process count, RSS/heap, OOM events, restart loops. This is the only place that touches `/proc` and cgroups.
+- **Prometheus**: The truth source for time-series trends and persistence windows. Also stores “why did we recycle this” evidence.
+- **Healer Controller**: The policy engine + state machine. It decides *when* recycling is safe and executes the drain/recycle sequence.
+- **Orchestrator API**: Kubernetes/ASG interface that cordons/drains/replaces instances. We use standard primitives (readiness gates, PDBs, rollouts).
+
+## Deep Dive: Safe Recycling Without Dropping Traffic
+
+The hardest part is turning “this instance is sick” into “this instance is gone” without interrupting real user traffic. The controller treats recycling as a **transaction with invariants**:
+
+1. **Acquire permission (budget + safety gates)**
+   - Check disruption budget: e.g., at least `N` healthy instances remain and max `K` concurrent drains for this service.
+   - Check signal freshness: Prometheus scrape age < 2 intervals; otherwise, enter safe-mode (no action).
+   - Check service health: if error rate is already elevated, pause recycling (don’t worsen an incident).
+
+2. **Enter Draining (stop new traffic first)**
+   - Flip instance to **NotReady** (Kubernetes readiness gate) so it is removed from LB/service discovery.
+   - Wait for propagation: confirm endpoint removal via control-plane observation (e.g., endpoints list no longer includes it).
+   - Start a drain timer.
+
+3. **Grace period for in-flight work**
+   - For HTTP: rely on Envoy/LB connection draining + server-side graceful shutdown.
+   - For async workers: stop fetching new jobs, finish current lease, and extend visibility timeouts accordingly.
+   - Enforce a hard deadline: draining is bounded (e.g., 60–120s). Past that, terminate anyway to avoid “immortal drains”.
+
+4. **Recycle (idempotent)**
+   - Terminate the instance (delete pod / terminate VM).
+   - Replacement is handled by the orchestrator’s normal reconciliation (ReplicaSet/ASG).
+   - Record an event with the precise trigger window (zombie slope, memory slope, persistence duration).
+
+5. **Post-check and cooldown**
+   - Observe service error rate and latency for a short window.
+   - Apply cooldown per service to avoid synchronized churn (the classic “everyone leaked at the same time” scenario).
+
+### Detection that’s actually actionable
+
+Two examples of signals that work in practice:
+
+- **Zombie accumulation**
+  - Trigger on *sustained growth* in zombies, not absolute count:
+    - `zombie_slope = deriv(process_state{state="Z"}[10m])`
+    - Action when `zombie_slope > 0` for 10m **and** total zombies exceeds a small floor (filters noise).
+  - Rationale: one-off zombies happen; monotonically increasing zombies means something isn’t reaping and will eventually hit PID/resource limits.
+
+- **Memory leak**
+  - Use a trend with workload normalization:
+    - `rss_slope = deriv(container_memory_rss[30m])`
+    - Gate on stable request rate (avoid mistaking load spikes for leaks).
+  - Act *before* OOM: once OOM happens, you’ve already impacted latency and retry storms.
+
+The controller doesn’t pretend to “fix” the leak; it restores a healthy steady state while surfacing a crisp, debuggable signal to engineers.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Zero-drop recycling via draining | Faster “kill it now” remediation |
+| Bounded disruption with budgets | Maximum remediation throughput |
+| High-confidence, trend-based triggers | Detecting extremely rare edge cases quickly |
+| Simple primitives (readiness, PDB, drain) | “Smart” in-process self-repair magic |
+
+## Failure Modes
+
+- **False positives cause churn**
+  - *What happens:* Instances recycle unnecessarily; warmups and cache misses degrade p95.
+  - *Detect:* Spike in recycle rate, elevated cold-start latency, stable error rate but rising latency.
+  - *Recover:* Tighten persistence windows, add workload-stability gates, reduce budget temporarily; ship a “no recycle during incident” guardrail.
+
+- **Drain gets stuck (hung connections / stuck workers)**
+  - *What happens:* Instances remain in Draining; capacity shrinks.
+  - *Detect:* Draining duration exceeds SLA; concurrent drains hits budget ceiling.
+  - *Recover:* Enforce hard drain timeout; terminate after deadline; require services to implement graceful shutdown correctly.
+
+- **Control plane / metrics outage**
+  - *What happens:* Stale signals lead to bad decisions—or no decisions when needed.
+  - *Detect:* Scrape age alarms, controller can’t observe endpoints, API errors.
+  - *Recover:* Fail closed: stop initiating new recycling; allow only local protections (OOMKill, liveness) until signals recover.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move from per-instance decisions to *cohort* decisions (batch draining with jitter), shard the controller by service, and add per-service “risk budgets” that vary by criticality.
+- **100x scale:** Treat remediation as a first-class platform product: dedicated remediation pipeline, stronger dependency-aware constraints (don’t recycle all of a tier across AZs), and richer signal attribution (eBPF profiles, heap sampling) to reduce false positives.
+
+## Operational Notes
+
+- The controller must be boring and predictable: **rate limits, budgets, and clear state transitions** matter more than clever detection.
+- Enforce “drain correctness” as a platform contract: readiness must cut off new traffic quickly, and shutdown must be graceful within the drain timeout.
+- Alert on *trends in remediation*: recycling rate and time-in-drain are leading indicators of systemic issues (leaks, deploy regressions, traffic shifts).
+- Always log the “why” with the “what”: remediation without explainability becomes un-debuggable and will get turned off during the first incident.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/self-healing-infrastructure.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-9af7-71d2-941e-1965eedf154f
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Self-Healing Infrastructure"
+category: "Strategic Problems"
+difficulty: "Medium"
+tags: ["control-loop", "sre", "kubernetes", "traffic-draining", "reliability"]
+---
+
+## Overview
+
+This system is a control loop that detects *degrading instances* (zombie accumulation, runaway memory growth) and recycles them without dropping traffic. The key insight is that **recycling is the easy part**—the elegant design is making recycling *safe*: explicit draining, bounded disruption, and anti-flap hysteresis.
+
+The architecture separates concerns: a **local signal layer** (what’s happening on the box/container) and a **global remediation layer** (what actions are safe right now). Detection produces a small set of high-confidence “actionable” conditions; remediation is an idempotent state machine that moves an instance through *in-service → draining → terminated → replaced* under strict budgets.
+
+This keeps the system boring: Prometheus for signals, Kubernetes (or an ASG equivalent) for replacement, and Envoy/LB semantics for draining. The only custom logic is the policy and state machine—which is exactly where the differentiation belongs.
+
+## What Makes This Hard
+
+Naive implementations confuse “unhealthy” with “kill it now”. That drops traffic because load balancers and clients are still using the instance, long-lived connections get severed, and retries amplify load (self-inflicted DDoS). The real trap is **flapping**: transient spikes trigger restarts, restarts cause warmup latency and cache misses, which trigger more restarts.
+
+The second trap is relying on a single symptom. Zombies and leaks rarely fail cleanly; they degrade. If you only act on OOMKills, you recycle too late. If you act on raw RSS, you recycle too early. The design needs **trend-based signals + gating + disruption budgets**.
+
+## Requirements
+
+### Functional Requirements
+- Detect and remediate:
+  - Zombie process accumulation (increasing `process_state{state="Z"}` or rising “unreaped children” indicators)
+  - Memory leaks (monotonic RSS/heap growth over time under steady load)
+- Recycle instances without dropping traffic:
+  - Stop sending *new* requests before termination
+  - Allow in-flight requests to complete up to a bounded drain timeout
+- Prevent self-harm:
+  - Global disruption budget per service/cluster
+  - Cooldowns and hysteresis to avoid flapping
+  - Safe-mode when signals are stale or control plane is impaired
+- Provide auditability:
+  - Every recycle decision is explainable from recorded signals and policy
+
+### Scale Targets
+- Fleet: 5,000 instances across 50 services (typical mid-large platform)
+- Detection latency: 15–30s (fast enough to catch runaway, slow enough to smooth noise)
+- Remediation rate limit: max 1% of a service per 10 minutes (prevents brownouts)
+- SLO constraint: recycling must not increase 5xx beyond 0.01% during steady state (forces real draining, not “best effort”)
+
+## Key Design Decisions
+
+- **Chose:** Explicit *instance lifecycle state machine* (InService → Draining → Recycled)
+  - **Rejected:** “Restart on alert” scripts
+  - **Why:** Safe recycling requires ordered steps, timeouts, and idempotency; scripts become untestable spaghetti under real failures.
+
+- **Chose:** Trend + gating signals (rate-of-change, persistence windows) over single thresholds
+  - **Rejected:** One-shot “RSS > X” or “zombies > Y” triggers
+  - **Why:** Leaks and zombie accumulation are *slopes*, not points; gating eliminates noise and flapping.
+
+- **Chose:** Enforced disruption budgets (PDB-style) as a hard constraint
+  - **Rejected:** “Trust the controller to be careful”
+  - **Why:** Budgeting is the only reliable way to keep remediation from becoming the outage.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Clients] --> LB["L7 Load Balancer"]
+  LB --> I["Service Instances"]
+
+  I --> A["Node/Pod Agent"]
+  A --> P["Prometheus"]
+  P --> H["Healer Controller"]
+  H --> O["Orchestrator API"]
+  O --> I
+```
+
+### Components
+
+- **Service Instances**: The units we recycle (pods/VMs). They expose readiness, drain hooks, and basic health endpoints.
+- **L7 Load Balancer**: The traffic gate. It must support removing endpoints quickly (readiness/health) and respecting connection draining.
+- **Node/Pod Agent**: A small daemon that emits *actionable* signals: zombie count, process count, RSS/heap, OOM events, restart loops. This is the only place that touches `/proc` and cgroups.
+- **Prometheus**: The truth source for time-series trends and persistence windows. Also stores “why did we recycle this” evidence.
+- **Healer Controller**: The policy engine + state machine. It decides *when* recycling is safe and executes the drain/recycle sequence.
+- **Orchestrator API**: Kubernetes/ASG interface that cordons/drains/replaces instances. We use standard primitives (readiness gates, PDBs, rollouts).
+
+## Deep Dive: Safe Recycling Without Dropping Traffic
+
+The hardest part is turning “this instance is sick” into “this instance is gone” without interrupting real user traffic. The controller treats recycling as a **transaction with invariants**:
+
+1. **Acquire permission (budget + safety gates)**
+   - Check disruption budget: e.g., at least `N` healthy instances remain and max `K` concurrent drains for this service.
+   - Check signal freshness: Prometheus scrape age < 2 intervals; otherwise, enter safe-mode (no action).
+   - Check service health: if error rate is already elevated, pause recycling (don’t worsen an incident).
+
+2. **Enter Draining (stop new traffic first)**
+   - Flip instance to **NotReady** (Kubernetes readiness gate) so it is removed from LB/service discovery.
+   - Wait for propagation: confirm endpoint removal via control-plane observation (e.g., endpoints list no longer includes it).
+   - Start a drain timer.
+
+3. **Grace period for in-flight work**
+   - For HTTP: rely on Envoy/LB connection draining + server-side graceful shutdown.
+   - For async workers: stop fetching new jobs, finish current lease, and extend visibility timeouts accordingly.
+   - Enforce a hard deadline: draining is bounded (e.g., 60–120s). Past that, terminate anyway to avoid “immortal drains”.
+
+4. **Recycle (idempotent)**
+   - Terminate the instance (delete pod / terminate VM).
+   - Replacement is handled by the orchestrator’s normal reconciliation (ReplicaSet/ASG).
+   - Record an event with the precise trigger window (zombie slope, memory slope, persistence duration).
+
+5. **Post-check and cooldown**
+   - Observe service error rate and latency for a short window.
+   - Apply cooldown per service to avoid synchronized churn (the classic “everyone leaked at the same time” scenario).
+
+### Detection that’s actually actionable
+
+Two examples of signals that work in practice:
+
+- **Zombie accumulation**
+  - Trigger on *sustained growth* in zombies, not absolute count:
+    - `zombie_slope = deriv(process_state{state="Z"}[10m])`
+    - Action when `zombie_slope > 0` for 10m **and** total zombies exceeds a small floor (filters noise).
+  - Rationale: one-off zombies happen; monotonically increasing zombies means something isn’t reaping and will eventually hit PID/resource limits.
+
+- **Memory leak**
+  - Use a trend with workload normalization:
+    - `rss_slope = deriv(container_memory_rss[30m])`
+    - Gate on stable request rate (avoid mistaking load spikes for leaks).
+  - Act *before* OOM: once OOM happens, you’ve already impacted latency and retry storms.
+
+The controller doesn’t pretend to “fix” the leak; it restores a healthy steady state while surfacing a crisp, debuggable signal to engineers.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Zero-drop recycling via draining | Faster “kill it now” remediation |
+| Bounded disruption with budgets | Maximum remediation throughput |
+| High-confidence, trend-based triggers | Detecting extremely rare edge cases quickly |
+| Simple primitives (readiness, PDB, drain) | “Smart” in-process self-repair magic |
+
+## Failure Modes
+
+- **False positives cause churn**
+  - *What happens:* Instances recycle unnecessarily; warmups and cache misses degrade p95.
+  - *Detect:* Spike in recycle rate, elevated cold-start latency, stable error rate but rising latency.
+  - *Recover:* Tighten persistence windows, add workload-stability gates, reduce budget temporarily; ship a “no recycle during incident” guardrail.
+
+- **Drain gets stuck (hung connections / stuck workers)**
+  - *What happens:* Instances remain in Draining; capacity shrinks.
+  - *Detect:* Draining duration exceeds SLA; concurrent drains hits budget ceiling.
+  - *Recover:* Enforce hard drain timeout; terminate after deadline; require services to implement graceful shutdown correctly.
+
+- **Control plane / metrics outage**
+  - *What happens:* Stale signals lead to bad decisions—or no decisions when needed.
+  - *Detect:* Scrape age alarms, controller can’t observe endpoints, API errors.
+  - *Recover:* Fail closed: stop initiating new recycling; allow only local protections (OOMKill, liveness) until signals recover.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move from per-instance decisions to *cohort* decisions (batch draining with jitter), shard the controller by service, and add per-service “risk budgets” that vary by criticality.
+- **100x scale:** Treat remediation as a first-class platform product: dedicated remediation pipeline, stronger dependency-aware constraints (don’t recycle all of a tier across AZs), and richer signal attribution (eBPF profiles, heap sampling) to reduce false positives.
+
+## Operational Notes
+
+- The controller must be boring and predictable: **rate limits, budgets, and clear state transitions** matter more than clever detection.
+- Enforce “drain correctness” as a platform contract: readiness must cut off new traffic quickly, and shutdown must be graceful within the drain timeout.
+- Alert on *trends in remediation*: recycling rate and time-in-drain are leading indicators of systemic issues (leaks, deploy regressions, traffic shifts).
+- Always log the “why” with the “what”: remediation without explainability becomes un-debuggable and will get turned off during the first incident.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+codex
+## Elegance Check
+
+### The Core Insight
+Safe recycling is a *traffic-control* problem, not a “kill unhealthy things” problem: explicit draining + hard disruption budgets + hysteresis turns remediation into a predictable transaction.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| L7 LB / Envoy drain semantics | Only reliable way to stop *new* traffic without severing in-flight work |
+| Explicit lifecycle state machine | Makes idempotency/timeouts/auditability testable and reviewable |
+| Disruption budget enforcement | Prevents the healer from becoming the outage under false positives or correlated failures |
+| Cooldowns/hysteresis | Addresses the real enemy (flapping and synchronized churn) |
+| Orchestrator (Kubernetes/ASG) | Replacement should be boring reconciliation, not custom provisioning logic |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom “Node/Pod Agent” reading `/proc` + cgroups | Prefer existing exporters (`node-exporter`, `process-exporter`, cAdvisor/kubelet metrics); keep custom agent only for truly missing signals (e.g., unreaped children heuristic) | Less bespoke fidelity; may need one small custom exporter for zombie/reaping signals |
+| Controller “terminates instance” (delete pod/terminate VM) | On Kubernetes, use the `Eviction` subresource so PDBs are enforced by the API server | Slightly more plumbing; eviction can be blocked, so you need a clear “what if PDB prevents action” path |
+| Prometheus as “truth source” for decisions + evidence | Treat Prometheus as *signal source*, but persist decision state/evidence in a CRD (e.g., `RemediationAction` with snapshot labels/values) | Adds a CRD, but greatly improves auditability and controller restart safety |
+| Global budgets implemented in controller logic | Lean on native primitives where possible: PDB for concurrency + controller token-bucket only for *rate* (1%/10m) | Two mechanisms to reason about, but each does what it’s best at |
+| “Confirm endpoint removal via control-plane observation” | Prefer a single canonical check: Kubernetes Endpoints/EndpointSlice membership + readiness gate; avoid per-LB bespoke verification unless needed | Might miss LB propagation edge cases; if LB is out-of-band, you still need a provider-specific check |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Prometheus down / metrics stale for 5 minutes**
+   - Design’s answer: fail closed (no new recycling)
+   - Recommendation: Strengthen (define a *degraded-mode* policy: allow only “imminent OOM” local protection, and explicitly disable trend-based actions; also alert loudly on “healing blind”)
+
+2. **Kubernetes API partially failing / slow (cordon/evict hangs)**
+   - Design’s answer: “API errors” mentioned, but state-machine behavior under partial progress isn’t explicit
+   - Recommendation: Strengthen (spell out reconciliation semantics: every step must be resumable; store per-instance state with deadlines; include a “stuck in draining because API can’t confirm” branch)
+
+3. **LB propagation is slow or inconsistent (NotReady set, but traffic still arrives)**
+   - Design’s answer: wait for propagation + drain timer
+   - Recommendation: Strengthen (add a “self-protect” behavior on the instance: once draining starts, return fast-fail/redirect for *new* requests at the app/sidecar level; otherwise you’re trusting control-plane timing)
+
+4. **Bad policy/config deploy (thresholds too aggressive → 10x recycle rate)**
+   - Design’s answer: not addressed
+   - Recommendation: Strengthen (ship policy changes behind progressive delivery: dry-run mode that only emits “would recycle” events; hard global kill-switch; per-service max recycle rate ceiling independent of thresholds)
+
+5. **Network partition between controller and cluster (controller sees signals, can’t act; or acts twice)**
+   - Design’s answer: not addressed
+   - Recommendation: Strengthen (leader election + exactly-once *intent*: write “intent to drain X” to durable state, then act; if partitioned, intents stop progressing rather than duplicating)
+
+## Recommendations
+
+### Must Fix
+- Clarify Kubernetes enforcement: use `Eviction`/PDB semantics explicitly; “delete pod” can bypass the protection you’re counting on.
+- Persist state + evidence outside Prometheus: controller restarts and partial progress are guaranteed; without durable action records, idempotency/auditability will be fragile in practice.
+- Define the “draining but still receiving traffic” contract: require instance/sidecar behavior for new requests during drain (not just LB readiness assumptions).
+
+### Should Consider
+- Reduce custom surface area by defaulting to existing exporters; reserve the agent for signals you can’t get otherwise.
+- Make budgets two-dimensional: concurrency (PDB) + rate (token bucket) + blast-radius constraints (per-AZ cap) to avoid draining a whole zone under correlated leaks.
+- Add an operator-friendly control plane: per-service enable/disable, manual “quarantine this instance”, and a clear runbook for 3am mistakes.
+
+### Nice to Have
+- A “dry-run + explain” mode that produces the exact audit event without action (great for tuning slope/persistence windows).
+- A small library/spec for “graceful termination contract” (HTTP servers vs workers) so teams implement drain correctly and consistently.
+- Correlation dampening: jitter drains and detect cohort-wide leaks to avoid synchronized cache-cold storms.
+
+## What’s Working Well
+- The design is honest about the hard part (draining + flapping), and the state-machine framing is the right abstraction.
+- The disruption-budget-first philosophy is production-grade and aligned with SRE reality.
+- Trend + gating signals focus on actionable degradation, not noisy point-in-time thresholds.
+- You explicitly call out safe-mode under impaired observability/control plane—this avoids a common “automation makes it worse” failure.
+tokens used
+5,511
+## Elegance Check
+
+### The Core Insight
+Safe recycling is a *traffic-control* problem, not a “kill unhealthy things” problem: explicit draining + hard disruption budgets + hysteresis turns remediation into a predictable transaction.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| L7 LB / Envoy drain semantics | Only reliable way to stop *new* traffic without severing in-flight work |
+| Explicit lifecycle state machine | Makes idempotency/timeouts/auditability testable and reviewable |
+| Disruption budget enforcement | Prevents the healer from becoming the outage under false positives or correlated failures |
+| Cooldowns/hysteresis | Addresses the real enemy (flapping and synchronized churn) |
+| Orchestrator (Kubernetes/ASG) | Replacement should be boring reconciliation, not custom provisioning logic |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom “Node/Pod Agent” reading `/proc` + cgroups | Prefer existing exporters (`node-exporter`, `process-exporter`, cAdvisor/kubelet metrics); keep custom agent only for truly missing signals (e.g., unreaped children heuristic) | Less bespoke fidelity; may need one small custom exporter for zombie/reaping signals |
+| Controller “terminates instance” (delete pod/terminate VM) | On Kubernetes, use the `Eviction` subresource so PDBs are enforced by the API server | Slightly more plumbing; eviction can be blocked, so you need a clear “what if PDB prevents action” path |
+| Prometheus as “truth source” for decisions + evidence | Treat Prometheus as *signal source*, but persist decision state/evidence in a CRD (e.g., `RemediationAction` with snapshot labels/values) | Adds a CRD, but greatly improves auditability and controller restart safety |
+| Global budgets implemented in controller logic | Lean on native primitives where possible: PDB for concurrency + controller token-bucket only for *rate* (1%/10m) | Two mechanisms to reason about, but each does what it’s best at |
+| “Confirm endpoint removal via control-plane observation” | Prefer a single canonical check: Kubernetes Endpoints/EndpointSlice membership + readiness gate; avoid per-LB bespoke verification unless needed | Might miss LB propagation edge cases; if LB is out-of-band, you still need a provider-specific check |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Prometheus down / metrics stale for 5 minutes**
+   - Design’s answer: fail closed (no new recycling)
+   - Recommendation: Strengthen (define a *degraded-mode* policy: allow only “imminent OOM” local protection, and explicitly disable trend-based actions; also alert loudly on “healing blind”)
+
+2. **Kubernetes API partially failing / slow (cordon/evict hangs)**
+   - Design’s answer: “API errors” mentioned, but state-machine behavior under partial progress isn’t explicit
+   - Recommendation: Strengthen (spell out reconciliation semantics: every step must be resumable; store per-instance state with deadlines; include a “stuck in draining because API can’t confirm” branch)
+
+3. **LB propagation is slow or inconsistent (NotReady set, but traffic still arrives)**
+   - Design’s answer: wait for propagation + drain timer
+   - Recommendation: Strengthen (add a “self-protect” behavior on the instance: once draining starts, return fast-fail/redirect for *new* requests at the app/sidecar level; otherwise you’re trusting control-plane timing)
+
+4. **Bad policy/config deploy (thresholds too aggressive → 10x recycle rate)**
+   - Design’s answer: not addressed
+   - Recommendation: Strengthen (ship policy changes behind progressive delivery: dry-run mode that only emits “would recycle” events; hard global kill-switch; per-service max recycle rate ceiling independent of thresholds)
+
+5. **Network partition between controller and cluster (controller sees signals, can’t act; or acts twice)**
+   - Design’s answer: not addressed
+   - Recommendation: Strengthen (leader election + exactly-once *intent*: write “intent to drain X” to durable state, then act; if partitioned, intents stop progressing rather than duplicating)
+
+## Recommendations
+
+### Must Fix
+- Clarify Kubernetes enforcement: use `Eviction`/PDB semantics explicitly; “delete pod” can bypass the protection you’re counting on.
+- Persist state + evidence outside Prometheus: controller restarts and partial progress are guaranteed; without durable action records, idempotency/auditability will be fragile in practice.
+- Define the “draining but still receiving traffic” contract: require instance/sidecar behavior for new requests during drain (not just LB readiness assumptions).
+
+### Should Consider
+- Reduce custom surface area by defaulting to existing exporters; reserve the agent for signals you can’t get otherwise.
+- Make budgets two-dimensional: concurrency (PDB) + rate (token bucket) + blast-radius constraints (per-AZ cap) to avoid draining a whole zone under correlated leaks.
+- Add an operator-friendly control plane: per-service enable/disable, manual “quarantine this instance”, and a clear runbook for 3am mistakes.
+
+### Nice to Have
+- A “dry-run + explain” mode that produces the exact audit event without action (great for tuning slope/persistence windows).
+- A small library/spec for “graceful termination contract” (HTTP servers vs workers) so teams implement drain correctly and consistently.
+- Correlation dampening: jitter drains and detect cohort-wide leaks to avoid synchronized cache-cold storms.
+
+## What’s Working Well
+- The design is honest about the hard part (draining + flapping), and the state-machine framing is the right abstraction.
+- The disruption-budget-first philosophy is production-grade and aligned with SRE reality.
+- Trend + gating signals focus on actionable degradation, not noisy point-in-time thresholds.
+- You explicitly call out safe-mode under impaired observability/control plane—this avoids a common “automation makes it worse” failure.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/self-healing-infrastructure.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afd-0f58-7681-bc66-a53b31bb208d
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Self-Healing Infrastructure"
+category: "Strategic Problems"
+difficulty: "Medium"
+tags: ["control-loop", "sre", "kubernetes", "traffic-draining", "reliability"]
+---
+
+## Overview
+
+This system is a control loop that detects *degrading instances* (zombie accumulation, runaway memory growth) and recycles them without dropping traffic. The key insight is that **recycling is the easy part**—the elegant design is making recycling *safe*: explicit draining, bounded disruption, and anti-flap hysteresis.
+
+The architecture separates concerns: a **local signal layer** (what’s happening on the box/container) and a **global remediation layer** (what actions are safe right now). Detection produces a small set of high-confidence “actionable” conditions; remediation is an idempotent state machine that moves an instance through *in-service → draining → terminated → replaced* under strict budgets.
+
+This keeps the system boring: Prometheus for signals, Kubernetes (or an ASG equivalent) for replacement, and Envoy/LB semantics for draining. The only custom logic is the policy and state machine—which is exactly where the differentiation belongs.
+
+## What Makes This Hard
+
+Naive implementations confuse “unhealthy” with “kill it now”. That drops traffic because load balancers and clients are still using the instance, long-lived connections get severed, and retries amplify load (self-inflicted DDoS). The real trap is **flapping**: transient spikes trigger restarts, restarts cause warmup latency and cache misses, which trigger more restarts.
+
+The second trap is relying on a single symptom. Zombies and leaks rarely fail cleanly; they degrade. If you only act on OOMKills, you recycle too late. If you act on raw RSS, you recycle too early. The design needs **trend-based signals + gating + disruption budgets**.
+
+## Requirements
+
+### Functional Requirements
+- Detect and remediate:
+  - Zombie process accumulation (increasing `process_state{state="Z"}` or rising “unreaped children” indicators)
+  - Memory leaks (monotonic RSS/heap growth over time under steady load)
+- Recycle instances without dropping traffic:
+  - Stop sending *new* requests before termination
+  - Allow in-flight requests to complete up to a bounded drain timeout
+- Prevent self-harm:
+  - Global disruption budget per service/cluster
+  - Cooldowns and hysteresis to avoid flapping
+  - Safe-mode when signals are stale or control plane is impaired
+- Provide auditability:
+  - Every recycle decision is explainable from recorded signals and policy
+
+### Scale Targets
+- Fleet: 5,000 instances across 50 services (typical mid-large platform)
+- Detection latency: 15–30s (fast enough to catch runaway, slow enough to smooth noise)
+- Remediation rate limit: max 1% of a service per 10 minutes (prevents brownouts)
+- SLO constraint: recycling must not increase 5xx beyond 0.01% during steady state (forces real draining, not “best effort”)
+
+## Key Design Decisions
+
+- **Chose:** Explicit *instance lifecycle state machine* (InService → Draining → Recycled)
+  - **Rejected:** “Restart on alert” scripts
+  - **Why:** Safe recycling requires ordered steps, timeouts, and idempotency; scripts become untestable spaghetti under real failures.
+
+- **Chose:** Trend + gating signals (rate-of-change, persistence windows) over single thresholds
+  - **Rejected:** One-shot “RSS > X” or “zombies > Y” triggers
+  - **Why:** Leaks and zombie accumulation are *slopes*, not points; gating eliminates noise and flapping.
+
+- **Chose:** Enforced disruption budgets (PDB-style) as a hard constraint
+  - **Rejected:** “Trust the controller to be careful”
+  - **Why:** Budgeting is the only reliable way to keep remediation from becoming the outage.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Clients] --> LB["L7 Load Balancer"]
+  LB --> I["Service Instances"]
+
+  I --> A["Node/Pod Agent"]
+  A --> P["Prometheus"]
+  P --> H["Healer Controller"]
+  H --> O["Orchestrator API"]
+  O --> I
+```
+
+### Components
+
+- **Service Instances**: The units we recycle (pods/VMs). They expose readiness, drain hooks, and basic health endpoints.
+- **L7 Load Balancer**: The traffic gate. It must support removing endpoints quickly (readiness/health) and respecting connection draining.
+- **Node/Pod Agent**: A small daemon that emits *actionable* signals: zombie count, process count, RSS/heap, OOM events, restart loops. This is the only place that touches `/proc` and cgroups.
+- **Prometheus**: The truth source for time-series trends and persistence windows. Also stores “why did we recycle this” evidence.
+- **Healer Controller**: The policy engine + state machine. It decides *when* recycling is safe and executes the drain/recycle sequence.
+- **Orchestrator API**: Kubernetes/ASG interface that cordons/drains/replaces instances. We use standard primitives (readiness gates, PDBs, rollouts).
+
+## Deep Dive: Safe Recycling Without Dropping Traffic
+
+The hardest part is turning “this instance is sick” into “this instance is gone” without interrupting real user traffic. The controller treats recycling as a **transaction with invariants**:
+
+1. **Acquire permission (budget + safety gates)**
+   - Check disruption budget: e.g., at least `N` healthy instances remain and max `K` concurrent drains for this service.
+   - Check signal freshness: Prometheus scrape age < 2 intervals; otherwise, enter safe-mode (no action).
+   - Check service health: if error rate is already elevated, pause recycling (don’t worsen an incident).
+
+2. **Enter Draining (stop new traffic first)**
+   - Flip instance to **NotReady** (Kubernetes readiness gate) so it is removed from LB/service discovery.
+   - Wait for propagation: confirm endpoint removal via control-plane observation (e.g., endpoints list no longer includes it).
+   - Start a drain timer.
+
+3. **Grace period for in-flight work**
+   - For HTTP: rely on Envoy/LB connection draining + server-side graceful shutdown.
+   - For async workers: stop fetching new jobs, finish current lease, and extend visibility timeouts accordingly.
+   - Enforce a hard deadline: draining is bounded (e.g., 60–120s). Past that, terminate anyway to avoid “immortal drains”.
+
+4. **Recycle (idempotent)**
+   - Terminate the instance (delete pod / terminate VM).
+   - Replacement is handled by the orchestrator’s normal reconciliation (ReplicaSet/ASG).
+   - Record an event with the precise trigger window (zombie slope, memory slope, persistence duration).
+
+5. **Post-check and cooldown**
+   - Observe service error rate and latency for a short window.
+   - Apply cooldown per service to avoid synchronized churn (the classic “everyone leaked at the same time” scenario).
+
+### Detection that’s actually actionable
+
+Two examples of signals that work in practice:
+
+- **Zombie accumulation**
+  - Trigger on *sustained growth* in zombies, not absolute count:
+    - `zombie_slope = deriv(process_state{state="Z"}[10m])`
+    - Action when `zombie_slope > 0` for 10m **and** total zombies exceeds a small floor (filters noise).
+  - Rationale: one-off zombies happen; monotonically increasing zombies means something isn’t reaping and will eventually hit PID/resource limits.
+
+- **Memory leak**
+  - Use a trend with workload normalization:
+    - `rss_slope = deriv(container_memory_rss[30m])`
+    - Gate on stable request rate (avoid mistaking load spikes for leaks).
+  - Act *before* OOM: once OOM happens, you’ve already impacted latency and retry storms.
+
+The controller doesn’t pretend to “fix” the leak; it restores a healthy steady state while surfacing a crisp, debuggable signal to engineers.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Zero-drop recycling via draining | Faster “kill it now” remediation |
+| Bounded disruption with budgets | Maximum remediation throughput |
+| High-confidence, trend-based triggers | Detecting extremely rare edge cases quickly |
+| Simple primitives (readiness, PDB, drain) | “Smart” in-process self-repair magic |
+
+## Failure Modes
+
+- **False positives cause churn**
+  - *What happens:* Instances recycle unnecessarily; warmups and cache misses degrade p95.
+  - *Detect:* Spike in recycle rate, elevated cold-start latency, stable error rate but rising latency.
+  - *Recover:* Tighten persistence windows, add workload-stability gates, reduce budget temporarily; ship a “no recycle during incident” guardrail.
+
+- **Drain gets stuck (hung connections / stuck workers)**
+  - *What happens:* Instances remain in Draining; capacity shrinks.
+  - *Detect:* Draining duration exceeds SLA; concurrent drains hits budget ceiling.
+  - *Recover:* Enforce hard drain timeout; terminate after deadline; require services to implement graceful shutdown correctly.
+
+- **Control plane / metrics outage**
+  - *What happens:* Stale signals lead to bad decisions—or no decisions when needed.
+  - *Detect:* Scrape age alarms, controller can’t observe endpoints, API errors.
+  - *Recover:* Fail closed: stop initiating new recycling; allow only local protections (OOMKill, liveness) until signals recover.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move from per-instance decisions to *cohort* decisions (batch draining with jitter), shard the controller by service, and add per-service “risk budgets” that vary by criticality.
+- **100x scale:** Treat remediation as a first-class platform product: dedicated remediation pipeline, stronger dependency-aware constraints (don’t recycle all of a tier across AZs), and richer signal attribution (eBPF profiles, heap sampling) to reduce false positives.
+
+## Operational Notes
+
+- The controller must be boring and predictable: **rate limits, budgets, and clear state transitions** matter more than clever detection.
+- Enforce “drain correctness” as a platform contract: readiness must cut off new traffic quickly, and shutdown must be graceful within the drain timeout.
+- Alert on *trends in remediation*: recycling rate and time-in-drain are leading indicators of systemic issues (leaks, deploy regressions, traffic shifts).
+- Always log the “why” with the “what”: remediation without explainability becomes un-debuggable and will get turned off during the first incident.
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Safe recycling is a *traffic-control* problem, not a “kill unhealthy things” problem: explicit draining + hard disruption budgets + hysteresis turns remediation into a predictable transaction.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| L7 LB / Envoy drain semantics | Only reliable way to stop *new* traffic without severing in-flight work |
+| Explicit lifecycle state machine | Makes idempotency/timeouts/auditability testable and reviewable |
+| Disruption budget enforcement | Prevents the healer from becoming the outage under false positives or correlated failures |
+| Cooldowns/hysteresis | Addresses the real enemy (flapping and synchronized churn) |
+| Orchestrator (Kubernetes/ASG) | Replacement should be boring reconciliation, not custom provisioning logic |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom “Node/Pod Agent” reading `/proc` + cgroups | Prefer existing exporters (`node-exporter`, `process-exporter`, cAdvisor/kubelet metrics); keep custom agent only for truly missing signals (e.g., unreaped children heuristic) | Less bespoke fidelity; may need one small custom exporter for zombie/reaping signals |
+| Controller “terminates instance” (delete pod/terminate VM) | On Kubernetes, use the `Eviction` subresource so PDBs are enforced by the API server | Slightly more plumbing; eviction can be blocked, so you need a clear “what if PDB prevents action” path |
+| Prometheus as “truth source” for decisions + evidence | Treat Prometheus as *signal source*, but persist decision state/evidence in a CRD (e.g., `RemediationAction` with snapshot labels/values) | Adds a CRD, but greatly improves auditability and controller restart safety |
+| Global budgets implemented in controller logic | Lean on native primitives where possible: PDB for concurrency + controller token-bucket only for *rate* (1%/10m) | Two mechanisms to reason about, but each does what it’s best at |
+| “Confirm endpoint removal via control-plane observation” | Prefer a single canonical check: Kubernetes Endpoints/EndpointSlice membership + readiness gate; avoid per-LB bespoke verification unless needed | Might miss LB propagation edge cases; if LB is out-of-band, you still need a provider-specific check |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Prometheus down / metrics stale for 5 minutes**
+   - Design’s answer: fail closed (no new recycling)
+   - Recommendation: Strengthen (define a *degraded-mode* policy: allow only “imminent OOM” local protection, and explicitly disable trend-based actions; also alert loudly on “healing blind”)
+
+2. **Kubernetes API partially failing / slow (cordon/evict hangs)**
+   - Design’s answer: “API errors” mentioned, but state-machine behavior under partial progress isn’t explicit
+   - Recommendation: Strengthen (spell out reconciliation semantics: every step must be resumable; store per-instance state with deadlines; include a “stuck in draining because API can’t confirm” branch)
+
+3. **LB propagation is slow or inconsistent (NotReady set, but traffic still arrives)**
+   - Design’s answer: wait for propagation + drain timer
+   - Recommendation: Strengthen (add a “self-protect” behavior on the instance: once draining starts, return fast-fail/redirect for *new* requests at the app/sidecar level; otherwise you’re trusting control-plane timing)
+
+4. **Bad policy/config deploy (thresholds too aggressive → 10x recycle rate)**
+   - Design’s answer: not addressed
+   - Recommendation: Strengthen (ship policy changes behind progressive delivery: dry-run mode that only emits “would recycle” events; hard global kill-switch; per-service max recycle rate ceiling independent of thresholds)
+
+5. **Network partition between controller and cluster (controller sees signals, can’t act; or acts twice)**
+   - Design’s answer: not addressed
+   - Recommendation: Strengthen (leader election + exactly-once *intent*: write “intent to drain X” to durable state, then act; if partitioned, intents stop progressing rather than duplicating)
+
+## Recommendations
+
+### Must Fix
+- Clarify Kubernetes enforcement: use `Eviction`/PDB semantics explicitly; “delete pod” can bypass the protection you’re counting on.
+- Persist state + evidence outside Prometheus: controller restarts and partial progress are guaranteed; without durable action records, idempotency/auditability will be fragile in practice.
+- Define the “draining but still receiving traffic” contract: require instance/sidecar behavior for new requests during drain (not just LB readiness assumptions).
+
+### Should Consider
+- Reduce custom surface area by defaulting to existing exporters; reserve the agent for signals you can’t get otherwise.
+- Make budgets two-dimensional: concurrency (PDB) + rate (token bucket) + blast-radius constraints (per-AZ cap) to avoid draining a whole zone under correlated leaks.
+- Add an operator-friendly control plane: per-service enable/disable, manual “quarantine this instance”, and a clear runbook for 3am mistakes.
+
+### Nice to Have
+- A “dry-run + explain” mode that produces the exact audit event without action (great for tuning slope/persistence windows).
+- A small library/spec for “graceful termination contract” (HTTP servers vs workers) so teams implement drain correctly and consistently.
+- Correlation dampening: jitter drains and detect cohort-wide leaks to avoid synchronized cache-cold storms.
+
+## What’s Working Well
+- The design is honest about the hard part (draining + flapping), and the state-machine framing is the right abstraction.
+- The disruption-budget-first philosophy is production-grade and aligned with SRE reality.
+- Trend + gating signals focus on actionable degradation, not noisy point-in-time thresholds.
+- You explicitly call out safe-mode under impaired observability/control plane—this avoids a common “automation makes it worse” failure.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+
+thinking
+**Evaluating design decisions**
+
+I’m wondering if we should drop the Key Design Decisions section entirely and replace it with "What We Removed." I’d summarize decisions like replacing the custom agent with exporters and using eviction. But I need to be careful not to add components, like the K8s CRD, even though the critique suggests it. Instead, I could persist state using existing Kubernetes features like annotations, which feels more in line with our goal of not adding new components.
+thinking
+**Simplifying state management**
+
+I think I should keep it minimal by using Kubernetes as a durable store. I can write an Event and annotate the Pod with its healing state or create a Lease object. This keeps it streamlined without adding new services. I’ll simplify the Node/Pod agent by relying on existing metrics exporters, but I need to address zombies. Maybe using the node-exporter is the way to go to track zombie processes. I should implement this as a small optional script in the app container, considering my options carefully!
+thinking
+**Considering component simplification**
+
+This approach feels pretty minimal; it’s just a cron job or a systemd timer on nodes. I’m replacing the Node/Pod agent with exporters, which seems okay since it reduces components. Even though I worry about adding new elements, swapping for something like a "node-exporter plus a tiny textfile script" keeps it small. The Healer Controller should stay, but we can make it minimal, using annotations with timestamps for state and auditing while emitting Kubernetes Events for clarity.
+thinking
+**Exploring audit storage options**
+
+I’m thinking about how to handle evidence snapshots without needing a CRD. Including metric values in the event message could work, or I could use controller logs, but I need to meet audit requirements, like explaining every recycle decision from recorded signals. Storing in Kubernetes Events seems beneficial, though they have a one-hour TTL, which isn't durable. A compromise would be to store annotations with JSON evidence. However, once a pod is deleted, I need an alternative, like a custom Remediation ConfigMap—yet that adds another object. I might have to accept a limited audit window.
+thinking
+**Finalizing markdown document**
+
+I’m considering how to compile everything into a complete markdown document. I need to store actions as metrics with a `healer_action_total` metric and potentially use Prometheus for evidence. But I have to balance using existing components without adding new services, so recording decisions within a Kubernetes `Lease` object and a `ConfigMap` for audit purposes could work. 
+
+I'll structure the document with sections like "Overview," "What Makes This Hard," and "What We Removed." I must keep justifications for each component, and I'll ensure we don't inadvertently add any sections. Let's keep things minimalist while incorporating critiques and adjusting existing structures!
+thinking
+**Drafting documentation**
+
+I want to ensure I'm clear about budget considerations. I think it's best to stick with using PDB and a rate token bucket without adding per-AZ caps, which could complicate things. I'll retain detection for memory leaks and zombies using Prometheus functions like `deriv`. 
+
+The state machine can be simplified to “InService -> Draining -> Recycled.” I’ll present design decisions without argumentative language and create a factual "What We Removed" section. I’ll also avoid mentions of new components and state that the application must handle "draining mode." Let’s get to drafting the document!
+codex
+```markdown
+---
+title: "Self-Healing Infrastructure"
+category: "Strategic Problems"
+difficulty: "Medium"
+tags: ["control-loop", "sre", "kubernetes", "traffic-draining", "reliability"]
+---
+
+## Overview
+
+This is a control loop that recycles degrading instances (zombie accumulation, runaway memory growth) without dropping traffic. Recycling stays safe by treating it as traffic control: explicit draining, hard disruption budgets, and hysteresis.
+
+The only custom logic is a small controller that decides *when* a recycle is allowed and then performs an idempotent sequence: **in-service → draining → evicted**.
+
+## What Makes This Hard
+
+“Unhealthy” is not “kill now”. If you terminate while traffic still arrives, you sever long-lived connections, trigger retries, and create self-inflicted load spikes.
+
+The real enemy is flapping: noisy signals trigger restarts, restarts cause warmup latency and cache misses, and the system restarts itself into an incident. The design needs trend-based signals, freshness checks, and strict disruption limits.
+
+## Requirements
+
+### Functional Requirements
+- Detect and remediate:
+  - Zombie process accumulation (sustained increase in zombie count)
+  - Memory leaks (monotonic RSS/heap growth under steady load)
+- Recycle without dropping traffic:
+  - Stop *new* requests before termination
+  - Allow in-flight requests to complete up to a bounded drain timeout
+- Prevent self-harm:
+  - Enforced disruption budget per service
+  - Cooldowns/hysteresis to avoid flapping
+  - Safe-mode when signals are stale or the control plane is impaired
+- Provide auditability:
+  - Every recycle decision is explainable from recorded signals and policy
+
+### Scale Targets
+- Fleet: 5,000 instances across 50 services
+- Detection latency: 15–30s
+- Remediation rate limit: max 1% of a service per 10 minutes
+- SLO constraint: recycling must not increase 5xx beyond 0.01% during steady state
+
+## What We Removed
+
+- Custom “Node/Pod Agent” daemon; signals come from standard exporters plus one minimal zombie metric
+- Direct “delete pod / terminate VM”; recycling uses Kubernetes `Eviction` so PDB enforcement is guaranteed
+- Load balancer-specific “confirm endpoint removal”; readiness + EndpointSlice membership is the single canonical check
+- Prometheus as the decision state store; Prometheus stays a signal source, while in-progress action state is persisted in Kubernetes (annotations + a per-service `Lease`)
+
+## Minimal Architecture
+
+```mermaid
+flowchart LR
+  C[Clients] --> LB["L7 Load Balancer"]
+  LB --> I["Service Instances"]
+
+  I --> P["Prometheus"]
+  P --> H["Healer Controller"]
+  H --> O["Kubernetes API (Eviction/PDB)"]
+  O --> I
+```
+
+### Components
+
+- **Service Instances**: Units we recycle. **Why:** only they can guarantee drain correctness (stop accepting new work while finishing in-flight work).
+- **L7 Load Balancer**: Routes traffic and respects readiness/draining semantics. **Why:** the reliable way to stop *new* traffic without severing in-flight requests.
+- **Prometheus**: Signal source for trends and freshness gating. **Why:** simplest way to compute “slope + persistence” from existing time-series.
+- **Healer Controller**: Policy + state machine. **Why:** the minimal custom component that turns signals into safe, rate-limited, idempotent action.
+- **Kubernetes API**: Replacement, budgets, and persistence for in-flight action state. **Why:** avoids custom provisioning and uses native PDB enforcement via `Eviction`.
+
+## Deep Dive: Safe Recycling Without Dropping Traffic
+
+Recycling is a small transaction with invariants:
+
+1. **Permission**
+   - Require fresh signals (scrape age within 2 intervals); otherwise safe-mode (no new actions).
+   - Require service health not already degraded (don’t add churn during incidents).
+   - Require disruption budget available (PDB + controller rate limit).
+
+2. **Drain**
+   - Mark the instance NotReady.
+   - Wait until it is absent from EndpointSlice membership.
+   - Require the instance to enter a drain behavior for *new* requests (fast-fail/redirect) while allowing in-flight work to complete.
+
+3. **Bounded grace**
+   - Allow in-flight requests/jobs to finish until a hard drain timeout (e.g., 60–120s).
+   - Past the deadline, proceed to eviction.
+
+4. **Recycle**
+   - Use `Eviction` to remove the pod so PDBs are enforced by the API server.
+   - Kubernetes reconciliation replaces capacity.
+
+5. **Cooldown**
+   - Apply per-service cooldown and rate limiting (token bucket targeting 1% per 10 minutes).
+   - Persist “intent/in-progress” in Kubernetes (annotations + `Lease`) so controller restarts or partial API failures resume cleanly.
+
+### Detection that’s actually actionable
+
+- **Zombie accumulation**
+  - Trigger on sustained growth with a small floor:
+    - `zombie_slope = deriv(zombie_count[10m])`
+    - Act when `zombie_slope > 0` for 10m and `zombie_count` exceeds a small baseline
+  - Zombie count comes from existing exporters where available; otherwise a tiny node textfile metric that reports zombies from `/proc`.
+
+- **Memory leak**
+  - Use trend plus workload stability gating:
+    - `rss_slope = deriv(container_memory_rss[30m])`
+    - Gate on stable request rate to avoid confusing load spikes for leaks
+  - Act before OOM to avoid latency and retry storms.
+
+Each action records the reason (signal names, windows, threshold results) into Kubernetes (event + persisted action state) so it’s explainable later alongside the Prometheus history.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Zero-drop recycling via draining | Faster “kill it now” remediation |
+| Bounded disruption with budgets | Maximum remediation throughput |
+| High-confidence, trend-based triggers | Catching extremely rare edge cases instantly |
+| Native primitives (readiness, EndpointSlice, PDB, eviction) | Provider-specific “perfect” LB propagation guarantees |
+
+## Failure Modes
+
+- **Prometheus down / signals stale**
+  - *What happens:* Trend-based decisions become unsafe.
+  - *Recover:* Safe-mode (no new recycling); rely on local Kubernetes protections (liveness/OOMKill) until signals return.
+
+- **Kubernetes API partially failing / slow**
+  - *What happens:* Drain/evict steps stall or partially apply.
+  - *Recover:* State machine resumes from persisted action state; deadlines force progress or cancel; no duplicate drains for the same instance.
+
+- **Draining but traffic still arrives**
+  - *What happens:* Some clients/LBs continue sending traffic briefly.
+  - *Recover:* Instance drain behavior rejects *new* requests once draining starts; in-flight work completes until timeout.
+
+- **Bad policy/config deploy (over-aggressive)**
+  - *What happens:* Recycle rate spikes and causes churn.
+  - *Recover:* Controller kill-switch + dry-run mode; hard global ceiling on recycle rate independent of thresholds.
+
+- **Network partition / controller duplication**
+  - *What happens:* Multiple controllers attempt the same action or actions stop mid-flight.
+  - *Recover:* Leader election + persisted “intent/in-progress” in Kubernetes makes actions idempotent; partitions stop progressing rather than duplicating.
+
+## Operational Notes
+
+- Enforce a simple “drain contract” for services: NotReady must cut off new traffic fast, and shutdown must finish within the drain timeout.
+- Budgets are two knobs: **PDB** for concurrency and **token bucket** for rate; both are always-on.
+- Alert on leading indicators: recycle rate, time-in-drain, and “healing blind” (stale signals).
+- Every action emits a Kubernetes event and persists minimal action state (who/why/when/deadline) so failures and restarts are routine, not special.
+```
+tokens used
+8,958
+```markdown
+---
+title: "Self-Healing Infrastructure"
+category: "Strategic Problems"
+difficulty: "Medium"
+tags: ["control-loop", "sre", "kubernetes", "traffic-draining", "reliability"]
+---
+
+## Overview
+
+This is a control loop that recycles degrading instances (zombie accumulation, runaway memory growth) without dropping traffic. Recycling stays safe by treating it as traffic control: explicit draining, hard disruption budgets, and hysteresis.
+
+The only custom logic is a small controller that decides *when* a recycle is allowed and then performs an idempotent sequence: **in-service → draining → evicted**.
+
+## What Makes This Hard
+
+“Unhealthy” is not “kill now”. If you terminate while traffic still arrives, you sever long-lived connections, trigger retries, and create self-inflicted load spikes.
+
+The real enemy is flapping: noisy signals trigger restarts, restarts cause warmup latency and cache misses, and the system restarts itself into an incident. The design needs trend-based signals, freshness checks, and strict disruption limits.
+
+## Requirements
+
+### Functional Requirements
+- Detect and remediate:
+  - Zombie process accumulation (sustained increase in zombie count)
+  - Memory leaks (monotonic RSS/heap growth under steady load)
+- Recycle without dropping traffic:
+  - Stop *new* requests before termination
+  - Allow in-flight requests to complete up to a bounded drain timeout
+- Prevent self-harm:
+  - Enforced disruption budget per service
+  - Cooldowns/hysteresis to avoid flapping
+  - Safe-mode when signals are stale or the control plane is impaired
+- Provide auditability:
+  - Every recycle decision is explainable from recorded signals and policy
+
+### Scale Targets
+- Fleet: 5,000 instances across 50 services
+- Detection latency: 15–30s
+- Remediation rate limit: max 1% of a service per 10 minutes
+- SLO constraint: recycling must not increase 5xx beyond 0.01% during steady state
+
+## What We Removed
+
+- Custom “Node/Pod Agent” daemon; signals come from standard exporters plus one minimal zombie metric
+- Direct “delete pod / terminate VM”; recycling uses Kubernetes `Eviction` so PDB enforcement is guaranteed
+- Load balancer-specific “confirm endpoint removal”; readiness + EndpointSlice membership is the single canonical check
+- Prometheus as the decision state store; Prometheus stays a signal source, while in-progress action state is persisted in Kubernetes (annotations + a per-service `Lease`)
+
+## Minimal Architecture
+
+```mermaid
+flowchart LR
+  C[Clients] --> LB["L7 Load Balancer"]
+  LB --> I["Service Instances"]
+
+  I --> P["Prometheus"]
+  P --> H["Healer Controller"]
+  H --> O["Kubernetes API (Eviction/PDB)"]
+  O --> I
+```
+
+### Components
+
+- **Service Instances**: Units we recycle. **Why:** only they can guarantee drain correctness (stop accepting new work while finishing in-flight work).
+- **L7 Load Balancer**: Routes traffic and respects readiness/draining semantics. **Why:** the reliable way to stop *new* traffic without severing in-flight requests.
+- **Prometheus**: Signal source for trends and freshness gating. **Why:** simplest way to compute “slope + persistence” from existing time-series.
+- **Healer Controller**: Policy + state machine. **Why:** the minimal custom component that turns signals into safe, rate-limited, idempotent action.
+- **Kubernetes API**: Replacement, budgets, and persistence for in-flight action state. **Why:** avoids custom provisioning and uses native PDB enforcement via `Eviction`.
+
+## Deep Dive: Safe Recycling Without Dropping Traffic
+
+Recycling is a small transaction with invariants:
+
+1. **Permission**
+   - Require fresh signals (scrape age within 2 intervals); otherwise safe-mode (no new actions).
+   - Require service health not already degraded (don’t add churn during incidents).
+   - Require disruption budget available (PDB + controller rate limit).
+
+2. **Drain**
+   - Mark the instance NotReady.
+   - Wait until it is absent from EndpointSlice membership.
+   - Require the instance to enter a drain behavior for *new* requests (fast-fail/redirect) while allowing in-flight work to complete.
+
+3. **Bounded grace**
+   - Allow in-flight requests/jobs to finish until a hard drain timeout (e.g., 60–120s).
+   - Past the deadline, proceed to eviction.
+
+4. **Recycle**
+   - Use `Eviction` to remove the pod so PDBs are enforced by the API server.
+   - Kubernetes reconciliation replaces capacity.
+
+5. **Cooldown**
+   - Apply per-service cooldown and rate limiting (token bucket targeting 1% per 10 minutes).
+   - Persist “intent/in-progress” in Kubernetes (annotations + `Lease`) so controller restarts or partial API failures resume cleanly.
+
+### Detection that’s actually actionable
+
+- **Zombie accumulation**
+  - Trigger on sustained growth with a small floor:
+    - `zombie_slope = deriv(zombie_count[10m])`
+    - Act when `zombie_slope > 0` for 10m and `zombie_count` exceeds a small baseline
+  - Zombie count comes from existing exporters where available; otherwise a tiny node textfile metric that reports zombies from `/proc`.
+
+- **Memory leak**
+  - Use trend plus workload stability gating:
+    - `rss_slope = deriv(container_memory_rss[30m])`
+    - Gate on stable request rate to avoid confusing load spikes for leaks
+  - Act before OOM to avoid latency and retry storms.
+
+Each action records the reason (signal names, windows, threshold results) into Kubernetes (event + persisted action state) so it’s explainable later alongside the Prometheus history.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Zero-drop recycling via draining | Faster “kill it now” remediation |
+| Bounded disruption with budgets | Maximum remediation throughput |
+| High-confidence, trend-based triggers | Catching extremely rare edge cases instantly |
+| Native primitives (readiness, EndpointSlice, PDB, eviction) | Provider-specific “perfect” LB propagation guarantees |
+
+## Failure Modes
+
+- **Prometheus down / signals stale**
+  - *What happens:* Trend-based decisions become unsafe.
+  - *Recover:* Safe-mode (no new recycling); rely on local Kubernetes protections (liveness/OOMKill) until signals return.
+
+- **Kubernetes API partially failing / slow**
+  - *What happens:* Drain/evict steps stall or partially apply.
+  - *Recover:* State machine resumes from persisted action state; deadlines force progress or cancel; no duplicate drains for the same instance.
+
+- **Draining but traffic still arrives**
+  - *What happens:* Some clients/LBs continue sending traffic briefly.
+  - *Recover:* Instance drain behavior rejects *new* requests once draining starts; in-flight work completes until timeout.
+
+- **Bad policy/config deploy (over-aggressive)**
+  - *What happens:* Recycle rate spikes and causes churn.
+  - *Recover:* Controller kill-switch + dry-run mode; hard global ceiling on recycle rate independent of thresholds.
+
+- **Network partition / controller duplication**
+  - *What happens:* Multiple controllers attempt the same action or actions stop mid-flight.
+  - *Recover:* Leader election + persisted “intent/in-progress” in Kubernetes makes actions idempotent; partitions stop progressing rather than duplicating.
+
+## Operational Notes
+
+- Enforce a simple “drain contract” for services: NotReady must cut off new traffic fast, and shutdown must finish within the drain timeout.
+- Budgets are two knobs: **PDB** for concurrency and **token bucket** for rate; both are always-on.
+- Alert on leading indicators: recycle rate, time-in-drain, and “healing blind” (stale signals).
+- Every action emits a Kubernetes event and persists minimal action state (who/why/when/deadline) so failures and restarts are routine, not special.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/10-strategic-problems/self-healing-infrastructure.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Self-Healing Infrastructure
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/self-healing-infrastructure.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/self-healing-infrastructure.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/10-strategic-problems/self-healing-infrastructure.md

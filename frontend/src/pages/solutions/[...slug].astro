@@ -1,0 +1,190 @@
+---
+import SolutionLayout from "../../layouts/SolutionLayout.astro";
+import {
+  getAllSolutions,
+  getPrevNextWithinCategory,
+  getSolutionByParams,
+  getSolutionStage,
+  hasStage,
+  type PipelineStage,
+} from "../../lib/solutions";
+
+export async function getStaticPaths() {
+  return getAllSolutions().map((s) => ({
+    params: { slug: `${s.categorySlug}/${s.slug}` },
+  }));
+}
+
+const raw = Astro.params.slug ?? "";
+const [categorySlug, solutionSlug] = raw.split("/");
+const solution = getSolutionByParams(categorySlug, solutionSlug);
+if (!solution) throw new Error(`Solution not found: ${raw}`);
+
+// Get stage from query parameter, default to "final"
+// Note: For static sites, query params are handled client-side
+const stageParam = Astro.url.searchParams.get("stage") as PipelineStage | null;
+const currentStage: PipelineStage = (stageParam && ["draft", "reviewed", "final"].includes(stageParam)) 
+  ? stageParam 
+  : "final";
+
+// Validate stage
+if (!["draft", "reviewed", "final"].includes(currentStage)) {
+  throw new Error(`Invalid stage: ${currentStage}`);
+}
+
+// Load all available stage modules
+const draftModule = hasStage(solution.slug, solution.categoryDir, "draft")
+  ? getSolutionStage(solution.slug, solution.categoryDir, "draft")
+  : null;
+const reviewedModule = hasStage(solution.slug, solution.categoryDir, "reviewed")
+  ? getSolutionStage(solution.slug, solution.categoryDir, "reviewed")
+  : null;
+const finalModule = getSolutionStage(solution.slug, solution.categoryDir, "final");
+
+if (!finalModule) {
+  throw new Error(`Final stage not found for solution: ${raw}`);
+}
+
+// Get the current stage module
+const stageModule =
+  currentStage === "draft" && draftModule
+    ? draftModule
+    : currentStage === "reviewed" && reviewedModule
+      ? reviewedModule
+      : finalModule;
+
+const headingsRaw = stageModule.getHeadings ? await stageModule.getHeadings() : [];
+const headings = Array.isArray(headingsRaw) ? headingsRaw : [];
+const { prev, next } = getPrevNextWithinCategory(solution);
+const Content = stageModule.Content;
+
+// Check which stages are available
+const hasDraft = !!draftModule;
+const hasReviewed = !!reviewedModule;
+const hasFinal = !!finalModule;
+
+---
+
+<SolutionLayout
+  solution={solution}
+  headings={headings}
+  prev={prev}
+  next={next}
+  currentStage={currentStage}
+  hasDraft={hasDraft}
+  hasReviewed={hasReviewed}
+  hasFinal={hasFinal}
+>
+  <div id="solution-content" data-stage={currentStage}>
+    {hasDraft && draftModule ? (
+      <div id="stage-draft" data-stage-content="draft" style={currentStage !== "draft" ? "display: none;" : ""}>
+        {(() => {
+          const DraftContent = draftModule.Content;
+          return <DraftContent />;
+        })()}
+      </div>
+    ) : null}
+    {hasReviewed && reviewedModule ? (
+      <div id="stage-reviewed" data-stage-content="reviewed" style={currentStage !== "reviewed" ? "display: none;" : ""}>
+        {(() => {
+          const ReviewedContent = reviewedModule.Content;
+          return <ReviewedContent />;
+        })()}
+      </div>
+    ) : null}
+    {hasFinal && finalModule ? (
+      <div id="stage-final" data-stage-content="final" style={currentStage !== "final" ? "display: none;" : ""}>
+        <Content />
+      </div>
+    ) : null}
+  </div>
+  
+  {hasDraft || hasReviewed ? (
+    <script>
+      // Client-side stage switching
+      (() => {
+        const url = new URL(window.location.href);
+        const stageParam = url.searchParams.get("stage") || "final";
+        const validStages = ["draft", "reviewed", "final"];
+        const currentStage = validStages.includes(stageParam) ? stageParam : "final";
+        
+        // Show/hide stage content
+        validStages.forEach((stage) => {
+          const el = document.getElementById(`stage-${stage}`);
+          if (el) {
+            el.style.display = stage === currentStage ? "" : "none";
+          }
+        });
+        
+        // Update URL without reload when clicking stage links
+        const stageLinks = document.querySelectorAll("a[data-stage]");
+        stageLinks.forEach((link) => {
+          link.addEventListener("click", (e) => {
+            e.preventDefault();
+            const stage = link.getAttribute("data-stage");
+            if (stage && validStages.includes(stage)) {
+              const newUrl = new URL(window.location.href);
+              if (stage === "final") {
+                newUrl.searchParams.delete("stage");
+              } else {
+                newUrl.searchParams.set("stage", stage);
+              }
+              window.history.pushState({ stage }, "", newUrl);
+              
+              // Switch content
+              validStages.forEach((s) => {
+                const el = document.getElementById(`stage-${s}`);
+                if (el) {
+                  el.style.display = s === stage ? "" : "none";
+                }
+              });
+              
+              // Update active link styles
+              stageLinks.forEach((l) => {
+                const lStage = l.getAttribute("data-stage");
+                if (lStage === stage) {
+                  l.classList.add("border-b-2", "border-sda-brand", "text-sda-brand");
+                  l.classList.remove("text-sda-fg-muted");
+                } else {
+                  l.classList.remove("border-b-2", "border-sda-brand", "text-sda-brand");
+                  l.classList.add("text-sda-fg-muted");
+                }
+              });
+              
+              // Re-initialize Mermaid diagrams
+              if ((window as any).mermaid) {
+                (window as any).mermaid.run({ querySelector: ".mermaid[data-mermaid='true']:not([data-processed='true'])" });
+              }
+            }
+          });
+        });
+        
+        // Handle browser back/forward
+        window.addEventListener("popstate", () => {
+          const url = new URL(window.location.href);
+          const stage = url.searchParams.get("stage") || "final";
+          const validStage = validStages.includes(stage) ? stage : "final";
+          
+          validStages.forEach((s) => {
+            const el = document.getElementById(`stage-${s}`);
+            if (el) {
+              el.style.display = s === validStage ? "" : "none";
+            }
+          });
+          
+          stageLinks.forEach((l) => {
+            const lStage = l.getAttribute("data-stage");
+            if (lStage === validStage) {
+              l.classList.add("border-b-2", "border-sda-brand", "text-sda-brand");
+              l.classList.remove("text-sda-fg-muted");
+            } else {
+              l.classList.remove("border-b-2", "border-sda-brand", "text-sda-brand");
+              l.classList.add("text-sda-fg-muted");
+            }
+          });
+        });
+      })();
+    </script>
+  ) : null}
+</SolutionLayout>
+

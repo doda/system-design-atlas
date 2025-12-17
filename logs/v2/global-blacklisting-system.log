@@ -1,0 +1,1618 @@
+==========================================
+Generating (v2): Global Blacklisting System
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2cc2-7421-a87a-09d5adaea3d9
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Global Blacklisting System
+**Category**: Strategic Problems
+
+**Problem Statement**:
+Design a system to propagate abuse signals (IPs, domains) globally within seconds to block attackers.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+thinking
+**Designing a markdown document**
+
+I need to create a markdown document following the specified format, focusing on the toughest parts. I'll aim for a 6-8 node mermaid diagram. Global propagation needs to happen within seconds, ensuring integrity and consistency while avoiding false positives, rollbacks, and component confusion.
+
+The plan might involve a central policy service with signed updates and streaming pub/sub to edge POPs, using technologies like Kafka or NATS/JetStream. Low latency propagation and safe rollback are also vital, along with managing conflicting signals while ensuring authenticity and consistency.
+thinking
+**Exploring edge services and propagation**
+
+I'm considering using signed "delta" events along with edge services that maintain local in-memory Bloom filters. The strategy could involve a tiered global stream from the control plane to regional distribution clusters. Within the POP, I might use gRPC streams or WebSocket connections for efficient data transfer.
+
+I’m planning to create a document that includes an overview, challenges, requirements, architectural diagrams, and a deep dive into propagation speed, safety features, and trade-offs across various failure modes. I'll include crucial performance metrics like 10 million QPS and operational notes for effective rollouts.
+codex
+```markdown
+---
+title: "Global Blacklisting System"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["abuse", "security", "global-distribution", "streaming", "control-plane"]
+---
+
+## Overview
+
+This system propagates abuse signals (IP ranges, domains, ASN fingerprints) globally in seconds and enforces them at the edge with a deterministic, auditable policy. The key insight is to **treat “block decisions” as a globally replicated event stream with signed, versioned artifacts**, not as “a database everyone queries.” Edge enforcement becomes a local read (in-memory) with predictable latency, while distribution is an engineering problem with clear invariants.
+
+The elegance comes from separating concerns: **a small, strongly consistent control plane** that decides *what* to block, and **a fast, eventually consistent data plane** that decides *whether this request matches a current block artifact*. This keeps the hard parts (safety, correctness, poisoning resistance, rollback) in one place, and keeps the hot path boring.
+
+## What Makes This Hard
+
+Naive implementations die in three traps:
+
+1. **“Global DB lookup” trap:** querying a central store (or even a multi-region database) on every request makes enforcement brittle, expensive, and too slow under attack—exactly when you need it most.
+2. **“Fast push without safety” trap:** pushing rules instantly without cryptographic authenticity and rollback turns the system into a self-inflicted outage machine (one bad rule blocks the world).
+3. **“Rules don’t scale on the hot path” trap:** large, frequently changing lists turn into CPU cache misses, lock contention, and garbage collection pauses unless you build an artifact optimized for lookups and incremental updates.
+
+## Requirements
+
+### Functional Requirements
+- Ingest abuse signals from internal detectors and trusted external feeds, with provenance and confidence.
+- Produce **globally consistent policy artifacts** (what is blocked) with an audit trail and reversible changes.
+- Propagate policy updates to all enforcement points within seconds.
+- Enforce blocks on the request path with minimal latency overhead.
+- Support emergency actions: “block now”, “undo now”, and “quarantine suspicious feed.”
+
+### Scale Targets
+- **Enforcement throughput:** 10M req/s globally (edge/CDN scale). The design must add <1ms p99 overhead per request.
+- **Rule volume:** up to 5M IPs / 500k CIDRs + 2M domains (realistic if you ingest noisy feeds). Lookups must remain O(1)-ish in practice.
+- **Update rate:** bursts of 10k updates/s during attacks. Propagation **p99 < 5s** end-to-end (decision → enforced globally).
+- **Regions/PoPs:** 20 regions, 200 PoPs. Distribution must tolerate partitions and still converge quickly.
+
+## Key Design Decisions
+
+- **Decision:** Use an append-only event log + signed policy artifacts.
+  - **Chose:** Kafka (or equivalent durable log) as the distribution spine; artifacts are versioned and signed.
+  - **Rejected:** “Update a DB row and poll” and “push configs via ad-hoc RPC.”
+  - **Why:** The log gives ordering, replay, backpressure, and an audit trail. Signed artifacts let the edge trust updates even during partial compromise.
+
+- **Decision:** Enforce from compiled artifacts, not from raw rule lists.
+  - **Chose:** A two-tier structure: (1) compact probabilistic prefilter (Bloom/Xor filter) + (2) exact set for positives (hash set / radix trie for CIDRs).
+  - **Rejected:** Linear scans, regex-heavy matching, and per-request remote checks.
+  - **Why:** Most traffic is not abusive; a prefilter keeps CPU predictable. Exact sets keep false positives at zero where it matters (final decision).
+
+- **Decision:** Roll out globally via “version gates” with canary + instant rollback.
+  - **Chose:** Every artifact has a monotonically increasing version; PoPs apply only if signature verifies and version advances; rollback is “publish new version that removes rule(s).”
+  - **Rejected:** Mutable config blobs without versioning and “delete the bad rule everywhere.”
+  - **Why:** Under stress, you need one lever: publish version N+1. Rollback becomes the same mechanism as rollout.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Detectors & Feeds"] --> B["Ingest API"]
+  B --> C["Policy Engine"]
+  C --> D["Event Log"]
+  C --> E["Artifact Store"]
+  D --> F["Regional Distributors"]
+  E --> F
+  F --> G["PoP Enforcers"]
+  G --> H["Edge Gateways"]
+```
+
+### Components
+
+- **Ingest API**
+  - Normalizes signals, attaches provenance, enforces quotas per source, and rejects malformed/poisonous input (e.g., “block 0.0.0.0/0” without elevated approval).
+
+- **Policy Engine**
+  - The “brain”: deduplicates, scores, applies allowlists, and decides which signals graduate into the active blacklist. Writes every decision as an immutable event.
+
+- **Event Log**
+  - The propagation backbone. Consumers can replay from offsets to recover instantly after outages, and ordering is explicit.
+
+- **Artifact Store**
+  - Stores the compiled, signed artifacts (full snapshot + deltas). This is what PoPs fetch on cold start or when they fall behind.
+
+- **Regional Distributors**
+  - Maintain long-lived connections to PoPs, push deltas immediately, and serve snapshots locally to avoid cross-ocean fetches.
+
+- **PoP Enforcers**
+  - Turn artifacts into a hot in-memory structure and expose a tiny “isBlocked(subject)” interface to the gateways.
+
+- **Edge Gateways**
+  - Apply the decision at L7 (HTTP Host / SNI) and L4 (source IP/CIDR), with strict timeouts and fail-closed/fail-open behavior chosen per risk class.
+
+## Deep Dive: Propagation in Seconds Without Global Self-DoS
+
+The hardest part is not “getting updates to the edge.” It’s doing it **fast, safely, and under attack**.
+
+**1) Make the edge trustless and deterministic.**  
+PoPs never “evaluate policy.” They only verify signatures and apply artifacts. The Policy Engine signs every artifact with an offline-protected key (or HSM-backed). PoPs accept artifacts only if:
+- signature verifies against a pinned public key,
+- `version` strictly increases,
+- artifact metadata matches their environment (prod vs staging),
+- and the artifact passes sanity checks (size bounds, CIDR count bounds, domain count bounds).
+
+This blocks the two nightmare scenarios: a compromised distributor pushing garbage, and accidental bad deploys without a clean rollback path.
+
+**2) Use snapshots + deltas with bounded catch-up.**  
+Deltas keep steady-state fast (kilobytes per second), but partitions happen. Every N versions (or every M minutes), the Policy Engine emits a **snapshot artifact**. PoPs that are behind more than a threshold stop applying deltas and fetch the latest snapshot from the regional distributor. This prevents “replay storms” when a PoP reconnects after a long outage.
+
+**3) Optimize the hot path for cache, not algorithms.**  
+For IPs/CIDRs:
+- Store CIDRs in a compressed radix trie (or a well-tested library) for exact matching.
+- Store individual IPs in a flat hash set.
+For domains:
+- Normalize to punycode, lowercase, and store **reversed labels** (e.g., `com.example`) in a trie for suffix matching when blocking subdomains.
+Prefilter:
+- A Bloom/Xor filter rejects obvious non-members cheaply.
+- Every “maybe” is checked against the exact structure to keep false positives from actually blocking.
+
+**4) Rollouts are gated, not simultaneous.**  
+The distributor does a fixed rollout order: 1% PoPs → 10% → 100%, with automated health checks (block-hit rate deltas, error rates, customer allowlist exceptions). Emergency mode overrides gating (for real attacks), but the same versioned mechanism still applies, so rollback is one publish.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Seconds-level global propagation | Strong global read-after-write everywhere |
+| Safe rollouts + instant rollback | More moving parts than “one DB table” |
+| Predictable hot-path latency | Slightly higher memory footprint at PoPs |
+| Auditability and provenance | More rigor in ingest and policy changes |
+
+## Failure Modes
+
+- **Bad rule blocks legitimate traffic**
+  - **What happens:** sudden drop in requests for specific customers/regions; spike in blocks.
+  - **Detect:** anomaly detection on block rate per customer/ASN/region; “top newly-blocked” dashboards keyed by artifact version.
+  - **Recover:** publish version N+1 removing the rule; distributors push immediately; PoPs apply within seconds.
+
+- **Partition: PoPs lose connectivity to distributors**
+  - **What happens:** PoPs stop receiving updates; enforcement becomes stale.
+  - **Detect:** PoP reports “current artifact version” heartbeat; alert on version lag SLO breach.
+  - **Recover:** PoPs continue enforcing last-known-good; on reconnect they fetch latest snapshot (not replaying hours of deltas).
+
+- **Poisoned feed attempts to inject massive blocks**
+  - **What happens:** ingest flood or “block the internet” payloads.
+  - **Detect:** per-source quotas, schema validation, and policy sanity checks (e.g., max CIDR size, max affected traffic estimate).
+  - **Recover:** automatically quarantine the source, require human approval to re-enable, and publish a corrective version if anything slipped through.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move more enforcement into kernel/sidecar primitives (eBPF/XDP for L4 IP blocking) while keeping the same signed artifact format; add per-customer policy overlays without forking the global stream.
+- **100x scale:** Split the policy stream into shards by subject type and hash (IPs/domains) to reduce fanout pressure; introduce dedicated “attack-mode” artifacts with ultra-short TTLs to avoid unbounded growth during sustained campaigns.
+
+## Operational Notes
+
+- Treat the artifact `version` as the primary on-call metric; everything else is secondary.
+- Keep a “break glass” path: publish an empty/allow-only artifact signed by a separate emergency key with strict access controls.
+- Maintain a global allowlist (customer IPs, critical partners, internal health checks) enforced *before* blacklist matching.
+- Always log decisions with `{artifact_version, matched_rule_id, provenance}` sampled at the edge; it’s the difference between “we think it works” and “we can prove what happened.”
+```
+tokens used
+3,825
+```markdown
+---
+title: "Global Blacklisting System"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["abuse", "security", "global-distribution", "streaming", "control-plane"]
+---
+
+## Overview
+
+This system propagates abuse signals (IP ranges, domains, ASN fingerprints) globally in seconds and enforces them at the edge with a deterministic, auditable policy. The key insight is to **treat “block decisions” as a globally replicated event stream with signed, versioned artifacts**, not as “a database everyone queries.” Edge enforcement becomes a local read (in-memory) with predictable latency, while distribution is an engineering problem with clear invariants.
+
+The elegance comes from separating concerns: **a small, strongly consistent control plane** that decides *what* to block, and **a fast, eventually consistent data plane** that decides *whether this request matches a current block artifact*. This keeps the hard parts (safety, correctness, poisoning resistance, rollback) in one place, and keeps the hot path boring.
+
+## What Makes This Hard
+
+Naive implementations die in three traps:
+
+1. **“Global DB lookup” trap:** querying a central store (or even a multi-region database) on every request makes enforcement brittle, expensive, and too slow under attack—exactly when you need it most.
+2. **“Fast push without safety” trap:** pushing rules instantly without cryptographic authenticity and rollback turns the system into a self-inflicted outage machine (one bad rule blocks the world).
+3. **“Rules don’t scale on the hot path” trap:** large, frequently changing lists turn into CPU cache misses, lock contention, and garbage collection pauses unless you build an artifact optimized for lookups and incremental updates.
+
+## Requirements
+
+### Functional Requirements
+- Ingest abuse signals from internal detectors and trusted external feeds, with provenance and confidence.
+- Produce **globally consistent policy artifacts** (what is blocked) with an audit trail and reversible changes.
+- Propagate policy updates to all enforcement points within seconds.
+- Enforce blocks on the request path with minimal latency overhead.
+- Support emergency actions: “block now”, “undo now”, and “quarantine suspicious feed.”
+
+### Scale Targets
+- **Enforcement throughput:** 10M req/s globally (edge/CDN scale). The design must add <1ms p99 overhead per request.
+- **Rule volume:** up to 5M IPs / 500k CIDRs + 2M domains (realistic if you ingest noisy feeds). Lookups must remain O(1)-ish in practice.
+- **Update rate:** bursts of 10k updates/s during attacks. Propagation **p99 < 5s** end-to-end (decision → enforced globally).
+- **Regions/PoPs:** 20 regions, 200 PoPs. Distribution must tolerate partitions and still converge quickly.
+
+## Key Design Decisions
+
+- **Decision:** Use an append-only event log + signed policy artifacts.
+  - **Chose:** Kafka (or equivalent durable log) as the distribution spine; artifacts are versioned and signed.
+  - **Rejected:** “Update a DB row and poll” and “push configs via ad-hoc RPC.”
+  - **Why:** The log gives ordering, replay, backpressure, and an audit trail. Signed artifacts let the edge trust updates even during partial compromise.
+
+- **Decision:** Enforce from compiled artifacts, not from raw rule lists.
+  - **Chose:** A two-tier structure: (1) compact probabilistic prefilter (Bloom/Xor filter) + (2) exact set for positives (hash set / radix trie for CIDRs).
+  - **Rejected:** Linear scans, regex-heavy matching, and per-request remote checks.
+  - **Why:** Most traffic is not abusive; a prefilter keeps CPU predictable. Exact sets keep false positives at zero where it matters (final decision).
+
+- **Decision:** Roll out globally via “version gates” with canary + instant rollback.
+  - **Chose:** Every artifact has a monotonically increasing version; PoPs apply only if signature verifies and version advances; rollback is “publish new version that removes rule(s).”
+  - **Rejected:** Mutable config blobs without versioning and “delete the bad rule everywhere.”
+  - **Why:** Under stress, you need one lever: publish version N+1. Rollback becomes the same mechanism as rollout.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Detectors & Feeds"] --> B["Ingest API"]
+  B --> C["Policy Engine"]
+  C --> D["Event Log"]
+  C --> E["Artifact Store"]
+  D --> F["Regional Distributors"]
+  E --> F
+  F --> G["PoP Enforcers"]
+  G --> H["Edge Gateways"]
+```
+
+### Components
+
+- **Ingest API**
+  - Normalizes signals, attaches provenance, enforces quotas per source, and rejects malformed/poisonous input (e.g., “block 0.0.0.0/0” without elevated approval).
+
+- **Policy Engine**
+  - The “brain”: deduplicates, scores, applies allowlists, and decides which signals graduate into the active blacklist. Writes every decision as an immutable event.
+
+- **Event Log**
+  - The propagation backbone. Consumers can replay from offsets to recover instantly after outages, and ordering is explicit.
+
+- **Artifact Store**
+  - Stores the compiled, signed artifacts (full snapshot + deltas). This is what PoPs fetch on cold start or when they fall behind.
+
+- **Regional Distributors**
+  - Maintain long-lived connections to PoPs, push deltas immediately, and serve snapshots locally to avoid cross-ocean fetches.
+
+- **PoP Enforcers**
+  - Turn artifacts into a hot in-memory structure and expose a tiny “isBlocked(subject)” interface to the gateways.
+
+- **Edge Gateways**
+  - Apply the decision at L7 (HTTP Host / SNI) and L4 (source IP/CIDR), with strict timeouts and fail-closed/fail-open behavior chosen per risk class.
+
+## Deep Dive: Propagation in Seconds Without Global Self-DoS
+
+The hardest part is not “getting updates to the edge.” It’s doing it **fast, safely, and under attack**.
+
+**1) Make the edge trustless and deterministic.**  
+PoPs never “evaluate policy.” They only verify signatures and apply artifacts. The Policy Engine signs every artifact with an offline-protected key (or HSM-backed). PoPs accept artifacts only if:
+- signature verifies against a pinned public key,
+- `version` strictly increases,
+- artifact metadata matches their environment (prod vs staging),
+- and the artifact passes sanity checks (size bounds, CIDR count bounds, domain count bounds).
+
+This blocks the two nightmare scenarios: a compromised distributor pushing garbage, and accidental bad deploys without a clean rollback path.
+
+**2) Use snapshots + deltas with bounded catch-up.**  
+Deltas keep steady-state fast (kilobytes per second), but partitions happen. Every N versions (or every M minutes), the Policy Engine emits a **snapshot artifact**. PoPs that are behind more than a threshold stop applying deltas and fetch the latest snapshot from the regional distributor. This prevents “replay storms” when a PoP reconnects after a long outage.
+
+**3) Optimize the hot path for cache, not algorithms.**  
+For IPs/CIDRs:
+- Store CIDRs in a compressed radix trie (or a well-tested library) for exact matching.
+- Store individual IPs in a flat hash set.
+For domains:
+- Normalize to punycode, lowercase, and store **reversed labels** (e.g., `com.example`) in a trie for suffix matching when blocking subdomains.
+Prefilter:
+- A Bloom/Xor filter rejects obvious non-members cheaply.
+- Every “maybe” is checked against the exact structure to keep false positives from actually blocking.
+
+**4) Rollouts are gated, not simultaneous.**  
+The distributor does a fixed rollout order: 1% PoPs → 10% → 100%, with automated health checks (block-hit rate deltas, error rates, customer allowlist exceptions). Emergency mode overrides gating (for real attacks), but the same versioned mechanism still applies, so rollback is one publish.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Seconds-level global propagation | Strong global read-after-write everywhere |
+| Safe rollouts + instant rollback | More moving parts than “one DB table” |
+| Predictable hot-path latency | Slightly higher memory footprint at PoPs |
+| Auditability and provenance | More rigor in ingest and policy changes |
+
+## Failure Modes
+
+- **Bad rule blocks legitimate traffic**
+  - **What happens:** sudden drop in requests for specific customers/regions; spike in blocks.
+  - **Detect:** anomaly detection on block rate per customer/ASN/region; “top newly-blocked” dashboards keyed by artifact version.
+  - **Recover:** publish version N+1 removing the rule; distributors push immediately; PoPs apply within seconds.
+
+- **Partition: PoPs lose connectivity to distributors**
+  - **What happens:** PoPs stop receiving updates; enforcement becomes stale.
+  - **Detect:** PoP reports “current artifact version” heartbeat; alert on version lag SLO breach.
+  - **Recover:** PoPs continue enforcing last-known-good; on reconnect they fetch latest snapshot (not replaying hours of deltas).
+
+- **Poisoned feed attempts to inject massive blocks**
+  - **What happens:** ingest flood or “block the internet” payloads.
+  - **Detect:** per-source quotas, schema validation, and policy sanity checks (e.g., max CIDR size, max affected traffic estimate).
+  - **Recover:** automatically quarantine the source, require human approval to re-enable, and publish a corrective version if anything slipped through.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move more enforcement into kernel/sidecar primitives (eBPF/XDP for L4 IP blocking) while keeping the same signed artifact format; add per-customer policy overlays without forking the global stream.
+- **100x scale:** Split the policy stream into shards by subject type and hash (IPs/domains) to reduce fanout pressure; introduce dedicated “attack-mode” artifacts with ultra-short TTLs to avoid unbounded growth during sustained campaigns.
+
+## Operational Notes
+
+- Treat the artifact `version` as the primary on-call metric; everything else is secondary.
+- Keep a “break glass” path: publish an empty/allow-only artifact signed by a separate emergency key with strict access controls.
+- Maintain a global allowlist (customer IPs, critical partners, internal health checks) enforced *before* blacklist matching.
+- Always log decisions with `{artifact_version, matched_rule_id, provenance}` sampled at the edge; it’s the difference between “we think it works” and “we can prove what happened.”
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/global-blacklisting-system.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-ac39-73b3-a39f-985b1dd68afd
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Global Blacklisting System"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["abuse", "security", "global-distribution", "streaming", "control-plane"]
+---
+
+## Overview
+
+This system propagates abuse signals (IP ranges, domains, ASN fingerprints) globally in seconds and enforces them at the edge with a deterministic, auditable policy. The key insight is to **treat “block decisions” as a globally replicated event stream with signed, versioned artifacts**, not as “a database everyone queries.” Edge enforcement becomes a local read (in-memory) with predictable latency, while distribution is an engineering problem with clear invariants.
+
+The elegance comes from separating concerns: **a small, strongly consistent control plane** that decides *what* to block, and **a fast, eventually consistent data plane** that decides *whether this request matches a current block artifact*. This keeps the hard parts (safety, correctness, poisoning resistance, rollback) in one place, and keeps the hot path boring.
+
+## What Makes This Hard
+
+Naive implementations die in three traps:
+
+1. **“Global DB lookup” trap:** querying a central store (or even a multi-region database) on every request makes enforcement brittle, expensive, and too slow under attack—exactly when you need it most.
+2. **“Fast push without safety” trap:** pushing rules instantly without cryptographic authenticity and rollback turns the system into a self-inflicted outage machine (one bad rule blocks the world).
+3. **“Rules don’t scale on the hot path” trap:** large, frequently changing lists turn into CPU cache misses, lock contention, and garbage collection pauses unless you build an artifact optimized for lookups and incremental updates.
+
+## Requirements
+
+### Functional Requirements
+- Ingest abuse signals from internal detectors and trusted external feeds, with provenance and confidence.
+- Produce **globally consistent policy artifacts** (what is blocked) with an audit trail and reversible changes.
+- Propagate policy updates to all enforcement points within seconds.
+- Enforce blocks on the request path with minimal latency overhead.
+- Support emergency actions: “block now”, “undo now”, and “quarantine suspicious feed.”
+
+### Scale Targets
+- **Enforcement throughput:** 10M req/s globally (edge/CDN scale). The design must add <1ms p99 overhead per request.
+- **Rule volume:** up to 5M IPs / 500k CIDRs + 2M domains (realistic if you ingest noisy feeds). Lookups must remain O(1)-ish in practice.
+- **Update rate:** bursts of 10k updates/s during attacks. Propagation **p99 < 5s** end-to-end (decision → enforced globally).
+- **Regions/PoPs:** 20 regions, 200 PoPs. Distribution must tolerate partitions and still converge quickly.
+
+## Key Design Decisions
+
+- **Decision:** Use an append-only event log + signed policy artifacts.
+  - **Chose:** Kafka (or equivalent durable log) as the distribution spine; artifacts are versioned and signed.
+  - **Rejected:** “Update a DB row and poll” and “push configs via ad-hoc RPC.”
+  - **Why:** The log gives ordering, replay, backpressure, and an audit trail. Signed artifacts let the edge trust updates even during partial compromise.
+
+- **Decision:** Enforce from compiled artifacts, not from raw rule lists.
+  - **Chose:** A two-tier structure: (1) compact probabilistic prefilter (Bloom/Xor filter) + (2) exact set for positives (hash set / radix trie for CIDRs).
+  - **Rejected:** Linear scans, regex-heavy matching, and per-request remote checks.
+  - **Why:** Most traffic is not abusive; a prefilter keeps CPU predictable. Exact sets keep false positives at zero where it matters (final decision).
+
+- **Decision:** Roll out globally via “version gates” with canary + instant rollback.
+  - **Chose:** Every artifact has a monotonically increasing version; PoPs apply only if signature verifies and version advances; rollback is “publish new version that removes rule(s).”
+  - **Rejected:** Mutable config blobs without versioning and “delete the bad rule everywhere.”
+  - **Why:** Under stress, you need one lever: publish version N+1. Rollback becomes the same mechanism as rollout.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Detectors & Feeds"] --> B["Ingest API"]
+  B --> C["Policy Engine"]
+  C --> D["Event Log"]
+  C --> E["Artifact Store"]
+  D --> F["Regional Distributors"]
+  E --> F
+  F --> G["PoP Enforcers"]
+  G --> H["Edge Gateways"]
+```
+
+### Components
+
+- **Ingest API**
+  - Normalizes signals, attaches provenance, enforces quotas per source, and rejects malformed/poisonous input (e.g., “block 0.0.0.0/0” without elevated approval).
+
+- **Policy Engine**
+  - The “brain”: deduplicates, scores, applies allowlists, and decides which signals graduate into the active blacklist. Writes every decision as an immutable event.
+
+- **Event Log**
+  - The propagation backbone. Consumers can replay from offsets to recover instantly after outages, and ordering is explicit.
+
+- **Artifact Store**
+  - Stores the compiled, signed artifacts (full snapshot + deltas). This is what PoPs fetch on cold start or when they fall behind.
+
+- **Regional Distributors**
+  - Maintain long-lived connections to PoPs, push deltas immediately, and serve snapshots locally to avoid cross-ocean fetches.
+
+- **PoP Enforcers**
+  - Turn artifacts into a hot in-memory structure and expose a tiny “isBlocked(subject)” interface to the gateways.
+
+- **Edge Gateways**
+  - Apply the decision at L7 (HTTP Host / SNI) and L4 (source IP/CIDR), with strict timeouts and fail-closed/fail-open behavior chosen per risk class.
+
+## Deep Dive: Propagation in Seconds Without Global Self-DoS
+
+The hardest part is not “getting updates to the edge.” It’s doing it **fast, safely, and under attack**.
+
+**1) Make the edge trustless and deterministic.**  
+PoPs never “evaluate policy.” They only verify signatures and apply artifacts. The Policy Engine signs every artifact with an offline-protected key (or HSM-backed). PoPs accept artifacts only if:
+- signature verifies against a pinned public key,
+- `version` strictly increases,
+- artifact metadata matches their environment (prod vs staging),
+- and the artifact passes sanity checks (size bounds, CIDR count bounds, domain count bounds).
+
+This blocks the two nightmare scenarios: a compromised distributor pushing garbage, and accidental bad deploys without a clean rollback path.
+
+**2) Use snapshots + deltas with bounded catch-up.**  
+Deltas keep steady-state fast (kilobytes per second), but partitions happen. Every N versions (or every M minutes), the Policy Engine emits a **snapshot artifact**. PoPs that are behind more than a threshold stop applying deltas and fetch the latest snapshot from the regional distributor. This prevents “replay storms” when a PoP reconnects after a long outage.
+
+**3) Optimize the hot path for cache, not algorithms.**  
+For IPs/CIDRs:
+- Store CIDRs in a compressed radix trie (or a well-tested library) for exact matching.
+- Store individual IPs in a flat hash set.
+For domains:
+- Normalize to punycode, lowercase, and store **reversed labels** (e.g., `com.example`) in a trie for suffix matching when blocking subdomains.
+Prefilter:
+- A Bloom/Xor filter rejects obvious non-members cheaply.
+- Every “maybe” is checked against the exact structure to keep false positives from actually blocking.
+
+**4) Rollouts are gated, not simultaneous.**  
+The distributor does a fixed rollout order: 1% PoPs → 10% → 100%, with automated health checks (block-hit rate deltas, error rates, customer allowlist exceptions). Emergency mode overrides gating (for real attacks), but the same versioned mechanism still applies, so rollback is one publish.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Seconds-level global propagation | Strong global read-after-write everywhere |
+| Safe rollouts + instant rollback | More moving parts than “one DB table” |
+| Predictable hot-path latency | Slightly higher memory footprint at PoPs |
+| Auditability and provenance | More rigor in ingest and policy changes |
+
+## Failure Modes
+
+- **Bad rule blocks legitimate traffic**
+  - **What happens:** sudden drop in requests for specific customers/regions; spike in blocks.
+  - **Detect:** anomaly detection on block rate per customer/ASN/region; “top newly-blocked” dashboards keyed by artifact version.
+  - **Recover:** publish version N+1 removing the rule; distributors push immediately; PoPs apply within seconds.
+
+- **Partition: PoPs lose connectivity to distributors**
+  - **What happens:** PoPs stop receiving updates; enforcement becomes stale.
+  - **Detect:** PoP reports “current artifact version” heartbeat; alert on version lag SLO breach.
+  - **Recover:** PoPs continue enforcing last-known-good; on reconnect they fetch latest snapshot (not replaying hours of deltas).
+
+- **Poisoned feed attempts to inject massive blocks**
+  - **What happens:** ingest flood or “block the internet” payloads.
+  - **Detect:** per-source quotas, schema validation, and policy sanity checks (e.g., max CIDR size, max affected traffic estimate).
+  - **Recover:** automatically quarantine the source, require human approval to re-enable, and publish a corrective version if anything slipped through.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move more enforcement into kernel/sidecar primitives (eBPF/XDP for L4 IP blocking) while keeping the same signed artifact format; add per-customer policy overlays without forking the global stream.
+- **100x scale:** Split the policy stream into shards by subject type and hash (IPs/domains) to reduce fanout pressure; introduce dedicated “attack-mode” artifacts with ultra-short TTLs to avoid unbounded growth during sustained campaigns.
+
+## Operational Notes
+
+- Treat the artifact `version` as the primary on-call metric; everything else is secondary.
+- Keep a “break glass” path: publish an empty/allow-only artifact signed by a separate emergency key with strict access controls.
+- Maintain a global allowlist (customer IPs, critical partners, internal health checks) enforced *before* blacklist matching.
+- Always log decisions with `{artifact_version, matched_rule_id, provenance}` sampled at the edge; it’s the difference between “we think it works” and “we can prove what happened.”
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+thinking
+**Considering system architecture**
+
+I realize that the event log isn't necessarily required for edge operations; it might be used for auditing, while distribution could rely on pubsub (like SNS) with S3 for storage. The policy engine could be a single point of failure, so I think about running it in an active-active setup using a consensus store, maybe Postgres with advisory locks. Allowlists and overrides must be versioned per customer. I want to ensure an elegant core featuring an event stream, signed artifacts, and version gating. Let's simplify our components effectively.
+thinking
+**Planning a critique**
+
+I’m considering using existing open-source projects like TUF for update security and Envoy xDS for configuration distribution, plus NGINX keyval and potentially WAF rulesets or Suricata. The user asked for a critique that needs to be concise yet thorough, maybe around 6-10 bullet points. However, since the output format is multi-section, I can’t let it be too short. I think I’ll organize everything using markdown with headings and tables to make it clearer. Let's deliver!
+codex
+## Elegance Check
+
+### The Core Insight
+Treating “block decisions” as a signed, versioned, globally replicated artifact stream (instead of a globally queried DB) is the right abstraction: it makes the edge hot path deterministic, bounded, and auditable, while keeping correctness/safety centralized.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Policy Engine | Single place for scoring, allowlists, provenance, sanity checks, and producing a canonical “truth” with rollback semantics. |
+| Signed Artifacts (snapshot + delta) | Deterministic edge enforcement, fast cold start/catch-up, and a strong “what was active when” audit trail. |
+| Artifact Store (object store semantics) | Decouples “publish” from “fetch,” enables caching, and gives PoPs a reliable recovery path after partitions. |
+| PoP Enforcers (in-memory matcher) | Keeps the request path local and predictable; isolates data structure complexity from gateways. |
+| Ingest API w/ quotas + validation | Prevents poisoned inputs and operational mistakes from becoming global incidents. |
+| Version gating + rollback-as-next-version | One operational lever that works under stress; avoids “delete everywhere” coordination failures. |
+
+### Simplification Opportunities
+| Current | Simper Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Kafka as the global distribution spine to edge | Object store + CDN for artifacts, plus a lightweight notification channel (SNS/SQS/PubSub/WebSocket fanout) carrying only `{version, manifest_hash}` | You lose “one system does everything”; you gain fewer moving parts and better cache economics. |
+| Regional Distributors maintaining long-lived PoP connections | Use CDN/edge caching + long-polling (or server-sent events) to a small notification service; PoPs fetch artifacts directly from nearest cache | Slightly higher fetch latency in some cases; much simpler ops than bespoke connection management. |
+| Custom secure update protocol (pinned key + version monotonicity) | Adopt **TUF** (The Update Framework) concepts: signed manifests, key roles, rotation, threshold signatures, rollback/freeze protections | Some upfront complexity, but it’s “standard hardening” instead of bespoke crypto + edge cases. |
+| Always-on prefilter (Bloom/Xor) + exact structure | Start with exact-only (radix trie + hash set) and add prefilter only if profiling shows CPU issues at p99 under realistic cache pressure | Risk of higher CPU; but avoids dual-structure complexity and correctness pitfalls early. |
+| Single global artifact for all PoPs | Per-region/per-product “views” (still signed) so PoPs load only what they need (e.g., IP-only at L4, domain-only at L7, jurisdictional sets) | More build variants; big win in memory, rollout blast radius, and operational clarity. |
+| Append-only events at the same granularity as inputs | Micro-batching in the Policy Engine (e.g., 200–500ms windows) to amortize rebuild costs and reduce version churn during 10k/s bursts | Slightly slower “block now” unless emergency bypass exists; major stability improvement during attack spikes. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Control plane (Policy Engine) down for 5 minutes**
+   - Design’s answer: PoPs keep enforcing last-known-good; replay after recovery via log/artifacts.
+   - Recommendation: Strengthen — define explicit SLOs and behavior: max “staleness” tolerated per risk class, and an operator-visible “stale mode” at PoPs.
+
+2. **Artifact signing key compromised (or suspected compromise)**
+   - Design’s answer: pinned public key, offline/HSM-backed signing.
+   - Recommendation: Strengthen — spell out key rotation and revocation (new root keys, threshold/multi-sig for “break glass,” rapid invalidation of compromised keys). TUF-style roles help a lot here.
+
+3. **Network partition: PoPs split-brain across versions**
+   - Design’s answer: version monotonicity; PoPs accept only higher versions; stale enforcement continues.
+   - Recommendation: Acceptable, but add “max version skew” dashboards and a playbook: when to halt rollout, when to force snapshot fetch, and when to freeze publishing.
+
+4. **Update storm (10k updates/s) causes artifact rebuild thrash**
+   - Design’s answer: not explicitly addressed (mentions deltas/snapshots, bounded catch-up).
+   - Recommendation: Strengthen — add batching + backpressure at publish time, plus “attack-mode” short-TTL artifacts that can be compacted/expired aggressively.
+
+5. **Bad rule or bad normalization blocks a major customer globally**
+   - Design’s answer: anomaly detection + rollback by publishing N+1.
+   - Recommendation: Strengthen — ensure rollback is fast even if publishing is impaired: keep a pre-signed “empty/allow-only” emergency artifact, and consider per-customer override artifacts that can be published independently of the global stream.
+
+## Recommendations
+
+### Must Fix
+- Define secure update hardening beyond “signature + monotonic version”: key rotation/revocation, freeze/rollback attacks, and distributor compromise model (TUF/Uptane patterns fit well).
+- Specify artifact lifecycle semantics: TTL/expiry, compaction, and how removals work under partitions (avoid “zombie blocks” that never age out).
+- Add explicit publish-side backpressure: batching, rate limits, and emergency lanes so “block now” doesn’t imply “rebuild everything now” at 10k/s.
+
+### Should Consider
+- Replace or drastically simplify **Regional Distributors** using CDN/object-store caching + a tiny notify plane; keep only what’s truly needed for seconds-level convergence.
+- Split artifacts by scope (subject type / region / product / jurisdiction) to reduce memory and blast radius while keeping the same signing/verifiability story.
+- Make the build reproducible and content-addressed: publish `{manifest, artifact_hashes}` and sign the manifest; PoPs verify hashes for integrity and easier debugging.
+
+### Nice to Have
+- Public Suffix List-aware domain handling and explicit normalization rules (punycode, trailing dots, wildcard semantics), because domain mistakes are a common outage source.
+- “Prove it” tooling: given a request sample + artifact version, deterministically explain the match (`rule_id`, provenance, and the exact matcher path), to speed up 3am incidents.
+
+## What's Working Well
+- The separation of a strongly consistent control plane from an eventually consistent enforcement plane is clean and operationally sane.
+- Versioned, signed artifacts + “rollback by publishing” is an elegant, unified mechanism that scales operationally.
+- The design is honest about the hot-path reality (cache behavior, GC pauses) and pushes complexity out of the request path.
+- The failure mode thinking (staleness, poisoned feeds, canary gating) is pointed at the right real-world risks.
+tokens used
+4,632
+## Elegance Check
+
+### The Core Insight
+Treating “block decisions” as a signed, versioned, globally replicated artifact stream (instead of a globally queried DB) is the right abstraction: it makes the edge hot path deterministic, bounded, and auditable, while keeping correctness/safety centralized.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Policy Engine | Single place for scoring, allowlists, provenance, sanity checks, and producing a canonical “truth” with rollback semantics. |
+| Signed Artifacts (snapshot + delta) | Deterministic edge enforcement, fast cold start/catch-up, and a strong “what was active when” audit trail. |
+| Artifact Store (object store semantics) | Decouples “publish” from “fetch,” enables caching, and gives PoPs a reliable recovery path after partitions. |
+| PoP Enforcers (in-memory matcher) | Keeps the request path local and predictable; isolates data structure complexity from gateways. |
+| Ingest API w/ quotas + validation | Prevents poisoned inputs and operational mistakes from becoming global incidents. |
+| Version gating + rollback-as-next-version | One operational lever that works under stress; avoids “delete everywhere” coordination failures. |
+
+### Simplification Opportunities
+| Current | Simper Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Kafka as the global distribution spine to edge | Object store + CDN for artifacts, plus a lightweight notification channel (SNS/SQS/PubSub/WebSocket fanout) carrying only `{version, manifest_hash}` | You lose “one system does everything”; you gain fewer moving parts and better cache economics. |
+| Regional Distributors maintaining long-lived PoP connections | Use CDN/edge caching + long-polling (or server-sent events) to a small notification service; PoPs fetch artifacts directly from nearest cache | Slightly higher fetch latency in some cases; much simpler ops than bespoke connection management. |
+| Custom secure update protocol (pinned key + version monotonicity) | Adopt **TUF** (The Update Framework) concepts: signed manifests, key roles, rotation, threshold signatures, rollback/freeze protections | Some upfront complexity, but it’s “standard hardening” instead of bespoke crypto + edge cases. |
+| Always-on prefilter (Bloom/Xor) + exact structure | Start with exact-only (radix trie + hash set) and add prefilter only if profiling shows CPU issues at p99 under realistic cache pressure | Risk of higher CPU; but avoids dual-structure complexity and correctness pitfalls early. |
+| Single global artifact for all PoPs | Per-region/per-product “views” (still signed) so PoPs load only what they need (e.g., IP-only at L4, domain-only at L7, jurisdictional sets) | More build variants; big win in memory, rollout blast radius, and operational clarity. |
+| Append-only events at the same granularity as inputs | Micro-batching in the Policy Engine (e.g., 200–500ms windows) to amortize rebuild costs and reduce version churn during 10k/s bursts | Slightly slower “block now” unless emergency bypass exists; major stability improvement during attack spikes. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Control plane (Policy Engine) down for 5 minutes**
+   - Design’s answer: PoPs keep enforcing last-known-good; replay after recovery via log/artifacts.
+   - Recommendation: Strengthen — define explicit SLOs and behavior: max “staleness” tolerated per risk class, and an operator-visible “stale mode” at PoPs.
+
+2. **Artifact signing key compromised (or suspected compromise)**
+   - Design’s answer: pinned public key, offline/HSM-backed signing.
+   - Recommendation: Strengthen — spell out key rotation and revocation (new root keys, threshold/multi-sig for “break glass,” rapid invalidation of compromised keys). TUF-style roles help a lot here.
+
+3. **Network partition: PoPs split-brain across versions**
+   - Design’s answer: version monotonicity; PoPs accept only higher versions; stale enforcement continues.
+   - Recommendation: Acceptable, but add “max version skew” dashboards and a playbook: when to halt rollout, when to force snapshot fetch, and when to freeze publishing.
+
+4. **Update storm (10k updates/s) causes artifact rebuild thrash**
+   - Design’s answer: not explicitly addressed (mentions deltas/snapshots, bounded catch-up).
+   - Recommendation: Strengthen — add batching + backpressure at publish time, plus “attack-mode” short-TTL artifacts that can be compacted/expired aggressively.
+
+5. **Bad rule or bad normalization blocks a major customer globally**
+   - Design’s answer: anomaly detection + rollback by publishing N+1.
+   - Recommendation: Strengthen — ensure rollback is fast even if publishing is impaired: keep a pre-signed “empty/allow-only” emergency artifact, and consider per-customer override artifacts that can be published independently of the global stream.
+
+## Recommendations
+
+### Must Fix
+- Define secure update hardening beyond “signature + monotonic version”: key rotation/revocation, freeze/rollback attacks, and distributor compromise model (TUF/Uptane patterns fit well).
+- Specify artifact lifecycle semantics: TTL/expiry, compaction, and how removals work under partitions (avoid “zombie blocks” that never age out).
+- Add explicit publish-side backpressure: batching, rate limits, and emergency lanes so “block now” doesn’t imply “rebuild everything now” at 10k/s.
+
+### Should Consider
+- Replace or drastically simplify **Regional Distributors** using CDN/object-store caching + a tiny notify plane; keep only what’s truly needed for seconds-level convergence.
+- Split artifacts by scope (subject type / region / product / jurisdiction) to reduce memory and blast radius while keeping the same signing/verifiability story.
+- Make the build reproducible and content-addressed: publish `{manifest, artifact_hashes}` and sign the manifest; PoPs verify hashes for integrity and easier debugging.
+
+### Nice to Have
+- Public Suffix List-aware domain handling and explicit normalization rules (punycode, trailing dots, wildcard semantics), because domain mistakes are a common outage source.
+- “Prove it” tooling: given a request sample + artifact version, deterministically explain the match (`rule_id`, provenance, and the exact matcher path), to speed up 3am incidents.
+
+## What's Working Well
+- The separation of a strongly consistent control plane from an eventually consistent enforcement plane is clean and operationally sane.
+- Versioned, signed artifacts + “rollback by publishing” is an elegant, unified mechanism that scales operationally.
+- The design is honest about the hot-path reality (cache behavior, GC pauses) and pushes complexity out of the request path.
+- The failure mode thinking (staleness, poisoned feeds, canary gating) is pointed at the right real-world risks.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/global-blacklisting-system.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afa-7f9f-7400-911b-37ced16b9975
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Global Blacklisting System"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["abuse", "security", "global-distribution", "streaming", "control-plane"]
+---
+
+## Overview
+
+This system propagates abuse signals (IP ranges, domains, ASN fingerprints) globally in seconds and enforces them at the edge with a deterministic, auditable policy. The key insight is to **treat “block decisions” as a globally replicated event stream with signed, versioned artifacts**, not as “a database everyone queries.” Edge enforcement becomes a local read (in-memory) with predictable latency, while distribution is an engineering problem with clear invariants.
+
+The elegance comes from separating concerns: **a small, strongly consistent control plane** that decides *what* to block, and **a fast, eventually consistent data plane** that decides *whether this request matches a current block artifact*. This keeps the hard parts (safety, correctness, poisoning resistance, rollback) in one place, and keeps the hot path boring.
+
+## What Makes This Hard
+
+Naive implementations die in three traps:
+
+1. **“Global DB lookup” trap:** querying a central store (or even a multi-region database) on every request makes enforcement brittle, expensive, and too slow under attack—exactly when you need it most.
+2. **“Fast push without safety” trap:** pushing rules instantly without cryptographic authenticity and rollback turns the system into a self-inflicted outage machine (one bad rule blocks the world).
+3. **“Rules don’t scale on the hot path” trap:** large, frequently changing lists turn into CPU cache misses, lock contention, and garbage collection pauses unless you build an artifact optimized for lookups and incremental updates.
+
+## Requirements
+
+### Functional Requirements
+- Ingest abuse signals from internal detectors and trusted external feeds, with provenance and confidence.
+- Produce **globally consistent policy artifacts** (what is blocked) with an audit trail and reversible changes.
+- Propagate policy updates to all enforcement points within seconds.
+- Enforce blocks on the request path with minimal latency overhead.
+- Support emergency actions: “block now”, “undo now”, and “quarantine suspicious feed.”
+
+### Scale Targets
+- **Enforcement throughput:** 10M req/s globally (edge/CDN scale). The design must add <1ms p99 overhead per request.
+- **Rule volume:** up to 5M IPs / 500k CIDRs + 2M domains (realistic if you ingest noisy feeds). Lookups must remain O(1)-ish in practice.
+- **Update rate:** bursts of 10k updates/s during attacks. Propagation **p99 < 5s** end-to-end (decision → enforced globally).
+- **Regions/PoPs:** 20 regions, 200 PoPs. Distribution must tolerate partitions and still converge quickly.
+
+## Key Design Decisions
+
+- **Decision:** Use an append-only event log + signed policy artifacts.
+  - **Chose:** Kafka (or equivalent durable log) as the distribution spine; artifacts are versioned and signed.
+  - **Rejected:** “Update a DB row and poll” and “push configs via ad-hoc RPC.”
+  - **Why:** The log gives ordering, replay, backpressure, and an audit trail. Signed artifacts let the edge trust updates even during partial compromise.
+
+- **Decision:** Enforce from compiled artifacts, not from raw rule lists.
+  - **Chose:** A two-tier structure: (1) compact probabilistic prefilter (Bloom/Xor filter) + (2) exact set for positives (hash set / radix trie for CIDRs).
+  - **Rejected:** Linear scans, regex-heavy matching, and per-request remote checks.
+  - **Why:** Most traffic is not abusive; a prefilter keeps CPU predictable. Exact sets keep false positives at zero where it matters (final decision).
+
+- **Decision:** Roll out globally via “version gates” with canary + instant rollback.
+  - **Chose:** Every artifact has a monotonically increasing version; PoPs apply only if signature verifies and version advances; rollback is “publish new version that removes rule(s).”
+  - **Rejected:** Mutable config blobs without versioning and “delete the bad rule everywhere.”
+  - **Why:** Under stress, you need one lever: publish version N+1. Rollback becomes the same mechanism as rollout.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Detectors & Feeds"] --> B["Ingest API"]
+  B --> C["Policy Engine"]
+  C --> D["Event Log"]
+  C --> E["Artifact Store"]
+  D --> F["Regional Distributors"]
+  E --> F
+  F --> G["PoP Enforcers"]
+  G --> H["Edge Gateways"]
+```
+
+### Components
+
+- **Ingest API**
+  - Normalizes signals, attaches provenance, enforces quotas per source, and rejects malformed/poisonous input (e.g., “block 0.0.0.0/0” without elevated approval).
+
+- **Policy Engine**
+  - The “brain”: deduplicates, scores, applies allowlists, and decides which signals graduate into the active blacklist. Writes every decision as an immutable event.
+
+- **Event Log**
+  - The propagation backbone. Consumers can replay from offsets to recover instantly after outages, and ordering is explicit.
+
+- **Artifact Store**
+  - Stores the compiled, signed artifacts (full snapshot + deltas). This is what PoPs fetch on cold start or when they fall behind.
+
+- **Regional Distributors**
+  - Maintain long-lived connections to PoPs, push deltas immediately, and serve snapshots locally to avoid cross-ocean fetches.
+
+- **PoP Enforcers**
+  - Turn artifacts into a hot in-memory structure and expose a tiny “isBlocked(subject)” interface to the gateways.
+
+- **Edge Gateways**
+  - Apply the decision at L7 (HTTP Host / SNI) and L4 (source IP/CIDR), with strict timeouts and fail-closed/fail-open behavior chosen per risk class.
+
+## Deep Dive: Propagation in Seconds Without Global Self-DoS
+
+The hardest part is not “getting updates to the edge.” It’s doing it **fast, safely, and under attack**.
+
+**1) Make the edge trustless and deterministic.**  
+PoPs never “evaluate policy.” They only verify signatures and apply artifacts. The Policy Engine signs every artifact with an offline-protected key (or HSM-backed). PoPs accept artifacts only if:
+- signature verifies against a pinned public key,
+- `version` strictly increases,
+- artifact metadata matches their environment (prod vs staging),
+- and the artifact passes sanity checks (size bounds, CIDR count bounds, domain count bounds).
+
+This blocks the two nightmare scenarios: a compromised distributor pushing garbage, and accidental bad deploys without a clean rollback path.
+
+**2) Use snapshots + deltas with bounded catch-up.**  
+Deltas keep steady-state fast (kilobytes per second), but partitions happen. Every N versions (or every M minutes), the Policy Engine emits a **snapshot artifact**. PoPs that are behind more than a threshold stop applying deltas and fetch the latest snapshot from the regional distributor. This prevents “replay storms” when a PoP reconnects after a long outage.
+
+**3) Optimize the hot path for cache, not algorithms.**  
+For IPs/CIDRs:
+- Store CIDRs in a compressed radix trie (or a well-tested library) for exact matching.
+- Store individual IPs in a flat hash set.
+For domains:
+- Normalize to punycode, lowercase, and store **reversed labels** (e.g., `com.example`) in a trie for suffix matching when blocking subdomains.
+Prefilter:
+- A Bloom/Xor filter rejects obvious non-members cheaply.
+- Every “maybe” is checked against the exact structure to keep false positives from actually blocking.
+
+**4) Rollouts are gated, not simultaneous.**  
+The distributor does a fixed rollout order: 1% PoPs → 10% → 100%, with automated health checks (block-hit rate deltas, error rates, customer allowlist exceptions). Emergency mode overrides gating (for real attacks), but the same versioned mechanism still applies, so rollback is one publish.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Seconds-level global propagation | Strong global read-after-write everywhere |
+| Safe rollouts + instant rollback | More moving parts than “one DB table” |
+| Predictable hot-path latency | Slightly higher memory footprint at PoPs |
+| Auditability and provenance | More rigor in ingest and policy changes |
+
+## Failure Modes
+
+- **Bad rule blocks legitimate traffic**
+  - **What happens:** sudden drop in requests for specific customers/regions; spike in blocks.
+  - **Detect:** anomaly detection on block rate per customer/ASN/region; “top newly-blocked” dashboards keyed by artifact version.
+  - **Recover:** publish version N+1 removing the rule; distributors push immediately; PoPs apply within seconds.
+
+- **Partition: PoPs lose connectivity to distributors**
+  - **What happens:** PoPs stop receiving updates; enforcement becomes stale.
+  - **Detect:** PoP reports “current artifact version” heartbeat; alert on version lag SLO breach.
+  - **Recover:** PoPs continue enforcing last-known-good; on reconnect they fetch latest snapshot (not replaying hours of deltas).
+
+- **Poisoned feed attempts to inject massive blocks**
+  - **What happens:** ingest flood or “block the internet” payloads.
+  - **Detect:** per-source quotas, schema validation, and policy sanity checks (e.g., max CIDR size, max affected traffic estimate).
+  - **Recover:** automatically quarantine the source, require human approval to re-enable, and publish a corrective version if anything slipped through.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move more enforcement into kernel/sidecar primitives (eBPF/XDP for L4 IP blocking) while keeping the same signed artifact format; add per-customer policy overlays without forking the global stream.
+- **100x scale:** Split the policy stream into shards by subject type and hash (IPs/domains) to reduce fanout pressure; introduce dedicated “attack-mode” artifacts with ultra-short TTLs to avoid unbounded growth during sustained campaigns.
+
+## Operational Notes
+
+- Treat the artifact `version` as the primary on-call metric; everything else is secondary.
+- Keep a “break glass” path: publish an empty/allow-only artifact signed by a separate emergency key with strict access controls.
+- Maintain a global allowlist (customer IPs, critical partners, internal health checks) enforced *before* blacklist matching.
+- Always log decisions with `{artifact_version, matched_rule_id, provenance}` sampled at the edge; it’s the difference between “we think it works” and “we can prove what happened.”
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Treating “block decisions” as a signed, versioned, globally replicated artifact stream (instead of a globally queried DB) is the right abstraction: it makes the edge hot path deterministic, bounded, and auditable, while keeping correctness/safety centralized.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Policy Engine | Single place for scoring, allowlists, provenance, sanity checks, and producing a canonical “truth” with rollback semantics. |
+| Signed Artifacts (snapshot + delta) | Deterministic edge enforcement, fast cold start/catch-up, and a strong “what was active when” audit trail. |
+| Artifact Store (object store semantics) | Decouples “publish” from “fetch,” enables caching, and gives PoPs a reliable recovery path after partitions. |
+| PoP Enforcers (in-memory matcher) | Keeps the request path local and predictable; isolates data structure complexity from gateways. |
+| Ingest API w/ quotas + validation | Prevents poisoned inputs and operational mistakes from becoming global incidents. |
+| Version gating + rollback-as-next-version | One operational lever that works under stress; avoids “delete everywhere” coordination failures. |
+
+### Simplification Opportunities
+| Current | Simper Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Kafka as the global distribution spine to edge | Object store + CDN for artifacts, plus a lightweight notification channel (SNS/SQS/PubSub/WebSocket fanout) carrying only `{version, manifest_hash}` | You lose “one system does everything”; you gain fewer moving parts and better cache economics. |
+| Regional Distributors maintaining long-lived PoP connections | Use CDN/edge caching + long-polling (or server-sent events) to a small notification service; PoPs fetch artifacts directly from nearest cache | Slightly higher fetch latency in some cases; much simpler ops than bespoke connection management. |
+| Custom secure update protocol (pinned key + version monotonicity) | Adopt **TUF** (The Update Framework) concepts: signed manifests, key roles, rotation, threshold signatures, rollback/freeze protections | Some upfront complexity, but it’s “standard hardening” instead of bespoke crypto + edge cases. |
+| Always-on prefilter (Bloom/Xor) + exact structure | Start with exact-only (radix trie + hash set) and add prefilter only if profiling shows CPU issues at p99 under realistic cache pressure | Risk of higher CPU; but avoids dual-structure complexity and correctness pitfalls early. |
+| Single global artifact for all PoPs | Per-region/per-product “views” (still signed) so PoPs load only what they need (e.g., IP-only at L4, domain-only at L7, jurisdictional sets) | More build variants; big win in memory, rollout blast radius, and operational clarity. |
+| Append-only events at the same granularity as inputs | Micro-batching in the Policy Engine (e.g., 200–500ms windows) to amortize rebuild costs and reduce version churn during 10k/s bursts | Slightly slower “block now” unless emergency bypass exists; major stability improvement during attack spikes. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Control plane (Policy Engine) down for 5 minutes**
+   - Design’s answer: PoPs keep enforcing last-known-good; replay after recovery via log/artifacts.
+   - Recommendation: Strengthen — define explicit SLOs and behavior: max “staleness” tolerated per risk class, and an operator-visible “stale mode” at PoPs.
+
+2. **Artifact signing key compromised (or suspected compromise)**
+   - Design’s answer: pinned public key, offline/HSM-backed signing.
+   - Recommendation: Strengthen — spell out key rotation and revocation (new root keys, threshold/multi-sig for “break glass,” rapid invalidation of compromised keys). TUF-style roles help a lot here.
+
+3. **Network partition: PoPs split-brain across versions**
+   - Design’s answer: version monotonicity; PoPs accept only higher versions; stale enforcement continues.
+   - Recommendation: Acceptable, but add “max version skew” dashboards and a playbook: when to halt rollout, when to force snapshot fetch, and when to freeze publishing.
+
+4. **Update storm (10k updates/s) causes artifact rebuild thrash**
+   - Design’s answer: not explicitly addressed (mentions deltas/snapshots, bounded catch-up).
+   - Recommendation: Strengthen — add batching + backpressure at publish time, plus “attack-mode” short-TTL artifacts that can be compacted/expired aggressively.
+
+5. **Bad rule or bad normalization blocks a major customer globally**
+   - Design’s answer: anomaly detection + rollback by publishing N+1.
+   - Recommendation: Strengthen — ensure rollback is fast even if publishing is impaired: keep a pre-signed “empty/allow-only” emergency artifact, and consider per-customer override artifacts that can be published independently of the global stream.
+
+## Recommendations
+
+### Must Fix
+- Define secure update hardening beyond “signature + monotonic version”: key rotation/revocation, freeze/rollback attacks, and distributor compromise model (TUF/Uptane patterns fit well).
+- Specify artifact lifecycle semantics: TTL/expiry, compaction, and how removals work under partitions (avoid “zombie blocks” that never age out).
+- Add explicit publish-side backpressure: batching, rate limits, and emergency lanes so “block now” doesn’t imply “rebuild everything now” at 10k/s.
+
+### Should Consider
+- Replace or drastically simplify **Regional Distributors** using CDN/object-store caching + a tiny notify plane; keep only what’s truly needed for seconds-level convergence.
+- Split artifacts by scope (subject type / region / product / jurisdiction) to reduce memory and blast radius while keeping the same signing/verifiability story.
+- Make the build reproducible and content-addressed: publish `{manifest, artifact_hashes}` and sign the manifest; PoPs verify hashes for integrity and easier debugging.
+
+### Nice to Have
+- Public Suffix List-aware domain handling and explicit normalization rules (punycode, trailing dots, wildcard semantics), because domain mistakes are a common outage source.
+- “Prove it” tooling: given a request sample + artifact version, deterministically explain the match (`rule_id`, provenance, and the exact matcher path), to speed up 3am incidents.
+
+## What's Working Well
+- The separation of a strongly consistent control plane from an eventually consistent enforcement plane is clean and operationally sane.
+- Versioned, signed artifacts + “rollback by publishing” is an elegant, unified mechanism that scales operationally.
+- The design is honest about the hot-path reality (cache behavior, GC pauses) and pushes complexity out of the request path.
+- The failure mode thinking (staleness, poisoned feeds, canary gating) is pointed at the right real-world risks.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+
+thinking
+**Evaluating notification components**
+
+I'm considering how to integrate notification within existing components. The Ingest API and Policy Engine could publish to a managed pub/sub system, but that may add complexity. I'm thinking about streamlining by removing the Event Log and Regional Distributors, relying instead on the Artifact Store and CDN distribution for fast propagation. Using edge long-polling might be effective and manageable with caching. My goal is to simplify while ensuring we maintain control through the Ingest API, Policy Engine, and Artifact Store.
+thinking
+**Analyzing component integration**
+
+I'm thinking about the total components involved and whether they could be simplified. I wonder if merging the Ingest API and Policy Engine into one "Control Plane Service" would help reduce complexity. The PoP Enforcer could also be integrated as a library within the Edge Gateways, which makes sense. So, I’d have three main components: the Control Plane Service, Artifact Store plus CDN, and Edge Gateways. However, I need to ensure there’s an audit trail, which might complicate things if I add a database like Postgres.
+thinking
+**Considering component replacement**
+
+I'm trying to follow the rule about not adding components, but I think replacing existing ones is still allowed. For instance, I could swap the Event Log for a Postgres table combined with an append-only audit log. This setup lets the control plane query the audit information, which seems reasonable. I can use the Artifact Store as the source of truth and even write an `audit.jsonl` file, ensuring the audit trail remains intact. Ultimately, I want the signed artifact versions stored in the Artifact Store to serve as the canonical truth and audit trail.
+thinking
+**Refining artifact management**
+
+I'm thinking about how each artifact can be versioned with metadata for decisions, and I wonder if I should store full provenance, even though that could get large. A simpler approach might be to maintain a small Postgres database for control plane metadata and allowlists while using an object store for artifacts. I need to consider failure scenarios too, like control plane downtime and signing key compromises. Incorporating key rotation and emergency measures makes sense, but I also have to think about complexities like TTL semantics.
+thinking
+**Designing with simplifications**
+
+I’m considering how to implement TTL in rules, ensuring artifacts include expiry times to prevent zombie blocks. I need to keep headings but can prune some details. The snapshots and deltas seem essential, but maybe we should publish full snapshots each version to simplify propagation. I plan to maintain a focus on signed artifacts fetched from an object store/CDN while addressing failure scenarios. I’m also working on condensing sections, maintaining clarity and justification for each component without adding anything new. I want to ensure coherent design while following the constraints.
+thinking
+**Integrating design elements**
+
+I'm working on incorporating the failure scenario around update storms and the need for micro-batching and "attack-mode" TTL rules while avoiding the addition of new components. Since this is pure text, using tools isn't necessary. I’ll output a complete markdown document as requested. I have to be careful not to sound argumentative, especially regarding what we've removed. Instead, I’ll present it factually within the Key Design Decisions section, ensuring clarity while embedding necessary elements like justification and maintaining the original document structure. Let's get to crafting that document!
+codex
+```markdown
+---
+title: "Global Blacklisting System"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["abuse", "security", "global-distribution", "streaming", "control-plane"]
+---
+
+## Overview
+
+This system enforces global blocks at the edge by having every PoP load a **signed, versioned policy artifact** into memory and do **local lookups** on the request path. A single control plane decides what is blocked and publishes a new artifact version; every PoP converges by fetching the latest signed manifest and artifact from an object-store-backed artifact store with caching.
+
+The only thing that “moves globally” is an immutable sequence of artifact versions. The edge stays deterministic: verify signature, accept newer version, atomically swap in-memory state.
+
+## What Makes This Hard
+
+1. **Remote checks on the hot path:** any per-request global dependency fails under attack and adds latency.
+2. **Unsafe updates:** fast rule push without authenticity, versioning, and rollback turns mistakes into global outages.
+3. **Large changing sets:** millions of IPs/domains require data structures that stay predictable under cache pressure.
+
+## Requirements
+
+### Functional Requirements
+- Ingest abuse signals from internal detectors and trusted external feeds, with provenance and confidence.
+- Produce **globally consistent policy artifacts** (what is blocked) with an audit trail and reversible changes.
+- Propagate policy updates to all enforcement points within seconds.
+- Enforce blocks on the request path with minimal latency overhead.
+- Support emergency actions: “block now”, “undo now”, and “quarantine suspicious feed.”
+
+### Scale Targets
+- **Enforcement throughput:** 10M req/s globally (edge/CDN scale). The design must add <1ms p99 overhead per request.
+- **Rule volume:** up to 5M IPs / 500k CIDRs + 2M domains. Lookups must remain O(1)-ish in practice.
+- **Update rate:** bursts of 10k updates/s during attacks. Propagation **p99 < 5s** end-to-end (decision → enforced globally).
+- **Regions/PoPs:** 20 regions, 200 PoPs. Distribution must tolerate partitions and still converge quickly.
+
+## Key Design Decisions
+
+- **Decision:** Publish a signed manifest + artifact versions to an artifact store.
+  - The control plane publishes `manifest` (small) and `artifact` (compiled matcher payload), both content-addressed.
+  - PoPs poll `manifest` frequently, verify signatures, and fetch the referenced artifact only when the version changes.
+
+- **Decision:** Keep the edge hot path exact and local.
+  - PoPs load the compiled artifact into an in-process, immutable matcher and do local checks for `{source_ip, cidr, domain}`.
+  - Fail behavior is explicit per risk class (fail-open vs fail-closed) and uses the last-known-good artifact.
+
+- **Decision:** Rollout and rollback are “publish the next version”.
+  - A version is the unit of change, audit, rollout, and rollback.
+  - Canary is a separate artifact channel (same signing keys, same verification rules).
+
+- **Decision:** Batching and expiry are part of publishing.
+  - The control plane micro-batches updates into version ticks (e.g., 200–500ms) to avoid rebuild thrash.
+  - Rules carry expiry/TTL so removals and temporary “attack blocks” converge even across partitions.
+
+- **Decision:** Secure update hardening is manifest-first.
+  - PoPs pin a root public key and accept only manifests that verify and strictly advance.
+  - Key rotation is done by publishing a manifest that introduces new keys and deprecates old ones; an emergency key can publish an allow-only artifact.
+
+- **What We Removed:** event log as a global spine; regional distributors and long-lived PoP connections; a separate PoP enforcer service; always-on probabilistic prefilter; delta streaming as a requirement.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Detectors & Feeds"] --> B["Control Plane (Ingest + Policy + Build)"]
+  B --> C["Artifact Store (Object Store + Caching)"]
+  C --> D["Edge Gateways (In-memory Matcher)"]
+```
+
+### Components
+
+- **Control Plane (Ingest + Policy + Build)**
+  - **Justification:** one place to validate inputs, apply allowlists/sanity checks, quarantine sources, and produce the canonical signed artifact version with an audit trail and rollback.
+
+- **Artifact Store (Object Store + Caching)**
+  - **Justification:** immutable distribution and recovery path; PoPs fetch a small signed manifest often and pull large artifacts only on version change; works through partitions and cold starts.
+
+- **Edge Gateways (In-memory Matcher)**
+  - **Justification:** enforcement stays local, fast, and deterministic; matcher complexity is an internal module, not a distributed service dependency.
+
+## Deep Dive: Propagation in Seconds Without Global Self-DoS
+
+**1) PoPs pull a signed manifest, not a stream.**  
+Each PoP periodically fetches the small `manifest` (seconds cadence). If the signature verifies and `version` is newer, it downloads the referenced artifact (often from cache), verifies hashes, builds the matcher, and atomically swaps.
+
+PoPs accept only if:
+- signature verifies against pinned root key (or rotated successor),
+- `version` strictly increases,
+- artifact metadata matches environment (prod vs staging),
+- sanity checks pass (size bounds, CIDR/domain count bounds, required allowlist present).
+
+**2) Snapshots are the default.**  
+Each published version is a complete snapshot artifact. Catch-up is “fetch latest”, not “replay history”.
+
+**3) The matcher is simple and exact.**  
+- IPs: hash set for individual IPs.
+- CIDRs: radix trie (library or proven implementation).
+- Domains: normalized (lowercase, punycode) and stored for suffix match (reversed-label trie or equivalent exact structure).
+
+**4) Publish-side controls prevent thrash.**  
+- Micro-batching turns bursts into stable version ticks.
+- TTL/expiry in rules prevents “zombie blocks” across partitions and supports short-lived attack blocks without unbounded growth.
+- Emergency publish path is just a higher-priority version that yields an allow-only artifact.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Deterministic, local enforcement | No global read-after-write guarantee |
+| Fewer moving parts | More bytes moved on each new version (snapshot) |
+| Simple recovery (fetch latest) | Higher artifact build cost in the control plane |
+| Safe updates with rollback | Strong discipline around signing keys and publish controls |
+
+## Failure Modes
+
+- **Control plane down for 5 minutes**
+  - **What happens:** no new versions published.
+  - **Recover:** PoPs keep enforcing last-known-good; on recovery, publish resumes and PoPs converge on the next manifest poll.
+
+- **Artifact signing key compromised (or suspected)**
+  - **What happens:** compromised key can publish a bad version.
+  - **Recover:** rotate to a new key via a root-signed manifest update; publish an emergency allow-only artifact with the emergency key; permanently reject compromised keys.
+
+- **Network partition: PoPs split across versions**
+  - **What happens:** some PoPs lag and enforce older artifacts.
+  - **Recover:** lagging PoPs converge by fetching the latest manifest and snapshot when connectivity returns; operationally track max version skew and stale-mode counts.
+
+- **Update storm (10k updates/s) causes rebuild thrash**
+  - **What happens:** control plane risks spending all cycles rebuilding.
+  - **Recover:** micro-batching and rate limits bound publish frequency; emergency lane publishes a minimal, short-TTL attack artifact version without forcing continuous rebuilds.
+
+- **Bad rule blocks legitimate traffic**
+  - **What happens:** block spikes tied to a specific artifact version.
+  - **Recover:** publish version N+1 removing the rule; PoPs converge on the next poll; keep global allowlist enforced before blacklist matching.
+
+## What I'd Do Differently At...
+
+- **10x scale:** split artifacts by subject type (IP vs domain) to reduce gateway memory and rebuild time, keeping the same manifest/signing rules.
+- **100x scale:** shard artifact generation inside the control plane build step (still one published manifest/version) to keep publish latency stable.
+
+## Operational Notes
+
+- Treat `artifact_version` as the primary on-call metric; track version skew and stale-mode PoPs.
+- Keep a global allowlist enforced before blacklist matching.
+- Always log decisions with `{artifact_version, matched_rule_id, provenance}` sampled at the edge.
+- Keep a pre-signed emergency allow-only artifact path with tightly controlled access.
+```
+tokens used
+9,176
+```markdown
+---
+title: "Global Blacklisting System"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["abuse", "security", "global-distribution", "streaming", "control-plane"]
+---
+
+## Overview
+
+This system enforces global blocks at the edge by having every PoP load a **signed, versioned policy artifact** into memory and do **local lookups** on the request path. A single control plane decides what is blocked and publishes a new artifact version; every PoP converges by fetching the latest signed manifest and artifact from an object-store-backed artifact store with caching.
+
+The only thing that “moves globally” is an immutable sequence of artifact versions. The edge stays deterministic: verify signature, accept newer version, atomically swap in-memory state.
+
+## What Makes This Hard
+
+1. **Remote checks on the hot path:** any per-request global dependency fails under attack and adds latency.
+2. **Unsafe updates:** fast rule push without authenticity, versioning, and rollback turns mistakes into global outages.
+3. **Large changing sets:** millions of IPs/domains require data structures that stay predictable under cache pressure.
+
+## Requirements
+
+### Functional Requirements
+- Ingest abuse signals from internal detectors and trusted external feeds, with provenance and confidence.
+- Produce **globally consistent policy artifacts** (what is blocked) with an audit trail and reversible changes.
+- Propagate policy updates to all enforcement points within seconds.
+- Enforce blocks on the request path with minimal latency overhead.
+- Support emergency actions: “block now”, “undo now”, and “quarantine suspicious feed.”
+
+### Scale Targets
+- **Enforcement throughput:** 10M req/s globally (edge/CDN scale). The design must add <1ms p99 overhead per request.
+- **Rule volume:** up to 5M IPs / 500k CIDRs + 2M domains. Lookups must remain O(1)-ish in practice.
+- **Update rate:** bursts of 10k updates/s during attacks. Propagation **p99 < 5s** end-to-end (decision → enforced globally).
+- **Regions/PoPs:** 20 regions, 200 PoPs. Distribution must tolerate partitions and still converge quickly.
+
+## Key Design Decisions
+
+- **Decision:** Publish a signed manifest + artifact versions to an artifact store.
+  - The control plane publishes `manifest` (small) and `artifact` (compiled matcher payload), both content-addressed.
+  - PoPs poll `manifest` frequently, verify signatures, and fetch the referenced artifact only when the version changes.
+
+- **Decision:** Keep the edge hot path exact and local.
+  - PoPs load the compiled artifact into an in-process, immutable matcher and do local checks for `{source_ip, cidr, domain}`.
+  - Fail behavior is explicit per risk class (fail-open vs fail-closed) and uses the last-known-good artifact.
+
+- **Decision:** Rollout and rollback are “publish the next version”.
+  - A version is the unit of change, audit, rollout, and rollback.
+  - Canary is a separate artifact channel (same signing keys, same verification rules).
+
+- **Decision:** Batching and expiry are part of publishing.
+  - The control plane micro-batches updates into version ticks (e.g., 200–500ms) to avoid rebuild thrash.
+  - Rules carry expiry/TTL so removals and temporary “attack blocks” converge even across partitions.
+
+- **Decision:** Secure update hardening is manifest-first.
+  - PoPs pin a root public key and accept only manifests that verify and strictly advance.
+  - Key rotation is done by publishing a manifest that introduces new keys and deprecates old ones; an emergency key can publish an allow-only artifact.
+
+- **What We Removed:** event log as a global spine; regional distributors and long-lived PoP connections; a separate PoP enforcer service; always-on probabilistic prefilter; delta streaming as a requirement.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Detectors & Feeds"] --> B["Control Plane (Ingest + Policy + Build)"]
+  B --> C["Artifact Store (Object Store + Caching)"]
+  C --> D["Edge Gateways (In-memory Matcher)"]
+```
+
+### Components
+
+- **Control Plane (Ingest + Policy + Build)**
+  - **Justification:** one place to validate inputs, apply allowlists/sanity checks, quarantine sources, and produce the canonical signed artifact version with an audit trail and rollback.
+
+- **Artifact Store (Object Store + Caching)**
+  - **Justification:** immutable distribution and recovery path; PoPs fetch a small signed manifest often and pull large artifacts only on version change; works through partitions and cold starts.
+
+- **Edge Gateways (In-memory Matcher)**
+  - **Justification:** enforcement stays local, fast, and deterministic; matcher complexity is an internal module, not a distributed service dependency.
+
+## Deep Dive: Propagation in Seconds Without Global Self-DoS
+
+**1) PoPs pull a signed manifest, not a stream.**  
+Each PoP periodically fetches the small `manifest` (seconds cadence). If the signature verifies and `version` is newer, it downloads the referenced artifact (often from cache), verifies hashes, builds the matcher, and atomically swaps.
+
+PoPs accept only if:
+- signature verifies against pinned root key (or rotated successor),
+- `version` strictly increases,
+- artifact metadata matches environment (prod vs staging),
+- sanity checks pass (size bounds, CIDR/domain count bounds, required allowlist present).
+
+**2) Snapshots are the default.**  
+Each published version is a complete snapshot artifact. Catch-up is “fetch latest”, not “replay history”.
+
+**3) The matcher is simple and exact.**  
+- IPs: hash set for individual IPs.
+- CIDRs: radix trie (library or proven implementation).
+- Domains: normalized (lowercase, punycode) and stored for suffix match (reversed-label trie or equivalent exact structure).
+
+**4) Publish-side controls prevent thrash.**  
+- Micro-batching turns bursts into stable version ticks.
+- TTL/expiry in rules prevents “zombie blocks” across partitions and supports short-lived attack blocks without unbounded growth.
+- Emergency publish path is just a higher-priority version that yields an allow-only artifact.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Deterministic, local enforcement | No global read-after-write guarantee |
+| Fewer moving parts | More bytes moved on each new version (snapshot) |
+| Simple recovery (fetch latest) | Higher artifact build cost in the control plane |
+| Safe updates with rollback | Strong discipline around signing keys and publish controls |
+
+## Failure Modes
+
+- **Control plane down for 5 minutes**
+  - **What happens:** no new versions published.
+  - **Recover:** PoPs keep enforcing last-known-good; on recovery, publish resumes and PoPs converge on the next manifest poll.
+
+- **Artifact signing key compromised (or suspected)**
+  - **What happens:** compromised key can publish a bad version.
+  - **Recover:** rotate to a new key via a root-signed manifest update; publish an emergency allow-only artifact with the emergency key; permanently reject compromised keys.
+
+- **Network partition: PoPs split across versions**
+  - **What happens:** some PoPs lag and enforce older artifacts.
+  - **Recover:** lagging PoPs converge by fetching the latest manifest and snapshot when connectivity returns; operationally track max version skew and stale-mode counts.
+
+- **Update storm (10k updates/s) causes rebuild thrash**
+  - **What happens:** control plane risks spending all cycles rebuilding.
+  - **Recover:** micro-batching and rate limits bound publish frequency; emergency lane publishes a minimal, short-TTL attack artifact version without forcing continuous rebuilds.
+
+- **Bad rule blocks legitimate traffic**
+  - **What happens:** block spikes tied to a specific artifact version.
+  - **Recover:** publish version N+1 removing the rule; PoPs converge on the next poll; keep global allowlist enforced before blacklist matching.
+
+## What I'd Do Differently At...
+
+- **10x scale:** split artifacts by subject type (IP vs domain) to reduce gateway memory and rebuild time, keeping the same manifest/signing rules.
+- **100x scale:** shard artifact generation inside the control plane build step (still one published manifest/version) to keep publish latency stable.
+
+## Operational Notes
+
+- Treat `artifact_version` as the primary on-call metric; track version skew and stale-mode PoPs.
+- Keep a global allowlist enforced before blacklist matching.
+- Always log decisions with `{artifact_version, matched_rule_id, provenance}` sampled at the edge.
+- Keep a pre-signed emergency allow-only artifact path with tightly controlled access.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/10-strategic-problems/global-blacklisting-system.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Global Blacklisting System
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/global-blacklisting-system.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/global-blacklisting-system.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/10-strategic-problems/global-blacklisting-system.md

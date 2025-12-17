@@ -1,0 +1,1690 @@
+==========================================
+Generating (v2): Privacy-Preserving Analytics
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2e2a-76d3-9c5f-4844ed0c22ce
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Privacy-Preserving Analytics
+**Category**: Strategic Problems
+
+**Problem Statement**:
+Design a system using differential privacy or federated analytics to compute aggregate stats without raw data access.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+thinking
+**Making key decisions on privacy**
+
+I’m considering several key decisions about federated secure aggregation versus raw collection. I think I should prioritize privacy accounting and governance, especially since analysts can inadvertently leak data by running unlimited queries. I want to treat analytics as productized, templated metrics while maintaining a privacy budget ledger. I’ll also focus on secure aggregation to avoid storing raw data. I need to carefully monitor cohort selection, key rotation, and the privacy budget to prevent risks like cohort size or leakage issues. Let's document this with a clear YAML structure.
+codex
+```markdown
+---
+title: "Privacy-Preserving Analytics"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["differential-privacy", "federated-analytics", "secure-aggregation", "privacy-budget", "governance"]
+---
+
+## Overview
+
+This system computes product analytics (counts, rates, histograms) without ever collecting raw user-level data on the server. The key insight is to **productize analytics into a small set of query templates** (DAU, funnels, retention, top-N, histograms) and run them via **federated execution + secure aggregation**, then apply **central differential privacy (DP)** to the aggregated result. You get the operational simplicity of “normal analytics dashboards” while keeping the server blind to individual contributions.
+
+Most teams fail by treating privacy as a bolt-on (“we’ll add DP later”) while keeping an ad-hoc query surface. The elegant version constrains the surface area: every metric is a predefined computation with explicit contribution bounds, cohort thresholds, and a privacy cost. Analysts don’t query data; they request *metrics*.
+
+## What Makes This Hard
+
+The trap is **composition**: even if each query is “private,” repeated slicing (country × app version × device model × day × campaign) turns into a reconstruction attack. The hardest engineering problem isn’t adding Laplace noise—it’s **governing what can be asked**, enforcing **contribution bounds**, and maintaining a **privacy budget ledger** that survives retries, backfills, and “one-off” analyst requests.
+
+The second hard problem is **secure aggregation under real-world client behavior** (dropouts, skewed connectivity, adversarial clients). Secure aggregation protocols look clean on paper; production reality is all about cohort sizing, time windows, and making partial failures boring.
+
+## Requirements
+
+### Functional Requirements
+- Compute standard aggregates: event counts, unique users, rates (conversion/retention), histograms (e.g., session length buckets), top-K categories from a bounded vocabulary.
+- No server access to raw per-user data; server storage contains only encrypted shares and DP-sanitized aggregates.
+- Enforce per-metric **contribution bounds** (e.g., max events per user per day) and **minimum cohort sizes** before releasing results.
+- Support scheduled jobs (hourly/daily), backfills, and metric versioning without “double spending” privacy budget.
+- Provide auditable lineage: metric definition → cohort parameters → privacy cost → released value.
+
+### Scale Targets
+- 5M DAU, 50M MAU.
+- 100 core metrics, each computed daily; ~20 computed hourly.
+- Each client sends at most 1 analytics report/day (bounded payload, ~1–5KB).
+- Secure aggregation cohorts: target 10,000 devices per metric per window; hard floor 1,000 (below that, no release).
+- End-to-end freshness: daily metrics within 2 hours of day close; hourly within 20 minutes.
+
+Why these numbers matter: secure aggregation needs large cohorts to hide individuals, and DP needs enough signal-to-noise. If your product can’t regularly form 1k+ cohorts per slice, you must reduce dimensionality or accept “no data” rather than leak.
+
+## Key Design Decisions
+
+- **We chose: Federated computation + secure aggregation, then central DP on the aggregate**
+  - **Rejected:** collecting raw events then “restricting access”
+  - **Rejected:** pure local DP for everything
+  - **Why:** secure aggregation prevents the server from seeing individual values; central DP provides consistent, tunable privacy/utility across metrics. Pure local DP is simple but typically too noisy for product analytics at realistic scales.
+
+- **We chose: Metric templates (no ad-hoc SQL), with explicit contribution bounding**
+  - **Rejected:** “DP query layer” over a general warehouse
+  - **Why:** ad-hoc query surfaces destroy privacy budgets through composition and dimension explosion. Templates make privacy enforceable and operations predictable.
+
+- **We chose: A privacy budget ledger as a first-class service**
+  - **Rejected:** embedding privacy logic inside each job
+  - **Why:** privacy needs global invariants (no double releases, consistent accounting across backfills). Centralizing it prevents accidental leakage during operational churn.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client SDK] -->|bounded contributions| A[Secure Aggregation]
+  A --> R[Aggregate Store]
+  Q[Metric Scheduler] --> E[Federated Executor]
+  E --> A
+  R --> D[DP Release Service]
+  D --> P[Privacy Ledger]
+  D --> B[Analytics UI]
+```
+
+### Components
+
+- **Client SDK**
+  - Computes metric-specific contributions locally (e.g., “sessions today capped at 20”).
+  - Enforces contribution bounds before anything leaves the device.
+  - Produces a compact, versioned report for a given metric/window.
+
+- **Federated Executor**
+  - Orchestrates which clients participate in which metric/window (cohorts).
+  - Handles retries, rollouts, and metric version upgrades without changing privacy semantics.
+
+- **Secure Aggregation**
+  - Implements a production-secure aggregation protocol (e.g., Bonawitz-style SecAgg) so the server only learns sums over a cohort.
+  - Enforces cohort thresholds and dropout tolerance; emits only aggregated plaintext (never per-client plaintext).
+
+- **Aggregate Store**
+  - Stores per-(metric, window, cohort) aggregates plus metadata (counts, dropout rate, schema version).
+  - This is not user data; it’s pre-DP intermediate state with strict access controls.
+
+- **DP Release Service**
+  - Applies central DP mechanisms (Laplace/Gaussian + post-processing) to aggregates.
+  - Performs release gating: minimum cohort size, allowed dimensions, sensitivity derived from metric definition.
+
+- **Privacy Ledger**
+  - The system’s “bank”: tracks privacy spending by metric, slice, and time range.
+  - Guarantees idempotency: a backfill or retry cannot mint a second release “for free.”
+
+- **Analytics UI**
+  - Reads only DP-sanitized released metrics.
+  - Exposes confidence intervals/expected error so teams don’t overreact to noise.
+
+## Deep Dive: Privacy Budget + Metric Governance (The Real Hard Part)
+
+A privacy-preserving system fails the moment it allows “just one more breakdown.” The only robust approach is to make privacy an invariant enforced by design, not policy.
+
+**1) Define metrics as contracts, not queries.**  
+Each metric template specifies:
+- Contribution bounds (per user per window): e.g., `max_sessions_per_user_per_day = 20`
+- Sensitivity: derived from the bound and aggregation type (sum/count/histogram)
+- Allowed dimensions: a fixed whitelist with capped cardinality (e.g., country, app_version_major)
+- Release cadence and retention (how long we keep intermediate aggregates)
+
+This turns privacy from “best effort” into compile-time-like constraints.
+
+**2) Treat every release as a spend with deterministic identity.**  
+A release is keyed by `(metric_id, metric_version, window_start, window_end, dimension_values_hash)`. The DP Release Service requests a spend from the Privacy Ledger; the ledger returns either:
+- **Approved** with a privacy cost grant (ε, δ), or
+- **Denied** (budget exhausted / disallowed slice / cohort too small / already released)
+
+This prevents accidental double releases during retries, and blocks “creative” slicing that would otherwise leak.
+
+**3) Use a simple, explicit accountant and stick to it.**  
+Pick one DP accounting model and operationalize it. A practical choice:
+- Per-metric per-day budget ε (and δ for Gaussian), with strict caps for slices.
+- Composition handled by the ledger; no hidden spending.
+- If a team needs more accuracy, they negotiate budget explicitly, which forces trade-offs.
+
+**4) Make dimension explosion physically impossible.**  
+Even with DP, too many slices create correlated leakage and useless noisy charts. Enforce:
+- Maximum number of slices per metric per window (e.g., 200).
+- Minimum cohort size per slice (e.g., 1,000).
+- Bounded vocabularies for categorical metrics (top-K computed via a DP-friendly approach over a fixed dictionary, not arbitrary strings).
+
+The non-obvious lesson: **privacy is mostly governance and determinism**. The math is the easy part.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Strong privacy guarantees (no raw server data) | Ad-hoc analyst flexibility |
+| Operational simplicity via templates | “One-off” exploratory queries |
+| Predictable accuracy via bounded sensitivity | Fine-grained segmentation |
+| Boring, auditable releases | Maximum metric velocity |
+
+## Failure Modes
+
+- **Cohorts too small (or too many slices)**
+  - **What happens:** releases are denied; dashboards show gaps.
+  - **Detect:** cohort-size and slice-count monitors; denial-rate SLOs.
+  - **Recover:** reduce dimensionality, widen time windows, or increase participation rate (SDK prompts, scheduling changes). Do not lower thresholds.
+
+- **Client dropout breaks secure aggregation**
+  - **What happens:** jobs stall or aggregates fail to decrypt.
+  - **Detect:** dropout rate, time-to-completion, and “incomplete cohort” alarms.
+  - **Recover:** increase cohort over-recruitment, extend collection window, and use a protocol configuration with dropout resilience; fail closed (no aggregate) rather than partial release.
+
+- **Privacy budget exhaustion / accidental overspend attempts**
+  - **What happens:** releases denied; teams attempt workarounds.
+  - **Detect:** budget burn-down dashboards and alerting on repeated denied attempts.
+  - **Recover:** raise budget only via a reviewable change (metric contract update), or reduce cadence/slices; never bypass the ledger.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move aggregation and storage to a more partitioned pipeline (sharded executors per region), and precompute common cohorts to reduce orchestration overhead; privacy model stays the same.
+- **100x scale:** Rearchitect cohort selection and scheduling to be globally optimized (minimize overlap between cohorts to reduce correlated composition), and introduce formal privacy loss distribution tracking for large metric catalogs.
+
+## Operational Notes
+
+- The on-call “kill switch” is the DP Release Service: if anything looks wrong, stop releases; secure aggregation can continue collecting aggregates safely.
+- Backfills are the easiest way to leak: every backfill must mint releases through the same deterministic identity and ledger path.
+- Keep a tight rotation policy for secure aggregation keys and signing keys; treat any key anomaly as a release freeze event.
+- Monitor three health signals together: cohort size, dropout rate, and expected DP error. A “successful” release with terrible error is operationally a silent failure.
+```
+tokens used
+3,968
+```markdown
+---
+title: "Privacy-Preserving Analytics"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["differential-privacy", "federated-analytics", "secure-aggregation", "privacy-budget", "governance"]
+---
+
+## Overview
+
+This system computes product analytics (counts, rates, histograms) without ever collecting raw user-level data on the server. The key insight is to **productize analytics into a small set of query templates** (DAU, funnels, retention, top-N, histograms) and run them via **federated execution + secure aggregation**, then apply **central differential privacy (DP)** to the aggregated result. You get the operational simplicity of “normal analytics dashboards” while keeping the server blind to individual contributions.
+
+Most teams fail by treating privacy as a bolt-on (“we’ll add DP later”) while keeping an ad-hoc query surface. The elegant version constrains the surface area: every metric is a predefined computation with explicit contribution bounds, cohort thresholds, and a privacy cost. Analysts don’t query data; they request *metrics*.
+
+## What Makes This Hard
+
+The trap is **composition**: even if each query is “private,” repeated slicing (country × app version × device model × day × campaign) turns into a reconstruction attack. The hardest engineering problem isn’t adding Laplace noise—it’s **governing what can be asked**, enforcing **contribution bounds**, and maintaining a **privacy budget ledger** that survives retries, backfills, and “one-off” analyst requests.
+
+The second hard problem is **secure aggregation under real-world client behavior** (dropouts, skewed connectivity, adversarial clients). Secure aggregation protocols look clean on paper; production reality is all about cohort sizing, time windows, and making partial failures boring.
+
+## Requirements
+
+### Functional Requirements
+- Compute standard aggregates: event counts, unique users, rates (conversion/retention), histograms (e.g., session length buckets), top-K categories from a bounded vocabulary.
+- No server access to raw per-user data; server storage contains only encrypted shares and DP-sanitized aggregates.
+- Enforce per-metric **contribution bounds** (e.g., max events per user per day) and **minimum cohort sizes** before releasing results.
+- Support scheduled jobs (hourly/daily), backfills, and metric versioning without “double spending” privacy budget.
+- Provide auditable lineage: metric definition → cohort parameters → privacy cost → released value.
+
+### Scale Targets
+- 5M DAU, 50M MAU.
+- 100 core metrics, each computed daily; ~20 computed hourly.
+- Each client sends at most 1 analytics report/day (bounded payload, ~1–5KB).
+- Secure aggregation cohorts: target 10,000 devices per metric per window; hard floor 1,000 (below that, no release).
+- End-to-end freshness: daily metrics within 2 hours of day close; hourly within 20 minutes.
+
+Why these numbers matter: secure aggregation needs large cohorts to hide individuals, and DP needs enough signal-to-noise. If your product can’t regularly form 1k+ cohorts per slice, you must reduce dimensionality or accept “no data” rather than leak.
+
+## Key Design Decisions
+
+- **We chose: Federated computation + secure aggregation, then central DP on the aggregate**
+  - **Rejected:** collecting raw events then “restricting access”
+  - **Rejected:** pure local DP for everything
+  - **Why:** secure aggregation prevents the server from seeing individual values; central DP provides consistent, tunable privacy/utility across metrics. Pure local DP is simple but typically too noisy for product analytics at realistic scales.
+
+- **We chose: Metric templates (no ad-hoc SQL), with explicit contribution bounding**
+  - **Rejected:** “DP query layer” over a general warehouse
+  - **Why:** ad-hoc query surfaces destroy privacy budgets through composition and dimension explosion. Templates make privacy enforceable and operations predictable.
+
+- **We chose: A privacy budget ledger as a first-class service**
+  - **Rejected:** embedding privacy logic inside each job
+  - **Why:** privacy needs global invariants (no double releases, consistent accounting across backfills). Centralizing it prevents accidental leakage during operational churn.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client SDK] -->|bounded contributions| A[Secure Aggregation]
+  A --> R[Aggregate Store]
+  Q[Metric Scheduler] --> E[Federated Executor]
+  E --> A
+  R --> D[DP Release Service]
+  D --> P[Privacy Ledger]
+  D --> B[Analytics UI]
+```
+
+### Components
+
+- **Client SDK**
+  - Computes metric-specific contributions locally (e.g., “sessions today capped at 20”).
+  - Enforces contribution bounds before anything leaves the device.
+  - Produces a compact, versioned report for a given metric/window.
+
+- **Federated Executor**
+  - Orchestrates which clients participate in which metric/window (cohorts).
+  - Handles retries, rollouts, and metric version upgrades without changing privacy semantics.
+
+- **Secure Aggregation**
+  - Implements a production-secure aggregation protocol (e.g., Bonawitz-style SecAgg) so the server only learns sums over a cohort.
+  - Enforces cohort thresholds and dropout tolerance; emits only aggregated plaintext (never per-client plaintext).
+
+- **Aggregate Store**
+  - Stores per-(metric, window, cohort) aggregates plus metadata (counts, dropout rate, schema version).
+  - This is not user data; it’s pre-DP intermediate state with strict access controls.
+
+- **DP Release Service**
+  - Applies central DP mechanisms (Laplace/Gaussian + post-processing) to aggregates.
+  - Performs release gating: minimum cohort size, allowed dimensions, sensitivity derived from metric definition.
+
+- **Privacy Ledger**
+  - The system’s “bank”: tracks privacy spending by metric, slice, and time range.
+  - Guarantees idempotency: a backfill or retry cannot mint a second release “for free.”
+
+- **Analytics UI**
+  - Reads only DP-sanitized released metrics.
+  - Exposes confidence intervals/expected error so teams don’t overreact to noise.
+
+## Deep Dive: Privacy Budget + Metric Governance (The Real Hard Part)
+
+A privacy-preserving system fails the moment it allows “just one more breakdown.” The only robust approach is to make privacy an invariant enforced by design, not policy.
+
+**1) Define metrics as contracts, not queries.**  
+Each metric template specifies:
+- Contribution bounds (per user per window): e.g., `max_sessions_per_user_per_day = 20`
+- Sensitivity: derived from the bound and aggregation type (sum/count/histogram)
+- Allowed dimensions: a fixed whitelist with capped cardinality (e.g., country, app_version_major)
+- Release cadence and retention (how long we keep intermediate aggregates)
+
+This turns privacy from “best effort” into compile-time-like constraints.
+
+**2) Treat every release as a spend with deterministic identity.**  
+A release is keyed by `(metric_id, metric_version, window_start, window_end, dimension_values_hash)`. The DP Release Service requests a spend from the Privacy Ledger; the ledger returns either:
+- **Approved** with a privacy cost grant (ε, δ), or
+- **Denied** (budget exhausted / disallowed slice / cohort too small / already released)
+
+This prevents accidental double releases during retries, and blocks “creative” slicing that would otherwise leak.
+
+**3) Use a simple, explicit accountant and stick to it.**  
+Pick one DP accounting model and operationalize it. A practical choice:
+- Per-metric per-day budget ε (and δ for Gaussian), with strict caps for slices.
+- Composition handled by the ledger; no hidden spending.
+- If a team needs more accuracy, they negotiate budget explicitly, which forces trade-offs.
+
+**4) Make dimension explosion physically impossible.**  
+Even with DP, too many slices create correlated leakage and useless noisy charts. Enforce:
+- Maximum number of slices per metric per window (e.g., 200).
+- Minimum cohort size per slice (e.g., 1,000).
+- Bounded vocabularies for categorical metrics (top-K computed via a DP-friendly approach over a fixed dictionary, not arbitrary strings).
+
+The non-obvious lesson: **privacy is mostly governance and determinism**. The math is the easy part.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Strong privacy guarantees (no raw server data) | Ad-hoc analyst flexibility |
+| Operational simplicity via templates | “One-off” exploratory queries |
+| Predictable accuracy via bounded sensitivity | Fine-grained segmentation |
+| Boring, auditable releases | Maximum metric velocity |
+
+## Failure Modes
+
+- **Cohorts too small (or too many slices)**
+  - **What happens:** releases are denied; dashboards show gaps.
+  - **Detect:** cohort-size and slice-count monitors; denial-rate SLOs.
+  - **Recover:** reduce dimensionality, widen time windows, or increase participation rate (SDK prompts, scheduling changes). Do not lower thresholds.
+
+- **Client dropout breaks secure aggregation**
+  - **What happens:** jobs stall or aggregates fail to decrypt.
+  - **Detect:** dropout rate, time-to-completion, and “incomplete cohort” alarms.
+  - **Recover:** increase cohort over-recruitment, extend collection window, and use a protocol configuration with dropout resilience; fail closed (no aggregate) rather than partial release.
+
+- **Privacy budget exhaustion / accidental overspend attempts**
+  - **What happens:** releases denied; teams attempt workarounds.
+  - **Detect:** budget burn-down dashboards and alerting on repeated denied attempts.
+  - **Recover:** raise budget only via a reviewable change (metric contract update), or reduce cadence/slices; never bypass the ledger.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move aggregation and storage to a more partitioned pipeline (sharded executors per region), and precompute common cohorts to reduce orchestration overhead; privacy model stays the same.
+- **100x scale:** Rearchitect cohort selection and scheduling to be globally optimized (minimize overlap between cohorts to reduce correlated composition), and introduce formal privacy loss distribution tracking for large metric catalogs.
+
+## Operational Notes
+
+- The on-call “kill switch” is the DP Release Service: if anything looks wrong, stop releases; secure aggregation can continue collecting aggregates safely.
+- Backfills are the easiest way to leak: every backfill must mint releases through the same deterministic identity and ledger path.
+- Keep a tight rotation policy for secure aggregation keys and signing keys; treat any key anomaly as a release freeze event.
+- Monitor three health signals together: cohort size, dropout rate, and expected DP error. A “successful” release with terrible error is operationally a silent failure.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/privacy-preserving-analytics.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-3993-7c61-b85e-6a76a81a646b
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Privacy-Preserving Analytics"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["differential-privacy", "federated-analytics", "secure-aggregation", "privacy-budget", "governance"]
+---
+
+## Overview
+
+This system computes product analytics (counts, rates, histograms) without ever collecting raw user-level data on the server. The key insight is to **productize analytics into a small set of query templates** (DAU, funnels, retention, top-N, histograms) and run them via **federated execution + secure aggregation**, then apply **central differential privacy (DP)** to the aggregated result. You get the operational simplicity of “normal analytics dashboards” while keeping the server blind to individual contributions.
+
+Most teams fail by treating privacy as a bolt-on (“we’ll add DP later”) while keeping an ad-hoc query surface. The elegant version constrains the surface area: every metric is a predefined computation with explicit contribution bounds, cohort thresholds, and a privacy cost. Analysts don’t query data; they request *metrics*.
+
+## What Makes This Hard
+
+The trap is **composition**: even if each query is “private,” repeated slicing (country × app version × device model × day × campaign) turns into a reconstruction attack. The hardest engineering problem isn’t adding Laplace noise—it’s **governing what can be asked**, enforcing **contribution bounds**, and maintaining a **privacy budget ledger** that survives retries, backfills, and “one-off” analyst requests.
+
+The second hard problem is **secure aggregation under real-world client behavior** (dropouts, skewed connectivity, adversarial clients). Secure aggregation protocols look clean on paper; production reality is all about cohort sizing, time windows, and making partial failures boring.
+
+## Requirements
+
+### Functional Requirements
+- Compute standard aggregates: event counts, unique users, rates (conversion/retention), histograms (e.g., session length buckets), top-K categories from a bounded vocabulary.
+- No server access to raw per-user data; server storage contains only encrypted shares and DP-sanitized aggregates.
+- Enforce per-metric **contribution bounds** (e.g., max events per user per day) and **minimum cohort sizes** before releasing results.
+- Support scheduled jobs (hourly/daily), backfills, and metric versioning without “double spending” privacy budget.
+- Provide auditable lineage: metric definition → cohort parameters → privacy cost → released value.
+
+### Scale Targets
+- 5M DAU, 50M MAU.
+- 100 core metrics, each computed daily; ~20 computed hourly.
+- Each client sends at most 1 analytics report/day (bounded payload, ~1–5KB).
+- Secure aggregation cohorts: target 10,000 devices per metric per window; hard floor 1,000 (below that, no release).
+- End-to-end freshness: daily metrics within 2 hours of day close; hourly within 20 minutes.
+
+Why these numbers matter: secure aggregation needs large cohorts to hide individuals, and DP needs enough signal-to-noise. If your product can’t regularly form 1k+ cohorts per slice, you must reduce dimensionality or accept “no data” rather than leak.
+
+## Key Design Decisions
+
+- **We chose: Federated computation + secure aggregation, then central DP on the aggregate**
+  - **Rejected:** collecting raw events then “restricting access”
+  - **Rejected:** pure local DP for everything
+  - **Why:** secure aggregation prevents the server from seeing individual values; central DP provides consistent, tunable privacy/utility across metrics. Pure local DP is simple but typically too noisy for product analytics at realistic scales.
+
+- **We chose: Metric templates (no ad-hoc SQL), with explicit contribution bounding**
+  - **Rejected:** “DP query layer” over a general warehouse
+  - **Why:** ad-hoc query surfaces destroy privacy budgets through composition and dimension explosion. Templates make privacy enforceable and operations predictable.
+
+- **We chose: A privacy budget ledger as a first-class service**
+  - **Rejected:** embedding privacy logic inside each job
+  - **Why:** privacy needs global invariants (no double releases, consistent accounting across backfills). Centralizing it prevents accidental leakage during operational churn.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client SDK] -->|bounded contributions| A[Secure Aggregation]
+  A --> R[Aggregate Store]
+  Q[Metric Scheduler] --> E[Federated Executor]
+  E --> A
+  R --> D[DP Release Service]
+  D --> P[Privacy Ledger]
+  D --> B[Analytics UI]
+```
+
+### Components
+
+- **Client SDK**
+  - Computes metric-specific contributions locally (e.g., “sessions today capped at 20”).
+  - Enforces contribution bounds before anything leaves the device.
+  - Produces a compact, versioned report for a given metric/window.
+
+- **Federated Executor**
+  - Orchestrates which clients participate in which metric/window (cohorts).
+  - Handles retries, rollouts, and metric version upgrades without changing privacy semantics.
+
+- **Secure Aggregation**
+  - Implements a production-secure aggregation protocol (e.g., Bonawitz-style SecAgg) so the server only learns sums over a cohort.
+  - Enforces cohort thresholds and dropout tolerance; emits only aggregated plaintext (never per-client plaintext).
+
+- **Aggregate Store**
+  - Stores per-(metric, window, cohort) aggregates plus metadata (counts, dropout rate, schema version).
+  - This is not user data; it’s pre-DP intermediate state with strict access controls.
+
+- **DP Release Service**
+  - Applies central DP mechanisms (Laplace/Gaussian + post-processing) to aggregates.
+  - Performs release gating: minimum cohort size, allowed dimensions, sensitivity derived from metric definition.
+
+- **Privacy Ledger**
+  - The system’s “bank”: tracks privacy spending by metric, slice, and time range.
+  - Guarantees idempotency: a backfill or retry cannot mint a second release “for free.”
+
+- **Analytics UI**
+  - Reads only DP-sanitized released metrics.
+  - Exposes confidence intervals/expected error so teams don’t overreact to noise.
+
+## Deep Dive: Privacy Budget + Metric Governance (The Real Hard Part)
+
+A privacy-preserving system fails the moment it allows “just one more breakdown.” The only robust approach is to make privacy an invariant enforced by design, not policy.
+
+**1) Define metrics as contracts, not queries.**  
+Each metric template specifies:
+- Contribution bounds (per user per window): e.g., `max_sessions_per_user_per_day = 20`
+- Sensitivity: derived from the bound and aggregation type (sum/count/histogram)
+- Allowed dimensions: a fixed whitelist with capped cardinality (e.g., country, app_version_major)
+- Release cadence and retention (how long we keep intermediate aggregates)
+
+This turns privacy from “best effort” into compile-time-like constraints.
+
+**2) Treat every release as a spend with deterministic identity.**  
+A release is keyed by `(metric_id, metric_version, window_start, window_end, dimension_values_hash)`. The DP Release Service requests a spend from the Privacy Ledger; the ledger returns either:
+- **Approved** with a privacy cost grant (ε, δ), or
+- **Denied** (budget exhausted / disallowed slice / cohort too small / already released)
+
+This prevents accidental double releases during retries, and blocks “creative” slicing that would otherwise leak.
+
+**3) Use a simple, explicit accountant and stick to it.**  
+Pick one DP accounting model and operationalize it. A practical choice:
+- Per-metric per-day budget ε (and δ for Gaussian), with strict caps for slices.
+- Composition handled by the ledger; no hidden spending.
+- If a team needs more accuracy, they negotiate budget explicitly, which forces trade-offs.
+
+**4) Make dimension explosion physically impossible.**  
+Even with DP, too many slices create correlated leakage and useless noisy charts. Enforce:
+- Maximum number of slices per metric per window (e.g., 200).
+- Minimum cohort size per slice (e.g., 1,000).
+- Bounded vocabularies for categorical metrics (top-K computed via a DP-friendly approach over a fixed dictionary, not arbitrary strings).
+
+The non-obvious lesson: **privacy is mostly governance and determinism**. The math is the easy part.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Strong privacy guarantees (no raw server data) | Ad-hoc analyst flexibility |
+| Operational simplicity via templates | “One-off” exploratory queries |
+| Predictable accuracy via bounded sensitivity | Fine-grained segmentation |
+| Boring, auditable releases | Maximum metric velocity |
+
+## Failure Modes
+
+- **Cohorts too small (or too many slices)**
+  - **What happens:** releases are denied; dashboards show gaps.
+  - **Detect:** cohort-size and slice-count monitors; denial-rate SLOs.
+  - **Recover:** reduce dimensionality, widen time windows, or increase participation rate (SDK prompts, scheduling changes). Do not lower thresholds.
+
+- **Client dropout breaks secure aggregation**
+  - **What happens:** jobs stall or aggregates fail to decrypt.
+  - **Detect:** dropout rate, time-to-completion, and “incomplete cohort” alarms.
+  - **Recover:** increase cohort over-recruitment, extend collection window, and use a protocol configuration with dropout resilience; fail closed (no aggregate) rather than partial release.
+
+- **Privacy budget exhaustion / accidental overspend attempts**
+  - **What happens:** releases denied; teams attempt workarounds.
+  - **Detect:** budget burn-down dashboards and alerting on repeated denied attempts.
+  - **Recover:** raise budget only via a reviewable change (metric contract update), or reduce cadence/slices; never bypass the ledger.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move aggregation and storage to a more partitioned pipeline (sharded executors per region), and precompute common cohorts to reduce orchestration overhead; privacy model stays the same.
+- **100x scale:** Rearchitect cohort selection and scheduling to be globally optimized (minimize overlap between cohorts to reduce correlated composition), and introduce formal privacy loss distribution tracking for large metric catalogs.
+
+## Operational Notes
+
+- The on-call “kill switch” is the DP Release Service: if anything looks wrong, stop releases; secure aggregation can continue collecting aggregates safely.
+- Backfills are the easiest way to leak: every backfill must mint releases through the same deterministic identity and ledger path.
+- Keep a tight rotation policy for secure aggregation keys and signing keys; treat any key anomaly as a release freeze event.
+- Monitor three health signals together: cohort size, dropout rate, and expected DP error. A “successful” release with terrible error is operationally a silent failure.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+thinking
+**Evaluating system components**
+
+I'm considering various components like SDK, SecAgg, DP release, Ledger, and possibly a UI. I think I can simplify the executor scheduler. For the Aggregate Store, using something like S3 for object storage could work well. When it comes to the ledger, I'm thinking of Postgres with transactions and unique constraints, or maybe Spanner. I also want to look into stress tests and ensure we manage potential risks properly. Access controls are critical, and I may need to rethink how DP release and storage interact.
+thinking
+**Considering security and governance**
+
+I'm thinking about key rotation and potential collusion between the server and clients. If the server can see the participation list, that could lead to leaks. The Federated Executor knows which clients are in a cohort, so we need governance for cohort selection, like random sampling and anti-targeting measures to prevent manipulation. It’s crucial that cohort formation isn't controlled by attackers. For differential privacy, I should ensure trust in the DP release service while maintaining isolation and minimal access. I’m also pondering the reporting requirements to resolve the conflict in metrics frequencies.
+thinking
+**Clarifying unique user aggregation**
+
+I need to clarify my thoughts on unique users, as they require a distinct count. Secure aggregation can sum indicators, but it must be bounded per user. For large populations, I might consider HyperLogLog, though it could leak information. Perhaps using a Bloom filter for secure counting of unique users would work better, where clients contribute a count if they perform an event. For unique user sets across events, we might require intersections through multi-step contributions. I also want to ensure templates support this. Simplifying it might mean using standard DAP/Prio or exploring tools like the browser's Private Aggregation API.
+thinking
+**Drafting key improvement scenarios**
+
+I’m focusing on producing tables without any fluff or emojis, and I’ll provide 3-5 clear scenarios. 
+
+First, I need to clarify the threat model and trust assumptions, accounting for honest-but-curious servers versus malicious or colluding clients. For cohort selection, I must prevent targeted groups and ensure a minimum size while implementing "k-anonymity" through random sampling. 
+
+Adding to that, I'll use an append-only privacy ledger, likely Postgres with immutability. I'll also ensure backfills are budgeted and define handling policies for updates and late data. Lastly, for operational security, I need to figure out how to restrict access to aggregates while implementing key management.
+thinking
+**Exploring simplification opportunities**
+
+I’m identifying ways to simplify the system by merging the Metric Scheduler and Federated Executor, using a workflow engine, and incorporating Kafka for data collection while utilizing S3 for intermediate storage. For the ledger, I’ll recommend Postgres with unique constraints and transactions. 
+
+I’ll propose using open-source differential privacy libraries like Google’s DP. Managed KMS/HSM is essential for signing, and I need to address audit logs and change management too. I must consider various stress scenarios and their recommendations, including database downtime and network issues. To guard against Sybil attacks, I’ll look into anomaly detection and rate limiting, and I need to clarify privacy budget connections and ensure no double counting in metric composition. I need everything structured clearly, so I’ll provide this in markdown format.
+codex
+## Elegance Check
+
+### The Core Insight
+Constrain analytics into a small set of **versioned metric templates with explicit contribution bounds**, then make every release go through a **deterministic, globally enforced privacy ledger** so “ops churn” (retries/backfills/one-offs) can’t accidentally turn into privacy leakage.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Client SDK | Only place you can reliably enforce per-user contribution bounds before data leaves the device. |
+| Secure Aggregation | Prevents the server from observing individual contributions; turns “raw event collection” into “cohort-only sums.” |
+| DP Release Service | Single choke point to apply DP, gate releases (k-thresholds/slices), and standardize mechanisms/post-processing. |
+| Privacy Ledger | Enforces composition/idempotency across retries/backfills and across the entire metric catalog. |
+| Analytics UI | Keeps consumers on the DP-only surface and makes uncertainty visible (error bars/confidence). |
+
+### Simplification Opportunities
+| Current | Simper Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom “Privacy Ledger” service | Postgres-backed ledger with `UNIQUE(release_id)` + transactional “spend” rows, append-only audit table, and signed config versions | Less bespoke infra; you still need careful schema + operational discipline (migrations/replication). |
+| Separate “Metric Scheduler” + “Federated Executor” | One workflow system (Temporal/Airflow) that (a) selects cohorts (b) drives SecAgg rounds (c) records outcomes | Fewer moving parts; workflow engine becomes a critical dependency. |
+| “Aggregate Store” as a general database | Object storage (S3/GCS) for immutable per-window artifacts + small relational index in Postgres | Cheaper and simpler at scale; slightly more plumbing for reads/retention. |
+| Homegrown secure aggregation protocol implementation | Adopt an existing, well-reviewed protocol/standard (e.g., Prio/DAP-style) and reuse audited libs where possible | Less flexibility; may need to adapt metric templates to protocol constraints. |
+| DP mechanisms/accounting implemented bespoke | Use a mature DP library + accountant (OpenDP / Google DP) behind a minimal wrapper | You inherit library constraints/updates; reduces risk of “almost DP” bugs. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Database/ledger is down for 5 minutes**
+   - Design's answer: not addressed (kill switch focuses on DP Release, but ledger outage behavior isn’t specified)
+   - Recommendation: Strengthen — define “fail closed” semantics: aggregation may proceed, but **no release** without a recorded ledger spend; queue release attempts with idempotency keys.
+
+2. **Federated Executor (or cohort selection) is compromised or misconfigured and targets individuals**
+   - Design's answer: not addressed (minimum cohort size helps, but doesn’t prevent adversarial cohort construction)
+   - Recommendation: Must fix — add anti-targeting rules: cohort membership derived from **public, pre-committed criteria** (random sampling with verifiable seed, or deterministic eligibility), plus guardrails like “no single-device inclusion changes cohort outcome eligibility.”
+
+3. **Secure aggregation completes, but DP Release is slow/backlogged (or partially failing)**
+   - Design's answer: partially addressed (DP Release is choke point / kill switch, but backlog behavior unclear)
+   - Recommendation: Strengthen — treat pre-DP aggregates as sensitive; enforce TTL + encryption-at-rest + strict access, and prefer “apply DP immediately then persist only DP outputs” unless you truly need intermediates.
+
+4. **Bad config deploy lowers thresholds / changes ε defaults**
+   - Design's answer: hinted (reviewable budget changes), but no concrete safety mechanisms
+   - Recommendation: Must fix — require signed, versioned configs; two-person review for any change that increases release surface (ε up, cohort floor down, new dimensions); add runtime “policy invariant checks” that refuse unsafe configs.
+
+5. **Traffic 10× or participation drops (can’t form 1k cohorts consistently)**
+   - Design's answer: addressed (deny releases; widen windows / reduce dimensionality)
+   - Recommendation: Acceptable — but also plan for “graceful degradation” metrics (coarser rollups) so dashboards don’t go dark unexpectedly.
+
+## Recommendations
+
+### Must Fix
+- Clarify the **threat model** explicitly (honest-but-curious server? malicious clients? collusion? insider risk?) because it drives protocol choices and what “secure” means operationally.
+- Fix the **cohort-targeting hole**: cohort selection must be constrained/verifiable so an operator can’t silently define cohorts that isolate a user.
+- Reconcile **composition accounting**: budgets can’t be “per-metric per-day” only; you need a global view that caps total ε spend for overlapping cohorts/windows (especially with hourly + daily releases).
+- Treat **pre-DP aggregates as sensitive**: the claim “not user data” is directionally true, but operationally dangerous—access to pre-DP aggregates can still leak (small slices, differencing, insider access).
+
+### Should Consider
+- Define a strict policy for **late arrivals and revisions**: do you allow re-releases for the same window? If yes, it must spend additional budget and be visible in lineage.
+- Add **poisoning/Sybil resistance**: secure aggregation hides individuals, but doesn’t stop adversarial clients from skewing aggregates; use attestation, rate limits, anomaly detection, and bounded vocabularies with allowlists.
+- Make “dimension explosion impossible” more concrete: encode limits as schema-level constraints and compile-time checks in metric definitions, not just runtime gating.
+
+### Nice to Have
+- Tamper-evident audit trail for ledger spends (append-only + periodic checkpoints/signatures).
+- “Privacy SLOs” alongside freshness SLOs (denial rate, expected error, budget burn rate).
+- A clean “break glass” runbook that explains exactly what on-call can do at 3am without risking privacy.
+
+## What's Working Well
+- The **template-only query surface** is the right forcing function; it makes privacy governance tractable and keeps the system operable for a small team.
+- The **deterministic release identity** is a strong foundation for idempotency and backfill safety.
+- The design correctly focuses on the real problems: **composition, governance, and cohort formation**, not just “add Laplace noise.”
+- The **kill switch at DP Release** is the right blast-radius boundary; it’s a simple, powerful operational control.
+tokens used
+6,294
+## Elegance Check
+
+### The Core Insight
+Constrain analytics into a small set of **versioned metric templates with explicit contribution bounds**, then make every release go through a **deterministic, globally enforced privacy ledger** so “ops churn” (retries/backfills/one-offs) can’t accidentally turn into privacy leakage.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Client SDK | Only place you can reliably enforce per-user contribution bounds before data leaves the device. |
+| Secure Aggregation | Prevents the server from observing individual contributions; turns “raw event collection” into “cohort-only sums.” |
+| DP Release Service | Single choke point to apply DP, gate releases (k-thresholds/slices), and standardize mechanisms/post-processing. |
+| Privacy Ledger | Enforces composition/idempotency across retries/backfills and across the entire metric catalog. |
+| Analytics UI | Keeps consumers on the DP-only surface and makes uncertainty visible (error bars/confidence). |
+
+### Simplification Opportunities
+| Current | Simper Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom “Privacy Ledger” service | Postgres-backed ledger with `UNIQUE(release_id)` + transactional “spend” rows, append-only audit table, and signed config versions | Less bespoke infra; you still need careful schema + operational discipline (migrations/replication). |
+| Separate “Metric Scheduler” + “Federated Executor” | One workflow system (Temporal/Airflow) that (a) selects cohorts (b) drives SecAgg rounds (c) records outcomes | Fewer moving parts; workflow engine becomes a critical dependency. |
+| “Aggregate Store” as a general database | Object storage (S3/GCS) for immutable per-window artifacts + small relational index in Postgres | Cheaper and simpler at scale; slightly more plumbing for reads/retention. |
+| Homegrown secure aggregation protocol implementation | Adopt an existing, well-reviewed protocol/standard (e.g., Prio/DAP-style) and reuse audited libs where possible | Less flexibility; may need to adapt metric templates to protocol constraints. |
+| DP mechanisms/accounting implemented bespoke | Use a mature DP library + accountant (OpenDP / Google DP) behind a minimal wrapper | You inherit library constraints/updates; reduces risk of “almost DP” bugs. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Database/ledger is down for 5 minutes**
+   - Design's answer: not addressed (kill switch focuses on DP Release, but ledger outage behavior isn’t specified)
+   - Recommendation: Strengthen — define “fail closed” semantics: aggregation may proceed, but **no release** without a recorded ledger spend; queue release attempts with idempotency keys.
+
+2. **Federated Executor (or cohort selection) is compromised or misconfigured and targets individuals**
+   - Design's answer: not addressed (minimum cohort size helps, but doesn’t prevent adversarial cohort construction)
+   - Recommendation: Must fix — add anti-targeting rules: cohort membership derived from **public, pre-committed criteria** (random sampling with verifiable seed, or deterministic eligibility), plus guardrails like “no single-device inclusion changes cohort outcome eligibility.”
+
+3. **Secure aggregation completes, but DP Release is slow/backlogged (or partially failing)**
+   - Design's answer: partially addressed (DP Release is choke point / kill switch, but backlog behavior unclear)
+   - Recommendation: Strengthen — treat pre-DP aggregates as sensitive; enforce TTL + encryption-at-rest + strict access, and prefer “apply DP immediately then persist only DP outputs” unless you truly need intermediates.
+
+4. **Bad config deploy lowers thresholds / changes ε defaults**
+   - Design's answer: hinted (reviewable budget changes), but no concrete safety mechanisms
+   - Recommendation: Must fix — require signed, versioned configs; two-person review for any change that increases release surface (ε up, cohort floor down, new dimensions); add runtime “policy invariant checks” that refuse unsafe configs.
+
+5. **Traffic 10× or participation drops (can’t form 1k cohorts consistently)**
+   - Design's answer: addressed (deny releases; widen windows / reduce dimensionality)
+   - Recommendation: Acceptable — but also plan for “graceful degradation” metrics (coarser rollups) so dashboards don’t go dark unexpectedly.
+
+## Recommendations
+
+### Must Fix
+- Clarify the **threat model** explicitly (honest-but-curious server? malicious clients? collusion? insider risk?) because it drives protocol choices and what “secure” means operationally.
+- Fix the **cohort-targeting hole**: cohort selection must be constrained/verifiable so an operator can’t silently define cohorts that isolate a user.
+- Reconcile **composition accounting**: budgets can’t be “per-metric per-day” only; you need a global view that caps total ε spend for overlapping cohorts/windows (especially with hourly + daily releases).
+- Treat **pre-DP aggregates as sensitive**: the claim “not user data” is directionally true, but operationally dangerous—access to pre-DP aggregates can still leak (small slices, differencing, insider access).
+
+### Should Consider
+- Define a strict policy for **late arrivals and revisions**: do you allow re-releases for the same window? If yes, it must spend additional budget and be visible in lineage.
+- Add **poisoning/Sybil resistance**: secure aggregation hides individuals, but doesn’t stop adversarial clients from skewing aggregates; use attestation, rate limits, anomaly detection, and bounded vocabularies with allowlists.
+- Make “dimension explosion impossible” more concrete: encode limits as schema-level constraints and compile-time checks in metric definitions, not just runtime gating.
+
+### Nice to Have
+- Tamper-evident audit trail for ledger spends (append-only + periodic checkpoints/signatures).
+- “Privacy SLOs” alongside freshness SLOs (denial rate, expected error, budget burn rate).
+- A clean “break glass” runbook that explains exactly what on-call can do at 3am without risking privacy.
+
+## What's Working Well
+- The **template-only query surface** is the right forcing function; it makes privacy governance tractable and keeps the system operable for a small team.
+- The **deterministic release identity** is a strong foundation for idempotency and backfill safety.
+- The design correctly focuses on the real problems: **composition, governance, and cohort formation**, not just “add Laplace noise.”
+- The **kill switch at DP Release** is the right blast-radius boundary; it’s a simple, powerful operational control.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/privacy-preserving-analytics.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af9-7bfc-7251-8a94-815999c75ea0
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Privacy-Preserving Analytics"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["differential-privacy", "federated-analytics", "secure-aggregation", "privacy-budget", "governance"]
+---
+
+## Overview
+
+This system computes product analytics (counts, rates, histograms) without ever collecting raw user-level data on the server. The key insight is to **productize analytics into a small set of query templates** (DAU, funnels, retention, top-N, histograms) and run them via **federated execution + secure aggregation**, then apply **central differential privacy (DP)** to the aggregated result. You get the operational simplicity of “normal analytics dashboards” while keeping the server blind to individual contributions.
+
+Most teams fail by treating privacy as a bolt-on (“we’ll add DP later”) while keeping an ad-hoc query surface. The elegant version constrains the surface area: every metric is a predefined computation with explicit contribution bounds, cohort thresholds, and a privacy cost. Analysts don’t query data; they request *metrics*.
+
+## What Makes This Hard
+
+The trap is **composition**: even if each query is “private,” repeated slicing (country × app version × device model × day × campaign) turns into a reconstruction attack. The hardest engineering problem isn’t adding Laplace noise—it’s **governing what can be asked**, enforcing **contribution bounds**, and maintaining a **privacy budget ledger** that survives retries, backfills, and “one-off” analyst requests.
+
+The second hard problem is **secure aggregation under real-world client behavior** (dropouts, skewed connectivity, adversarial clients). Secure aggregation protocols look clean on paper; production reality is all about cohort sizing, time windows, and making partial failures boring.
+
+## Requirements
+
+### Functional Requirements
+- Compute standard aggregates: event counts, unique users, rates (conversion/retention), histograms (e.g., session length buckets), top-K categories from a bounded vocabulary.
+- No server access to raw per-user data; server storage contains only encrypted shares and DP-sanitized aggregates.
+- Enforce per-metric **contribution bounds** (e.g., max events per user per day) and **minimum cohort sizes** before releasing results.
+- Support scheduled jobs (hourly/daily), backfills, and metric versioning without “double spending” privacy budget.
+- Provide auditable lineage: metric definition → cohort parameters → privacy cost → released value.
+
+### Scale Targets
+- 5M DAU, 50M MAU.
+- 100 core metrics, each computed daily; ~20 computed hourly.
+- Each client sends at most 1 analytics report/day (bounded payload, ~1–5KB).
+- Secure aggregation cohorts: target 10,000 devices per metric per window; hard floor 1,000 (below that, no release).
+- End-to-end freshness: daily metrics within 2 hours of day close; hourly within 20 minutes.
+
+Why these numbers matter: secure aggregation needs large cohorts to hide individuals, and DP needs enough signal-to-noise. If your product can’t regularly form 1k+ cohorts per slice, you must reduce dimensionality or accept “no data” rather than leak.
+
+## Key Design Decisions
+
+- **We chose: Federated computation + secure aggregation, then central DP on the aggregate**
+  - **Rejected:** collecting raw events then “restricting access”
+  - **Rejected:** pure local DP for everything
+  - **Why:** secure aggregation prevents the server from seeing individual values; central DP provides consistent, tunable privacy/utility across metrics. Pure local DP is simple but typically too noisy for product analytics at realistic scales.
+
+- **We chose: Metric templates (no ad-hoc SQL), with explicit contribution bounding**
+  - **Rejected:** “DP query layer” over a general warehouse
+  - **Why:** ad-hoc query surfaces destroy privacy budgets through composition and dimension explosion. Templates make privacy enforceable and operations predictable.
+
+- **We chose: A privacy budget ledger as a first-class service**
+  - **Rejected:** embedding privacy logic inside each job
+  - **Why:** privacy needs global invariants (no double releases, consistent accounting across backfills). Centralizing it prevents accidental leakage during operational churn.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client SDK] -->|bounded contributions| A[Secure Aggregation]
+  A --> R[Aggregate Store]
+  Q[Metric Scheduler] --> E[Federated Executor]
+  E --> A
+  R --> D[DP Release Service]
+  D --> P[Privacy Ledger]
+  D --> B[Analytics UI]
+```
+
+### Components
+
+- **Client SDK**
+  - Computes metric-specific contributions locally (e.g., “sessions today capped at 20”).
+  - Enforces contribution bounds before anything leaves the device.
+  - Produces a compact, versioned report for a given metric/window.
+
+- **Federated Executor**
+  - Orchestrates which clients participate in which metric/window (cohorts).
+  - Handles retries, rollouts, and metric version upgrades without changing privacy semantics.
+
+- **Secure Aggregation**
+  - Implements a production-secure aggregation protocol (e.g., Bonawitz-style SecAgg) so the server only learns sums over a cohort.
+  - Enforces cohort thresholds and dropout tolerance; emits only aggregated plaintext (never per-client plaintext).
+
+- **Aggregate Store**
+  - Stores per-(metric, window, cohort) aggregates plus metadata (counts, dropout rate, schema version).
+  - This is not user data; it’s pre-DP intermediate state with strict access controls.
+
+- **DP Release Service**
+  - Applies central DP mechanisms (Laplace/Gaussian + post-processing) to aggregates.
+  - Performs release gating: minimum cohort size, allowed dimensions, sensitivity derived from metric definition.
+
+- **Privacy Ledger**
+  - The system’s “bank”: tracks privacy spending by metric, slice, and time range.
+  - Guarantees idempotency: a backfill or retry cannot mint a second release “for free.”
+
+- **Analytics UI**
+  - Reads only DP-sanitized released metrics.
+  - Exposes confidence intervals/expected error so teams don’t overreact to noise.
+
+## Deep Dive: Privacy Budget + Metric Governance (The Real Hard Part)
+
+A privacy-preserving system fails the moment it allows “just one more breakdown.” The only robust approach is to make privacy an invariant enforced by design, not policy.
+
+**1) Define metrics as contracts, not queries.**  
+Each metric template specifies:
+- Contribution bounds (per user per window): e.g., `max_sessions_per_user_per_day = 20`
+- Sensitivity: derived from the bound and aggregation type (sum/count/histogram)
+- Allowed dimensions: a fixed whitelist with capped cardinality (e.g., country, app_version_major)
+- Release cadence and retention (how long we keep intermediate aggregates)
+
+This turns privacy from “best effort” into compile-time-like constraints.
+
+**2) Treat every release as a spend with deterministic identity.**  
+A release is keyed by `(metric_id, metric_version, window_start, window_end, dimension_values_hash)`. The DP Release Service requests a spend from the Privacy Ledger; the ledger returns either:
+- **Approved** with a privacy cost grant (ε, δ), or
+- **Denied** (budget exhausted / disallowed slice / cohort too small / already released)
+
+This prevents accidental double releases during retries, and blocks “creative” slicing that would otherwise leak.
+
+**3) Use a simple, explicit accountant and stick to it.**  
+Pick one DP accounting model and operationalize it. A practical choice:
+- Per-metric per-day budget ε (and δ for Gaussian), with strict caps for slices.
+- Composition handled by the ledger; no hidden spending.
+- If a team needs more accuracy, they negotiate budget explicitly, which forces trade-offs.
+
+**4) Make dimension explosion physically impossible.**  
+Even with DP, too many slices create correlated leakage and useless noisy charts. Enforce:
+- Maximum number of slices per metric per window (e.g., 200).
+- Minimum cohort size per slice (e.g., 1,000).
+- Bounded vocabularies for categorical metrics (top-K computed via a DP-friendly approach over a fixed dictionary, not arbitrary strings).
+
+The non-obvious lesson: **privacy is mostly governance and determinism**. The math is the easy part.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Strong privacy guarantees (no raw server data) | Ad-hoc analyst flexibility |
+| Operational simplicity via templates | “One-off” exploratory queries |
+| Predictable accuracy via bounded sensitivity | Fine-grained segmentation |
+| Boring, auditable releases | Maximum metric velocity |
+
+## Failure Modes
+
+- **Cohorts too small (or too many slices)**
+  - **What happens:** releases are denied; dashboards show gaps.
+  - **Detect:** cohort-size and slice-count monitors; denial-rate SLOs.
+  - **Recover:** reduce dimensionality, widen time windows, or increase participation rate (SDK prompts, scheduling changes). Do not lower thresholds.
+
+- **Client dropout breaks secure aggregation**
+  - **What happens:** jobs stall or aggregates fail to decrypt.
+  - **Detect:** dropout rate, time-to-completion, and “incomplete cohort” alarms.
+  - **Recover:** increase cohort over-recruitment, extend collection window, and use a protocol configuration with dropout resilience; fail closed (no aggregate) rather than partial release.
+
+- **Privacy budget exhaustion / accidental overspend attempts**
+  - **What happens:** releases denied; teams attempt workarounds.
+  - **Detect:** budget burn-down dashboards and alerting on repeated denied attempts.
+  - **Recover:** raise budget only via a reviewable change (metric contract update), or reduce cadence/slices; never bypass the ledger.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move aggregation and storage to a more partitioned pipeline (sharded executors per region), and precompute common cohorts to reduce orchestration overhead; privacy model stays the same.
+- **100x scale:** Rearchitect cohort selection and scheduling to be globally optimized (minimize overlap between cohorts to reduce correlated composition), and introduce formal privacy loss distribution tracking for large metric catalogs.
+
+## Operational Notes
+
+- The on-call “kill switch” is the DP Release Service: if anything looks wrong, stop releases; secure aggregation can continue collecting aggregates safely.
+- Backfills are the easiest way to leak: every backfill must mint releases through the same deterministic identity and ledger path.
+- Keep a tight rotation policy for secure aggregation keys and signing keys; treat any key anomaly as a release freeze event.
+- Monitor three health signals together: cohort size, dropout rate, and expected DP error. A “successful” release with terrible error is operationally a silent failure.
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Constrain analytics into a small set of **versioned metric templates with explicit contribution bounds**, then make every release go through a **deterministic, globally enforced privacy ledger** so “ops churn” (retries/backfills/one-offs) can’t accidentally turn into privacy leakage.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Client SDK | Only place you can reliably enforce per-user contribution bounds before data leaves the device. |
+| Secure Aggregation | Prevents the server from observing individual contributions; turns “raw event collection” into “cohort-only sums.” |
+| DP Release Service | Single choke point to apply DP, gate releases (k-thresholds/slices), and standardize mechanisms/post-processing. |
+| Privacy Ledger | Enforces composition/idempotency across retries/backfills and across the entire metric catalog. |
+| Analytics UI | Keeps consumers on the DP-only surface and makes uncertainty visible (error bars/confidence). |
+
+### Simplification Opportunities
+| Current | Simper Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom “Privacy Ledger” service | Postgres-backed ledger with `UNIQUE(release_id)` + transactional “spend” rows, append-only audit table, and signed config versions | Less bespoke infra; you still need careful schema + operational discipline (migrations/replication). |
+| Separate “Metric Scheduler” + “Federated Executor” | One workflow system (Temporal/Airflow) that (a) selects cohorts (b) drives SecAgg rounds (c) records outcomes | Fewer moving parts; workflow engine becomes a critical dependency. |
+| “Aggregate Store” as a general database | Object storage (S3/GCS) for immutable per-window artifacts + small relational index in Postgres | Cheaper and simpler at scale; slightly more plumbing for reads/retention. |
+| Homegrown secure aggregation protocol implementation | Adopt an existing, well-reviewed protocol/standard (e.g., Prio/DAP-style) and reuse audited libs where possible | Less flexibility; may need to adapt metric templates to protocol constraints. |
+| DP mechanisms/accounting implemented bespoke | Use a mature DP library + accountant (OpenDP / Google DP) behind a minimal wrapper | You inherit library constraints/updates; reduces risk of “almost DP” bugs. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Database/ledger is down for 5 minutes**
+   - Design's answer: not addressed (kill switch focuses on DP Release, but ledger outage behavior isn’t specified)
+   - Recommendation: Strengthen — define “fail closed” semantics: aggregation may proceed, but **no release** without a recorded ledger spend; queue release attempts with idempotency keys.
+
+2. **Federated Executor (or cohort selection) is compromised or misconfigured and targets individuals**
+   - Design's answer: not addressed (minimum cohort size helps, but doesn’t prevent adversarial cohort construction)
+   - Recommendation: Must fix — add anti-targeting rules: cohort membership derived from **public, pre-committed criteria** (random sampling with verifiable seed, or deterministic eligibility), plus guardrails like “no single-device inclusion changes cohort outcome eligibility.”
+
+3. **Secure aggregation completes, but DP Release is slow/backlogged (or partially failing)**
+   - Design's answer: partially addressed (DP Release is choke point / kill switch, but backlog behavior unclear)
+   - Recommendation: Strengthen — treat pre-DP aggregates as sensitive; enforce TTL + encryption-at-rest + strict access, and prefer “apply DP immediately then persist only DP outputs” unless you truly need intermediates.
+
+4. **Bad config deploy lowers thresholds / changes ε defaults**
+   - Design's answer: hinted (reviewable budget changes), but no concrete safety mechanisms
+   - Recommendation: Must fix — require signed, versioned configs; two-person review for any change that increases release surface (ε up, cohort floor down, new dimensions); add runtime “policy invariant checks” that refuse unsafe configs.
+
+5. **Traffic 10× or participation drops (can’t form 1k cohorts consistently)**
+   - Design's answer: addressed (deny releases; widen windows / reduce dimensionality)
+   - Recommendation: Acceptable — but also plan for “graceful degradation” metrics (coarser rollups) so dashboards don’t go dark unexpectedly.
+
+## Recommendations
+
+### Must Fix
+- Clarify the **threat model** explicitly (honest-but-curious server? malicious clients? collusion? insider risk?) because it drives protocol choices and what “secure” means operationally.
+- Fix the **cohort-targeting hole**: cohort selection must be constrained/verifiable so an operator can’t silently define cohorts that isolate a user.
+- Reconcile **composition accounting**: budgets can’t be “per-metric per-day” only; you need a global view that caps total ε spend for overlapping cohorts/windows (especially with hourly + daily releases).
+- Treat **pre-DP aggregates as sensitive**: the claim “not user data” is directionally true, but operationally dangerous—access to pre-DP aggregates can still leak (small slices, differencing, insider access).
+
+### Should Consider
+- Define a strict policy for **late arrivals and revisions**: do you allow re-releases for the same window? If yes, it must spend additional budget and be visible in lineage.
+- Add **poisoning/Sybil resistance**: secure aggregation hides individuals, but doesn’t stop adversarial clients from skewing aggregates; use attestation, rate limits, anomaly detection, and bounded vocabularies with allowlists.
+- Make “dimension explosion impossible” more concrete: encode limits as schema-level constraints and compile-time checks in metric definitions, not just runtime gating.
+
+### Nice to Have
+- Tamper-evident audit trail for ledger spends (append-only + periodic checkpoints/signatures).
+- “Privacy SLOs” alongside freshness SLOs (denial rate, expected error, budget burn rate).
+- A clean “break glass” runbook that explains exactly what on-call can do at 3am without risking privacy.
+
+## What's Working Well
+- The **template-only query surface** is the right forcing function; it makes privacy governance tractable and keeps the system operable for a small team.
+- The **deterministic release identity** is a strong foundation for idempotency and backfill safety.
+- The design correctly focuses on the real problems: **composition, governance, and cohort formation**, not just “add Laplace noise.”
+- The **kill switch at DP Release** is the right blast-radius boundary; it’s a simple, powerful operational control.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+Reconnecting... 1/5
+
+
+
+
+
+
+thinking
+**Assessing document simplification**
+
+I need to rewrite this document while preserving important elements like the title and difficulty tags. The task specifies that I can only remove or merge content, not add anything new. I should simplify based on critiques and address potential failure scenarios without increasing complexity. I can restructure existing sections, but my output must be a fully simplified document that stands as the design. I'll keep the main sections and consider merging components and implementing suggested simplifications.
+thinking
+**Evaluating component integration**
+
+I am considering swapping the store type within the existing "Aggregate Store" definition to "Postgres + object storage" while adhering to the guideline of not adding new components. I can merge this into existing definitions and incorporate secure aggregation libraries without introducing extra components. For cohort selection, I'll add constraints to prevent targeting and weave these into the Federated Executor workflow. I’ll address threat models, composition accounting, and update sensitive aggregate semantics, while also addressing downtime and deployment configurations in relevant sections.
+thinking
+**Analyzing component integration**
+
+I'm looking at how to manage participation drops by possibly degrading to coarser rollups, which I should mention in either Failure Modes or Requirements. For concerns like poisoning or Sybil attacks, I want to keep things minimal, mentioning bounded inputs and optional attestation while avoiding new components. I can incorporate these into the SDK and secure aggregation. I’m also thinking about whether to merge the DP Release Service and Privacy Ledger into one Postgres-backed service, ensuring the diagram remains uncluttered while keeping the essential components.
+thinking
+**Reassessing data storage and processing**
+
+I'm considering folding the "Analytics UI" into the outputs stored in Postgres and possibly removing the "Aggregate Store" by using Postgres directly. At scale, with 5 million daily active users, I'll need to simplify this to store metrics in Postgres and keep the object store optional. My simplest approach might be not using a pre-DP store and only keeping DP outputs and essential metadata. While I plan for retries and backfills, I need to ensure that clients can report when online, which complicates things a bit. Overall, I want to streamline the process while meeting the requirements for backfills.
+thinking
+**Streamlining document structure**
+
+I need to keep the intermediate aggregate store for a short TTL in object storage to allow for release retries without re-running SecAgg. However, it might be simpler to store everything in Postgres directly. My plan includes merging components like the Metric Scheduler and Federated Executor into one workflow while ensuring I don’t add new component names. I also want to address issues like deterministic cohort targeting and the threat model while producing a final markdown document and incorporating a "What We Removed" section under an existing heading. This requires careful consideration to stay within the stipulated guidelines.
+thinking
+**Finalizing document structure and content**
+
+I'm considering what to do with the "What I'd Do Differently At..." section. It seems best to replace it with a "What We Removed" label in the "Operational Notes," ensuring we aren't adding new sections. I’ll streamline the architecture to focus on essential components, leveraging Postgres efficiently and integrating the workflow runner without introducing new services. I'll include deterministic releases, budget tracking, and backfill strategies while keeping explanations concise. Throughout the document, I aim to maintain clarity while adhering to the user’s requirements for minimalism and justification of design choices.
+codex
+```markdown
+---
+title: "Privacy-Preserving Analytics"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["differential-privacy", "federated-analytics", "secure-aggregation", "privacy-budget", "governance"]
+---
+
+## Overview
+
+This system ships analytics as a small set of **versioned metric templates** (DAU, funnels, retention, histograms, top-K from a fixed vocabulary). Devices compute **bounded contributions** locally, cohorts run **secure aggregation** so the server only learns cohort totals, and a single release path applies **central differential privacy (DP)** and publishes results.
+
+The system stays operable by keeping the query surface tiny and making every release **deterministic, budgeted, and auditable**. Teams request metrics, not data.
+
+## What Makes This Hard
+
+The hard part is **governance under composition**: repeated slicing and retries/backfills can turn “private per query” into leakage. Privacy holds only if releases are strictly limited, deterministically identified, and globally accounted.
+
+The other hard part is **cohort reality**: dropouts, skewed connectivity, and operational misconfiguration. Secure aggregation must fail closed, cohorts must stay large, and cohort construction must be constrained to prevent targeting.
+
+## Requirements
+
+### Functional Requirements
+- Standard aggregates only: counts, uniques, rates, histograms, top-K over a bounded dictionary.
+- Server never sees per-user plaintext; releases are DP-sanitized aggregates only.
+- Enforce contribution bounds and minimum cohort size before release.
+- Scheduled runs and backfills without double-releasing or double-spending budget.
+- Auditable lineage: metric version + cohort parameters + DP spend + released value.
+
+### Scale Targets
+- 5M DAU, 50M MAU.
+- ~100 daily metrics; ~20 hourly metrics.
+- Each client sends at most 1 bounded report/day (1–5KB).
+- Cohorts target 10,000 devices; hard floor 1,000 (otherwise no release).
+- Freshness: daily within 2 hours of day close; hourly within 20 minutes.
+
+## Key Design Decisions
+
+- **Federated execution + secure aggregation, then central DP**
+  - Secure aggregation keeps the server blind to individual values; central DP gives consistent privacy/utility knobs per metric.
+
+- **Metric templates only**
+  - Every metric is a contract: bounded contribution, fixed dimensions, capped slices, fixed cadence.
+
+- **One release path with a Postgres-backed ledger**
+  - Releases are idempotent, budgeted, and audited via transactional writes and uniqueness constraints.
+
+- **Cadence normalization**
+  - Each metric has one “base window” (hourly *or* daily). Other rollups come from post-processing already released DP outputs (no extra privacy spend).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client SDK] --> A[Secure Aggregation Rounds]
+  W[Workflow Runner] --> A
+  A --> PG[(Postgres: ledger + aggregates + releases)]
+  PG --> U[Analytics UI]
+```
+
+### Components
+
+- **Client SDK**
+  - Why it stays: the only reliable place to enforce per-user contribution bounds before data leaves the device.
+
+- **Workflow Runner**
+  - Why it stays: one place to schedule windows, form cohorts, drive secure aggregation rounds, and record outcomes deterministically.
+
+- **Secure Aggregation Rounds**
+  - Why it stays: prevents the server from observing individual contributions; only cohort totals exist server-side.
+
+- **Postgres (ledger + aggregates + releases)**
+  - Why it stays: transactional idempotency and global accounting; the simplest durable store for policy, spends, and released metrics.
+
+- **Analytics UI**
+  - Why it stays: keeps consumers on the DP-only surface and makes uncertainty visible.
+
+## Deep Dive: Privacy Budget + Metric Governance (The Real Hard Part)
+
+**1) Metrics are contracts.**  
+Each metric template defines:
+- Contribution bounds per user per window.
+- Allowed dimensions and capped cardinality.
+- Maximum slices per window (hard cap).
+- Cadence and retention.
+- DP mechanism parameters (ε, δ) and expected error.
+
+**2) Cohorts are constrained and reproducible.**  
+Cohort membership is derived from:
+- A metric-defined eligibility rule (public, pre-committed), and
+- Deterministic sampling using a logged seed per window.
+This makes targeting observable and prevents “silent one-person cohorts” even before k-threshold gating.
+
+**3) Releases are deterministic spends in Postgres.**  
+A release is keyed by:
+`(metric_id, metric_version, window_start, window_end, dimension_values_hash)`  
+The workflow writes a single transactional “spend + release” record:
+- `UNIQUE(release_id)` enforces idempotency across retries/backfills.
+- Budget checks happen inside the same transaction (fail closed).
+- Any revision is a new release_id and spends additional budget, showing up in lineage.
+
+**4) Pre-DP intermediates are treated as sensitive.**  
+Aggregates are stored only as needed for operational retries, with:
+- Short TTL/retention,
+- Encryption at rest,
+- Strict access controls,
+- “No release without a recorded spend” invariant.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Strong privacy guarantees | Ad-hoc analyst flexibility |
+| Small, enforceable metric surface | Exploratory “one-off” breakdowns |
+| Deterministic, auditable releases | Maximum segmentation |
+| Simple operations (Postgres + workflow) | Some utility loss (DP noise + slice caps) |
+
+## Failure Modes
+
+- **Ledger/DB down**
+  - What happens: secure aggregation may complete, but releases stop.
+  - Recover: resume from idempotent release_ids; no release occurs without a committed spend.
+
+- **Cohorts too small / too many slices**
+  - What happens: releases are denied; dashboards show gaps or coarser rollups only.
+  - Recover: reduce dimensions/slices or widen windows; thresholds remain fixed.
+
+- **Cohort targeting via misconfiguration**
+  - What happens: ineligible cohort definitions are rejected (eligibility + deterministic sampling + k-threshold).
+  - Recover: rotate to a known-good signed metric config; audit the logged seeds/eligibility inputs.
+
+- **Secure aggregation dropouts**
+  - What happens: window fails closed (no aggregate, no release).
+  - Recover: over-recruit, extend window, tune dropout tolerance; retry stays idempotent.
+
+- **Bad config deploy increases release surface**
+  - What happens: policy invariants reject unsafe configs at runtime.
+  - Recover: roll back to prior signed config version; releases remain blocked until invariants pass.
+
+## What We Removed
+
+- Separate **Privacy Ledger service**: replaced by Postgres tables with transactional spend + `UNIQUE(release_id)` idempotency and an append-only audit trail.
+- Separate **Metric Scheduler** and **Federated Executor**: merged into one workflow runner that schedules windows, forms cohorts, runs secure aggregation, and records outcomes.
+- General-purpose **Aggregate Store**: collapsed into Postgres with TTL retention for intermediates and a single source of truth for released metrics.
+- Bespoke DP and secure aggregation implementations: treated as library choices behind the same release path and metric contracts.
+
+## Operational Notes
+
+- The kill switch is the release transaction: if policy invariants or budget checks fail, nothing is published.
+- Backfills and retries reuse the same deterministic release_id; revisions mint a new release_id and spend again.
+- Monitor: cohort size, dropout rate, denial rate, and expected DP error; alert on sustained “released but useless” error.
+```
+tokens used
+8,838
+```markdown
+---
+title: "Privacy-Preserving Analytics"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["differential-privacy", "federated-analytics", "secure-aggregation", "privacy-budget", "governance"]
+---
+
+## Overview
+
+This system ships analytics as a small set of **versioned metric templates** (DAU, funnels, retention, histograms, top-K from a fixed vocabulary). Devices compute **bounded contributions** locally, cohorts run **secure aggregation** so the server only learns cohort totals, and a single release path applies **central differential privacy (DP)** and publishes results.
+
+The system stays operable by keeping the query surface tiny and making every release **deterministic, budgeted, and auditable**. Teams request metrics, not data.
+
+## What Makes This Hard
+
+The hard part is **governance under composition**: repeated slicing and retries/backfills can turn “private per query” into leakage. Privacy holds only if releases are strictly limited, deterministically identified, and globally accounted.
+
+The other hard part is **cohort reality**: dropouts, skewed connectivity, and operational misconfiguration. Secure aggregation must fail closed, cohorts must stay large, and cohort construction must be constrained to prevent targeting.
+
+## Requirements
+
+### Functional Requirements
+- Standard aggregates only: counts, uniques, rates, histograms, top-K over a bounded dictionary.
+- Server never sees per-user plaintext; releases are DP-sanitized aggregates only.
+- Enforce contribution bounds and minimum cohort size before release.
+- Scheduled runs and backfills without double-releasing or double-spending budget.
+- Auditable lineage: metric version + cohort parameters + DP spend + released value.
+
+### Scale Targets
+- 5M DAU, 50M MAU.
+- ~100 daily metrics; ~20 hourly metrics.
+- Each client sends at most 1 bounded report/day (1–5KB).
+- Cohorts target 10,000 devices; hard floor 1,000 (otherwise no release).
+- Freshness: daily within 2 hours of day close; hourly within 20 minutes.
+
+## Key Design Decisions
+
+- **Federated execution + secure aggregation, then central DP**
+  - Secure aggregation keeps the server blind to individual values; central DP gives consistent privacy/utility knobs per metric.
+
+- **Metric templates only**
+  - Every metric is a contract: bounded contribution, fixed dimensions, capped slices, fixed cadence.
+
+- **One release path with a Postgres-backed ledger**
+  - Releases are idempotent, budgeted, and audited via transactional writes and uniqueness constraints.
+
+- **Cadence normalization**
+  - Each metric has one “base window” (hourly *or* daily). Other rollups come from post-processing already released DP outputs (no extra privacy spend).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client SDK] --> A[Secure Aggregation Rounds]
+  W[Workflow Runner] --> A
+  A --> PG[(Postgres: ledger + aggregates + releases)]
+  PG --> U[Analytics UI]
+```
+
+### Components
+
+- **Client SDK**
+  - Why it stays: the only reliable place to enforce per-user contribution bounds before data leaves the device.
+
+- **Workflow Runner**
+  - Why it stays: one place to schedule windows, form cohorts, drive secure aggregation rounds, and record outcomes deterministically.
+
+- **Secure Aggregation Rounds**
+  - Why it stays: prevents the server from observing individual contributions; only cohort totals exist server-side.
+
+- **Postgres (ledger + aggregates + releases)**
+  - Why it stays: transactional idempotency and global accounting; the simplest durable store for policy, spends, and released metrics.
+
+- **Analytics UI**
+  - Why it stays: keeps consumers on the DP-only surface and makes uncertainty visible.
+
+## Deep Dive: Privacy Budget + Metric Governance (The Real Hard Part)
+
+**1) Metrics are contracts.**  
+Each metric template defines:
+- Contribution bounds per user per window.
+- Allowed dimensions and capped cardinality.
+- Maximum slices per window (hard cap).
+- Cadence and retention.
+- DP mechanism parameters (ε, δ) and expected error.
+
+**2) Cohorts are constrained and reproducible.**  
+Cohort membership is derived from:
+- A metric-defined eligibility rule (public, pre-committed), and
+- Deterministic sampling using a logged seed per window.
+This makes targeting observable and prevents “silent one-person cohorts” even before k-threshold gating.
+
+**3) Releases are deterministic spends in Postgres.**  
+A release is keyed by:
+`(metric_id, metric_version, window_start, window_end, dimension_values_hash)`  
+The workflow writes a single transactional “spend + release” record:
+- `UNIQUE(release_id)` enforces idempotency across retries/backfills.
+- Budget checks happen inside the same transaction (fail closed).
+- Any revision is a new release_id and spends additional budget, showing up in lineage.
+
+**4) Pre-DP intermediates are treated as sensitive.**  
+Aggregates are stored only as needed for operational retries, with:
+- Short TTL/retention,
+- Encryption at rest,
+- Strict access controls,
+- “No release without a recorded spend” invariant.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Strong privacy guarantees | Ad-hoc analyst flexibility |
+| Small, enforceable metric surface | Exploratory “one-off” breakdowns |
+| Deterministic, auditable releases | Maximum segmentation |
+| Simple operations (Postgres + workflow) | Some utility loss (DP noise + slice caps) |
+
+## Failure Modes
+
+- **Ledger/DB down**
+  - What happens: secure aggregation may complete, but releases stop.
+  - Recover: resume from idempotent release_ids; no release occurs without a committed spend.
+
+- **Cohorts too small / too many slices**
+  - What happens: releases are denied; dashboards show gaps or coarser rollups only.
+  - Recover: reduce dimensions/slices or widen windows; thresholds remain fixed.
+
+- **Cohort targeting via misconfiguration**
+  - What happens: ineligible cohort definitions are rejected (eligibility + deterministic sampling + k-threshold).
+  - Recover: rotate to a known-good signed metric config; audit the logged seeds/eligibility inputs.
+
+- **Secure aggregation dropouts**
+  - What happens: window fails closed (no aggregate, no release).
+  - Recover: over-recruit, extend window, tune dropout tolerance; retry stays idempotent.
+
+- **Bad config deploy increases release surface**
+  - What happens: policy invariants reject unsafe configs at runtime.
+  - Recover: roll back to prior signed config version; releases remain blocked until invariants pass.
+
+## What We Removed
+
+- Separate **Privacy Ledger service**: replaced by Postgres tables with transactional spend + `UNIQUE(release_id)` idempotency and an append-only audit trail.
+- Separate **Metric Scheduler** and **Federated Executor**: merged into one workflow runner that schedules windows, forms cohorts, runs secure aggregation, and records outcomes.
+- General-purpose **Aggregate Store**: collapsed into Postgres with TTL retention for intermediates and a single source of truth for released metrics.
+- Bespoke DP and secure aggregation implementations: treated as library choices behind the same release path and metric contracts.
+
+## Operational Notes
+
+- The kill switch is the release transaction: if policy invariants or budget checks fail, nothing is published.
+- Backfills and retries reuse the same deterministic release_id; revisions mint a new release_id and spend again.
+- Monitor: cohort size, dropout rate, denial rate, and expected DP error; alert on sustained “released but useless” error.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/10-strategic-problems/privacy-preserving-analytics.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Privacy-Preserving Analytics
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/privacy-preserving-analytics.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/privacy-preserving-analytics.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/10-strategic-problems/privacy-preserving-analytics.md

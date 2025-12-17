@@ -1,0 +1,250 @@
+---
+title: "Experimentation (A/B) Platform"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["experimentation", "ab-testing", "metrics", "analytics", "statistics", "data-quality", "governance"]
+---
+
+## Overview
+
+This experimentation (A/B) platform enables product teams to safely change behavior, measure impact, and make statistically valid decisions with strong auditability. It provides:
+
+- **Low-latency assignment** with deterministic, sticky bucketing and mutual exclusion/layering.
+- **Trustworthy exposure logging** so downstream events are attributable to experiments and variants.
+- **Nearline and final results** with versioned analyses, data-quality gates, and statistical safeguards.
+- **Governance** for multi-tenant RBAC, immutable configuration history, and reproducible readouts.
+
+A core principle is that **exposure is the join key**: product events become attributable through a consistent exposure model, enabling repeatable results, backfills, and shared metric definitions.
+
+## Requirements
+
+### Functional Requirements
+- Create, configure, and ramp experiments (targeting, traffic allocation, start/stop, holdouts).
+- Deterministic randomized assignment for a chosen unit (`user_id`, `device_id`, `org_id`, `session_id`).
+- Sticky bucketing across requests and over time (unless re-randomization is explicitly configured).
+- Mutual exclusion and layering across overlapping tests.
+- Exposure tracking and attribution of downstream events to variants.
+- Metric definition management (north-star + guardrails), including derived metrics and windows (D1/D7 retention).
+- Nearline readouts every 5–15 minutes plus final analyses with confidence intervals.
+- Statistical safeguards: SRM detection, sequential-safe inference for peeking, multiple-testing controls.
+- Auditability: immutable config history, reproducible results, explainable outputs, and provenance for every readout.
+
+### Non-Functional Requirements (targets)
+- **Assignment**: 100k QPS peak, 10M DAU.
+- **Telemetry ingestion**: 0.5–2M events/sec peak (bursty).
+- **Data volume**: 1–5 TB/day raw events; 30–180 days hot retention; 2+ years cold retention.
+- **Latency**: assignment P99 ≤ 20 ms (same region), hard timeout 50–100 ms with fallback; nearline readouts within 15 minutes (P95).
+- **Availability**: assignment/exposure 99.99%; analytics/readouts 99.9%.
+- **Consistency**: deterministic assignment per `(experiment_id, unit_id, config_version)`; results versioned by analysis run + data cut.
+
+### Constraints & Assumptions
+- Multi-tenant with RBAC, quotas, and tenant isolation.
+- Privacy/compliance: minimize PII; support GDPR/CCPA deletion and retention policies.
+- Small core platform team: prioritize correctness and operability.
+- Clients include mobile/web/server; offline clients require caching and retry.
+
+## Simplified Architecture
+
+### High-Level Diagram
+
+```mermaid
+flowchart TB
+  C["Apps + SDKs"] --> LB["LB / Edge"]
+  LB --> SVC["Experiment Service"]
+  SVC --> PG["Postgres (metadata)"]
+  C --> ING["Events Ingest (HTTP)"]
+  ING --> OBJ["Object Storage (raw)"]
+  ING --> WH["Warehouse (events)"]
+  WH --> AGG["Aggregate Tables"]
+  SVC --> WH
+  SVC --> AGG
+```
+
+### What This Provides
+- **One service** for experiment management, assignment, results APIs, and governance.
+- **One metadata store** (Postgres) for strong consistency, versioning, and audit.
+- **One analytics store** (a managed warehouse such as BigQuery/Snowflake/Redshift) for events, ABTs, and aggregates using SQL.
+- **Raw archival** (object storage) for immutable retention and reprocessing.
+
+Nearline readouts are produced by incremental warehouse queries on a fixed cadence (e.g., every 5 minutes) with a freshness watermark.
+
+## Core Concepts
+
+- **Unit of randomization**: the entity randomized (`user/device/org/session`).
+- **Assignment**: deterministic mapping from `(experiment, unit)` to variant under a config snapshot.
+- **Exposure**: a logged record that the unit had an opportunity to experience the treatment; attribution begins at exposure time.
+- **SRM**: sample ratio mismatch between expected and observed allocations.
+- **Analysis run**: immutable, versioned computation tied to a config snapshot, metric snapshot, and data cut time.
+
+## Components
+
+### Experiment Service (single deployable)
+**Responsibilities**
+- Experiment CRUD, targeting, ramps, holdouts, approvals, RBAC, quotas.
+- Low-latency assignment API with layering/mutual exclusion.
+- Results API and UI backend: reads aggregates, runs statistical routines, stores versioned outputs.
+- Governance: immutable config history, audit log, provenance in every response.
+
+**Key decisions**
+- **Immutable configs**: each change writes a new `config_version`; prior versions remain queryable.
+- **Deterministic hashing assignment**:
+  - `bucket = H(experiment_salt, unit_id) mod 10000`
+  - bucket-to-variant mapping via allocation thresholds (bps).
+- **Layering**: experiments in the same `layer_key` share a layer bucket so a unit enrolls in at most one experiment per layer (or per configured policy).
+- **Config caching**: in-process compiled configs with short TTL and version checks; SDK caches assignments client-side.
+- **Versioned results**: every readout is tied to `(analysis_run_id, config_version, data_cut_time)`.
+
+**Implementation note**
+- Background work (analysis runs, scheduled validations, exports) uses a Postgres-backed job table within the same codebase to avoid external workflow infrastructure.
+
+### SDKs (client + server)
+**Responsibilities**
+- Call assignment, cache results, apply local targeting context.
+- Log exposures and product events reliably with batching and retry.
+- Provide explicit fallback behavior and instrumentation.
+
+**Key decisions**
+- Cache assignments for `cacheTtlSeconds` and persist on mobile.
+- Fallback order:
+  - use cached assignment if present
+  - otherwise default to control and emit `fallback_reason`
+- Standardized exposure semantics per experiment type (`first_seen`, `impression`, `session_start`), configured centrally and enforced by SDK helpers.
+
+### Events Ingest (HTTP endpoint, scalable tier)
+**Responsibilities**
+- Accept batched events (exposures + product events), validate schema, apply backpressure, and write to storage.
+- Ensure at-least-once delivery with idempotency keys and dedupe support.
+
+**Key decisions**
+- Each event includes `event_id`, `event_time`, `received_time`, `tenant_id`, unit identifiers, and controlled context keys.
+- Backpressure via `429` + `Retry-After`.
+- Raw archive written to object storage (append-only partitions by date/hour).
+- Events written to the warehouse (streaming load or frequent micro-batches), partitioned by `event_date`.
+
+### Warehouse Tables (events, ABTs, aggregates)
+**Responsibilities**
+- Store append-only event tables (with partitioning and clustering).
+- Build **Analysis Base Tables (ABTs)** and aggregate tables using SQL.
+- Serve fast queries for UI and APIs from pre-aggregated tables.
+
+**Key decisions**
+- ABT keyed by `(tenant_id, experiment_id, unit_id, first_exposure_time, variant_id, config_version, segment_keys...)`.
+- Attribution: join product events to ABT by unit and time window **after first exposure**.
+- Controlled segmentation keys to cap cardinality (e.g., country, platform, app_version_major).
+- Nearline aggregates refreshed on a fixed cadence with a published watermark.
+
+## Data Model
+
+### Postgres (metadata + governance)
+- `tenants(tenant_id, name, created_at, ...)`
+- `experiments(experiment_id, tenant_id, experiment_key, name, status, unit_type, layer_key, targeting_rules, allocation, salt, created_at, ...)`
+- `experiment_versions(experiment_id, config_version, config_blob, created_by, created_at)` (append-only)
+- `metric_definitions(metric_id, tenant_id, name, type, numerator_expr, denominator_expr, window, owner, version, created_at)`
+- `analysis_runs(analysis_run_id, tenant_id, experiment_id, config_version, metrics_snapshot, data_cut_time, method, status, created_at)`
+- `analysis_results(analysis_run_id, metric_id, segment_key, variant_id, value, lift, ci_low, ci_high, srm_flag, dq_flags, computed_at)` (append-only)
+- `audit_log(audit_id, tenant_id, actor, action, resource_type, resource_id, before, after, created_at)` (append-only)
+- `jobs(job_id, type, payload, status, run_at, attempts, last_error, created_at, updated_at)`
+
+### Warehouse (analytics)
+- `events_exposure(...)` partitioned by `event_date`
+- `events_product(...)` partitioned by `event_date`
+- `abt_exposures(...)` (derived; incremental rebuild by date range)
+- `exp_variant_rollup_{5m|hour|day}(...)` including `watermark_time` and `analysis_version`
+
+### Retention & Deletion
+- Pseudonymous IDs are preferred; tokenization is supported where required.
+- Deletion requests write tombstones keyed by `(tenant_id, unit_id)`; warehouse jobs apply deletions by partition rewrite/delete support and trigger recomputation for affected date ranges.
+- Analyses record the identity/deletion version for reproducibility.
+
+## Data Flow
+
+```mermaid
+sequenceDiagram
+  participant C as SDK
+  participant S as Experiment Service
+  participant I as Events Ingest
+  participant W as Warehouse
+  participant O as Object Storage
+
+  C->>S: BatchGetAssignments(unit, context)
+  S-->>C: assignments + config_version + cache_ttl
+  C->>I: POST /events:ingest (exposures + events)
+  I->>O: append raw partitions
+  I->>W: load events (stream/micro-batch)
+  W->>W: build ABT + refresh aggregates (scheduled)
+  S->>W: query aggregates for results
+  S-->>C: readouts + provenance + watermark
+```
+
+## API Design
+
+### Assignment API
+**`POST /v1/assignments:batchGet`**
+- Request: `unit`, `context`, optional `experimentKeys`
+- Response: `assignments[]` with `variant`, `configVersion`, `reason`; plus `cacheTtlSeconds`
+
+**Error handling**
+- `400` invalid schema/context
+- `403` RBAC violation
+- `429` throttled with retry guidance
+- `503` degraded; SDK uses cached assignment or control and logs `fallback_reason`
+
+### Events Ingestion API
+**`POST /v1/events:ingest`**
+- Batch up to size limits; gzip/zstd supported.
+- Idempotency via `eventId`; downstream dedupe supported by `(tenant_id, event_id)`.
+
+**Error handling**
+- `413` payload too large
+- `429` backpressure
+- `400` schema violation with field-level errors
+
+### Experiment Management API
+- `POST /v1/experiments`
+- `PATCH /v1/experiments/{id}`
+- `POST /v1/experiments/{id}:start|pause|stop`
+- All changes create a new immutable `config_version` row.
+
+### Results API
+**`GET /v1/experiments/{id}/results?run=latest&segment=country:US`**
+- Returns sample sizes, metrics per variant, lift and CI, SRM and data-quality gates, `analysis_run_id`, `config_version`, `data_cut_time`, and `watermark_time`.
+
+## Correctness & Statistics
+
+### Data Quality Gates
+- SRM check (chi-square) with minimum sample thresholds.
+- Exposure completeness (missing exposure rate, exposure-to-event join rates).
+- Duplicate rate and timestamp skew indicators.
+- Explicit invalidation flags on results when gates fail.
+
+### Inference Modes
+- Fixed-horizon (final) for pre-registered end dates.
+- Sequential-safe option for frequent peeking (alpha spending or always-valid methods).
+- Multiple-testing controls applied per metric pack and/or per experiment policy.
+
+All results are stored as immutable analysis artifacts, versioned by run and data cut.
+
+## Scaling & Operations
+
+### Performance Approach
+- Assignment stays fast via compiled configs, in-process cache, and SDK caching.
+- Ingest scales horizontally; backpressure protects the platform and prioritizes exposure events.
+- Warehouse handles heavy joins and aggregation; UI reads from pre-aggregated tables.
+
+### Monitoring (SLO-driven)
+- Assignment: latency, error rate, fallback rate, config_version skew.
+- Ingest: accepted events/sec, 4xx/5xx, sustained 429s, load latency to warehouse.
+- Analytics: aggregate refresh success, watermark freshness, query latency.
+- Data quality: SRM rate, join-rate drops, duplicate spikes, timestamp skew.
+
+### DR
+- Postgres: PITR + replicas (RPO ≈ 0 for metadata).
+- Raw archive in object storage supports rebuild.
+- Aggregates and ABTs are rebuildable from raw + warehouse event tables by date range.
+
+## Simplification Notes
+- Removed: durable log/stream processor/OLAP stack; acceptable because the warehouse supports streaming or micro-batch loads plus scheduled incremental aggregates for 5–15 minute freshness.
+- Removed: separate analysis workflow system; acceptable because a Postgres-backed job table supports analysis runs and scheduled validations within the same operational footprint.
+- Merged: experiment management, assignment, results API, governance, and UI backend into a single Experiment Service; acceptable because these functions share the same metadata, authorization, and versioning model.
+- Merged: nearline and batch computation into warehouse-native SQL pipelines; acceptable because ABTs and aggregates are versioned and rebuildable by partition/date range.
+- Complexity remaining: deterministic assignment + layering, exposure-based attribution, versioned analysis runs, and privacy/deletion handling; necessary for unbiased assignment, causal interpretation, reproducibility, and compliance.

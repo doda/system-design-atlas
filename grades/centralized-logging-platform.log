@@ -1,0 +1,351 @@
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2a94-b537-7dd0-86ab-7ea5de211c98
+--------
+user
+You are a senior systems architect reviewing a system design document.
+
+Grade this solution on three dimensions (1-10 scale):
+
+1. **Strength** (1-10): How technically sound, complete, and production-ready is the design?
+   - Does it address scalability, reliability, and failure modes?
+   - Are the trade-offs well-reasoned?
+   - Would this actually work at scale?
+
+2. **Interestingness** (1-10): How engaging and educational is the content?
+   - Does it teach useful concepts?
+   - Are there insights that aren't obvious?
+   - Would an engineer learn something valuable?
+
+3. **Novelty** (1-10): How unique or creative is the approach?
+   - Does it go beyond textbook solutions?
+   - Are there clever simplifications or unconventional choices?
+   - Does it challenge common assumptions?
+
+Also note any major issues or particularly strong aspects.
+
+Output ONLY valid JSON in this exact format:
+{
+  "slug": "centralized-logging-platform",
+  "strength": <1-10>,
+  "interestingness": <1-10>,
+  "novelty": <1-10>,
+  "overall": <average of three scores, 1 decimal>,
+  "summary": "<2-3 sentence summary of the design>",
+  "strengths": ["<strength 1>", "<strength 2>"],
+  "weaknesses": ["<weakness 1>", "<weakness 2>"],
+  "verdict": "<one of: exceptional, strong, adequate, weak>"
+}
+
+---
+
+## Solution to Grade
+
+---
+title: "Centralized Logging Platform"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["logging", "search", "data-pipelines", "security", "multi-tenancy", "pii"]
+---
+
+## Overview
+
+This platform ingests logs at high volume from many producers, enforces centrally managed PII redaction before data becomes searchable, and provides fast search plus near-real-time tailing for incident response. It uses a durable ingestion buffer to absorb spikes, a deterministic processing step as the policy boundary, and two storage tiers: a hot search index for interactive queries and low-cost object storage for long retention and forensics.
+
+---
+
+## Requirements
+
+### Functional
+- Ingest via HTTP and gRPC, including OpenTelemetry Logs; accept JSON and text.
+- Multi-tenancy with authN/authZ, quotas, per-tenant retention, and isolation.
+- Centrally managed PII policies applied before data is searchable by default.
+- Schema evolution (new fields, type changes, parser updates) without downtime or data loss.
+- Search by time range, free-text, and selected structured fields; cursor pagination; streaming.
+- “Tail -f” for recent logs with low latency (redacted output).
+- Export for compliance/forensics with strict access controls, break-glass for raw, and immutable audit trails.
+- Operational tooling: ingestion health, pipeline lag, indexing status, usage/cost by tenant.
+
+### Non-functional targets
+- Throughput: 100k events/sec avg, 300k events/sec peak; 2–10 TB/day compressed.
+- Latency: durable ingest ack P50 20 ms / P99 200 ms (in-region); tail P50 < 500 ms; hot search P99 1s; 24h complex search P99 5s with guards.
+- Availability: ingest 99.99%; search API/UI 99.9%.
+- Durability: no data loss for acknowledged events in-region; DR RPO up to 5 min, RTO 60 min.
+
+### Assumptions
+- Cloud object storage and managed KMS available.
+- Untrusted networks: mTLS and/or short-lived tokens.
+- Small team: prefer managed services and one primary codebase.
+
+---
+
+## Simplified Architecture
+
+```mermaid
+graph TB
+  A["Apps/Agents"] --> LB["Load Balancer"]
+  LB --> API["Log API"]
+  API --> BUF["Durable Log Buffer"]
+  BUF --> W["Pipeline Workers"]
+  W --> OS["Object Storage"]
+  W --> IDX["Search Index"]
+  API --> DB["Postgres (Config+Audit)"]
+  API --> UI["UI / CLI"]
+  API --> IDX
+  API --> OS
+```
+
+### Components
+
+#### 1) Log API (single service)
+One service handles ingestion, search/tail, exports, and admin endpoints. Internally it’s modular (ingest, query, export, admin), but deployed and operated as one unit.
+
+Responsibilities:
+- AuthN/AuthZ, tenant isolation, quotas, request validation.
+- Durable ack semantics by appending to the buffer before responding.
+- Query guardrails (time range required, complexity limits, rate limiting).
+- Export orchestration and break-glass workflow.
+- Writes audit events to Postgres and to immutable storage.
+
+#### 2) Durable Log Buffer (managed Kafka or equivalent)
+Responsibilities:
+- Absorb bursts, decouple ingest from processing, provide replay for short windows.
+- Guarantee in-region durability for acknowledged writes via replication.
+
+Topics (minimal):
+- `logs_raw`: immutable raw events (primary stream).
+- `logs_tail_redacted`: redacted events optimized for tail streaming.
+
+#### 3) Pipeline Workers
+A stateless worker fleet consuming `logs_raw` to apply parsing, schema normalization, and PII policy enforcement, then writing:
+- Raw encrypted bundles to object storage.
+- Redacted normalized records (Parquet) to object storage.
+- Search documents to the hot search index.
+- Redacted tail events to `logs_tail_redacted`.
+
+Workers cache tenant config/policies from Postgres with versioning to make processing deterministic and auditable.
+
+#### 4) Object Storage (long retention)
+Stores:
+- Raw encrypted bundles (append-only) for forensics and reprocessing.
+- Normalized redacted Parquet for efficient exports and cost-effective retention.
+
+Bucket policies separate raw vs redacted prefixes and enforce tighter access on raw.
+
+#### 5) Search Index (OpenSearch/Elasticsearch)
+Stores the hot window for interactive search and dashboards:
+- Time-based indices with lifecycle management (hot 7–14 days; optional warm; cold in object storage only).
+- Strict mapping controls to prevent high-cardinality mapping explosion.
+- Routing by `tenant_id` and guardrails enforced in the Log API.
+
+#### 6) Postgres (control + audit)
+Stores:
+- Tenants, quotas, retention plans.
+- PII policy versions and schema/parser configurations.
+- Export job state.
+- Audit events and break-glass approvals (plus pointers to immutable audit objects).
+
+Immutable audit copies are also appended to object storage with Object Lock / retention policies where available.
+
+---
+
+## Data Flow
+
+### Ingest → Process → Index
+
+```mermaid
+sequenceDiagram
+  participant A as Agent
+  participant API as Log API
+  participant B as Buffer
+  participant W as Workers
+  participant O as Object Store
+  participant S as Search
+
+  A->>API: Send log batch
+  API->>B: Append raw (durable)
+  API-->>A: Durable ack
+  W->>B: Consume raw
+  W->>W: Parse + PII + normalize
+  W->>O: Write raw+redacted
+  W->>S: Index redacted docs
+```
+
+### Query, Tail, Export
+- Hot search: Log API → Search Index (cursor pagination via `search_after`).
+- Tail: Log API consumes `logs_tail_redacted` and streams to clients (SSE/WebSocket).
+- Cold/large exports: Log API enqueues an export job in Postgres; export workers scan object storage Parquet and write results back to object storage, returning signed URLs (with audit).
+
+---
+
+## Data Model
+
+### Buffered event envelope
+- `event_id` (required; ULID/UUID)
+- `tenant_id`
+- `source` (service/agent identifier)
+- `timestamp_ms`
+- `format` (`json|text|otlp`)
+- `raw_bytes`
+- `attrs` (routing hints: `service`, `host`, `env`, `region`, `level`, `trace_id`, `span_id`)
+- `policy_version` (active PII policy version at ingest time)
+- `parser_version` (active parser/schema version at ingest time)
+- `ingest_received_ms`
+
+### Normalized Parquet (redacted)
+- `tenant_id`, `timestamp`, `source`, `service`, `host`, `level`, `message` (redacted)
+- `trace_id`, `span_id`
+- `attrs` (controlled)
+- `pii_tokens` (optional deterministic tokens)
+- `raw_ref` (opaque pointer to encrypted raw bundle; restricted access)
+
+### Search document (redacted)
+- Core indexed fields: `tenant_id`, `@timestamp`, `service`, `host`, `source`, `env`, `region`, `level`, `trace_id`, `span_id`
+- `message` (full-text)
+- `attrs` (flattened/controlled)
+- `pii_tokens.*` (keyword, optional)
+- `raw_ref` stored but hidden from standard roles
+
+---
+
+## PII, Policies, and Schema Evolution
+
+### PII enforcement (policy boundary)
+- Workers apply tenant-specific PII rules before writing to the search index or tail stream.
+- Default posture: only approved fields and transformations are emitted into searchable form; everything else is redacted, tokenized (where configured), or omitted from the index.
+
+Deterministic tokenization (optional, for exact-match workflows):
+- `token = HMAC-SHA256(tenant_key_version, normalized_value)`
+- Keys are KMS-managed, versioned, and rotated; workers record token key version for reprocessing.
+
+### Schema evolution
+- Parsers/schemas are versioned per tenant/integration in Postgres.
+- Ingestion stamps `parser_version` and `policy_version` onto each event for auditable, reproducible processing.
+- Raw is always persisted to enable reprocessing after parser/policy changes.
+
+---
+
+## API Design
+
+### Ingestion
+- `POST /v1/logs:ingest` (HTTP)
+- `POST /v1/otlp/logs` (HTTP/gRPC)
+
+Durable ack:
+- The Log API responds only after the batch is appended durably to the buffer.
+
+Errors:
+- `401/403` auth/authZ
+- `413` batch too large
+- `429` tenant throttled
+- `400` invalid envelope/timestamps
+- `503` durability not available (e.g., replication quorum not met)
+
+Idempotency:
+- Require `event_id`; downstream uses `(tenant_id, event_id)` for overwrite-safe indexing and optional export dedupe.
+
+### Search
+- `POST /v1/logs:search`
+- Cursor pagination only; time range required; role-based field visibility enforced.
+
+### Tail (redacted)
+- `GET /v1/logs:tail?...` over SSE or WebSocket
+- Streams from `logs_tail_redacted`; always redacted for standard roles.
+
+### Export (compliance/forensics)
+- `POST /v1/logs:export` creates an async job
+- `GET /v1/logs:export/{export_id}` returns status and signed URLs
+
+Break-glass raw:
+- `include_raw=true` requires elevated role + justification + approval record.
+- Every export and raw access is audited to Postgres and immutable audit storage.
+
+### Admin
+- `PUT /v1/tenants/{tenant_id}/pii-policies/{policy_id}` (versioned)
+- `PUT /v1/tenants/{tenant_id}/schemas/{schema_name}` (versioned)
+
+---
+
+## Scaling, Guardrails, and Operations
+
+### Scaling
+- Buffer partitions scale ingestion and worker parallelism; workers autoscale on lag and throughput.
+- Search index uses time-based rollover and lifecycle management; shard sizing targets keep merges stable.
+- Object storage and Parquet enable cheap long retention and high-throughput exports.
+
+### Guardrails
+- Ingest quotas per tenant and per source; global overload protection.
+- Search requires time range; limits on wildcards/regex, disjunctions, and result sizes; rate limiting by tenant and role.
+- Strict index mapping: promote a small fixed set of fields; store remaining attributes in controlled/flattened form with limits.
+
+### SLIs
+- Ingest durable-ack latency and reject rates.
+- Buffer health and consumer lag.
+- End-to-end lag to searchable.
+- Search latency and slow query rate.
+- PII leakage signals (sampling/DLP checks).
+- Break-glass and export audit rates.
+
+### DR
+- Buffer replication in-region for durability; async cross-region replication if required by RPO.
+- Object storage cross-region replication for long retention.
+- Search index snapshots to object storage; restore in DR region as needed.
+
+---
+
+## Failure Modes (summary)
+
+- Search degraded: indexing slows; buffer absorbs; UI degrades; exports continue from object storage.
+- Buffer quorum issues: Log API returns `503` to preserve durability guarantees.
+- Policy/parsing failures: workers route problematic events to a dead-letter prefix in object storage with reason codes; indexing continues for valid events.
+- Object storage issues: workers pause persistence/indexing and rely on buffer retention until storage recovers; ingest continues while buffer capacity allows.
+- Postgres issues: Log API falls back to cached configs for a bounded window; policy uncertainty blocks indexing/tail for affected tenants while preserving raw persistence.
+
+---
+
+## Simplification Notes
+
+- Removed: separate Query API and Ingest Gateway; combined into a single `Log API` service for one deployable control surface and consistent auth/guards.
+- Removed: metadata invalidation stream; replaced with versioned configs in Postgres and short TTL caches in API/workers for predictable behavior.
+- Removed: dedicated dead-letter topic; dead-letter records are persisted to an object storage prefix with reason codes for operational review and reprocessing.
+- Merged: metadata DB and audit metadata into one Postgres database; immutable audit copies are appended to object storage with retention/lock policies for tamper resistance.
+- Complexity retained: a durable buffer and a search index remain necessary to meet durability-on-ack, spike absorption, replay, and low-latency search/tail targets at the stated scale.
+mcp startup: no servers
+
+thinking
+**Establishing platform issues**
+
+I'm focusing on key challenges like tail scalability, single service structures, the risk of explosion in ES mapping, and complications in tokenization key management. I need to summarize this in just 2-3 sentences. I'll outline strengths with an array of 2 items and weaknesses with an array of 2 as well. Finally, it’s important to set the slug to "centralized-logging-platform" and format everything in valid JSON, making sure to keep numerical data in mind.
+codex
+{
+  "slug": "centralized-logging-platform",
+  "strength": 8,
+  "interestingness": 7,
+  "novelty": 6,
+  "overall": 7.0,
+  "summary": "Solid, production-plausible logging architecture: durable buffer for spike absorption, deterministic worker pipeline as the PII boundary, hot search index for low-latency queries, and object storage/Parquet for cheap retention and exports. Versioned policies/schemas with raw preservation enables auditable reprocessing, and the failure-mode story generally matches the stated SLOs.",
+  "strengths": ["Clear PII enforcement boundary before index/tail, with auditable policy/schema versioning and raw retention for reprocessing", "Good scalability primitives (buffer partitions, stateless workers, index lifecycle + mapping guardrails) and pragmatic DR/snapshot approach"],
+  "weaknesses": ["Single \"Log API\" doing ingest + query + tail + export concentrates blast radius and scaling concerns (especially tail fanout and query isolation under load)", "Some scale-critical details are underspecified (exactly-once/duplication handling end-to-end, per-tenant isolation in the search index, and operational limits for Kafka-to-SSE/WebSocket tailing)"],
+  "verdict": "strong"
+}
+tokens used
+3,717
+{
+  "slug": "centralized-logging-platform",
+  "strength": 8,
+  "interestingness": 7,
+  "novelty": 6,
+  "overall": 7.0,
+  "summary": "Solid, production-plausible logging architecture: durable buffer for spike absorption, deterministic worker pipeline as the PII boundary, hot search index for low-latency queries, and object storage/Parquet for cheap retention and exports. Versioned policies/schemas with raw preservation enables auditable reprocessing, and the failure-mode story generally matches the stated SLOs.",
+  "strengths": ["Clear PII enforcement boundary before index/tail, with auditable policy/schema versioning and raw retention for reprocessing", "Good scalability primitives (buffer partitions, stateless workers, index lifecycle + mapping guardrails) and pragmatic DR/snapshot approach"],
+  "weaknesses": ["Single \"Log API\" doing ingest + query + tail + export concentrates blast radius and scaling concerns (especially tail fanout and query isolation under load)", "Some scale-critical details are underspecified (exactly-once/duplication handling end-to-end, per-tenant isolation in the search index, and operational limits for Kafka-to-SSE/WebSocket tailing)"],
+  "verdict": "strong"
+}
+Graded: centralized-logging-platform

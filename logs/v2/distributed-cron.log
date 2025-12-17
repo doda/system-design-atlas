@@ -1,0 +1,3041 @@
+==========================================
+Generating (v2): Distributed Cron
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2e6e-7b93-83c8-17b20323efa3
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Distributed Cron
+**Category**: IoT & Edge
+
+**Problem Statement**:
+Design a reliable periodic task runner that guarantees execution even if the leader node crashes.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+Reconnecting... 1/5
+
+
+thinking
+**Exploring scheduling solutions**
+
+I'm considering using Postgres with pg_cron for managing distributed tasks. The backup plan could involve having multiple scheduler nodes that share the load. I think it’s worth looking into eliminating the leader node entirely to avoid complications during a crash. By using a DB-based claiming system, all nodes could schedule jobs concurrently. There's this crucial insight about separating scheduling from execution for better reliability. I also want to think about scaling for millions of devices and job runs.
+thinking
+**Designing IoT task scheduling**
+
+For IoT and edge computing, I’m thinking about how tasks could involve remote commands to devices, requiring specific schedules per device. I want to keep the design general while considering network instability. The architecture could consist of components like Clients, API, Postgres, Scheduler, Queue, Workers, and etcd for observability. I need to note failure modes, including leader crashes and queue outages. It’s important to guarantee that schedules will be created and executed, but I can’t promise exact execution without idempotency measures.
+codex
+```markdown
+---
+title: "Distributed Cron"
+category: "IoT & Edge"
+difficulty: "Hard"
+tags: ["scheduler", "leader-election", "idempotency", "leases", "postgres", "queues"]
+---
+
+## Overview
+
+Distributed Cron is a periodic task runner where *scheduling decisions are durable* and *execution is decoupled*. The elegant idea is to treat “a cron fire” as a first-class, persisted object (`job_id + scheduled_time`), not a transient timer event in memory. Once a fire is recorded, any worker can execute it; if the leader dies, a new leader can deterministically reconstruct what should have fired and continue.
+
+Naive designs put the schedule in the leader’s RAM and push directly to workers. That fails in the only moment that matters: leader crash near a tick causes either missed runs (no durable record) or duplicate runs (retry without idempotency). This design makes the leader replaceable by making the schedule itself the source of truth.
+
+## What Makes This Hard
+
+The trap is assuming “cron is just timers.” In a distributed system, *time is adversarial*: clock skew, GC pauses, partitions, and failover all land exactly on boundaries (e.g., `*/5 * * * *`). If “the tick” isn’t written somewhere durable with a unique identity, you cannot both (a) recover missed runs and (b) avoid duplicates after failover.
+
+The second trap is mixing concerns: the same component both decides *what should run* and *runs it*. That couples correctness to leader uptime. The correct split is: (1) a scheduler that only mints durable run records, and (2) workers that execute run records with idempotency.
+
+## Requirements
+
+### Functional Requirements
+- Support cron-like schedules (minute granularity is enough for IoT control loops; sub-minute is a separate product).
+- Guarantee **no missed scheduled executions** even if the leader crashes at any moment.
+- Bound duplicates to “at-least-once,” with a deterministic dedupe key so downstream side effects can be made idempotent.
+- Provide a backlog/catch-up mechanism after downtime (with explicit policy: skip vs. catch up vs. cap).
+- Multi-tenant fairness: one noisy tenant must not starve others during catch-up storms.
+
+### Scale Targets
+- 100k active schedules (common in IoT fleets: per-device jobs + fleet jobs).
+- Peak 50k “fires” per minute during aligned cron boundaries (the scary case is `0 * * * *`).
+- P99 schedule-to-enqueue latency < 2s under normal conditions; during catch-up, correctness beats latency.
+- 30 days of run history retained for debugging and audit (operators will demand it after an incident).
+
+## Key Design Decisions
+
+- **We chose: Postgres as the scheduling source of truth (jobs + runs)**
+  - **Rejected:** in-memory timers with “best effort” replay
+  - **Why:** a unique constraint on `(job_id, scheduled_at)` turns duplicates into a non-event and makes catch-up deterministic.
+
+- **We chose: lease-based leader election (etcd/Consul) for a single scheduler active at a time**
+  - **Rejected:** “let all schedulers race” without coordination
+  - **Why:** leader election keeps load predictable and simplifies backpressure; correctness still comes from the database, not from the leader.
+
+- **We chose: queue for execution (Kafka/SQS/RabbitMQ) with idempotent workers**
+  - **Rejected:** synchronous “scheduler calls worker” RPC
+  - **Why:** the queue absorbs bursts at cron boundaries and isolates scheduling correctness from execution capacity.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[API Clients] --> B[Schedule API]
+  B --> C[(Postgres)]
+  D[Leader Elect] --> E[Scheduler]
+  E --> C
+  E --> F[Exec Queue]
+  F --> G[Workers]
+  G --> C
+```
+
+### Components
+
+- **Schedule API**
+  - Creates/updates jobs (cron expression, timezone, payload, catch-up policy, concurrency limits).
+  - Stores only durable intent; no timers live here.
+
+- **Postgres**
+  - `jobs` table: schedule definition + `next_fire_at` cursor.
+  - `runs` table: immutable “this should execute” records with unique `(job_id, scheduled_at)`.
+  - Earns its place because it provides the *atomicity* and *uniqueness* that make failover safe.
+
+- **Leader Election (etcd/Consul)**
+  - Issues a short TTL lease to the active scheduler.
+  - Used for load control, not correctness.
+
+- **Scheduler**
+  - Mints `runs` records for due jobs and enqueues them.
+  - On startup (or after leadership change), performs catch-up by scanning for due/missed fires.
+
+- **Execution Queue**
+  - Buffers spikes and lets workers scale independently.
+  - Carries `run_id` (or `(job_id, scheduled_at)`), never “just run job X now.”
+
+- **Workers**
+  - Execute run records and write outcomes (`started_at`, `finished_at`, `status`, `attempt`).
+  - Must be idempotent by `run_id`; if a run is delivered twice, the second attempt becomes a no-op or a retry with safe side effects.
+
+## Deep Dive: Leader Crash Without Missing a Tick
+
+The scheduler’s only job is to turn “time has passed” into durable run rows. The key is that a run is identified deterministically: `(job_id, scheduled_at)`. That lets a new leader safely recreate anything the old leader *might* have been doing.
+
+**Data model (essential fields):**
+- `jobs(id, cron, timezone, next_fire_at, catchup_policy, max_inflight, tenant_id, updated_at, ...)`
+- `runs(id, job_id, scheduled_at, status, attempt, enqueued_at, started_at, finished_at, last_error, ...)`
+- Unique index: `UNIQUE(job_id, scheduled_at)`
+
+**Scheduling loop (single leader, but crash-safe):**
+1. Select due jobs: `WHERE next_fire_at <= now()` ordered by `next_fire_at` with a limit (prevents runaway catch-up).
+2. For each job, compute a bounded set of fire times to mint:
+   - `fire_times = all ticks from next_fire_at up to floor(now, 1m)` capped by policy (e.g., max 60 fires per iteration).
+   - This makes downtime recovery explicit instead of accidental.
+3. Insert runs using `INSERT ... ON CONFLICT DO NOTHING` on `(job_id, scheduled_at)`.
+   - If the old leader inserted some runs before crashing, the new leader simply sees conflicts and moves on.
+4. Enqueue runs using an outbox pattern:
+   - Write to `run_outbox(run_id, ...)` in the same transaction as the run insert.
+   - A separate “outbox publisher” reliably publishes to the queue and marks outbox rows as sent.
+   - This avoids the worst failure: run inserted but never enqueued (or enqueued without a run row).
+
+**Why this survives leader death cleanly:**
+- If the leader dies before inserting runs: the new leader computes the same `fire_times` and inserts them.
+- If it dies after inserting but before enqueue: outbox publisher (or new leader) publishes pending outbox rows.
+- If it dies after enqueue but before marking sent: duplicates hit the queue; workers dedupe by `run_id`.
+- If the leader’s clock is wrong: `scheduled_at` is computed using DB time (`SELECT now()`) and rounded consistently, so leadership change doesn’t change what “now” means.
+
+The non-obvious lesson: *you don’t need exactly-once delivery; you need exactly-once identity.* Once every intended execution has a unique durable ID, the rest becomes standard at-least-once engineering.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| No missed executions on leader crash | True exactly-once side effects (requires idempotency) |
+| Simple operations (Postgres + queue + etcd) | Ultra-high tick precision (minute-level default) |
+| Deterministic catch-up | Unbounded backlog without explicit caps/policy |
+
+## Failure Modes
+
+- **Leader dies during a cron boundary spike**
+  - **What happens:** some runs are inserted, some not; some are queued, some not.
+  - **Detect:** gap between `runs` and `jobs.next_fire_at`, outbox backlog, queue lag.
+  - **Recover:** new leader re-mints missing runs via deterministic scan; outbox publisher drains pending rows; workers dedupe.
+
+- **Queue outage**
+  - **What happens:** runs exist durably but don’t get delivered to workers.
+  - **Detect:** growing outbox table, `runs.status='pending'` age, alert on publisher errors.
+  - **Recover:** keep minting runs (bounded); resume publishing when queue returns; optionally pause minting if backlog threatens DB.
+
+- **Database slow/unavailable**
+  - **What happens:** scheduling correctness is blocked; you cannot safely mint new runs.
+  - **Detect:** scheduler transaction latency, connection errors, replica lag (if using read replicas incorrectly).
+  - **Recover:** fail closed (stop minting); once DB recovers, scheduler catch-up replays deterministically.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Partition `runs` by time (daily) and keep hot indexes small.
+  - Add per-tenant rate limits and a priority queue for “fresh ticks” vs. “catch-up ticks.”
+
+- **100x scale:**
+  - Move scheduling state to a purpose-built durable store for high write rates (still keeping deterministic run IDs), and shard schedulers by `tenant_id` or `job_id` range to avoid a single leader bottleneck.
+  - Replace “scan due jobs” with a timing wheel or bucketed index to reduce DB pressure at boundaries.
+
+## Operational Notes
+
+- Use DB time for scheduling decisions; don’t trust node clocks.
+- Keep leader lease TTL short (e.g., 10–30s) and renew frequently; correctness comes from runs/outbox, not from long-lived leadership.
+- Make catch-up policy explicit per job: `skip`, `catch_up`, or `catch_up_capped(N)`; otherwise downtime turns into a surprise traffic storm.
+- Track three lags separately: `scheduler_lag` (now - next_fire_at), `outbox_lag`, and `worker_lag` (pending run age). They point to different bottlenecks.
+```
+tokens used
+3,094
+```markdown
+---
+title: "Distributed Cron"
+category: "IoT & Edge"
+difficulty: "Hard"
+tags: ["scheduler", "leader-election", "idempotency", "leases", "postgres", "queues"]
+---
+
+## Overview
+
+Distributed Cron is a periodic task runner where *scheduling decisions are durable* and *execution is decoupled*. The elegant idea is to treat “a cron fire” as a first-class, persisted object (`job_id + scheduled_time`), not a transient timer event in memory. Once a fire is recorded, any worker can execute it; if the leader dies, a new leader can deterministically reconstruct what should have fired and continue.
+
+Naive designs put the schedule in the leader’s RAM and push directly to workers. That fails in the only moment that matters: leader crash near a tick causes either missed runs (no durable record) or duplicate runs (retry without idempotency). This design makes the leader replaceable by making the schedule itself the source of truth.
+
+## What Makes This Hard
+
+The trap is assuming “cron is just timers.” In a distributed system, *time is adversarial*: clock skew, GC pauses, partitions, and failover all land exactly on boundaries (e.g., `*/5 * * * *`). If “the tick” isn’t written somewhere durable with a unique identity, you cannot both (a) recover missed runs and (b) avoid duplicates after failover.
+
+The second trap is mixing concerns: the same component both decides *what should run* and *runs it*. That couples correctness to leader uptime. The correct split is: (1) a scheduler that only mints durable run records, and (2) workers that execute run records with idempotency.
+
+## Requirements
+
+### Functional Requirements
+- Support cron-like schedules (minute granularity is enough for IoT control loops; sub-minute is a separate product).
+- Guarantee **no missed scheduled executions** even if the leader crashes at any moment.
+- Bound duplicates to “at-least-once,” with a deterministic dedupe key so downstream side effects can be made idempotent.
+- Provide a backlog/catch-up mechanism after downtime (with explicit policy: skip vs. catch up vs. cap).
+- Multi-tenant fairness: one noisy tenant must not starve others during catch-up storms.
+
+### Scale Targets
+- 100k active schedules (common in IoT fleets: per-device jobs + fleet jobs).
+- Peak 50k “fires” per minute during aligned cron boundaries (the scary case is `0 * * * *`).
+- P99 schedule-to-enqueue latency < 2s under normal conditions; during catch-up, correctness beats latency.
+- 30 days of run history retained for debugging and audit (operators will demand it after an incident).
+
+## Key Design Decisions
+
+- **We chose: Postgres as the scheduling source of truth (jobs + runs)**
+  - **Rejected:** in-memory timers with “best effort” replay
+  - **Why:** a unique constraint on `(job_id, scheduled_at)` turns duplicates into a non-event and makes catch-up deterministic.
+
+- **We chose: lease-based leader election (etcd/Consul) for a single scheduler active at a time**
+  - **Rejected:** “let all schedulers race” without coordination
+  - **Why:** leader election keeps load predictable and simplifies backpressure; correctness still comes from the database, not from the leader.
+
+- **We chose: queue for execution (Kafka/SQS/RabbitMQ) with idempotent workers**
+  - **Rejected:** synchronous “scheduler calls worker” RPC
+  - **Why:** the queue absorbs bursts at cron boundaries and isolates scheduling correctness from execution capacity.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[API Clients] --> B[Schedule API]
+  B --> C[(Postgres)]
+  D[Leader Elect] --> E[Scheduler]
+  E --> C
+  E --> F[Exec Queue]
+  F --> G[Workers]
+  G --> C
+```
+
+### Components
+
+- **Schedule API**
+  - Creates/updates jobs (cron expression, timezone, payload, catch-up policy, concurrency limits).
+  - Stores only durable intent; no timers live here.
+
+- **Postgres**
+  - `jobs` table: schedule definition + `next_fire_at` cursor.
+  - `runs` table: immutable “this should execute” records with unique `(job_id, scheduled_at)`.
+  - Earns its place because it provides the *atomicity* and *uniqueness* that make failover safe.
+
+- **Leader Election (etcd/Consul)**
+  - Issues a short TTL lease to the active scheduler.
+  - Used for load control, not correctness.
+
+- **Scheduler**
+  - Mints `runs` records for due jobs and enqueues them.
+  - On startup (or after leadership change), performs catch-up by scanning for due/missed fires.
+
+- **Execution Queue**
+  - Buffers spikes and lets workers scale independently.
+  - Carries `run_id` (or `(job_id, scheduled_at)`), never “just run job X now.”
+
+- **Workers**
+  - Execute run records and write outcomes (`started_at`, `finished_at`, `status`, `attempt`).
+  - Must be idempotent by `run_id`; if a run is delivered twice, the second attempt becomes a no-op or a retry with safe side effects.
+
+## Deep Dive: Leader Crash Without Missing a Tick
+
+The scheduler’s only job is to turn “time has passed” into durable run rows. The key is that a run is identified deterministically: `(job_id, scheduled_at)`. That lets a new leader safely recreate anything the old leader *might* have been doing.
+
+**Data model (essential fields):**
+- `jobs(id, cron, timezone, next_fire_at, catchup_policy, max_inflight, tenant_id, updated_at, ...)`
+- `runs(id, job_id, scheduled_at, status, attempt, enqueued_at, started_at, finished_at, last_error, ...)`
+- Unique index: `UNIQUE(job_id, scheduled_at)`
+
+**Scheduling loop (single leader, but crash-safe):**
+1. Select due jobs: `WHERE next_fire_at <= now()` ordered by `next_fire_at` with a limit (prevents runaway catch-up).
+2. For each job, compute a bounded set of fire times to mint:
+   - `fire_times = all ticks from next_fire_at up to floor(now, 1m)` capped by policy (e.g., max 60 fires per iteration).
+   - This makes downtime recovery explicit instead of accidental.
+3. Insert runs using `INSERT ... ON CONFLICT DO NOTHING` on `(job_id, scheduled_at)`.
+   - If the old leader inserted some runs before crashing, the new leader simply sees conflicts and moves on.
+4. Enqueue runs using an outbox pattern:
+   - Write to `run_outbox(run_id, ...)` in the same transaction as the run insert.
+   - A separate “outbox publisher” reliably publishes to the queue and marks outbox rows as sent.
+   - This avoids the worst failure: run inserted but never enqueued (or enqueued without a run row).
+
+**Why this survives leader death cleanly:**
+- If the leader dies before inserting runs: the new leader computes the same `fire_times` and inserts them.
+- If it dies after inserting but before enqueue: outbox publisher (or new leader) publishes pending outbox rows.
+- If it dies after enqueue but before marking sent: duplicates hit the queue; workers dedupe by `run_id`.
+- If the leader’s clock is wrong: `scheduled_at` is computed using DB time (`SELECT now()`) and rounded consistently, so leadership change doesn’t change what “now” means.
+
+The non-obvious lesson: *you don’t need exactly-once delivery; you need exactly-once identity.* Once every intended execution has a unique durable ID, the rest becomes standard at-least-once engineering.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| No missed executions on leader crash | True exactly-once side effects (requires idempotency) |
+| Simple operations (Postgres + queue + etcd) | Ultra-high tick precision (minute-level default) |
+| Deterministic catch-up | Unbounded backlog without explicit caps/policy |
+
+## Failure Modes
+
+- **Leader dies during a cron boundary spike**
+  - **What happens:** some runs are inserted, some not; some are queued, some not.
+  - **Detect:** gap between `runs` and `jobs.next_fire_at`, outbox backlog, queue lag.
+  - **Recover:** new leader re-mints missing runs via deterministic scan; outbox publisher drains pending rows; workers dedupe.
+
+- **Queue outage**
+  - **What happens:** runs exist durably but don’t get delivered to workers.
+  - **Detect:** growing outbox table, `runs.status='pending'` age, alert on publisher errors.
+  - **Recover:** keep minting runs (bounded); resume publishing when queue returns; optionally pause minting if backlog threatens DB.
+
+- **Database slow/unavailable**
+  - **What happens:** scheduling correctness is blocked; you cannot safely mint new runs.
+  - **Detect:** scheduler transaction latency, connection errors, replica lag (if using read replicas incorrectly).
+  - **Recover:** fail closed (stop minting); once DB recovers, scheduler catch-up replays deterministically.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Partition `runs` by time (daily) and keep hot indexes small.
+  - Add per-tenant rate limits and a priority queue for “fresh ticks” vs. “catch-up ticks.”
+
+- **100x scale:**
+  - Move scheduling state to a purpose-built durable store for high write rates (still keeping deterministic run IDs), and shard schedulers by `tenant_id` or `job_id` range to avoid a single leader bottleneck.
+  - Replace “scan due jobs” with a timing wheel or bucketed index to reduce DB pressure at boundaries.
+
+## Operational Notes
+
+- Use DB time for scheduling decisions; don’t trust node clocks.
+- Keep leader lease TTL short (e.g., 10–30s) and renew frequently; correctness comes from runs/outbox, not from long-lived leadership.
+- Make catch-up policy explicit per job: `skip`, `catch_up`, or `catch_up_capped(N)`; otherwise downtime turns into a surprise traffic storm.
+- Track three lags separately: `scheduler_lag` (now - next_fire_at), `outbox_lag`, and `worker_lag` (pending run age). They point to different bottlenecks.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/distributed-cron.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afd-ac15-71e2-abfb-d4cdd2c03f72
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Distributed Cron"
+category: "IoT & Edge"
+difficulty: "Hard"
+tags: ["scheduler", "leader-election", "idempotency", "leases", "postgres", "queues"]
+---
+
+## Overview
+
+Distributed Cron is a periodic task runner where *scheduling decisions are durable* and *execution is decoupled*. The elegant idea is to treat “a cron fire” as a first-class, persisted object (`job_id + scheduled_time`), not a transient timer event in memory. Once a fire is recorded, any worker can execute it; if the leader dies, a new leader can deterministically reconstruct what should have fired and continue.
+
+Naive designs put the schedule in the leader’s RAM and push directly to workers. That fails in the only moment that matters: leader crash near a tick causes either missed runs (no durable record) or duplicate runs (retry without idempotency). This design makes the leader replaceable by making the schedule itself the source of truth.
+
+## What Makes This Hard
+
+The trap is assuming “cron is just timers.” In a distributed system, *time is adversarial*: clock skew, GC pauses, partitions, and failover all land exactly on boundaries (e.g., `*/5 * * * *`). If “the tick” isn’t written somewhere durable with a unique identity, you cannot both (a) recover missed runs and (b) avoid duplicates after failover.
+
+The second trap is mixing concerns: the same component both decides *what should run* and *runs it*. That couples correctness to leader uptime. The correct split is: (1) a scheduler that only mints durable run records, and (2) workers that execute run records with idempotency.
+
+## Requirements
+
+### Functional Requirements
+- Support cron-like schedules (minute granularity is enough for IoT control loops; sub-minute is a separate product).
+- Guarantee **no missed scheduled executions** even if the leader crashes at any moment.
+- Bound duplicates to “at-least-once,” with a deterministic dedupe key so downstream side effects can be made idempotent.
+- Provide a backlog/catch-up mechanism after downtime (with explicit policy: skip vs. catch up vs. cap).
+- Multi-tenant fairness: one noisy tenant must not starve others during catch-up storms.
+
+### Scale Targets
+- 100k active schedules (common in IoT fleets: per-device jobs + fleet jobs).
+- Peak 50k “fires” per minute during aligned cron boundaries (the scary case is `0 * * * *`).
+- P99 schedule-to-enqueue latency < 2s under normal conditions; during catch-up, correctness beats latency.
+- 30 days of run history retained for debugging and audit (operators will demand it after an incident).
+
+## Key Design Decisions
+
+- **We chose: Postgres as the scheduling source of truth (jobs + runs)**
+  - **Rejected:** in-memory timers with “best effort” replay
+  - **Why:** a unique constraint on `(job_id, scheduled_at)` turns duplicates into a non-event and makes catch-up deterministic.
+
+- **We chose: lease-based leader election (etcd/Consul) for a single scheduler active at a time**
+  - **Rejected:** “let all schedulers race” without coordination
+  - **Why:** leader election keeps load predictable and simplifies backpressure; correctness still comes from the database, not from the leader.
+
+- **We chose: queue for execution (Kafka/SQS/RabbitMQ) with idempotent workers**
+  - **Rejected:** synchronous “scheduler calls worker” RPC
+  - **Why:** the queue absorbs bursts at cron boundaries and isolates scheduling correctness from execution capacity.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[API Clients] --> B[Schedule API]
+  B --> C[(Postgres)]
+  D[Leader Elect] --> E[Scheduler]
+  E --> C
+  E --> F[Exec Queue]
+  F --> G[Workers]
+  G --> C
+```
+
+### Components
+
+- **Schedule API**
+  - Creates/updates jobs (cron expression, timezone, payload, catch-up policy, concurrency limits).
+  - Stores only durable intent; no timers live here.
+
+- **Postgres**
+  - `jobs` table: schedule definition + `next_fire_at` cursor.
+  - `runs` table: immutable “this should execute” records with unique `(job_id, scheduled_at)`.
+  - Earns its place because it provides the *atomicity* and *uniqueness* that make failover safe.
+
+- **Leader Election (etcd/Consul)**
+  - Issues a short TTL lease to the active scheduler.
+  - Used for load control, not correctness.
+
+- **Scheduler**
+  - Mints `runs` records for due jobs and enqueues them.
+  - On startup (or after leadership change), performs catch-up by scanning for due/missed fires.
+
+- **Execution Queue**
+  - Buffers spikes and lets workers scale independently.
+  - Carries `run_id` (or `(job_id, scheduled_at)`), never “just run job X now.”
+
+- **Workers**
+  - Execute run records and write outcomes (`started_at`, `finished_at`, `status`, `attempt`).
+  - Must be idempotent by `run_id`; if a run is delivered twice, the second attempt becomes a no-op or a retry with safe side effects.
+
+## Deep Dive: Leader Crash Without Missing a Tick
+
+The scheduler’s only job is to turn “time has passed” into durable run rows. The key is that a run is identified deterministically: `(job_id, scheduled_at)`. That lets a new leader safely recreate anything the old leader *might* have been doing.
+
+**Data model (essential fields):**
+- `jobs(id, cron, timezone, next_fire_at, catchup_policy, max_inflight, tenant_id, updated_at, ...)`
+- `runs(id, job_id, scheduled_at, status, attempt, enqueued_at, started_at, finished_at, last_error, ...)`
+- Unique index: `UNIQUE(job_id, scheduled_at)`
+
+**Scheduling loop (single leader, but crash-safe):**
+1. Select due jobs: `WHERE next_fire_at <= now()` ordered by `next_fire_at` with a limit (prevents runaway catch-up).
+2. For each job, compute a bounded set of fire times to mint:
+   - `fire_times = all ticks from next_fire_at up to floor(now, 1m)` capped by policy (e.g., max 60 fires per iteration).
+   - This makes downtime recovery explicit instead of accidental.
+3. Insert runs using `INSERT ... ON CONFLICT DO NOTHING` on `(job_id, scheduled_at)`.
+   - If the old leader inserted some runs before crashing, the new leader simply sees conflicts and moves on.
+4. Enqueue runs using an outbox pattern:
+   - Write to `run_outbox(run_id, ...)` in the same transaction as the run insert.
+   - A separate “outbox publisher” reliably publishes to the queue and marks outbox rows as sent.
+   - This avoids the worst failure: run inserted but never enqueued (or enqueued without a run row).
+
+**Why this survives leader death cleanly:**
+- If the leader dies before inserting runs: the new leader computes the same `fire_times` and inserts them.
+- If it dies after inserting but before enqueue: outbox publisher (or new leader) publishes pending outbox rows.
+- If it dies after enqueue but before marking sent: duplicates hit the queue; workers dedupe by `run_id`.
+- If the leader’s clock is wrong: `scheduled_at` is computed using DB time (`SELECT now()`) and rounded consistently, so leadership change doesn’t change what “now” means.
+
+The non-obvious lesson: *you don’t need exactly-once delivery; you need exactly-once identity.* Once every intended execution has a unique durable ID, the rest becomes standard at-least-once engineering.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| No missed executions on leader crash | True exactly-once side effects (requires idempotency) |
+| Simple operations (Postgres + queue + etcd) | Ultra-high tick precision (minute-level default) |
+| Deterministic catch-up | Unbounded backlog without explicit caps/policy |
+
+## Failure Modes
+
+- **Leader dies during a cron boundary spike**
+  - **What happens:** some runs are inserted, some not; some are queued, some not.
+  - **Detect:** gap between `runs` and `jobs.next_fire_at`, outbox backlog, queue lag.
+  - **Recover:** new leader re-mints missing runs via deterministic scan; outbox publisher drains pending rows; workers dedupe.
+
+- **Queue outage**
+  - **What happens:** runs exist durably but don’t get delivered to workers.
+  - **Detect:** growing outbox table, `runs.status='pending'` age, alert on publisher errors.
+  - **Recover:** keep minting runs (bounded); resume publishing when queue returns; optionally pause minting if backlog threatens DB.
+
+- **Database slow/unavailable**
+  - **What happens:** scheduling correctness is blocked; you cannot safely mint new runs.
+  - **Detect:** scheduler transaction latency, connection errors, replica lag (if using read replicas incorrectly).
+  - **Recover:** fail closed (stop minting); once DB recovers, scheduler catch-up replays deterministically.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Partition `runs` by time (daily) and keep hot indexes small.
+  - Add per-tenant rate limits and a priority queue for “fresh ticks” vs. “catch-up ticks.”
+
+- **100x scale:**
+  - Move scheduling state to a purpose-built durable store for high write rates (still keeping deterministic run IDs), and shard schedulers by `tenant_id` or `job_id` range to avoid a single leader bottleneck.
+  - Replace “scan due jobs” with a timing wheel or bucketed index to reduce DB pressure at boundaries.
+
+## Operational Notes
+
+- Use DB time for scheduling decisions; don’t trust node clocks.
+- Keep leader lease TTL short (e.g., 10–30s) and renew frequently; correctness comes from runs/outbox, not from long-lived leadership.
+- Make catch-up policy explicit per job: `skip`, `catch_up`, or `catch_up_capped(N)`; otherwise downtime turns into a surprise traffic storm.
+- Track three lags separately: `scheduler_lag` (now - next_fire_at), `outbox_lag`, and `worker_lag` (pending run age). They point to different bottlenecks.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+codex
+## Elegance Check
+
+### The Core Insight
+Treating each “cron fire” as a durable, uniquely-identified object (`(job_id, scheduled_at)`) makes correctness independent of leader uptime; the leader becomes a replaceable *minting* process, not a single point of truth.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Postgres (`jobs`, `runs`) | Provides the atomic uniqueness guarantee and audit trail; enables deterministic catch-up after crashes. |
+| Outbox table + publisher | Closes the “inserted but never enqueued / enqueued without durable record” gap. |
+| Execution queue | Absorbs boundary spikes and decouples scheduling correctness from worker capacity. |
+| Idempotent workers keyed by `run_id` | Converts duplicates into safe retries; keeps delivery at-least-once but effects controlled. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| etcd/Consul leader election | Postgres advisory lock (`pg_try_advisory_lock`) or “leader row” with lease timestamp | Removes an external dependency, but couples leadership to DB health (often acceptable since DB is already correctness-critical). |
+| Separate scheduler + outbox publisher service | Single process with two loops (mint + publish) using `SKIP LOCKED` on outbox | Fewer deployables; need to ensure publish loop can’t starve mint loop under heavy backlog. |
+| `jobs.next_fire_at` cursor | Compute next times from cron + last minted run (`MAX(scheduled_at)`) | Removes cursor correctness concerns, but adds aggregation pressure unless you keep per-job “last_minted_at” anyway. |
+| Scan due jobs each tick | Use a bucketed index/table (minute bucket -> job ids) maintained on job updates | More moving parts, but reduces “WHERE next_fire_at <= now()” hotspots at aligned boundaries. |
+| Kafka/SQS/RabbitMQ left open-ended | Start with Postgres-based queue (outbox is already there) + workers polling `run_outbox` | Simplifies infra for a small team; loses some queue ergonomics (consumer scaling, retention, tooling) and can increase DB load. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Database down for 5 minutes**
+   - Design’s answer: fail closed; catch-up deterministically after recovery
+   - Recommendation: Strengthen — define explicit behavior for `catch_up` jobs during DB outage recovery (cap/priority) so “DB returns” doesn’t immediately become “queue/worker overload”, and document RPO/RTO expectations.
+
+2. **Network partition: scheduler has etcd lease but can’t reach Postgres (or vice versa)**
+   - Design’s answer: partially addressed (DB time, leader lease), but partition semantics aren’t spelled out
+   - Recommendation: Strengthen — treat Postgres as the final arbiter: if DB unreachable, scheduler must stop minting regardless of lease; ensure lease renewal doesn’t imply ability to act.
+
+3. **Queue outage for 10 minutes while DB is up**
+   - Design’s answer: runs accumulate, outbox grows; resume publish later; optional pause minting
+   - Recommendation: Strengthen — add a hard backpressure rule (“pause minting when outbox lag > X or table size > Y”) and a priority policy so “fresh” runs don’t get buried behind catch-up backlog.
+
+4. **Slow component (DB is up but transactions take 3–10s)**
+   - Design’s answer: not explicitly addressed beyond “detect latency”
+   - Recommendation: Strengthen — ensure scheduling loop is set-based (batch insert) and uses `SELECT … FOR UPDATE SKIP LOCKED` on `jobs` to avoid head-of-line blocking; avoid per-job transactions at peak boundaries.
+
+5. **Bad config / buggy cron parser deployed**
+   - Design’s answer: not addressed
+   - Recommendation: Strengthen — add safety rails: validate cron/timezone on write, version cron evaluation logic, and have a “dry-run mint” mode or feature flag to stop minting without stopping publishing/execution.
+
+## Recommendations
+
+### Must Fix
+- Define and enforce the invariant for advancing `jobs.next_fire_at`: update it in the same transaction as minting runs (or prove you don’t need it), otherwise you risk repeated scanning/lock contention and confusing “lag” signals.
+- Make the concurrency model explicit: how multiple scheduler instances behave against `jobs` (locking strategy, `SKIP LOCKED`, batch size) so a leader swap can’t cause thundering-herd DB load.
+- Specify worker idempotency semantics beyond “dedupe by `run_id`”: what is allowed to happen on retry, how side effects are made safe (e.g., downstream idempotency keys, exactly-once per external API).
+
+### Should Consider
+- Drop etcd/Consul if the team is small: Postgres advisory locks often give “good enough” leadership with fewer operational dependencies (and correctness already depends on Postgres).
+- Prioritize “fresh ticks” over catch-up in the outbox/queue to keep latency SLOs meaningful during recovery.
+- Add per-tenant quota + scheduling fairness at the minting stage (not only at worker stage) so one tenant can’t generate infinite run rows during downtime.
+
+### Nice to Have
+- Partition/TTL strategy spelled out for `runs` and `run_outbox` (including index choices) to keep P99 predictable at 30-day retention.
+- Operational runbooks: “DB down”, “queue down”, “scheduler wedged”, “catch-up storm”, including the one command/button to pause minting safely.
+- A clear policy for missed boundaries: how you round `scheduled_at`, timezone/DST behavior, and what “minute granularity” means during DST jumps.
+
+## What’s Working Well
+- The “exactly-once identity over exactly-once delivery” framing is the right mental model and keeps the design honest.
+- Outbox is correctly identified as the linchpin that prevents the nastiest split-brain between DB state and queue state.
+- Catch-up being explicit per job (skip vs capped) is pragmatic and prevents surprise storms.
+- The design cleanly separates correctness (mint durable runs) from capacity (workers/queue), which makes failures diagnosable and recoverable.
+tokens used
+4,527
+## Elegance Check
+
+### The Core Insight
+Treating each “cron fire” as a durable, uniquely-identified object (`(job_id, scheduled_at)`) makes correctness independent of leader uptime; the leader becomes a replaceable *minting* process, not a single point of truth.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Postgres (`jobs`, `runs`) | Provides the atomic uniqueness guarantee and audit trail; enables deterministic catch-up after crashes. |
+| Outbox table + publisher | Closes the “inserted but never enqueued / enqueued without durable record” gap. |
+| Execution queue | Absorbs boundary spikes and decouples scheduling correctness from worker capacity. |
+| Idempotent workers keyed by `run_id` | Converts duplicates into safe retries; keeps delivery at-least-once but effects controlled. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| etcd/Consul leader election | Postgres advisory lock (`pg_try_advisory_lock`) or “leader row” with lease timestamp | Removes an external dependency, but couples leadership to DB health (often acceptable since DB is already correctness-critical). |
+| Separate scheduler + outbox publisher service | Single process with two loops (mint + publish) using `SKIP LOCKED` on outbox | Fewer deployables; need to ensure publish loop can’t starve mint loop under heavy backlog. |
+| `jobs.next_fire_at` cursor | Compute next times from cron + last minted run (`MAX(scheduled_at)`) | Removes cursor correctness concerns, but adds aggregation pressure unless you keep per-job “last_minted_at” anyway. |
+| Scan due jobs each tick | Use a bucketed index/table (minute bucket -> job ids) maintained on job updates | More moving parts, but reduces “WHERE next_fire_at <= now()” hotspots at aligned boundaries. |
+| Kafka/SQS/RabbitMQ left open-ended | Start with Postgres-based queue (outbox is already there) + workers polling `run_outbox` | Simplifies infra for a small team; loses some queue ergonomics (consumer scaling, retention, tooling) and can increase DB load. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Database down for 5 minutes**
+   - Design’s answer: fail closed; catch-up deterministically after recovery
+   - Recommendation: Strengthen — define explicit behavior for `catch_up` jobs during DB outage recovery (cap/priority) so “DB returns” doesn’t immediately become “queue/worker overload”, and document RPO/RTO expectations.
+
+2. **Network partition: scheduler has etcd lease but can’t reach Postgres (or vice versa)**
+   - Design’s answer: partially addressed (DB time, leader lease), but partition semantics aren’t spelled out
+   - Recommendation: Strengthen — treat Postgres as the final arbiter: if DB unreachable, scheduler must stop minting regardless of lease; ensure lease renewal doesn’t imply ability to act.
+
+3. **Queue outage for 10 minutes while DB is up**
+   - Design’s answer: runs accumulate, outbox grows; resume publish later; optional pause minting
+   - Recommendation: Strengthen — add a hard backpressure rule (“pause minting when outbox lag > X or table size > Y”) and a priority policy so “fresh” runs don’t get buried behind catch-up backlog.
+
+4. **Slow component (DB is up but transactions take 3–10s)**
+   - Design’s answer: not explicitly addressed beyond “detect latency”
+   - Recommendation: Strengthen — ensure scheduling loop is set-based (batch insert) and uses `SELECT … FOR UPDATE SKIP LOCKED` on `jobs` to avoid head-of-line blocking; avoid per-job transactions at peak boundaries.
+
+5. **Bad config / buggy cron parser deployed**
+   - Design’s answer: not addressed
+   - Recommendation: Strengthen — add safety rails: validate cron/timezone on write, version cron evaluation logic, and have a “dry-run mint” mode or feature flag to stop minting without stopping publishing/execution.
+
+## Recommendations
+
+### Must Fix
+- Define and enforce the invariant for advancing `jobs.next_fire_at`: update it in the same transaction as minting runs (or prove you don’t need it), otherwise you risk repeated scanning/lock contention and confusing “lag” signals.
+- Make the concurrency model explicit: how multiple scheduler instances behave against `jobs` (locking strategy, `SKIP LOCKED`, batch size) so a leader swap can’t cause thundering-herd DB load.
+- Specify worker idempotency semantics beyond “dedupe by `run_id`”: what is allowed to happen on retry, how side effects are made safe (e.g., downstream idempotency keys, exactly-once per external API).
+
+### Should Consider
+- Drop etcd/Consul if the team is small: Postgres advisory locks often give “good enough” leadership with fewer operational dependencies (and correctness already depends on Postgres).
+- Prioritize “fresh ticks” over catch-up in the outbox/queue to keep latency SLOs meaningful during recovery.
+- Add per-tenant quota + scheduling fairness at the minting stage (not only at worker stage) so one tenant can’t generate infinite run rows during downtime.
+
+### Nice to Have
+- Partition/TTL strategy spelled out for `runs` and `run_outbox` (including index choices) to keep P99 predictable at 30-day retention.
+- Operational runbooks: “DB down”, “queue down”, “scheduler wedged”, “catch-up storm”, including the one command/button to pause minting safely.
+- A clear policy for missed boundaries: how you round `scheduled_at`, timezone/DST behavior, and what “minute granularity” means during DST jumps.
+
+## What’s Working Well
+- The “exactly-once identity over exactly-once delivery” framing is the right mental model and keeps the design honest.
+- Outbox is correctly identified as the linchpin that prevents the nastiest split-brain between DB state and queue state.
+- Catch-up being explicit per job (skip vs capped) is pragmatic and prevents surprise storms.
+- The design cleanly separates correctness (mint durable runs) from capacity (workers/queue), which makes failures diagnosable and recoverable.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/distributed-cron.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afe-358d-7e83-8e5b-4832fa58135d
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Distributed Cron"
+category: "IoT & Edge"
+difficulty: "Hard"
+tags: ["scheduler", "leader-election", "idempotency", "leases", "postgres", "queues"]
+---
+
+## Overview
+
+Distributed Cron is a periodic task runner where *scheduling decisions are durable* and *execution is decoupled*. The elegant idea is to treat “a cron fire” as a first-class, persisted object (`job_id + scheduled_time`), not a transient timer event in memory. Once a fire is recorded, any worker can execute it; if the leader dies, a new leader can deterministically reconstruct what should have fired and continue.
+
+Naive designs put the schedule in the leader’s RAM and push directly to workers. That fails in the only moment that matters: leader crash near a tick causes either missed runs (no durable record) or duplicate runs (retry without idempotency). This design makes the leader replaceable by making the schedule itself the source of truth.
+
+## What Makes This Hard
+
+The trap is assuming “cron is just timers.” In a distributed system, *time is adversarial*: clock skew, GC pauses, partitions, and failover all land exactly on boundaries (e.g., `*/5 * * * *`). If “the tick” isn’t written somewhere durable with a unique identity, you cannot both (a) recover missed runs and (b) avoid duplicates after failover.
+
+The second trap is mixing concerns: the same component both decides *what should run* and *runs it*. That couples correctness to leader uptime. The correct split is: (1) a scheduler that only mints durable run records, and (2) workers that execute run records with idempotency.
+
+## Requirements
+
+### Functional Requirements
+- Support cron-like schedules (minute granularity is enough for IoT control loops; sub-minute is a separate product).
+- Guarantee **no missed scheduled executions** even if the leader crashes at any moment.
+- Bound duplicates to “at-least-once,” with a deterministic dedupe key so downstream side effects can be made idempotent.
+- Provide a backlog/catch-up mechanism after downtime (with explicit policy: skip vs. catch up vs. cap).
+- Multi-tenant fairness: one noisy tenant must not starve others during catch-up storms.
+
+### Scale Targets
+- 100k active schedules (common in IoT fleets: per-device jobs + fleet jobs).
+- Peak 50k “fires” per minute during aligned cron boundaries (the scary case is `0 * * * *`).
+- P99 schedule-to-enqueue latency < 2s under normal conditions; during catch-up, correctness beats latency.
+- 30 days of run history retained for debugging and audit (operators will demand it after an incident).
+
+## Key Design Decisions
+
+- **We chose: Postgres as the scheduling source of truth (jobs + runs)**
+  - **Rejected:** in-memory timers with “best effort” replay
+  - **Why:** a unique constraint on `(job_id, scheduled_at)` turns duplicates into a non-event and makes catch-up deterministic.
+
+- **We chose: lease-based leader election (etcd/Consul) for a single scheduler active at a time**
+  - **Rejected:** “let all schedulers race” without coordination
+  - **Why:** leader election keeps load predictable and simplifies backpressure; correctness still comes from the database, not from the leader.
+
+- **We chose: queue for execution (Kafka/SQS/RabbitMQ) with idempotent workers**
+  - **Rejected:** synchronous “scheduler calls worker” RPC
+  - **Why:** the queue absorbs bursts at cron boundaries and isolates scheduling correctness from execution capacity.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[API Clients] --> B[Schedule API]
+  B --> C[(Postgres)]
+  D[Leader Elect] --> E[Scheduler]
+  E --> C
+  E --> F[Exec Queue]
+  F --> G[Workers]
+  G --> C
+```
+
+### Components
+
+- **Schedule API**
+  - Creates/updates jobs (cron expression, timezone, payload, catch-up policy, concurrency limits).
+  - Stores only durable intent; no timers live here.
+
+- **Postgres**
+  - `jobs` table: schedule definition + `next_fire_at` cursor.
+  - `runs` table: immutable “this should execute” records with unique `(job_id, scheduled_at)`.
+  - Earns its place because it provides the *atomicity* and *uniqueness* that make failover safe.
+
+- **Leader Election (etcd/Consul)**
+  - Issues a short TTL lease to the active scheduler.
+  - Used for load control, not correctness.
+
+- **Scheduler**
+  - Mints `runs` records for due jobs and enqueues them.
+  - On startup (or after leadership change), performs catch-up by scanning for due/missed fires.
+
+- **Execution Queue**
+  - Buffers spikes and lets workers scale independently.
+  - Carries `run_id` (or `(job_id, scheduled_at)`), never “just run job X now.”
+
+- **Workers**
+  - Execute run records and write outcomes (`started_at`, `finished_at`, `status`, `attempt`).
+  - Must be idempotent by `run_id`; if a run is delivered twice, the second attempt becomes a no-op or a retry with safe side effects.
+
+## Deep Dive: Leader Crash Without Missing a Tick
+
+The scheduler’s only job is to turn “time has passed” into durable run rows. The key is that a run is identified deterministically: `(job_id, scheduled_at)`. That lets a new leader safely recreate anything the old leader *might* have been doing.
+
+**Data model (essential fields):**
+- `jobs(id, cron, timezone, next_fire_at, catchup_policy, max_inflight, tenant_id, updated_at, ...)`
+- `runs(id, job_id, scheduled_at, status, attempt, enqueued_at, started_at, finished_at, last_error, ...)`
+- Unique index: `UNIQUE(job_id, scheduled_at)`
+
+**Scheduling loop (single leader, but crash-safe):**
+1. Select due jobs: `WHERE next_fire_at <= now()` ordered by `next_fire_at` with a limit (prevents runaway catch-up).
+2. For each job, compute a bounded set of fire times to mint:
+   - `fire_times = all ticks from next_fire_at up to floor(now, 1m)` capped by policy (e.g., max 60 fires per iteration).
+   - This makes downtime recovery explicit instead of accidental.
+3. Insert runs using `INSERT ... ON CONFLICT DO NOTHING` on `(job_id, scheduled_at)`.
+   - If the old leader inserted some runs before crashing, the new leader simply sees conflicts and moves on.
+4. Enqueue runs using an outbox pattern:
+   - Write to `run_outbox(run_id, ...)` in the same transaction as the run insert.
+   - A separate “outbox publisher” reliably publishes to the queue and marks outbox rows as sent.
+   - This avoids the worst failure: run inserted but never enqueued (or enqueued without a run row).
+
+**Why this survives leader death cleanly:**
+- If the leader dies before inserting runs: the new leader computes the same `fire_times` and inserts them.
+- If it dies after inserting but before enqueue: outbox publisher (or new leader) publishes pending outbox rows.
+- If it dies after enqueue but before marking sent: duplicates hit the queue; workers dedupe by `run_id`.
+- If the leader’s clock is wrong: `scheduled_at` is computed using DB time (`SELECT now()`) and rounded consistently, so leadership change doesn’t change what “now” means.
+
+The non-obvious lesson: *you don’t need exactly-once delivery; you need exactly-once identity.* Once every intended execution has a unique durable ID, the rest becomes standard at-least-once engineering.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| No missed executions on leader crash | True exactly-once side effects (requires idempotency) |
+| Simple operations (Postgres + queue + etcd) | Ultra-high tick precision (minute-level default) |
+| Deterministic catch-up | Unbounded backlog without explicit caps/policy |
+
+## Failure Modes
+
+- **Leader dies during a cron boundary spike**
+  - **What happens:** some runs are inserted, some not; some are queued, some not.
+  - **Detect:** gap between `runs` and `jobs.next_fire_at`, outbox backlog, queue lag.
+  - **Recover:** new leader re-mints missing runs via deterministic scan; outbox publisher drains pending rows; workers dedupe.
+
+- **Queue outage**
+  - **What happens:** runs exist durably but don’t get delivered to workers.
+  - **Detect:** growing outbox table, `runs.status='pending'` age, alert on publisher errors.
+  - **Recover:** keep minting runs (bounded); resume publishing when queue returns; optionally pause minting if backlog threatens DB.
+
+- **Database slow/unavailable**
+  - **What happens:** scheduling correctness is blocked; you cannot safely mint new runs.
+  - **Detect:** scheduler transaction latency, connection errors, replica lag (if using read replicas incorrectly).
+  - **Recover:** fail closed (stop minting); once DB recovers, scheduler catch-up replays deterministically.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Partition `runs` by time (daily) and keep hot indexes small.
+  - Add per-tenant rate limits and a priority queue for “fresh ticks” vs. “catch-up ticks.”
+
+- **100x scale:**
+  - Move scheduling state to a purpose-built durable store for high write rates (still keeping deterministic run IDs), and shard schedulers by `tenant_id` or `job_id` range to avoid a single leader bottleneck.
+  - Replace “scan due jobs” with a timing wheel or bucketed index to reduce DB pressure at boundaries.
+
+## Operational Notes
+
+- Use DB time for scheduling decisions; don’t trust node clocks.
+- Keep leader lease TTL short (e.g., 10–30s) and renew frequently; correctness comes from runs/outbox, not from long-lived leadership.
+- Make catch-up policy explicit per job: `skip`, `catch_up`, or `catch_up_capped(N)`; otherwise downtime turns into a surprise traffic storm.
+- Track three lags separately: `scheduler_lag` (now - next_fire_at), `outbox_lag`, and `worker_lag` (pending run age). They point to different bottlenecks.
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Treating each “cron fire” as a durable, uniquely-identified object (`(job_id, scheduled_at)`) makes correctness independent of leader uptime; the leader becomes a replaceable *minting* process, not a single point of truth.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Postgres (`jobs`, `runs`) | Provides the atomic uniqueness guarantee and audit trail; enables deterministic catch-up after crashes. |
+| Outbox table + publisher | Closes the “inserted but never enqueued / enqueued without durable record” gap. |
+| Execution queue | Absorbs boundary spikes and decouples scheduling correctness from worker capacity. |
+| Idempotent workers keyed by `run_id` | Converts duplicates into safe retries; keeps delivery at-least-once but effects controlled. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| etcd/Consul leader election | Postgres advisory lock (`pg_try_advisory_lock`) or “leader row” with lease timestamp | Removes an external dependency, but couples leadership to DB health (often acceptable since DB is already correctness-critical). |
+| Separate scheduler + outbox publisher service | Single process with two loops (mint + publish) using `SKIP LOCKED` on outbox | Fewer deployables; need to ensure publish loop can’t starve mint loop under heavy backlog. |
+| `jobs.next_fire_at` cursor | Compute next times from cron + last minted run (`MAX(scheduled_at)`) | Removes cursor correctness concerns, but adds aggregation pressure unless you keep per-job “last_minted_at” anyway. |
+| Scan due jobs each tick | Use a bucketed index/table (minute bucket -> job ids) maintained on job updates | More moving parts, but reduces “WHERE next_fire_at <= now()” hotspots at aligned boundaries. |
+| Kafka/SQS/RabbitMQ left open-ended | Start with Postgres-based queue (outbox is already there) + workers polling `run_outbox` | Simplifies infra for a small team; loses some queue ergonomics (consumer scaling, retention, tooling) and can increase DB load. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Database down for 5 minutes**
+   - Design’s answer: fail closed; catch-up deterministically after recovery
+   - Recommendation: Strengthen — define explicit behavior for `catch_up` jobs during DB outage recovery (cap/priority) so “DB returns” doesn’t immediately become “queue/worker overload”, and document RPO/RTO expectations.
+
+2. **Network partition: scheduler has etcd lease but can’t reach Postgres (or vice versa)**
+   - Design’s answer: partially addressed (DB time, leader lease), but partition semantics aren’t spelled out
+   - Recommendation: Strengthen — treat Postgres as the final arbiter: if DB unreachable, scheduler must stop minting regardless of lease; ensure lease renewal doesn’t imply ability to act.
+
+3. **Queue outage for 10 minutes while DB is up**
+   - Design’s answer: runs accumulate, outbox grows; resume publish later; optional pause minting
+   - Recommendation: Strengthen — add a hard backpressure rule (“pause minting when outbox lag > X or table size > Y”) and a priority policy so “fresh” runs don’t get buried behind catch-up backlog.
+
+4. **Slow component (DB is up but transactions take 3–10s)**
+   - Design’s answer: not explicitly addressed beyond “detect latency”
+   - Recommendation: Strengthen — ensure scheduling loop is set-based (batch insert) and uses `SELECT … FOR UPDATE SKIP LOCKED` on `jobs` to avoid head-of-line blocking; avoid per-job transactions at peak boundaries.
+
+5. **Bad config / buggy cron parser deployed**
+   - Design’s answer: not addressed
+   - Recommendation: Strengthen — add safety rails: validate cron/timezone on write, version cron evaluation logic, and have a “dry-run mint” mode or feature flag to stop minting without stopping publishing/execution.
+
+## Recommendations
+
+### Must Fix
+- Define and enforce the invariant for advancing `jobs.next_fire_at`: update it in the same transaction as minting runs (or prove you don’t need it), otherwise you risk repeated scanning/lock contention and confusing “lag” signals.
+- Make the concurrency model explicit: how multiple scheduler instances behave against `jobs` (locking strategy, `SKIP LOCKED`, batch size) so a leader swap can’t cause thundering-herd DB load.
+- Specify worker idempotency semantics beyond “dedupe by `run_id`”: what is allowed to happen on retry, how side effects are made safe (e.g., downstream idempotency keys, exactly-once per external API).
+
+### Should Consider
+- Drop etcd/Consul if the team is small: Postgres advisory locks often give “good enough” leadership with fewer operational dependencies (and correctness already depends on Postgres).
+- Prioritize “fresh ticks” over catch-up in the outbox/queue to keep latency SLOs meaningful during recovery.
+- Add per-tenant quota + scheduling fairness at the minting stage (not only at worker stage) so one tenant can’t generate infinite run rows during downtime.
+
+### Nice to Have
+- Partition/TTL strategy spelled out for `runs` and `run_outbox` (including index choices) to keep P99 predictable at 30-day retention.
+- Operational runbooks: “DB down”, “queue down”, “scheduler wedged”, “catch-up storm”, including the one command/button to pause minting safely.
+- A clear policy for missed boundaries: how you round `scheduled_at`, timezone/DST behavior, and what “minute granularity” means during DST jumps.
+
+## What’s Working Well
+- The “exactly-once identity over exactly-once delivery” framing is the right mental model and keeps the design honest.
+- Outbox is correctly identified as the linchpin that prevents the nastiest split-brain between DB state and queue state.
+- Catch-up being explicit per job (skip vs capped) is pragmatic and prevents surprise storms.
+- The design cleanly separates correctness (mint durable runs) from capacity (workers/queue), which makes failures diagnosable and recoverable.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+
+
+thinking
+**Reconciling document rewrite rules**
+
+The user asked me to rewrite a document but there are some conflicting rules I need to navigate. While modifications to the repository aren’t necessary, I can create a file. The instruction says to simplify and condense without adding sections, but also requests specific added sections like "What We Removed." It's tricky since the output format seems to require these sections even if they contradict the initial rule of not adding. I'll need to clarify how to address this.
+thinking
+**Thinking through document integration**
+
+I'm considering if I can fit "What We Removed" into sections like "Key Design Decisions" or "Trade-offs" without creating a new top-level section. Maybe a bullet list at the end could work, but it would still count as a section. Alternatively, I could add it as a subsection within "Key Design Decisions." That feels like adding, but under the same umbrella. Changing the heading in "What I’d Do Differently At..." could be a solution to repurpose it, balancing the rules and user requests!
+thinking
+**Navigating document modifications**
+
+The instructions clearly state not to modify the title, difficulty, or tags, but they don't mention headings. Perhaps renaming is an option? I need to integrate simplifications such as dropping etcd/consul, merging scheduler and publisher, and possibly using Postgres as a queue. A minimal architecture may include a Schedule API, Postgres, a combined "Scheduler/Publisher," and workers. It's important to think about scaling, and while using Postgres simplifies things, I must ensure it can handle bursts without losing data.
+thinking
+**Simplifying the queue structure**
+
+Without an external queue, the outbox essentially becomes the queue, transforming into the `run_queue` table with fields like `run_id` and `available_at`. The scheduler can insert runs and a queue entry in the same transaction, while workers will claim entries using `FOR UPDATE SKIP LOCKED`. This streamlines operations by removing the need for an external queue and leader elections. I’m pondering whether to keep the `next_fire_at` cursor for efficiency, but it remains necessary to maintain updates and the schema can definitely be reduced for clarity.
+thinking
+**Finalizing document structure and content**
+
+I need to simplify the document while keeping everything in check with the instructions. To minimize, I can use a composite key on `(job_id, scheduled_at)` for runs. For fairness, I’m considering limiting minted runs per tenant and using round-robin claiming from the queue. To cover failure scenarios, I'll outline specific policies, and keep essential sections but condense some concepts. I must also add a "What We Removed" list under "Key Design Decisions" without creating new top-level sections. I want to maintain clarity while following these complicated rules!
+thinking
+**Refining design and operational details**
+
+I need to be careful with how I nest bullets in the markdown document. I’m focusing on incorporating a minimal architecture and justifications into the document’s sections. The failure scenarios are critical; I want to cover network partitions and ensure that slow DB handling is well-defined. I might drop the `run_id`, using a composite key instead, while adding a `BIGSERIAL` ID can be tempting since it doesn't count as a component. This structure would keep everything organized while simplifying queue handling. Overall, I want to ensure clarity in each transactional process without adding unnecessary complexity!
+thinking
+**Drafting the final document**
+
+I'm focusing on implementing a worker that "leases" runs by updating their status from pending to running using `SKIP LOCKED` for queue claims. If a worker crashes, the scheduler will requeue runs that are stuck in the 'running' status. Fairness will be maintained with a per-tenant limit, and missed executions are avoided by ensuring insertion transactions are handled properly. The design also needs to account for duplicates, backpressure, and timezone-aware scheduling. I’ll ensure the document is concise and follows the required structure without modifications. Let's craft this!
+codex
+```markdown
+---
+title: "Distributed Cron"
+category: "IoT & Edge"
+difficulty: "Hard"
+tags: ["scheduler", "leader-election", "idempotency", "leases", "postgres", "queues"]
+---
+
+## Overview
+
+Distributed Cron is a periodic task runner where scheduling decisions are durable and execution is decoupled. Each intended execution is a persisted object identified by `(job_id, scheduled_at)`. Once that row exists, any worker can execute it; scheduler crashes and leader swaps do not change what should run.
+
+The scheduler is replaceable because correctness comes from Postgres uniqueness and DB time, not from an in-memory tick.
+
+## What Makes This Hard
+
+Time is adversarial: clock skew, pauses, partitions, and failover land on cron boundaries. Without a durable, unique identity for each “fire,” you can’t both recover missed runs and avoid duplicates.
+
+The second difficulty is crash gaps between “decided” and “dispatched.” If those are not made atomic, you create runs that never execute or executions with no durable record.
+
+## Requirements
+
+### Functional Requirements
+- Support cron-like schedules (minute granularity).
+- Guarantee no missed scheduled executions across scheduler crashes.
+- At-least-once execution with deterministic idempotency key `(job_id, scheduled_at)`.
+- Backlog/catch-up policy per job: `skip`, `catch_up`, `catch_up_capped(N)`.
+- Multi-tenant fairness so one tenant can’t monopolize catch-up.
+
+### Scale Targets
+- 100k active schedules.
+- Peak 50k fires/minute at aligned boundaries.
+- P99 schedule-to-ready latency < 2s in steady state.
+- 30 days of run history retained.
+
+## Key Design Decisions
+
+- **Postgres is the only source of truth (and the queue)**
+  - `runs` is the durable ledger of intended executions; uniqueness on `(job_id, scheduled_at)` makes duplicates harmless.
+  - `run_queue` is a Postgres-backed queue table; workers claim work with `SKIP LOCKED`.
+
+- **Single active scheduler via Postgres advisory lock**
+  - Scheduler leadership uses `pg_try_advisory_lock(...)`.
+  - If Postgres is unhealthy, the system fails closed (no minting), which matches the correctness dependency.
+
+- **Atomic “mint + enqueue”**
+  - A run and its queue entry are written in the same transaction.
+  - This removes the “inserted but never enqueued / enqueued without record” split-brain.
+
+- **Explicit backpressure and prioritization**
+  - Scheduler pauses catch-up (or all minting) when `run_queue` lag/size crosses a hard threshold.
+  - Fresh ticks are prioritized ahead of catch-up so recovery doesn’t bury steady-state latency.
+
+- **Simple, explicit concurrency model**
+  - Scheduler work is batched and uses `FOR UPDATE SKIP LOCKED` on `jobs` to avoid head-of-line blocking.
+  - Workers claim queue rows with `FOR UPDATE SKIP LOCKED` and lease runs for crash recovery.
+
+- **Invariant for `jobs.next_fire_at`**
+  - `next_fire_at` advances in the same transaction as minting runs/queue rows for that job, so “lag” is meaningful and rescans don’t thrash.
+
+- **What We Removed**
+  - etcd/Consul leader election (replaced by Postgres advisory lock).
+  - External execution queue (Kafka/SQS/RabbitMQ) (replaced by `run_queue` in Postgres).
+  - Separate outbox publisher service (merged into the scheduler; workers consume directly from DB queue).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[API Clients] --> B[Schedule API]
+  B --> C[(Postgres: jobs, runs, run_queue)]
+  D[Scheduler (advisory lock)] --> C
+  E[Workers] --> C
+```
+
+## Components
+
+- **Schedule API**
+  - Stores durable intent: cron, timezone, payload, catch-up policy, tenant id, concurrency limits.
+  - Validates cron/timezone on write; rejects invalid schedules.
+
+- **Postgres**
+  - `jobs` holds schedule definitions and the cursor `next_fire_at`.
+  - `runs` is the immutable ledger of intended executions keyed by `(job_id, scheduled_at)`.
+  - `run_queue` is the queue of runnable executions (fresh and catch-up), claimed with `SKIP LOCKED`.
+  - Justification: atomic transactions + uniqueness are the core correctness mechanism.
+
+- **Scheduler**
+  - Single process (one active leader) with two responsibilities:
+    1. Mint due run rows + queue rows (bounded by policy).
+    2. Re-enqueue expired leases for crashed workers (bounded sweep).
+  - Justification: converts time into durable run identities; keeps queue populated safely.
+
+- **Workers**
+  - Claim from `run_queue`, lease the run, execute, and record outcome in `runs`.
+  - Justification: provides parallel execution while keeping at-least-once delivery safe via run identity.
+
+## Deep Dive: Leader Crash Without Missing a Tick
+
+**Data model (essential fields):**
+- `jobs(id, cron, timezone, tenant_id, next_fire_at, catchup_policy, max_inflight, paused, updated_at, ...)`
+- `runs(job_id, scheduled_at, status, attempt, leased_until, worker_id, started_at, finished_at, last_error, ...)`
+- `run_queue(job_id, scheduled_at, priority, available_at, enqueued_at, ...)`
+- Unique index: `UNIQUE(job_id, scheduled_at)` on `runs` and on `run_queue`
+
+**Scheduler loop (crash-safe minting):**
+1. Read DB time: `now_min = date_trunc('minute', now())`.
+2. Lock a batch of due jobs: `... WHERE next_fire_at <= now_min ... FOR UPDATE SKIP LOCKED LIMIT K`.
+3. For each job, compute fire times from `next_fire_at` to `now_min` using `catchup_policy` caps.
+4. In one transaction per job:
+   - Insert `runs` rows with `ON CONFLICT DO NOTHING`.
+   - Insert matching `run_queue` rows with `ON CONFLICT DO NOTHING` and a priority (fresh > catch-up).
+   - Advance `jobs.next_fire_at` to the next scheduled time after the last considered tick.
+
+**Worker claim/execute (idempotent, at-least-once):**
+1. Claim queue rows with `FOR UPDATE SKIP LOCKED` ordered by `(priority desc, scheduled_at asc)`.
+2. In the same transaction:
+   - Transition the run to `running` only if it’s not already complete and set `leased_until = now() + lease`.
+   - Delete claimed `run_queue` rows.
+3. Execute side effects using `(job_id, scheduled_at)` as the idempotency key.
+4. Mark `runs` `succeeded`/`failed` and, on retryable failure, reinsert into `run_queue` with backoff (`available_at`).
+
+**Why crashes don’t miss ticks:**
+- If the scheduler dies before minting: the next leader computes the same fire times and inserts them.
+- If it dies mid-mint: uniqueness on `(job_id, scheduled_at)` collapses duplicates.
+- If a worker dies mid-run: the scheduler sweep re-enqueues runs whose `leased_until < now()`.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Minimal infra (Postgres-only) | Postgres carries queue load and needs careful indexing/retention |
+| No missed executions on scheduler crash | True exactly-once side effects still require idempotency |
+| Deterministic catch-up with caps | Catch-up can be delayed by backpressure to protect steady-state |
+
+## Failure Modes
+
+- **Database down (or scheduler can’t reach DB)**
+  - Minting stops; nothing can be done safely.
+  - On recovery, scheduler mints deterministically with catch-up caps and fresh-first priority.
+
+- **Slow database (3–10s transactions)**
+  - Scheduler uses bounded batches and `SKIP LOCKED` to avoid global stalls.
+  - Backpressure pauses catch-up when queue lag grows to prevent runaway writes.
+
+- **Scheduler crash or leader swap during boundary spikes**
+  - Some runs/queue rows may be written, some not; uniqueness + deterministic recompute converges.
+  - Advisory lock ensures one active minter; correctness still holds if a second instance briefly runs.
+
+- **Worker crash mid-run**
+  - Run stays `running` until lease expiry; scheduler sweep re-enqueues it.
+  - Attempts increment and outcomes are recorded for audit/debugging.
+
+- **Bad config / buggy cron parser**
+  - Cron/timezone validation on write prevents invalid schedules from entering the system.
+  - Scheduler supports a “pause minting” switch (e.g., `jobs.paused` by tenant or global) so publishing/execution can drain without creating new runs.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Partition `runs` by day and prune aggressively; keep hot indexes small.
+  - Tighten per-tenant caps during catch-up to preserve fairness.
+
+- **100x scale:**
+  - Shard scheduling and execution by `tenant_id` (independent advisory locks and tablespaces/DBs) to avoid a single Postgres bottleneck.
+
+## Operational Notes
+
+- Use DB time for all scheduling decisions; store `scheduled_at` in UTC.
+- Hard backpressure rule: pause catch-up when `run_queue` oldest age or row count exceeds a fixed threshold; resume automatically when it drops.
+- Track and alert on: `scheduler_lag` (`now - jobs.next_fire_at`), `queue_lag` (oldest `run_queue.scheduled_at`), `lease_expiries` (rate of re-enqueues), and `runs` error rates.
+- Retention: keep `runs` 30 days; keep `run_queue` small (only runnable/soon-runnable rows); vacuum/analyze tuned for high churn tables.
+```
+tokens used
+10,545
+```markdown
+---
+title: "Distributed Cron"
+category: "IoT & Edge"
+difficulty: "Hard"
+tags: ["scheduler", "leader-election", "idempotency", "leases", "postgres", "queues"]
+---
+
+## Overview
+
+Distributed Cron is a periodic task runner where scheduling decisions are durable and execution is decoupled. Each intended execution is a persisted object identified by `(job_id, scheduled_at)`. Once that row exists, any worker can execute it; scheduler crashes and leader swaps do not change what should run.
+
+The scheduler is replaceable because correctness comes from Postgres uniqueness and DB time, not from an in-memory tick.
+
+## What Makes This Hard
+
+Time is adversarial: clock skew, pauses, partitions, and failover land on cron boundaries. Without a durable, unique identity for each “fire,” you can’t both recover missed runs and avoid duplicates.
+
+The second difficulty is crash gaps between “decided” and “dispatched.” If those are not made atomic, you create runs that never execute or executions with no durable record.
+
+## Requirements
+
+### Functional Requirements
+- Support cron-like schedules (minute granularity).
+- Guarantee no missed scheduled executions across scheduler crashes.
+- At-least-once execution with deterministic idempotency key `(job_id, scheduled_at)`.
+- Backlog/catch-up policy per job: `skip`, `catch_up`, `catch_up_capped(N)`.
+- Multi-tenant fairness so one tenant can’t monopolize catch-up.
+
+### Scale Targets
+- 100k active schedules.
+- Peak 50k fires/minute at aligned boundaries.
+- P99 schedule-to-ready latency < 2s in steady state.
+- 30 days of run history retained.
+
+## Key Design Decisions
+
+- **Postgres is the only source of truth (and the queue)**
+  - `runs` is the durable ledger of intended executions; uniqueness on `(job_id, scheduled_at)` makes duplicates harmless.
+  - `run_queue` is a Postgres-backed queue table; workers claim work with `SKIP LOCKED`.
+
+- **Single active scheduler via Postgres advisory lock**
+  - Scheduler leadership uses `pg_try_advisory_lock(...)`.
+  - If Postgres is unhealthy, the system fails closed (no minting), which matches the correctness dependency.
+
+- **Atomic “mint + enqueue”**
+  - A run and its queue entry are written in the same transaction.
+  - This removes the “inserted but never enqueued / enqueued without record” split-brain.
+
+- **Explicit backpressure and prioritization**
+  - Scheduler pauses catch-up (or all minting) when `run_queue` lag/size crosses a hard threshold.
+  - Fresh ticks are prioritized ahead of catch-up so recovery doesn’t bury steady-state latency.
+
+- **Simple, explicit concurrency model**
+  - Scheduler work is batched and uses `FOR UPDATE SKIP LOCKED` on `jobs` to avoid head-of-line blocking.
+  - Workers claim queue rows with `FOR UPDATE SKIP LOCKED` and lease runs for crash recovery.
+
+- **Invariant for `jobs.next_fire_at`**
+  - `next_fire_at` advances in the same transaction as minting runs/queue rows for that job, so “lag” is meaningful and rescans don’t thrash.
+
+- **What We Removed**
+  - etcd/Consul leader election (replaced by Postgres advisory lock).
+  - External execution queue (Kafka/SQS/RabbitMQ) (replaced by `run_queue` in Postgres).
+  - Separate outbox publisher service (merged into the scheduler; workers consume directly from DB queue).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[API Clients] --> B[Schedule API]
+  B --> C[(Postgres: jobs, runs, run_queue)]
+  D[Scheduler (advisory lock)] --> C
+  E[Workers] --> C
+```
+
+## Components
+
+- **Schedule API**
+  - Stores durable intent: cron, timezone, payload, catch-up policy, tenant id, concurrency limits.
+  - Validates cron/timezone on write; rejects invalid schedules.
+
+- **Postgres**
+  - `jobs` holds schedule definitions and the cursor `next_fire_at`.
+  - `runs` is the immutable ledger of intended executions keyed by `(job_id, scheduled_at)`.
+  - `run_queue` is the queue of runnable executions (fresh and catch-up), claimed with `SKIP LOCKED`.
+  - Justification: atomic transactions + uniqueness are the core correctness mechanism.
+
+- **Scheduler**
+  - Single process (one active leader) with two responsibilities:
+    1. Mint due run rows + queue rows (bounded by policy).
+    2. Re-enqueue expired leases for crashed workers (bounded sweep).
+  - Justification: converts time into durable run identities; keeps queue populated safely.
+
+- **Workers**
+  - Claim from `run_queue`, lease the run, execute, and record outcome in `runs`.
+  - Justification: provides parallel execution while keeping at-least-once delivery safe via run identity.
+
+## Deep Dive: Leader Crash Without Missing a Tick
+
+**Data model (essential fields):**
+- `jobs(id, cron, timezone, tenant_id, next_fire_at, catchup_policy, max_inflight, paused, updated_at, ...)`
+- `runs(job_id, scheduled_at, status, attempt, leased_until, worker_id, started_at, finished_at, last_error, ...)`
+- `run_queue(job_id, scheduled_at, priority, available_at, enqueued_at, ...)`
+- Unique index: `UNIQUE(job_id, scheduled_at)` on `runs` and on `run_queue`
+
+**Scheduler loop (crash-safe minting):**
+1. Read DB time: `now_min = date_trunc('minute', now())`.
+2. Lock a batch of due jobs: `... WHERE next_fire_at <= now_min ... FOR UPDATE SKIP LOCKED LIMIT K`.
+3. For each job, compute fire times from `next_fire_at` to `now_min` using `catchup_policy` caps.
+4. In one transaction per job:
+   - Insert `runs` rows with `ON CONFLICT DO NOTHING`.
+   - Insert matching `run_queue` rows with `ON CONFLICT DO NOTHING` and a priority (fresh > catch-up).
+   - Advance `jobs.next_fire_at` to the next scheduled time after the last considered tick.
+
+**Worker claim/execute (idempotent, at-least-once):**
+1. Claim queue rows with `FOR UPDATE SKIP LOCKED` ordered by `(priority desc, scheduled_at asc)`.
+2. In the same transaction:
+   - Transition the run to `running` only if it’s not already complete and set `leased_until = now() + lease`.
+   - Delete claimed `run_queue` rows.
+3. Execute side effects using `(job_id, scheduled_at)` as the idempotency key.
+4. Mark `runs` `succeeded`/`failed` and, on retryable failure, reinsert into `run_queue` with backoff (`available_at`).
+
+**Why crashes don’t miss ticks:**
+- If the scheduler dies before minting: the next leader computes the same fire times and inserts them.
+- If it dies mid-mint: uniqueness on `(job_id, scheduled_at)` collapses duplicates.
+- If a worker dies mid-run: the scheduler sweep re-enqueues runs whose `leased_until < now()`.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Minimal infra (Postgres-only) | Postgres carries queue load and needs careful indexing/retention |
+| No missed executions on scheduler crash | True exactly-once side effects still require idempotency |
+| Deterministic catch-up with caps | Catch-up can be delayed by backpressure to protect steady-state |
+
+## Failure Modes
+
+- **Database down (or scheduler can’t reach DB)**
+  - Minting stops; nothing can be done safely.
+  - On recovery, scheduler mints deterministically with catch-up caps and fresh-first priority.
+
+- **Slow database (3–10s transactions)**
+  - Scheduler uses bounded batches and `SKIP LOCKED` to avoid global stalls.
+  - Backpressure pauses catch-up when queue lag grows to prevent runaway writes.
+
+- **Scheduler crash or leader swap during boundary spikes**
+  - Some runs/queue rows may be written, some not; uniqueness + deterministic recompute converges.
+  - Advisory lock ensures one active minter; correctness still holds if a second instance briefly runs.
+
+- **Worker crash mid-run**
+  - Run stays `running` until lease expiry; scheduler sweep re-enqueues it.
+  - Attempts increment and outcomes are recorded for audit/debugging.
+
+- **Bad config / buggy cron parser**
+  - Cron/timezone validation on write prevents invalid schedules from entering the system.
+  - Scheduler supports a “pause minting” switch (e.g., `jobs.paused` by tenant or global) so publishing/execution can drain without creating new runs.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Partition `runs` by day and prune aggressively; keep hot indexes small.
+  - Tighten per-tenant caps during catch-up to preserve fairness.
+
+- **100x scale:**
+  - Shard scheduling and execution by `tenant_id` (independent advisory locks and tablespaces/DBs) to avoid a single Postgres bottleneck.
+
+## Operational Notes
+
+- Use DB time for all scheduling decisions; store `scheduled_at` in UTC.
+- Hard backpressure rule: pause catch-up when `run_queue` oldest age or row count exceeds a fixed threshold; resume automatically when it drops.
+- Track and alert on: `scheduler_lag` (`now - jobs.next_fire_at`), `queue_lag` (oldest `run_queue.scheduled_at`), `lease_expiries` (rate of re-enqueues), and `runs` error rates.
+- Retention: keep `runs` 30 days; keep `run_queue` small (only runnable/soon-runnable rows); vacuum/analyze tuned for high churn tables.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/09-iot-edge/distributed-cron.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+Found invalid Mermaid diagrams, fixing...
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2b00-496e-7e90-a0d1-3a7d105988df
+--------
+user
+Fix these Mermaid syntax errors:
+
+
+--- Block 1 ---
+flowchart LR
+  A[API Clients] --> B[Schedule API]
+  B --> C[(Postgres: jobs, runs, run_queue)]
+  D[Scheduler (advisory lock)] --> C
+  E[Workers] --> C
+--- Error ---
+Generating single mermaid chart
+
+Error: Parse error on line 4:
+
+
+Common fixes:
+- Quote labels with special characters: A["Label (with parens)"]
+- Use short labels (2-4 words max)
+- Remove HTML tags
+- Keep diagrams simple (max 8 nodes)
+
+Output the complete fixed document.
+
+---
+
+```markdown
+---
+title: "Distributed Cron"
+category: "IoT & Edge"
+difficulty: "Hard"
+tags: ["scheduler", "leader-election", "idempotency", "leases", "postgres", "queues"]
+---
+
+## Overview
+
+Distributed Cron is a periodic task runner where scheduling decisions are durable and execution is decoupled. Each intended execution is a persisted object identified by `(job_id, scheduled_at)`. Once that row exists, any worker can execute it; scheduler crashes and leader swaps do not change what should run.
+
+The scheduler is replaceable because correctness comes from Postgres uniqueness and DB time, not from an in-memory tick.
+
+## What Makes This Hard
+
+Time is adversarial: clock skew, pauses, partitions, and failover land on cron boundaries. Without a durable, unique identity for each “fire,” you can’t both recover missed runs and avoid duplicates.
+
+The second difficulty is crash gaps between “decided” and “dispatched.” If those are not made atomic, you create runs that never execute or executions with no durable record.
+
+## Requirements
+
+### Functional Requirements
+- Support cron-like schedules (minute granularity).
+- Guarantee no missed scheduled executions across scheduler crashes.
+- At-least-once execution with deterministic idempotency key `(job_id, scheduled_at)`.
+- Backlog/catch-up policy per job: `skip`, `catch_up`, `catch_up_capped(N)`.
+- Multi-tenant fairness so one tenant can’t monopolize catch-up.
+
+### Scale Targets
+- 100k active schedules.
+- Peak 50k fires/minute at aligned boundaries.
+- P99 schedule-to-ready latency < 2s in steady state.
+- 30 days of run history retained.
+
+## Key Design Decisions
+
+- **Postgres is the only source of truth (and the queue)**
+  - `runs` is the durable ledger of intended executions; uniqueness on `(job_id, scheduled_at)` makes duplicates harmless.
+  - `run_queue` is a Postgres-backed queue table; workers claim work with `SKIP LOCKED`.
+
+- **Single active scheduler via Postgres advisory lock**
+  - Scheduler leadership uses `pg_try_advisory_lock(...)`.
+  - If Postgres is unhealthy, the system fails closed (no minting), which matches the correctness dependency.
+
+- **Atomic “mint + enqueue”**
+  - A run and its queue entry are written in the same transaction.
+  - This removes the “inserted but never enqueued / enqueued without record” split-brain.
+
+- **Explicit backpressure and prioritization**
+  - Scheduler pauses catch-up (or all minting) when `run_queue` lag/size crosses a hard threshold.
+  - Fresh ticks are prioritized ahead of catch-up so recovery doesn’t bury steady-state latency.
+
+- **Simple, explicit concurrency model**
+  - Scheduler work is batched and uses `FOR UPDATE SKIP LOCKED` on `jobs` to avoid head-of-line blocking.
+  - Workers claim queue rows with `FOR UPDATE SKIP LOCKED` and lease runs for crash recovery.
+
+- **Invariant for `jobs.next_fire_at`**
+  - `next_fire_at` advances in the same transaction as minting runs/queue rows for that job, so “lag” is meaningful and rescans don’t thrash.
+
+- **What We Removed**
+  - etcd/Consul leader election (replaced by Postgres advisory lock).
+  - External execution queue (Kafka/SQS/RabbitMQ) (replaced by `run_queue` in Postgres).
+  - Separate outbox publisher service (merged into the scheduler; workers consume directly from DB queue).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[API Clients] --> B[Schedule API]
+  B --> C[(Postgres: jobs, runs, run_queue)]
+  D[Scheduler (advisory lock)] --> C
+  E[Workers] --> C
+```
+
+## Components
+
+- **Schedule API**
+  - Stores durable intent: cron, timezone, payload, catch-up policy, tenant id, concurrency limits.
+  - Validates cron/timezone on write; rejects invalid schedules.
+
+- **Postgres**
+  - `jobs` holds schedule definitions and the cursor `next_fire_at`.
+  - `runs` is the immutable ledger of intended executions keyed by `(job_id, scheduled_at)`.
+  - `run_queue` is the queue of runnable executions (fresh and catch-up), claimed with `SKIP LOCKED`.
+  - Justification: atomic transactions + uniqueness are the core correctness mechanism.
+
+- **Scheduler**
+  - Single process (one active leader) with two responsibilities:
+    1. Mint due run rows + queue rows (bounded by policy).
+    2. Re-enqueue expired leases for crashed workers (bounded sweep).
+  - Justification: converts time into durable run identities; keeps queue populated safely.
+
+- **Workers**
+  - Claim from `run_queue`, lease the run, execute, and record outcome in `runs`.
+  - Justification: provides parallel execution while keeping at-least-once delivery safe via run identity.
+
+## Deep Dive: Leader Crash Without Missing a Tick
+
+**Data model (essential fields):**
+- `jobs(id, cron, timezone, tenant_id, next_fire_at, catchup_policy, max_inflight, paused, updated_at, ...)`
+- `runs(job_id, scheduled_at, status, attempt, leased_until, worker_id, started_at, finished_at, last_error, ...)`
+- `run_queue(job_id, scheduled_at, priority, available_at, enqueued_at, ...)`
+- Unique index: `UNIQUE(job_id, scheduled_at)` on `runs` and on `run_queue`
+
+**Scheduler loop (crash-safe minting):**
+1. Read DB time: `now_min = date_trunc('minute', now())`.
+2. Lock a batch of due jobs: `... WHERE next_fire_at <= now_min ... FOR UPDATE SKIP LOCKED LIMIT K`.
+3. For each job, compute fire times from `next_fire_at` to `now_min` using `catchup_policy` caps.
+4. In one transaction per job:
+   - Insert `runs` rows with `ON CONFLICT DO NOTHING`.
+   - Insert matching `run_queue` rows with `ON CONFLICT DO NOTHING` and a priority (fresh > catch-up).
+   - Advance `jobs.next_fire_at` to the next scheduled time after the last considered tick.
+
+**Worker claim/execute (idempotent, at-least-once):**
+1. Claim queue rows with `FOR UPDATE SKIP LOCKED` ordered by `(priority desc, scheduled_at asc)`.
+2. In the same transaction:
+   - Transition the run to `running` only if it’s not already complete and set `leased_until = now() + lease`.
+   - Delete claimed `run_queue` rows.
+3. Execute side effects using `(job_id, scheduled_at)` as the idempotency key.
+4. Mark `runs` `succeeded`/`failed` and, on retryable failure, reinsert into `run_queue` with backoff (`available_at`).
+
+**Why crashes don’t miss ticks:**
+- If the scheduler dies before minting: the next leader computes the same fire times and inserts them.
+- If it dies mid-mint: uniqueness on `(job_id, scheduled_at)` collapses duplicates.
+- If a worker dies mid-run: the scheduler sweep re-enqueues runs whose `leased_until < now()`.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Minimal infra (Postgres-only) | Postgres carries queue load and needs careful indexing/retention |
+| No missed executions on scheduler crash | True exactly-once side effects still require idempotency |
+| Deterministic catch-up with caps | Catch-up can be delayed by backpressure to protect steady-state |
+
+## Failure Modes
+
+- **Database down (or scheduler can’t reach DB)**
+  - Minting stops; nothing can be done safely.
+  - On recovery, scheduler mints deterministically with catch-up caps and fresh-first priority.
+
+- **Slow database (3–10s transactions)**
+  - Scheduler uses bounded batches and `SKIP LOCKED` to avoid global stalls.
+  - Backpressure pauses catch-up when queue lag grows to prevent runaway writes.
+
+- **Scheduler crash or leader swap during boundary spikes**
+  - Some runs/queue rows may be written, some not; uniqueness + deterministic recompute converges.
+  - Advisory lock ensures one active minter; correctness still holds if a second instance briefly runs.
+
+- **Worker crash mid-run**
+  - Run stays `running` until lease expiry; scheduler sweep re-enqueues it.
+  - Attempts increment and outcomes are recorded for audit/debugging.
+
+- **Bad config / buggy cron parser**
+  - Cron/timezone validation on write prevents invalid schedules from entering the system.
+  - Scheduler supports a “pause minting” switch (e.g., `jobs.paused` by tenant or global) so publishing/execution can drain without creating new runs.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Partition `runs` by day and prune aggressively; keep hot indexes small.
+  - Tighten per-tenant caps during catch-up to preserve fairness.
+
+- **100x scale:**
+  - Shard scheduling and execution by `tenant_id` (independent advisory locks and tablespaces/DBs) to avoid a single Postgres bottleneck.
+
+## Operational Notes
+
+- Use DB time for all scheduling decisions; store `scheduled_at` in UTC.
+- Hard backpressure rule: pause catch-up when `run_queue` oldest age or row count exceeds a fixed threshold; resume automatically when it drops.
+- Track and alert on: `scheduler_lag` (`now - jobs.next_fire_at`), `queue_lag` (oldest `run_queue.scheduled_at`), `lease_expiries` (rate of re-enqueues), and `runs` error rates.
+- Retention: keep `runs` 30 days; keep `run_queue` small (only runnable/soon-runnable rows); vacuum/analyze tuned for high churn tables.
+```
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+thinking
+**Fixing mermaid syntax errors**
+
+I need to address some mermaid syntax errors in the flowchart. The error indicates a problem on line 4, possibly due to the node label C[(Postgres: jobs, runs, run_queue)] containing a colon and commas, which may confuse the parser. In mermaid, we might have to quote labels with special characters, especially in square brackets. I’m realizing that the parentheses in the label could be triggering the error, meaning I might need to adjust how I'm structuring the labels.
+thinking
+**Examining mermaid parser issues**
+
+I’m considering that the mermaid parser might interpret the parentheses following "Scheduler" as the beginning of a link. I remember that mermaid uses parentheses for node shapes, but here, `D[Scheduler (advisory lock)]` should be fine. However, the parse error on line 4 points directly to this line. I think it might also relate to spacing in "advisory lock." To fix it, I could quote the label as `D["Scheduler (advisory lock)"] --> C`. For C, I’ll adjust it to `C[("Postgres: jobs, runs, run_queue")]` for consistency.
+thinking
+**Clarifying cylinder syntax**
+
+I’m digging into the syntax for defining a cylinder in mermaid: is it `[(Database)]` or `[("Database")]`? The flowchart documentation suggests that `[(Database)]` indeed corresponds to a database shape. But if I quote labels with special characters, I might need to format it as `C[("Postgres: jobs, runs, run_queue")]`. I wonder if that alters the shape, but it seems to still parse correctly. I’ll apply this quoting for any labels with special characters and ensure I return the complete fixed document with the corrected mermaid block in a proper markdown format.
+thinking
+**Preparing to output fixed document**
+
+I need to provide a complete document as the user requested, but I should only use tools if there's a repo file to work with. They asked specifically for the fixed document, and since they provided a markdown snippet, they might want me to patch a file. I should look for the title "Distributed Cron" in the repository to find the corresponding file. My plan is to locate the file and update the mermaid syntax before outputting the complete revised document. I'll use a command to search effectively in the repository.
+exec
+/bin/zsh -lc "rg -n \"title: \\\"Distributed Cron\\\"\" -S ." in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 81ms:
+./logs/distributed-cron.log:250:title: "Distributed Cron"
+./logs/distributed-cron.log:649:title: "Distributed Cron"
+./logs/distributed-cron.log:1129:title: "Distributed Cron"
+./logs/distributed-cron.log:1532:title: "Distributed Cron"
+./logs/distributed-cron.log:2138:title: "Distributed Cron"
+./logs/distributed-cron.log:2836:title: "Distributed Cron"
+./logs/distributed-cron.log:3471:title: "Distributed Cron"
+./logs/distributed-cron.log:3687:title: "Distributed Cron"
+./logs/calendar-scheduling-system.log:1824:title: "Distributed Cron"
+./logs/v2/distributed-cron.log:169:title: "Distributed Cron"
+./logs/v2/distributed-cron.log:331:title: "Distributed Cron"
+./logs/v2/distributed-cron.log:614:title: "Distributed Cron"
+./logs/v2/distributed-cron.log:1028:title: "Distributed Cron"
+./logs/v2/distributed-cron.log:1313:title: "Distributed Cron"
+./logs/v2/distributed-cron.log:1488:title: "Distributed Cron"
+./logs/v2/distributed-cron.log:1704:title: "Distributed Cron"
+./reviewed/distributed-cron.md:2:title: "Distributed Cron"
+./problems.yaml:531:    title: "Distributed Cron"
+./solutions-v2/09-iot-edge/distributed-cron.md:3:title: "Distributed Cron"
+./drafts-v2/distributed-cron.md:3:title: "Distributed Cron"
+
+thinking
+**Deciding on document fixes**
+
+I’m considering multiple versions of the document and whether to update the relevant solution doc. The snippet seems to match a specific error. I need to identify which file to fix, as they requested a complete, corrected document. I could just print the updated markdown without modifying the file, but since they want the errors fixed, it seems I'll need to work on the file used. I might check the "Architecture" section and mermaid sections, possibly in the solutions-v2 path. Let's explore those files!
+exec
+/bin/zsh -lc "sed -n '1,140p' reviewed/distributed-cron.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 90ms:
+---
+title: "Distributed Cron"
+category: "IoT & Edge"
+difficulty: "Hard"
+tags: ["scheduling", "distributed-systems", "fault-tolerance", "iot", "idempotency"]
+---
+
+## Overview
+
+A distributed cron system runs periodic jobs (e.g., “every minute”, “daily at 02:00 America/Los_Angeles”) across many targets (gateways/devices/regions) and must keep working through leader crashes, retries, partitions, and clock skew. The hard parts aren’t parsing cron strings—they’re:
+
+- **Correctness**: deciding *which* scheduled occurrences exist (including DST/misfires) and materializing them durably.
+- **Reliability**: ensuring due occurrences get dispatched and eventually executed when targets are reachable again.
+- **Safety**: preventing uncontrolled duplicates while accepting that **at-least-once** is unavoidable under failures.
+
+This design separates:
+1. **Schedule decision + durable run materialization** (create “Run” records with unique keys)
+2. **Execution** (workers claim runs via atomic transitions + leases/heartbeats)
+
+The key invariant is: **a run is the unit of truth**. Leaders are replaceable; correctness depends on durable state, unique constraints, and idempotent transitions—not on a single process remembering what’s due.
+exec
+/bin/zsh -lc "sed -n '1,120p' solutions/09-iot-edge/distributed-cron.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 45ms:
+---
+title: "Distributed Cron"
+category: "IoT & Edge"
+difficulty: "Hard"
+tags: ["scheduling", "distributed-systems", "fault-tolerance", "iot", "idempotency"]
+---
+
+## Overview
+
+A distributed cron system schedules periodic work across many IoT targets (gateways, groups, regions) and continues operating through crashes, retries, partitions, and clock skew. The core correctness rule is that **each scheduled occurrence is durably materialized as a Run** with a unique key. Execution is then a separate, retryable process that can be performed by any healthy worker.
+
+This design favors a small set of well-understood building blocks:
+- One stateless service for API + scheduling + dispatching (horizontally scalable)
+- One strongly consistent database for all durable state (jobs, runs, retries, audit)
+- At-least-once dispatch with effectively-once outcomes via idempotency keys
+
+---
+
+## Requirements
+
+exec
+/bin/zsh -lc "rg -n \"## Architecture\\n\\n"'```mermaid" -n solutions/09-iot-edge/distributed-cron.md reviewed/distributed-cron.md solutions-v2/09-iot-edge/distributed-cron.md drafts/distributed-cron.md drafts-v2/distributed-cron.md 2>/dev/null || true' in /Users/dominikdabrowski/pr/system-design-atlas exited 1 in 43ms:
+zsh:1: unmatched "
+exec
+/bin/zsh -lc "sed -n '1,140p' solutions-v2/09-iot-edge/distributed-cron.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 47ms:
+```markdown
+---
+title: "Distributed Cron"
+category: "IoT & Edge"
+difficulty: "Hard"
+tags: ["scheduler", "leader-election", "idempotency", "leases", "postgres", "queues"]
+---
+
+## Overview
+
+Distributed Cron is a periodic task runner where scheduling decisions are durable and execution is decoupled. Each intended execution is a persisted object identified by `(job_id, scheduled_at)`. Once that row exists, any worker can execute it; scheduler crashes and leader swaps do not change what should run.
+
+The scheduler is replaceable because correctness comes from Postgres uniqueness and DB time, not from an in-memory tick.
+
+## What Makes This Hard
+
+Time is adversarial: clock skew, pauses, partitions, and failover land on cron boundaries. Without a durable, unique identity for each “fire,” you can’t both recover missed runs and avoid duplicates.
+
+The second difficulty is crash gaps between “decided” and “dispatched.” If those are not made atomic, you create runs that never execute or executions with no durable record.
+
+exec
+/bin/zsh -lc "sed -n '1,30p' solutions-v2/09-iot-edge/distributed-cron.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 46ms:
+```markdown
+---
+title: "Distributed Cron"
+category: "IoT & Edge"
+difficulty: "Hard"
+tags: ["scheduler", "leader-election", "idempotency", "leases", "postgres", "queues"]
+---
+
+## Overview
+
+Distributed Cron is a periodic task runner where scheduling decisions are durable and execution is decoupled. Each intended execution is a persisted object identified by `(job_id, scheduled_at)`. Once that row exists, any worker can execute it; scheduler crashes and leader swaps do not change what should run.
+
+The scheduler is replaceable because correctness comes from Postgres uniqueness and DB time, not from an in-memory tick.
+
+## What Makes This Hard
+
+Time is adversarial: clock skew, pauses, partitions, and failover land on cron boundaries. Without a durable, unique identity for each “fire,” you can’t both recover missed runs and avoid duplicates.
+
+The second difficulty is crash gaps between “decided” and “dispatched.” If those are not made atomic, you create runs that never execute or executions with no durable record.
+
+
+thinking
+**Investigating mermaid syntax issues**
+
+I’m noticing that the solutions-v2 file has a code fence around the content, which might be causing issues for site generation. The user specifically asked to fix mermaid syntax errors, not to remove the code fence. The error likely happens when generating a chart from the mermaid block in the snippet. I’ll need to check which file(s) contain that diagram and look for "flowchart LR" to find the problematic line with the advisory lock.
+exec
+/bin/zsh -lc "rg -n \"flowchart LR\\n\\s*A\\[API Clients\\].*\\n\\s*B --> C\\[\\(Postgres: jobs, runs, run_queue\\)\\]\\n\\s*D\\[Scheduler \\(advisory lock\\)\\]\" -S ." in /Users/dominikdabrowski/pr/system-design-atlas exited 2 in 49ms:
+rg: the literal "\n" is not allowed in a regex
+
+Consider enabling multiline mode with the --multiline flag (or -U for short).
+When multiline mode is enabled, new line characters can be matched.
+exec
+/bin/zsh -lc "rg -n \"D\\[Scheduler \\(advisory lock\\)\\] --> C\" -S ." in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 97ms:
+./logs/v2/distributed-cron.log:1382:  D[Scheduler (advisory lock)] --> C
+./logs/v2/distributed-cron.log:1557:  D[Scheduler (advisory lock)] --> C
+./logs/v2/distributed-cron.log:1684:  D[Scheduler (advisory lock)] --> C
+./logs/v2/distributed-cron.log:1773:  D[Scheduler (advisory lock)] --> C
+./solutions-v2/09-iot-edge/distributed-cron.md:72:  D[Scheduler (advisory lock)] --> C
+
+
+thinking
+**Considering diagram fixes**
+
+I’m looking at patching the file’s mermaid diagram. If the file includes triple backticks around it, that’s a bit strange but could be intentional for packaging purposes. Maybe in version 2 they store things as a code block to render? I'm curious about what the system design atlas repository is, as it likely stores solutions in Markdown without that wrapper. The user wants me to fix mermaid syntax errors, but they also want a complete document without the outer code fence.
+thinking
+**Fixing parse errors**
+
+I see that the parse error is coming from the mermaid chart generator, which might have misread the provided document content since there’s no outer wrapper. So, it seems like the task is just to fix the error in the snippet without modifying the file itself. However, since I can patch the file, it might be a good idea to do that too. I’ll focus on fixing the mermaid label quoting and returning the full markdown document with that fix. I also need to check any instructions regarding AGENTS included in the repository.
+exec
+/bin/zsh -lc 'ls -la' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 58ms:
+total 64
+drwxr-xr-x@  15 dominikdabrowski  staff    480 Dec 17 01:07 .
+drwxr-xr-x@  43 dominikdabrowski  staff   1376 Dec 16 17:40 ..
+drwxr-xr-x@   9 dominikdabrowski  staff    288 Dec 17 01:30 .git
+drwxr-xr-x@  99 dominikdabrowski  staff   3168 Dec 17 01:29 challenges
+drwxr-xr-x@ 102 dominikdabrowski  staff   3264 Dec 16 22:34 drafts
+drwxr-xr-x@ 100 dominikdabrowski  staff   3200 Dec 17 01:30 drafts-v2
+drwxr-xr-x@  16 dominikdabrowski  staff    512 Dec 16 22:10 frontend
+drwxr-xr-x@ 203 dominikdabrowski  staff   6496 Dec 16 23:33 grades
+drwxr-xr-x@ 110 dominikdabrowski  staff   3520 Dec 17 01:19 logs
+-rw-------@   1 dominikdabrowski  staff  31640 Dec 16 21:23 problems.yaml
+drwxr-xr-x@   7 dominikdabrowski  staff    224 Dec 16 23:46 prompts
+drwxr-xr-x@ 102 dominikdabrowski  staff   3264 Dec 16 22:53 reviewed
+drwxr-xr-x@  13 dominikdabrowski  staff    416 Dec 17 01:19 scripts
+drwxr-xr-x@  12 dominikdabrowski  staff    384 Dec 16 21:36 solutions
+drwxr-xr-x@  12 dominikdabrowski  staff    384 Dec 17 01:19 solutions-v2
+exec
+/bin/zsh -lc 'find .. -maxdepth 2 -name AGENTS.md -print' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 117ms:
+../semper/AGENTS.md
+../24h_modal/AGENTS.md
+../betterdocs/AGENTS.md
+../kafkette/AGENTS.md
+
+thinking
+**Examining document output**
+
+I see there are no agents in this repo, which is good. I want to patch the diagram in `solutions-v2/09-iot-edge/distributed-cron.md` and possibly fix the parse error. The user seems to want the complete fixed document, so I need to consider if they prefer it without the outer code fence. I shouldn't just remove it if the document includes it. I should check the last lines of the file to clarify this.
+exec
+/bin/zsh -lc 'tail -n 5 solutions-v2/09-iot-edge/distributed-cron.md' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 77ms:
+- Use DB time for all scheduling decisions; store `scheduled_at` in UTC.
+- Hard backpressure rule: pause catch-up when `run_queue` oldest age or row count exceeds a fixed threshold; resume automatically when it drops.
+- Track and alert on: `scheduler_lag` (`now - jobs.next_fire_at`), `queue_lag` (oldest `run_queue.scheduled_at`), `lease_expiries` (rate of re-enqueues), and `runs` error rates.
+- Retention: keep `runs` 30 days; keep `run_queue` small (only runnable/soon-runnable rows); vacuum/analyze tuned for high churn tables.
+```
+exec
+/bin/zsh -lc "rg -n \"D\\[Scheduler \\(advisory lock\\)\\]\" drafts-v2/distributed-cron.md" in /Users/dominikdabrowski/pr/system-design-atlas exited 1 in 80ms:
+
+
+thinking
+**Adjusting syntax safely**
+
+I’m considering the parsing issue. It seems the error might be specific to the D label while keeping C intact. Quoting C could help but might not be necessary. If I change C’s syntax, there's a risk of breaking it. I think the simplest way is to quote only the D label and leave C as is. The error suggests parentheses are special, so quoting D should resolve it. I'll patch the file like this: `D["Scheduler (advisory lock)"] --> C`.
+file update
+M /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/09-iot-edge/distributed-cron.md
+@@ -71,3 +71,3 @@
+   B --> C[(Postgres: jobs, runs, run_queue)]
+-  D[Scheduler (advisory lock)] --> C
++  D["Scheduler (advisory lock)"] --> C
+   E[Workers] --> C
+@@ -172,2 +172,2 @@
+ - Retention: keep `runs` 30 days; keep `run_queue` small (only runnable/soon-runnable rows); vacuum/analyze tuned for high churn tables.
+-```
+\ No newline at end of file
++```
+apply_patch(auto_approved=true) exited 0 in 21ms:
+Success. Updated the following files:
+M solutions-v2/09-iot-edge/distributed-cron.md
+file update:
+diff --git a/solutions-v2/09-iot-edge/distributed-cron.md b/solutions-v2/09-iot-edge/distributed-cron.md
+index cd4866df8a35facf60db9bfe6c6b607a3046cd24..2411690f8a5e81453fe76186daa8c017729e5813
+--- a/solutions-v2/09-iot-edge/distributed-cron.md
++++ b/solutions-v2/09-iot-edge/distributed-cron.md
+@@ -69,7 +69,7 @@
+ flowchart LR
+   A[API Clients] --> B[Schedule API]
+   B --> C[(Postgres: jobs, runs, run_queue)]
+-  D[Scheduler (advisory lock)] --> C
++  D["Scheduler (advisory lock)"] --> C
+   E[Workers] --> C
+ ```
+ 
+@@ -170,4 +170,4 @@
+ - Hard backpressure rule: pause catch-up when `run_queue` oldest age or row count exceeds a fixed threshold; resume automatically when it drops.
+ - Track and alert on: `scheduler_lag` (`now - jobs.next_fire_at`), `queue_lag` (oldest `run_queue.scheduled_at`), `lease_expiries` (rate of re-enqueues), and `runs` error rates.
+ - Retention: keep `runs` 30 days; keep `run_queue` small (only runnable/soon-runnable rows); vacuum/analyze tuned for high churn tables.
+-```
+\ No newline at end of file
++```
+
+file update:
+diff --git a/solutions-v2/09-iot-edge/distributed-cron.md b/solutions-v2/09-iot-edge/distributed-cron.md
+index cd4866df8a35facf60db9bfe6c6b607a3046cd24..2411690f8a5e81453fe76186daa8c017729e5813
+--- a/solutions-v2/09-iot-edge/distributed-cron.md
++++ b/solutions-v2/09-iot-edge/distributed-cron.md
+@@ -69,7 +69,7 @@
+ flowchart LR
+   A[API Clients] --> B[Schedule API]
+   B --> C[(Postgres: jobs, runs, run_queue)]
+-  D[Scheduler (advisory lock)] --> C
++  D["Scheduler (advisory lock)"] --> C
+   E[Workers] --> C
+ ```
+ 
+@@ -170,4 +170,4 @@
+ - Hard backpressure rule: pause catch-up when `run_queue` oldest age or row count exceeds a fixed threshold; resume automatically when it drops.
+ - Track and alert on: `scheduler_lag` (`now - jobs.next_fire_at`), `queue_lag` (oldest `run_queue.scheduled_at`), `lease_expiries` (rate of re-enqueues), and `runs` error rates.
+ - Retention: keep `runs` 30 days; keep `run_queue` small (only runnable/soon-runnable rows); vacuum/analyze tuned for high churn tables.
+-```
+\ No newline at end of file
++```
+
+exec
+/bin/zsh -lc 'rg -n "mmdc|mermaid" scripts frontend package.json pnpm-lock.yaml yarn.lock 2>/dev/null || true' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 61ms:
+scripts/generate-solution-v2.sh:163:MMDC="$PROJECT_DIR/frontend/node_modules/.bin/mmdc"
+scripts/generate-solution-v2.sh:165:    echo "Warning: mermaid-cli not found, skipping validation"
+scripts/generate-solution-v2.sh:172:    in_mermaid=false
+scripts/generate-solution-v2.sh:176:        if [[ "$line" == '```mermaid' ]]; then
+scripts/generate-solution-v2.sh:177:            in_mermaid=true
+scripts/generate-solution-v2.sh:182:        if [[ "$in_mermaid" == true && "$line" == '```' ]]; then
+scripts/generate-solution-v2.sh:183:            in_mermaid=false
+scripts/generate-solution-v2.sh:202:        if [[ "$in_mermaid" == true ]]; then
+frontend/src/pages/solutions/[...slug].astro:155:              if ((window as any).mermaid) {
+frontend/src/pages/solutions/[...slug].astro:156:                (window as any).mermaid.run({ querySelector: ".mermaid[data-mermaid='true']:not([data-processed='true'])" });
+scripts/validate-mermaid.mjs:4: * Run from frontend directory: node ../scripts/validate-mermaid.mjs
+scripts/validate-mermaid.mjs:5: * Or: cd frontend && node ../scripts/validate-mermaid.mjs [files...] [--fix]
+scripts/validate-mermaid.mjs:16:// We'll use mermaid's parse function via dynamic import
+scripts/validate-mermaid.mjs:17:let mermaid;
+scripts/validate-mermaid.mjs:21:  const regex = /```mermaid\n([\s\S]*?)```/g;
+scripts/validate-mermaid.mjs:44:    await mermaid.parse(block.code);
+scripts/validate-mermaid.mjs:73:// Common fixes for mermaid syntax issues
+scripts/validate-mermaid.mjs:81:  // Fix 2: Replace <br/> with <br> (some mermaid versions prefer this)
+scripts/validate-mermaid.mjs:95:  const { default: mermaidModule } = await import('mermaid');
+scripts/validate-mermaid.mjs:96:  mermaid = mermaidModule;
+file update:
+diff --git a/solutions-v2/09-iot-edge/distributed-cron.md b/solutions-v2/09-iot-edge/distributed-cron.md
+index cd4866df8a35facf60db9bfe6c6b607a3046cd24..2411690f8a5e81453fe76186daa8c017729e5813
+--- a/solutions-v2/09-iot-edge/distributed-cron.md
++++ b/solutions-v2/09-iot-edge/distributed-cron.md
+@@ -69,7 +69,7 @@
+ flowchart LR
+   A[API Clients] --> B[Schedule API]
+   B --> C[(Postgres: jobs, runs, run_queue)]
+-  D[Scheduler (advisory lock)] --> C
++  D["Scheduler (advisory lock)"] --> C
+   E[Workers] --> C
+ ```
+ 
+@@ -170,4 +170,4 @@
+ - Hard backpressure rule: pause catch-up when `run_queue` oldest age or row count exceeds a fixed threshold; resume automatically when it drops.
+ - Track and alert on: `scheduler_lag` (`now - jobs.next_fire_at`), `queue_lag` (oldest `run_queue.scheduled_at`), `lease_expiries` (rate of re-enqueues), and `runs` error rates.
+ - Retention: keep `runs` 30 days; keep `run_queue` small (only runnable/soon-runnable rows); vacuum/analyze tuned for high churn tables.
+-```
+\ No newline at end of file
++```
+
+exec
+/bin/zsh -lc 'ls -la frontend/node_modules/.bin/mmdc 2>/dev/null || echo "no mmdc"' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 55ms:
+lrwxr-xr-x@ 1 dominikdabrowski  staff  37 Dec 16 21:11 frontend/node_modules/.bin/mmdc -> ../@mermaid-js/mermaid-cli/src/cli.js
+
+thinking
+**Running validation scripts**
+
+Alright, I've successfully installed the necessary dependencies! Now I can validate everything by running the script located at `scripts/validate-mermaid.mjs`. This script will read files and parse the data, and I don’t need any network access for this. I’m excited to see if it works properly on my local file. Fingers crossed that everything goes smoothly! Let's get this validation underway!
+file update:
+diff --git a/solutions-v2/09-iot-edge/distributed-cron.md b/solutions-v2/09-iot-edge/distributed-cron.md
+index cd4866df8a35facf60db9bfe6c6b607a3046cd24..2411690f8a5e81453fe76186daa8c017729e5813
+--- a/solutions-v2/09-iot-edge/distributed-cron.md
++++ b/solutions-v2/09-iot-edge/distributed-cron.md
+@@ -69,7 +69,7 @@
+ flowchart LR
+   A[API Clients] --> B[Schedule API]
+   B --> C[(Postgres: jobs, runs, run_queue)]
+-  D[Scheduler (advisory lock)] --> C
++  D["Scheduler (advisory lock)"] --> C
+   E[Workers] --> C
+ ```
+ 
+@@ -170,4 +170,4 @@
+ - Hard backpressure rule: pause catch-up when `run_queue` oldest age or row count exceeds a fixed threshold; resume automatically when it drops.
+ - Track and alert on: `scheduler_lag` (`now - jobs.next_fire_at`), `queue_lag` (oldest `run_queue.scheduled_at`), `lease_expiries` (rate of re-enqueues), and `runs` error rates.
+ - Retention: keep `runs` 30 days; keep `run_queue` small (only runnable/soon-runnable rows); vacuum/analyze tuned for high churn tables.
+-```
+\ No newline at end of file
++```
+
+exec
+/bin/zsh -lc 'cd frontend && node ../scripts/validate-mermaid.mjs ../solutions-v2/09-iot-edge/distributed-cron.md' in /Users/dominikdabrowski/pr/system-design-atlas exited 1 in 81ms:
+Validation failed: Cannot find package 'mermaid' imported from /Users/dominikdabrowski/pr/system-design-atlas/scripts/validate-mermaid.mjs
+file update:
+diff --git a/solutions-v2/09-iot-edge/distributed-cron.md b/solutions-v2/09-iot-edge/distributed-cron.md
+index cd4866df8a35facf60db9bfe6c6b607a3046cd24..2411690f8a5e81453fe76186daa8c017729e5813
+--- a/solutions-v2/09-iot-edge/distributed-cron.md
++++ b/solutions-v2/09-iot-edge/distributed-cron.md
+@@ -69,7 +69,7 @@
+ flowchart LR
+   A[API Clients] --> B[Schedule API]
+   B --> C[(Postgres: jobs, runs, run_queue)]
+-  D[Scheduler (advisory lock)] --> C
++  D["Scheduler (advisory lock)"] --> C
+   E[Workers] --> C
+ ```
+ 
+@@ -170,4 +170,4 @@
+ - Hard backpressure rule: pause catch-up when `run_queue` oldest age or row count exceeds a fixed threshold; resume automatically when it drops.
+ - Track and alert on: `scheduler_lag` (`now - jobs.next_fire_at`), `queue_lag` (oldest `run_queue.scheduled_at`), `lease_expiries` (rate of re-enqueues), and `runs` error rates.
+ - Retention: keep `runs` 30 days; keep `run_queue` small (only runnable/soon-runnable rows); vacuum/analyze tuned for high churn tables.
+-```
+\ No newline at end of file
++```
+
+exec
+/bin/zsh -lc "sed -n '1,120p' scripts/validate-mermaid.sh" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 59ms:
+#!/bin/bash
+# Validate Mermaid diagrams in markdown files
+# Usage: ./scripts/validate-mermaid.sh [--fix]
+# Run from project root or frontend directory
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+FRONTEND_DIR="$PROJECT_DIR/frontend"
+
+# Find mmdc
+MMDC="$FRONTEND_DIR/node_modules/.bin/mmdc"
+if [[ ! -x "$MMDC" ]]; then
+    echo "Error: mermaid-cli not found. Run: cd frontend && npm install"
+    exit 1
+fi
+
+SOLUTIONS_DIR="$PROJECT_DIR/solutions"
+TEMP_DIR=$(mktemp -d)
+file update:
+diff --git a/solutions-v2/09-iot-edge/distributed-cron.md b/solutions-v2/09-iot-edge/distributed-cron.md
+index cd4866df8a35facf60db9bfe6c6b607a3046cd24..2411690f8a5e81453fe76186daa8c017729e5813
+--- a/solutions-v2/09-iot-edge/distributed-cron.md
++++ b/solutions-v2/09-iot-edge/distributed-cron.md
+@@ -69,7 +69,7 @@
+ flowchart LR
+   A[API Clients] --> B[Schedule API]
+   B --> C[(Postgres: jobs, runs, run_queue)]
+-  D[Scheduler (advisory lock)] --> C
++  D["Scheduler (advisory lock)"] --> C
+   E[Workers] --> C
+ ```
+ 
+@@ -170,4 +170,4 @@
+ - Hard backpressure rule: pause catch-up when `run_queue` oldest age or row count exceeds a fixed threshold; resume automatically when it drops.
+ - Track and alert on: `scheduler_lag` (`now - jobs.next_fire_at`), `queue_lag` (oldest `run_queue.scheduled_at`), `lease_expiries` (rate of re-enqueues), and `runs` error rates.
+ - Retention: keep `runs` 30 days; keep `run_queue` small (only runnable/soon-runnable rows); vacuum/analyze tuned for high churn tables.
+-```
+\ No newline at end of file
++```
+
+exec
+/bin/zsh -lc "sed -n '140,240p' scripts/generate-solution-v2.sh" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 49ms:
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think \"that's surprisingly simple\" not \"very thorough.\"
+
+Output the complete, final markdown document."
+
+codex exec \
+    -m "$MODEL" \
+    --full-auto \
+    --skip-git-repo-check \
+    -o "$SOLUTION_FILE" \
+    "$REFINE_PROMPT"
+
+echo "[Pass 3/4] Refined design saved to: $SOLUTION_FILE"
+
+# ============================================================================
+# Pass 4: Validate Mermaid Diagrams
+# ============================================================================
+echo ""
+file update:
+diff --git a/solutions-v2/09-iot-edge/distributed-cron.md b/solutions-v2/09-iot-edge/distributed-cron.md
+index cd4866df8a35facf60db9bfe6c6b607a3046cd24..2411690f8a5e81453fe76186daa8c017729e5813
+--- a/solutions-v2/09-iot-edge/distributed-cron.md
++++ b/solutions-v2/09-iot-edge/distributed-cron.md
+@@ -69,7 +69,7 @@
+ flowchart LR
+   A[API Clients] --> B[Schedule API]
+   B --> C[(Postgres: jobs, runs, run_queue)]
+-  D[Scheduler (advisory lock)] --> C
++  D["Scheduler (advisory lock)"] --> C
+   E[Workers] --> C
+ ```
+ 
+@@ -170,4 +170,4 @@
+ - Hard backpressure rule: pause catch-up when `run_queue` oldest age or row count exceeds a fixed threshold; resume automatically when it drops.
+ - Track and alert on: `scheduler_lag` (`now - jobs.next_fire_at`), `queue_lag` (oldest `run_queue.scheduled_at`), `lease_expiries` (rate of re-enqueues), and `runs` error rates.
+ - Retention: keep `runs` 30 days; keep `run_queue` small (only runnable/soon-runnable rows); vacuum/analyze tuned for high churn tables.
+-```
+\ No newline at end of file
++```
+
+exec
+/bin/zsh -lc "cat > .tmp_mermaid.mmd <<'EOF'
+flowchart LR
+  A[API Clients] --> B[Schedule API]
+  B --> C[(Postgres: jobs, runs, run_queue)]
+  D[\"Scheduler (advisory lock)\"] --> C
+  E[Workers] --> C
+EOF
+frontend/node_modules/.bin/mmdc -i .tmp_mermaid.mmd -o .tmp_mermaid.svg" in /Users/dominikdabrowski/pr/system-design-atlas exited 1 in 196ms:
+Generating single mermaid chart
+
+Error: Failed to launch the browser process!
+[1217/013317.303502:ERROR:thermal_state_observer_mac.mm(88)] ThermalStateObserverMac unable to register to power notifications. Result: 9
+[1217/013317.304341:ERROR:dns_config_service_posix.cc(142)] DNS config watch failed to start.
+[1217/013317.304673:WARNING:dns_config_service_posix.cc(201)] Failed to read DnsConfig.
+[1217/013317.305021:FATAL:sandbox_parameters_mac.mm(68)] Check failed: . : Input/output error (5)
+
+
+TROUBLESHOOTING: https://pptr.dev/troubleshooting
+
+    at Interface.onClose (file:///Users/dominikdabrowski/pr/system-design-atlas/frontend/node_modules/@puppeteer/browsers/lib/esm/launch.js:303:24)
+    at Interface.emit (node:events:536:35)
+    at Interface.close (node:internal/readline/interface:527:10)
+    at Socket.onend (node:internal/readline/interface:253:10)
+    at Socket.emit (node:events:536:35)
+    at endReadableNT (node:internal/streams/readable:1698:12)
+    at process.processTicksAndRejections (node:internal/process/task_queues:82:21)
+
+file update:
+diff --git a/solutions-v2/09-iot-edge/distributed-cron.md b/solutions-v2/09-iot-edge/distributed-cron.md
+index cd4866df8a35facf60db9bfe6c6b607a3046cd24..2411690f8a5e81453fe76186daa8c017729e5813
+--- a/solutions-v2/09-iot-edge/distributed-cron.md
++++ b/solutions-v2/09-iot-edge/distributed-cron.md
+@@ -69,7 +69,7 @@
+ flowchart LR
+   A[API Clients] --> B[Schedule API]
+   B --> C[(Postgres: jobs, runs, run_queue)]
+-  D[Scheduler (advisory lock)] --> C
++  D["Scheduler (advisory lock)"] --> C
+   E[Workers] --> C
+ ```
+ 
+@@ -170,4 +170,4 @@
+ - Hard backpressure rule: pause catch-up when `run_queue` oldest age or row count exceeds a fixed threshold; resume automatically when it drops.
+ - Track and alert on: `scheduler_lag` (`now - jobs.next_fire_at`), `queue_lag` (oldest `run_queue.scheduled_at`), `lease_expiries` (rate of re-enqueues), and `runs` error rates.
+ - Retention: keep `runs` 30 days; keep `run_queue` small (only runnable/soon-runnable rows); vacuum/analyze tuned for high churn tables.
+-```
+\ No newline at end of file
++```
+
+exec
+/bin/zsh -lc "node --input-type=module -e \"import mermaid from 'mermaid'; mermaid.initialize({startOnLoad:false}); await mermaid.parse('flowchart LR\\nA[API Clients]-->B[Schedule API]\\nB-->C[(Postgres: jobs, runs, run_queue)]\\nD[\\\"Scheduler (advisory lock)\\\"]-->C\\nE[Workers]-->C'); console.log('ok');\"" in /Users/dominikdabrowski/pr/system-design-atlas/frontend exited 1 in 208ms:
+file:///Users/dominikdabrowski/pr/system-design-atlas/frontend/node_modules/mermaid/dist/chunks/mermaid.core/chunk-ABZYJK2D.mjs:2629
+  DOMPurify.addHook("beforeSanitizeAttributes", (node) => {
+            ^
+
+TypeError: DOMPurify.addHook is not a function
+    at setupDompurifyHooks (file:///Users/dominikdabrowski/pr/system-design-atlas/frontend/node_modules/mermaid/dist/chunks/mermaid.core/chunk-ABZYJK2D.mjs:2629:13)
+    at file:///Users/dominikdabrowski/pr/system-design-atlas/frontend/node_modules/mermaid/dist/chunks/mermaid.core/chunk-ABZYJK2D.mjs:2622:7
+    at removeScript (file:///Users/dominikdabrowski/pr/system-design-atlas/frontend/node_modules/mermaid/dist/chunks/mermaid.core/chunk-ABZYJK2D.mjs:2646:3)
+    at sanitizeMore (file:///Users/dominikdabrowski/pr/system-design-atlas/frontend/node_modules/mermaid/dist/chunks/mermaid.core/chunk-ABZYJK2D.mjs:2654:14)
+    at Object.sanitizeText (file:///Users/dominikdabrowski/pr/system-design-atlas/frontend/node_modules/mermaid/dist/chunks/mermaid.core/chunk-ABZYJK2D.mjs:2671:31)
+    at FlowDB.sanitizeText (file:///Users/dominikdabrowski/pr/system-design-atlas/frontend/node_modules/mermaid/dist/chunks/mermaid.core/flowDiagram-NV44I4VS.mjs:101:27)
+    at FlowDB.addVertex (file:///Users/dominikdabrowski/pr/system-design-atlas/frontend/node_modules/mermaid/dist/chunks/mermaid.core/flowDiagram-NV44I4VS.mjs:162:18)
+    at Object.anonymous (file:///Users/dominikdabrowski/pr/system-design-atlas/frontend/node_modules/mermaid/dist/chunks/mermaid.core/flowDiagram-NV44I4VS.mjs:1181:14)
+    at Parser.parse (file:///Users/dominikdabrowski/pr/system-design-atlas/frontend/node_modules/mermaid/dist/chunks/mermaid.core/flowDiagram-NV44I4VS.mjs:1565:36)
+    at newParser.parse (file:///Users/dominikdabrowski/pr/system-design-atlas/frontend/node_modules/mermaid/dist/chunks/mermaid.core/flowDiagram-NV44I4VS.mjs:2321:23)
+
+Node.js v20.19.4
+
+
+thinking
+**Checking parsing issues**
+
+It looks like the error message indicates a problem during the mermaid parse stage. I need to address the quoting for node labels, especially with special characters. According to mermaid, I should be using backticks, like `A["Label (with parens)"]`, which seems correct. I believe I have that in my syntax for `D["Scheduler (advisory lock)"]`. There's still the issue with `C[(Postgres: jobs, runs, run_queue)]`, which could cause a parse error due to its parentheses. I think quoting C as `C[("Postgres: jobs, runs, run_queue")]` could help make it more robust.
+thinking
+**Exploring potential parse errors**
+
+I want to check if `C` with its colon could be causing a parse error, which isn't typical. The colon might be reserved for node titles, but in mermaid, the syntax is `A[ text ]`, so I think it shouldn't cause issues.
+
+After considering, the parse error seems linked to the definition of `C[(Postgres: jobs, runs, run_queue)]`, since the parentheses are directly after the bracket. The colon in the label, which isn’t treated specially in flowcharts, suggests it may not be a problem. However, since they recommend quoting labels with special characters, I'll fix `D` properly and ensure there are no other mermaid blocks in the file.
+file update:
+diff --git a/solutions-v2/09-iot-edge/distributed-cron.md b/solutions-v2/09-iot-edge/distributed-cron.md
+index cd4866df8a35facf60db9bfe6c6b607a3046cd24..2411690f8a5e81453fe76186daa8c017729e5813
+--- a/solutions-v2/09-iot-edge/distributed-cron.md
++++ b/solutions-v2/09-iot-edge/distributed-cron.md
+@@ -69,7 +69,7 @@
+ flowchart LR
+   A[API Clients] --> B[Schedule API]
+   B --> C[(Postgres: jobs, runs, run_queue)]
+-  D[Scheduler (advisory lock)] --> C
++  D["Scheduler (advisory lock)"] --> C
+   E[Workers] --> C
+ ```
+ 
+@@ -170,4 +170,4 @@
+ - Hard backpressure rule: pause catch-up when `run_queue` oldest age or row count exceeds a fixed threshold; resume automatically when it drops.
+ - Track and alert on: `scheduler_lag` (`now - jobs.next_fire_at`), `queue_lag` (oldest `run_queue.scheduled_at`), `lease_expiries` (rate of re-enqueues), and `runs` error rates.
+ - Retention: keep `runs` 30 days; keep `run_queue` small (only runnable/soon-runnable rows); vacuum/analyze tuned for high churn tables.
+-```
+\ No newline at end of file
++```
+
+exec
+/bin/zsh -lc 'rg -n "```mermaid" solutions-v2/09-iot-edge/distributed-cron.md' in /Users/dominikdabrowski/pr/system-design-atlas exited 1 in 45ms:
+zsh:1: unmatched "
+
+thinking
+**Addressing quoting issues**
+
+I think there’s a problem with how I’m using quotes in my command. The command requires triple backticks, but my zsh shell might interpret them differently. I also need to be cautious with including double quotes inside. I realized I had an unmatched quote from the backticks, which could lead to command substitution issues. To fix this, I’ll switch to single quotes to protect the string properly. Let's see if that works!
+file update:
+diff --git a/solutions-v2/09-iot-edge/distributed-cron.md b/solutions-v2/09-iot-edge/distributed-cron.md
+index cd4866df8a35facf60db9bfe6c6b607a3046cd24..2411690f8a5e81453fe76186daa8c017729e5813
+--- a/solutions-v2/09-iot-edge/distributed-cron.md
++++ b/solutions-v2/09-iot-edge/distributed-cron.md
+@@ -69,7 +69,7 @@
+ flowchart LR
+   A[API Clients] --> B[Schedule API]
+   B --> C[(Postgres: jobs, runs, run_queue)]
+-  D[Scheduler (advisory lock)] --> C
++  D["Scheduler (advisory lock)"] --> C
+   E[Workers] --> C
+ ```
+ 
+@@ -170,4 +170,4 @@
+ - Hard backpressure rule: pause catch-up when `run_queue` oldest age or row count exceeds a fixed threshold; resume automatically when it drops.
+ - Track and alert on: `scheduler_lag` (`now - jobs.next_fire_at`), `queue_lag` (oldest `run_queue.scheduled_at`), `lease_expiries` (rate of re-enqueues), and `runs` error rates.
+ - Retention: keep `runs` 30 days; keep `run_queue` small (only runnable/soon-runnable rows); vacuum/analyze tuned for high churn tables.
+-```
+\ No newline at end of file
++```
+
+exec
+/bin/zsh -lc "rg -n '"'```mermaid'"' solutions-v2/09-iot-edge/distributed-cron.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 45ms:
+68:```mermaid
+
+thinking
+**Checking site generation**
+
+I’m exploring how site generation works, particularly focusing on parsing front matter. I think if the first line is marked with ```markdown, front matter won't work, so it seems necessary to remove those outer fences. Now, I'm curious whether `solutions-v2` is actually being used for the site, especially since it appears that the `frontend` has pages related to it. I’ll look into the usage of “solutions-v2” to get clarity.
+file update:
+diff --git a/solutions-v2/09-iot-edge/distributed-cron.md b/solutions-v2/09-iot-edge/distributed-cron.md
+index cd4866df8a35facf60db9bfe6c6b607a3046cd24..2411690f8a5e81453fe76186daa8c017729e5813
+--- a/solutions-v2/09-iot-edge/distributed-cron.md
++++ b/solutions-v2/09-iot-edge/distributed-cron.md
+@@ -69,7 +69,7 @@
+ flowchart LR
+   A[API Clients] --> B[Schedule API]
+   B --> C[(Postgres: jobs, runs, run_queue)]
+-  D[Scheduler (advisory lock)] --> C
++  D["Scheduler (advisory lock)"] --> C
+   E[Workers] --> C
+ ```
+ 
+@@ -170,4 +170,4 @@
+ - Hard backpressure rule: pause catch-up when `run_queue` oldest age or row count exceeds a fixed threshold; resume automatically when it drops.
+ - Track and alert on: `scheduler_lag` (`now - jobs.next_fire_at`), `queue_lag` (oldest `run_queue.scheduled_at`), `lease_expiries` (rate of re-enqueues), and `runs` error rates.
+ - Retention: keep `runs` 30 days; keep `run_queue` small (only runnable/soon-runnable rows); vacuum/analyze tuned for high churn tables.
+-```
+\ No newline at end of file
++```
+
+exec
+/bin/zsh -lc 'rg -n "solutions-v2" -S frontend scripts .' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 81ms:
+scripts/generate-solution-v2.sh:30:SOLUTION_DIR="$PROJECT_DIR/solutions-v2/$CATEGORY_DIR"
+scripts/run-all-v2-parallel.sh:19:mkdir -p drafts-v2 challenges solutions-v2 logs/v2
+./scripts/generate-solution-v2.sh:30:SOLUTION_DIR="$PROJECT_DIR/solutions-v2/$CATEGORY_DIR"
+./scripts/run-all-v2-parallel.sh:19:mkdir -p drafts-v2 challenges solutions-v2 logs/v2
+./logs/v2/distributed-cron.log:1659:[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/09-iot-edge/distributed-cron.md
+./logs/v2/distributed-cron.log:1917:./solutions-v2/09-iot-edge/distributed-cron.md:3:title: "Distributed Cron"
+./logs/v2/distributed-cron.log:1923:I’m considering multiple versions of the document and whether to update the relevant solution doc. The snippet seems to match a specific error. I need to identify which file to fix, as they requested a complete, corrected document. I could just print the updated markdown without modifying the file, but since they want the errors fixed, it seems I'll need to work on the file used. I might check the "Architecture" section and mermaid sections, possibly in the solutions-v2 path. Let's explore those files!
+./logs/v2/distributed-cron.log:1969:/bin/zsh -lc "rg -n \"## Architecture\\n\\n"'```mermaid" -n solutions/09-iot-edge/distributed-cron.md reviewed/distributed-cron.md solutions-v2/09-iot-edge/distributed-cron.md drafts/distributed-cron.md drafts-v2/distributed-cron.md 2>/dev/null || true' in /Users/dominikdabrowski/pr/system-design-atlas exited 1 in 43ms:
+./logs/v2/distributed-cron.log:1972:/bin/zsh -lc "sed -n '1,140p' solutions-v2/09-iot-edge/distributed-cron.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 47ms:
+./logs/v2/distributed-cron.log:1994:/bin/zsh -lc "sed -n '1,30p' solutions-v2/09-iot-edge/distributed-cron.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 46ms:
+./logs/v2/distributed-cron.log:2019:I’m noticing that the solutions-v2 file has a code fence around the content, which might be causing issues for site generation. The user specifically asked to fix mermaid syntax errors, not to remove the code fence. The error likely happens when generating a chart from the mermaid block in the snippet. I’ll need to check which file(s) contain that diagram and look for "flowchart LR" to find the problematic line with the advisory lock.
+./logs/v2/distributed-cron.log:2032:./solutions-v2/09-iot-edge/distributed-cron.md:72:  D[Scheduler (advisory lock)] --> C
+./logs/v2/distributed-cron.log:2060:drwxr-xr-x@  12 dominikdabrowski  staff    384 Dec 17 01:19 solutions-v2
+./logs/v2/distributed-cron.log:2071:I see there are no agents in this repo, which is good. I want to patch the diagram in `solutions-v2/09-iot-edge/distributed-cron.md` and possibly fix the parse error. The user seems to want the complete fixed document, so I need to consider if they prefer it without the outer code fence. I shouldn't just remove it if the document includes it. I should check the last lines of the file to clarify this.
+./logs/v2/distributed-cron.log:2073:/bin/zsh -lc 'tail -n 5 solutions-v2/09-iot-edge/distributed-cron.md' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 77ms:
+./logs/v2/distributed-cron.log:2088:M /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/09-iot-edge/distributed-cron.md
+./logs/v2/distributed-cron.log:2101:M solutions-v2/09-iot-edge/distributed-cron.md
+./logs/v2/distributed-cron.log:2103:diff --git a/solutions-v2/09-iot-edge/distributed-cron.md b/solutions-v2/09-iot-edge/distributed-cron.md
+./logs/v2/distributed-cron.log:2105:--- a/solutions-v2/09-iot-edge/distributed-cron.md
+./logs/v2/distributed-cron.log:2106:+++ b/solutions-v2/09-iot-edge/distributed-cron.md
+
+
+
+
+
+thinking
+**Considering document output**
+
+I need to make sure the final document is output correctly without wrapping it in code blocks. My answer should include the raw document, matching the user's request. However, there's a concern since our local file still has code fences. If the user reruns the script, it's crucial we provide the document without fences. They've also asked specifically about fixing mermaid syntax errors, so I wonder if I should also patch the file to remove them.
+thinking
+**Evaluating document formatting**
+
+In the prompt, the document is shown within a code block, but I can't tell if it has a wrapper. One option is to fix the file by removing the outer markdown code fences to create a proper markdown document. This could help, but I'm not sure if it would conflict with the instruction to "fix these Mermaid syntax errors." They didn't explicitly ask for this change, so I think it’s best not to modify it beyond what’s necessary. However, I need to deliver the complete fixed document as they provided, ensuring any parse errors are addressed.
+thinking
+**Considering diagram labels**
+
+I noticed that the diagram uses `C[(Postgres: jobs, runs, run_queue)]`, which contains commas and underscores. Some versions of Mermaid may have trouble with underscores in labels, specifically if they aren't quoted. Since `run_queue` includes an underscore, this might cause parse errors, but perhaps that's unlikely. To ensure it's safe, I should quote the entire label as `C[("Postgres: jobs, runs, run_queue")]`. This way, I can avoid potential issues. However, the current parse error might be due to parentheses in another label. To make it bulletproof, I'll consider using a shorter label like `C[(Postgres)]` and add a separate note.
+thinking
+**Simplifying diagram labels**
+
+I want to keep the diagram simple since the user requested short labels with 2-4 words max. Currently, the label for C is long, so I could shorten it to `C[(Postgres)]` to avoid complications. The document's text already covers jobs, runs, and run_queue, which maintains clarity without overwhelming detail. While the user didn't explicitly ask for this change, the "Common fixes" guideline suggests using short labels. Adjusting C this way would likely reduce parse issues, though I need to be mindful of how it might alter semantics. Given the parser is failing, it could be due to the current label, but I'm puzzled by the error pointing to line 4.
+thinking
+**Analyzing parse errors**
+
+Okay, the error is indicated at line 4, where the flowchart has connections like A->B, B->C, and D->C. While the parse error might be linked to earlier tokens, it typically reports where it fails to recover. It could be that the label `C[(Postgres: jobs, runs, run_queue)]` has an underscore within `run_queue`, which might confuse the parser. To be safe, I should quote the C label as `C[("Postgres: jobs, runs, run_queue")]`. 
+
+Also, I think it's good to quote both C and D labels since the script suggests quoting labels with special characters. Quoting C using parentheses as `C[("Postgres: jobs, runs, run_queue")]` should work fine. This way, the node will still appear as a cylinder shape. Given that making this adjustment minimally changes the semantics but increases safety, it seems wise to patch the file accordingly!
+file update:
+diff --git a/solutions-v2/09-iot-edge/distributed-cron.md b/solutions-v2/09-iot-edge/distributed-cron.md
+index cd4866df8a35facf60db9bfe6c6b607a3046cd24..2411690f8a5e81453fe76186daa8c017729e5813
+--- a/solutions-v2/09-iot-edge/distributed-cron.md
++++ b/solutions-v2/09-iot-edge/distributed-cron.md
+@@ -69,7 +69,7 @@
+ flowchart LR
+   A[API Clients] --> B[Schedule API]
+   B --> C[(Postgres: jobs, runs, run_queue)]
+-  D[Scheduler (advisory lock)] --> C
++  D["Scheduler (advisory lock)"] --> C
+   E[Workers] --> C
+ ```
+ 
+@@ -170,4 +170,4 @@
+ - Hard backpressure rule: pause catch-up when `run_queue` oldest age or row count exceeds a fixed threshold; resume automatically when it drops.
+ - Track and alert on: `scheduler_lag` (`now - jobs.next_fire_at`), `queue_lag` (oldest `run_queue.scheduled_at`), `lease_expiries` (rate of re-enqueues), and `runs` error rates.
+ - Retention: keep `runs` 30 days; keep `run_queue` small (only runnable/soon-runnable rows); vacuum/analyze tuned for high churn tables.
+-```
+\ No newline at end of file
++```
+
+file update
+M /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/09-iot-edge/distributed-cron.md
+@@ -70,3 +70,3 @@
+   A[API Clients] --> B[Schedule API]
+-  B --> C[(Postgres: jobs, runs, run_queue)]
++  B --> C[("Postgres: jobs, runs, run_queue")]
+   D["Scheduler (advisory lock)"] --> C
+apply_patch(auto_approved=true) exited 0 in 20ms:
+Success. Updated the following files:
+M solutions-v2/09-iot-edge/distributed-cron.md
+file update:
+diff --git a/solutions-v2/09-iot-edge/distributed-cron.md b/solutions-v2/09-iot-edge/distributed-cron.md
+index cd4866df8a35facf60db9bfe6c6b607a3046cd24..e48d331c0c5726a2ea0011b7e530a8b7a8babb32
+--- a/solutions-v2/09-iot-edge/distributed-cron.md
++++ b/solutions-v2/09-iot-edge/distributed-cron.md
+@@ -68,8 +68,8 @@
+ ```mermaid
+ flowchart LR
+   A[API Clients] --> B[Schedule API]
+-  B --> C[(Postgres: jobs, runs, run_queue)]
+-  D[Scheduler (advisory lock)] --> C
++  B --> C[("Postgres: jobs, runs, run_queue")]
++  D["Scheduler (advisory lock)"] --> C
+   E[Workers] --> C
+ ```
+ 
+@@ -170,4 +170,4 @@
+ - Hard backpressure rule: pause catch-up when `run_queue` oldest age or row count exceeds a fixed threshold; resume automatically when it drops.
+ - Track and alert on: `scheduler_lag` (`now - jobs.next_fire_at`), `queue_lag` (oldest `run_queue.scheduled_at`), `lease_expiries` (rate of re-enqueues), and `runs` error rates.
+ - Retention: keep `runs` 30 days; keep `run_queue` small (only runnable/soon-runnable rows); vacuum/analyze tuned for high churn tables.
+-```
+\ No newline at end of file
++```
+
+
+thinking
+**Considering file management**
+
+I’m looking at the diagram that includes C[("...")], ensuring it quotes properly and has a cylinder shape, but I think it might be better to shorten the label. Now I need to update the output doc based on that. We also have temporary files like `.tmp_mermaid.mmd`, and it's best to delete them since leaving stray files is not ideal. Even though the user didn’t ask me to do this, I think it’s safe and prudent to remove those temp files I created. Let's check before proceeding.
+file update:
+diff --git a/solutions-v2/09-iot-edge/distributed-cron.md b/solutions-v2/09-iot-edge/distributed-cron.md
+index cd4866df8a35facf60db9bfe6c6b607a3046cd24..e48d331c0c5726a2ea0011b7e530a8b7a8babb32
+--- a/solutions-v2/09-iot-edge/distributed-cron.md
++++ b/solutions-v2/09-iot-edge/distributed-cron.md
+@@ -68,8 +68,8 @@
+ ```mermaid
+ flowchart LR
+   A[API Clients] --> B[Schedule API]
+-  B --> C[(Postgres: jobs, runs, run_queue)]
+-  D[Scheduler (advisory lock)] --> C
++  B --> C[("Postgres: jobs, runs, run_queue")]
++  D["Scheduler (advisory lock)"] --> C
+   E[Workers] --> C
+ ```
+ 
+@@ -170,4 +170,4 @@
+ - Hard backpressure rule: pause catch-up when `run_queue` oldest age or row count exceeds a fixed threshold; resume automatically when it drops.
+ - Track and alert on: `scheduler_lag` (`now - jobs.next_fire_at`), `queue_lag` (oldest `run_queue.scheduled_at`), `lease_expiries` (rate of re-enqueues), and `runs` error rates.
+ - Retention: keep `runs` 30 days; keep `run_queue` small (only runnable/soon-runnable rows); vacuum/analyze tuned for high churn tables.
+-```
+\ No newline at end of file
++```
+
+exec
+/bin/zsh -lc 'ls -la .tmp_mermaid.mmd .tmp_mermaid.svg 2>/dev/null || true' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 55ms:
+-rw-r--r--@ 1 dominikdabrowski  staff  153 Dec 17 01:33 .tmp_mermaid.mmd
+
+thinking
+**Managing temporary files**
+
+I need to delete the .tmp_mermaid.mmd file, and I'll use the shell command `rm` for that. Even though it's a destructive action, it’s just for a temporary file, so it should be okay. I’m considering if `rm` is allowed in the sandbox environment. It seems it's permitted since it’s within the workspace, and I think it's safe to proceed. Let’s move forward with this cleanup!
+file update:
+diff --git a/solutions-v2/09-iot-edge/distributed-cron.md b/solutions-v2/09-iot-edge/distributed-cron.md
+index cd4866df8a35facf60db9bfe6c6b607a3046cd24..e48d331c0c5726a2ea0011b7e530a8b7a8babb32
+--- a/solutions-v2/09-iot-edge/distributed-cron.md
++++ b/solutions-v2/09-iot-edge/distributed-cron.md
+@@ -68,8 +68,8 @@
+ ```mermaid
+ flowchart LR
+   A[API Clients] --> B[Schedule API]
+-  B --> C[(Postgres: jobs, runs, run_queue)]
+-  D[Scheduler (advisory lock)] --> C
++  B --> C[("Postgres: jobs, runs, run_queue")]
++  D["Scheduler (advisory lock)"] --> C
+   E[Workers] --> C
+ ```
+ 
+@@ -170,4 +170,4 @@
+ - Hard backpressure rule: pause catch-up when `run_queue` oldest age or row count exceeds a fixed threshold; resume automatically when it drops.
+ - Track and alert on: `scheduler_lag` (`now - jobs.next_fire_at`), `queue_lag` (oldest `run_queue.scheduled_at`), `lease_expiries` (rate of re-enqueues), and `runs` error rates.
+ - Retention: keep `runs` 30 days; keep `run_queue` small (only runnable/soon-runnable rows); vacuum/analyze tuned for high churn tables.
+-```
+\ No newline at end of file
++```
+
+exec
+/bin/zsh -lc 'rm -f .tmp_mermaid.mmd' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 56ms:
+
+codex
+---
+title: "Distributed Cron"
+category: "IoT & Edge"
+difficulty: "Hard"
+tags: ["scheduler", "leader-election", "idempotency", "leases", "postgres", "queues"]
+---
+
+## Overview
+
+Distributed Cron is a periodic task runner where scheduling decisions are durable and execution is decoupled. Each intended execution is a persisted object identified by `(job_id, scheduled_at)`. Once that row exists, any worker can execute it; scheduler crashes and leader swaps do not change what should run.
+
+The scheduler is replaceable because correctness comes from Postgres uniqueness and DB time, not from an in-memory tick.
+
+## What Makes This Hard
+
+Time is adversarial: clock skew, pauses, partitions, and failover land on cron boundaries. Without a durable, unique identity for each “fire,” you can’t both recover missed runs and avoid duplicates.
+
+The second difficulty is crash gaps between “decided” and “dispatched.” If those are not made atomic, you create runs that never execute or executions with no durable record.
+
+## Requirements
+
+### Functional Requirements
+- Support cron-like schedules (minute granularity).
+- Guarantee no missed scheduled executions across scheduler crashes.
+- At-least-once execution with deterministic idempotency key `(job_id, scheduled_at)`.
+- Backlog/catch-up policy per job: `skip`, `catch_up`, `catch_up_capped(N)`.
+- Multi-tenant fairness so one tenant can’t monopolize catch-up.
+
+### Scale Targets
+- 100k active schedules.
+- Peak 50k fires/minute at aligned boundaries.
+- P99 schedule-to-ready latency < 2s in steady state.
+- 30 days of run history retained.
+
+## Key Design Decisions
+
+- **Postgres is the only source of truth (and the queue)**
+  - `runs` is the durable ledger of intended executions; uniqueness on `(job_id, scheduled_at)` makes duplicates harmless.
+  - `run_queue` is a Postgres-backed queue table; workers claim work with `SKIP LOCKED`.
+
+- **Single active scheduler via Postgres advisory lock**
+  - Scheduler leadership uses `pg_try_advisory_lock(...)`.
+  - If Postgres is unhealthy, the system fails closed (no minting), which matches the correctness dependency.
+
+- **Atomic “mint + enqueue”**
+  - A run and its queue entry are written in the same transaction.
+  - This removes the “inserted but never enqueued / enqueued without record” split-brain.
+
+- **Explicit backpressure and prioritization**
+  - Scheduler pauses catch-up (or all minting) when `run_queue` lag/size crosses a hard threshold.
+  - Fresh ticks are prioritized ahead of catch-up so recovery doesn’t bury steady-state latency.
+
+- **Simple, explicit concurrency model**
+  - Scheduler work is batched and uses `FOR UPDATE SKIP LOCKED` on `jobs` to avoid head-of-line blocking.
+  - Workers claim queue rows with `FOR UPDATE SKIP LOCKED` and lease runs for crash recovery.
+
+- **Invariant for `jobs.next_fire_at`**
+  - `next_fire_at` advances in the same transaction as minting runs/queue rows for that job, so “lag” is meaningful and rescans don’t thrash.
+
+- **What We Removed**
+  - etcd/Consul leader election (replaced by Postgres advisory lock).
+  - External execution queue (Kafka/SQS/RabbitMQ) (replaced by `run_queue` in Postgres).
+  - Separate outbox publisher service (merged into the scheduler; workers consume directly from DB queue).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[API Clients] --> B[Schedule API]
+  B --> C[("Postgres: jobs, runs, run_queue")]
+  D["Scheduler (advisory lock)"] --> C
+  E[Workers] --> C
+```
+
+## Components
+
+- **Schedule API**
+  - Stores durable intent: cron, timezone, payload, catch-up policy, tenant id, concurrency limits.
+  - Validates cron/timezone on write; rejects invalid schedules.
+
+- **Postgres**
+  - `jobs` holds schedule definitions and the cursor `next_fire_at`.
+  - `runs` is the immutable ledger of intended executions keyed by `(job_id, scheduled_at)`.
+  - `run_queue` is the queue of runnable executions (fresh and catch-up), claimed with `SKIP LOCKED`.
+  - Justification: atomic transactions + uniqueness are the core correctness mechanism.
+
+- **Scheduler**
+  - Single process (one active leader) with two responsibilities:
+    1. Mint due run rows + queue rows (bounded by policy).
+    2. Re-enqueue expired leases for crashed workers (bounded sweep).
+  - Justification: converts time into durable run identities; keeps queue populated safely.
+
+- **Workers**
+  - Claim from `run_queue`, lease the run, execute, and record outcome in `runs`.
+  - Justification: provides parallel execution while keeping at-least-once delivery safe via run identity.
+
+## Deep Dive: Leader Crash Without Missing a Tick
+
+**Data model (essential fields):**
+- `jobs(id, cron, timezone, tenant_id, next_fire_at, catchup_policy, max_inflight, paused, updated_at, ...)`
+- `runs(job_id, scheduled_at, status, attempt, leased_until, worker_id, started_at, finished_at, last_error, ...)`
+- `run_queue(job_id, scheduled_at, priority, available_at, enqueued_at, ...)`
+- Unique index: `UNIQUE(job_id, scheduled_at)` on `runs` and on `run_queue`
+
+**Scheduler loop (crash-safe minting):**
+1. Read DB time: `now_min = date_trunc('minute', now())`.
+2. Lock a batch of due jobs: `... WHERE next_fire_at <= now_min ... FOR UPDATE SKIP LOCKED LIMIT K`.
+3. For each job, compute fire times from `next_fire_at` to `now_min` using `catchup_policy` caps.
+4. In one transaction per job:
+   - Insert `runs` rows with `ON CONFLICT DO NOTHING`.
+   - Insert matching `run_queue` rows with `ON CONFLICT DO NOTHING` and a priority (fresh > catch-up).
+   - Advance `jobs.next_fire_at` to the next scheduled time after the last considered tick.
+
+**Worker claim/execute (idempotent, at-least-once):**
+1. Claim queue rows with `FOR UPDATE SKIP LOCKED` ordered by `(priority desc, scheduled_at asc)`.
+2. In the same transaction:
+   - Transition the run to `running` only if it’s not already complete and set `leased_until = now() + lease`.
+   - Delete claimed `run_queue` rows.
+3. Execute side effects using `(job_id, scheduled_at)` as the idempotency key.
+4. Mark `runs` `succeeded`/`failed` and, on retryable failure, reinsert into `run_queue` with backoff (`available_at`).
+
+**Why crashes don’t miss ticks:**
+- If the scheduler dies before minting: the next leader computes the same fire times and inserts them.
+- If it dies mid-mint: uniqueness on `(job_id, scheduled_at)` collapses duplicates.
+- If a worker dies mid-run: the scheduler sweep re-enqueues runs whose `leased_until < now()`.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Minimal infra (Postgres-only) | Postgres carries queue load and needs careful indexing/retention |
+| No missed executions on scheduler crash | True exactly-once side effects still require idempotency |
+| Deterministic catch-up with caps | Catch-up can be delayed by backpressure to protect steady-state |
+
+## Failure Modes
+
+- **Database down (or scheduler can’t reach DB)**
+  - Minting stops; nothing can be done safely.
+  - On recovery, scheduler mints deterministically with catch-up caps and fresh-first priority.
+
+- **Slow database (3–10s transactions)**
+  - Scheduler uses bounded batches and `SKIP LOCKED` to avoid global stalls.
+  - Backpressure pauses catch-up when queue lag grows to prevent runaway writes.
+
+- **Scheduler crash or leader swap during boundary spikes**
+  - Some runs/queue rows may be written, some not; uniqueness + deterministic recompute converges.
+  - Advisory lock ensures one active minter; correctness still holds if a second instance briefly runs.
+
+- **Worker crash mid-run**
+  - Run stays `running` until lease expiry; scheduler sweep re-enqueues it.
+  - Attempts increment and outcomes are recorded for audit/debugging.
+
+- **Bad config / buggy cron parser**
+  - Cron/timezone validation on write prevents invalid schedules from entering the system.
+  - Scheduler supports a “pause minting” switch (e.g., `jobs.paused` by tenant or global) so publishing/execution can drain without creating new runs.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Partition `runs` by day and prune aggressively; keep hot indexes small.
+  - Tighten per-tenant caps during catch-up to preserve fairness.
+
+- **100x scale:**
+  - Shard scheduling and execution by `tenant_id` (independent advisory locks and tablespaces/DBs) to avoid a single Postgres bottleneck.
+
+## Operational Notes
+
+- Use DB time for all scheduling decisions; store `scheduled_at` in UTC.
+- Hard backpressure rule: pause catch-up when `run_queue` oldest age or row count exceeds a fixed threshold; resume automatically when it drops.
+- Track and alert on: `scheduler_lag` (`now - jobs.next_fire_at`), `queue_lag` (oldest `run_queue.scheduled_at`), `lease_expiries` (rate of re-enqueues), and `runs` error rates.
+- Retention: keep `runs` 30 days; keep `run_queue` small (only runnable/soon-runnable rows); vacuum/analyze tuned for high churn tables.
+file update:
+diff --git a/solutions-v2/09-iot-edge/distributed-cron.md b/solutions-v2/09-iot-edge/distributed-cron.md
+index cd4866df8a35facf60db9bfe6c6b607a3046cd24..e48d331c0c5726a2ea0011b7e530a8b7a8babb32
+--- a/solutions-v2/09-iot-edge/distributed-cron.md
++++ b/solutions-v2/09-iot-edge/distributed-cron.md
+@@ -68,8 +68,8 @@
+ ```mermaid
+ flowchart LR
+   A[API Clients] --> B[Schedule API]
+-  B --> C[(Postgres: jobs, runs, run_queue)]
+-  D[Scheduler (advisory lock)] --> C
++  B --> C[("Postgres: jobs, runs, run_queue")]
++  D["Scheduler (advisory lock)"] --> C
+   E[Workers] --> C
+ ```
+ 
+@@ -170,4 +170,4 @@
+ - Hard backpressure rule: pause catch-up when `run_queue` oldest age or row count exceeds a fixed threshold; resume automatically when it drops.
+ - Track and alert on: `scheduler_lag` (`now - jobs.next_fire_at`), `queue_lag` (oldest `run_queue.scheduled_at`), `lease_expiries` (rate of re-enqueues), and `runs` error rates.
+ - Retention: keep `runs` 30 days; keep `run_queue` small (only runnable/soon-runnable rows); vacuum/analyze tuned for high churn tables.
+-```
+\ No newline at end of file
++```
+
+tokens used
+39,125
+---
+title: "Distributed Cron"
+category: "IoT & Edge"
+difficulty: "Hard"
+tags: ["scheduler", "leader-election", "idempotency", "leases", "postgres", "queues"]
+---
+
+## Overview
+
+Distributed Cron is a periodic task runner where scheduling decisions are durable and execution is decoupled. Each intended execution is a persisted object identified by `(job_id, scheduled_at)`. Once that row exists, any worker can execute it; scheduler crashes and leader swaps do not change what should run.
+
+The scheduler is replaceable because correctness comes from Postgres uniqueness and DB time, not from an in-memory tick.
+
+## What Makes This Hard
+
+Time is adversarial: clock skew, pauses, partitions, and failover land on cron boundaries. Without a durable, unique identity for each “fire,” you can’t both recover missed runs and avoid duplicates.
+
+The second difficulty is crash gaps between “decided” and “dispatched.” If those are not made atomic, you create runs that never execute or executions with no durable record.
+
+## Requirements
+
+### Functional Requirements
+- Support cron-like schedules (minute granularity).
+- Guarantee no missed scheduled executions across scheduler crashes.
+- At-least-once execution with deterministic idempotency key `(job_id, scheduled_at)`.
+- Backlog/catch-up policy per job: `skip`, `catch_up`, `catch_up_capped(N)`.
+- Multi-tenant fairness so one tenant can’t monopolize catch-up.
+
+### Scale Targets
+- 100k active schedules.
+- Peak 50k fires/minute at aligned boundaries.
+- P99 schedule-to-ready latency < 2s in steady state.
+- 30 days of run history retained.
+
+## Key Design Decisions
+
+- **Postgres is the only source of truth (and the queue)**
+  - `runs` is the durable ledger of intended executions; uniqueness on `(job_id, scheduled_at)` makes duplicates harmless.
+  - `run_queue` is a Postgres-backed queue table; workers claim work with `SKIP LOCKED`.
+
+- **Single active scheduler via Postgres advisory lock**
+  - Scheduler leadership uses `pg_try_advisory_lock(...)`.
+  - If Postgres is unhealthy, the system fails closed (no minting), which matches the correctness dependency.
+
+- **Atomic “mint + enqueue”**
+  - A run and its queue entry are written in the same transaction.
+  - This removes the “inserted but never enqueued / enqueued without record” split-brain.
+
+- **Explicit backpressure and prioritization**
+  - Scheduler pauses catch-up (or all minting) when `run_queue` lag/size crosses a hard threshold.
+  - Fresh ticks are prioritized ahead of catch-up so recovery doesn’t bury steady-state latency.
+
+- **Simple, explicit concurrency model**
+  - Scheduler work is batched and uses `FOR UPDATE SKIP LOCKED` on `jobs` to avoid head-of-line blocking.
+  - Workers claim queue rows with `FOR UPDATE SKIP LOCKED` and lease runs for crash recovery.
+
+- **Invariant for `jobs.next_fire_at`**
+  - `next_fire_at` advances in the same transaction as minting runs/queue rows for that job, so “lag” is meaningful and rescans don’t thrash.
+
+- **What We Removed**
+  - etcd/Consul leader election (replaced by Postgres advisory lock).
+  - External execution queue (Kafka/SQS/RabbitMQ) (replaced by `run_queue` in Postgres).
+  - Separate outbox publisher service (merged into the scheduler; workers consume directly from DB queue).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[API Clients] --> B[Schedule API]
+  B --> C[("Postgres: jobs, runs, run_queue")]
+  D["Scheduler (advisory lock)"] --> C
+  E[Workers] --> C
+```
+
+## Components
+
+- **Schedule API**
+  - Stores durable intent: cron, timezone, payload, catch-up policy, tenant id, concurrency limits.
+  - Validates cron/timezone on write; rejects invalid schedules.
+
+- **Postgres**
+  - `jobs` holds schedule definitions and the cursor `next_fire_at`.
+  - `runs` is the immutable ledger of intended executions keyed by `(job_id, scheduled_at)`.
+  - `run_queue` is the queue of runnable executions (fresh and catch-up), claimed with `SKIP LOCKED`.
+  - Justification: atomic transactions + uniqueness are the core correctness mechanism.
+
+- **Scheduler**
+  - Single process (one active leader) with two responsibilities:
+    1. Mint due run rows + queue rows (bounded by policy).
+    2. Re-enqueue expired leases for crashed workers (bounded sweep).
+  - Justification: converts time into durable run identities; keeps queue populated safely.
+
+- **Workers**
+  - Claim from `run_queue`, lease the run, execute, and record outcome in `runs`.
+  - Justification: provides parallel execution while keeping at-least-once delivery safe via run identity.
+
+## Deep Dive: Leader Crash Without Missing a Tick
+
+**Data model (essential fields):**
+- `jobs(id, cron, timezone, tenant_id, next_fire_at, catchup_policy, max_inflight, paused, updated_at, ...)`
+- `runs(job_id, scheduled_at, status, attempt, leased_until, worker_id, started_at, finished_at, last_error, ...)`
+- `run_queue(job_id, scheduled_at, priority, available_at, enqueued_at, ...)`
+- Unique index: `UNIQUE(job_id, scheduled_at)` on `runs` and on `run_queue`
+
+**Scheduler loop (crash-safe minting):**
+1. Read DB time: `now_min = date_trunc('minute', now())`.
+2. Lock a batch of due jobs: `... WHERE next_fire_at <= now_min ... FOR UPDATE SKIP LOCKED LIMIT K`.
+3. For each job, compute fire times from `next_fire_at` to `now_min` using `catchup_policy` caps.
+4. In one transaction per job:
+   - Insert `runs` rows with `ON CONFLICT DO NOTHING`.
+   - Insert matching `run_queue` rows with `ON CONFLICT DO NOTHING` and a priority (fresh > catch-up).
+   - Advance `jobs.next_fire_at` to the next scheduled time after the last considered tick.
+
+**Worker claim/execute (idempotent, at-least-once):**
+1. Claim queue rows with `FOR UPDATE SKIP LOCKED` ordered by `(priority desc, scheduled_at asc)`.
+2. In the same transaction:
+   - Transition the run to `running` only if it’s not already complete and set `leased_until = now() + lease`.
+   - Delete claimed `run_queue` rows.
+3. Execute side effects using `(job_id, scheduled_at)` as the idempotency key.
+4. Mark `runs` `succeeded`/`failed` and, on retryable failure, reinsert into `run_queue` with backoff (`available_at`).
+
+**Why crashes don’t miss ticks:**
+- If the scheduler dies before minting: the next leader computes the same fire times and inserts them.
+- If it dies mid-mint: uniqueness on `(job_id, scheduled_at)` collapses duplicates.
+- If a worker dies mid-run: the scheduler sweep re-enqueues runs whose `leased_until < now()`.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Minimal infra (Postgres-only) | Postgres carries queue load and needs careful indexing/retention |
+| No missed executions on scheduler crash | True exactly-once side effects still require idempotency |
+| Deterministic catch-up with caps | Catch-up can be delayed by backpressure to protect steady-state |
+
+## Failure Modes
+
+- **Database down (or scheduler can’t reach DB)**
+  - Minting stops; nothing can be done safely.
+  - On recovery, scheduler mints deterministically with catch-up caps and fresh-first priority.
+
+- **Slow database (3–10s transactions)**
+  - Scheduler uses bounded batches and `SKIP LOCKED` to avoid global stalls.
+  - Backpressure pauses catch-up when queue lag grows to prevent runaway writes.
+
+- **Scheduler crash or leader swap during boundary spikes**
+  - Some runs/queue rows may be written, some not; uniqueness + deterministic recompute converges.
+  - Advisory lock ensures one active minter; correctness still holds if a second instance briefly runs.
+
+- **Worker crash mid-run**
+  - Run stays `running` until lease expiry; scheduler sweep re-enqueues it.
+  - Attempts increment and outcomes are recorded for audit/debugging.
+
+- **Bad config / buggy cron parser**
+  - Cron/timezone validation on write prevents invalid schedules from entering the system.
+  - Scheduler supports a “pause minting” switch (e.g., `jobs.paused` by tenant or global) so publishing/execution can drain without creating new runs.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Partition `runs` by day and prune aggressively; keep hot indexes small.
+  - Tighten per-tenant caps during catch-up to preserve fairness.
+
+- **100x scale:**
+  - Shard scheduling and execution by `tenant_id` (independent advisory locks and tablespaces/DBs) to avoid a single Postgres bottleneck.
+
+## Operational Notes
+
+- Use DB time for all scheduling decisions; store `scheduled_at` in UTC.
+- Hard backpressure rule: pause catch-up when `run_queue` oldest age or row count exceeds a fixed threshold; resume automatically when it drops.
+- Track and alert on: `scheduler_lag` (`now - jobs.next_fire_at`), `queue_lag` (oldest `run_queue.scheduled_at`), `lease_expiries` (rate of re-enqueues), and `runs` error rates.
+- Retention: keep `runs` 30 days; keep `run_queue` small (only runnable/soon-runnable rows); vacuum/analyze tuned for high churn tables.
+[Pass 4/4] Mermaid diagrams fixed
+
+==========================================
+Completed (v2): Distributed Cron
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/distributed-cron.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/distributed-cron.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/09-iot-edge/distributed-cron.md

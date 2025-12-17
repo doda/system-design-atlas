@@ -1,0 +1,428 @@
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2a95-ac32-7592-ae36-c29daf90bcc6
+--------
+user
+You are a senior systems architect reviewing a system design document.
+
+Grade this solution on three dimensions (1-10 scale):
+
+1. **Strength** (1-10): How technically sound, complete, and production-ready is the design?
+   - Does it address scalability, reliability, and failure modes?
+   - Are the trade-offs well-reasoned?
+   - Would this actually work at scale?
+
+2. **Interestingness** (1-10): How engaging and educational is the content?
+   - Does it teach useful concepts?
+   - Are there insights that aren't obvious?
+   - Would an engineer learn something valuable?
+
+3. **Novelty** (1-10): How unique or creative is the approach?
+   - Does it go beyond textbook solutions?
+   - Are there clever simplifications or unconventional choices?
+   - Does it challenge common assumptions?
+
+Also note any major issues or particularly strong aspects.
+
+Output ONLY valid JSON in this exact format:
+{
+  "slug": "offline-first-application-sync",
+  "strength": <1-10>,
+  "interestingness": <1-10>,
+  "novelty": <1-10>,
+  "overall": <average of three scores, 1 decimal>,
+  "summary": "<2-3 sentence summary of the design>",
+  "strengths": ["<strength 1>", "<strength 2>"],
+  "weaknesses": ["<weakness 1>", "<weakness 2>"],
+  "verdict": "<one of: exceptional, strong, adequate, weak>"
+}
+
+---
+
+## Solution to Grade
+
+---
+title: "Offline-First Application Sync"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["offline-first", "sync", "conflict-resolution", "mobile", "crdt", "replication"]
+---
+
+## Overview
+
+Field-operations apps (inspections, deliveries, maintenance, incident response) must remain fully usable for days without reliable connectivity. The core requirement is a local-first UX with correct reconciliation when devices reconnect, including concurrent edits, retries, out-of-order delivery, partial uploads, and schema evolution.
+
+This design syncs by **replicating an operation log**. Clients record immutable operations locally and upload them in batches. The server durably stores operations, deterministically merges them into current entity state, and returns an opaque server-issued checkpoint that clients use to pull deltas efficiently.
+
+### Goals
+- Local-first UX: offline CRUD with fast local reads/writes.
+- Resumable, bandwidth-efficient two-way sync with long partitions and reconnect storms.
+- Idempotent ingestion and replayable history for audit/debug/rebuild.
+- Deterministic convergence with clear conflict handling (auto-merge when safe, review when required).
+
+### Non-Goals
+- Real-time collaborative editing (e.g., shared cursors) for rich text.
+- Perfectly preventing offline access after membership revocation (addressed as an optional hardening path).
+
+---
+
+## Requirements
+
+### Functional Requirements
+- Offline CRUD for core entities (`WorkOrder`, `Asset`, `Inspection`, `FormResponse`) with durable local persistence.
+- Two-way sync: push local ops; pull remote ops since last checkpoint.
+- Deterministic conflict handling: auto-merge when safe; flag conflicts for review.
+- Attachment sync (photos/videos/signatures) with resumable uploads and deduplication.
+- Multi-device per user with eventual convergence.
+- Idempotent retries: duplicated ops/requests must not corrupt state.
+- Server-enforced access control (tenant/project/site/user scopes) and filtered deltas.
+- Auditability: reconstruct who changed what, when, and from which device/app version.
+
+### Non-Functional Requirements (Concrete Targets)
+
+#### Scale (Illustrative but Realistic)
+Assume 50K DAU field workers and 5M MAU viewers/admins.
+
+- **Operations generated**:
+  - Typical: ~5M ops/day
+  - Heavy: ~10M ops/day
+- **Reconnect storms**:
+  - 10K devices / 10 minutes; average 1K ops backlog → ~16.7K ops/s ingestion
+- **Worst-case backlog**:
+  - 50M ops over hours; handled via throttling, batching, and progressive catch-up
+- **Attachments**:
+  - 2–10 GB/device/month; peak upload goes direct to object storage
+
+#### Latency & UX
+- **Handshake** P50 50ms / P99 250ms (auth + metadata).
+- **Push batch** P50 200ms / P99 1,200ms.
+- **Pull batch** P50 150ms / P99 900ms.
+- **Time-to-catch-up**: <2 minutes for 10K ops on good LTE via batching + compression + paging.
+- **Offline reads/writes** on device: <20ms P50.
+
+#### Availability & Durability
+- **Sync APIs**: 99.95% monthly availability (regional).
+- **Auth/token validation**: 99.99%.
+- **Durability**: RPO ≈ 0 for acknowledged operations.
+- **RTO**: 1 hour for regional failover (configurable).
+
+#### Consistency Model
+- Eventual consistency for business entities across devices with deterministic convergence.
+- Strong consistency for authentication, device registration, and checkpoint issuance.
+- Per-entity causal merges using per-actor sequencing and deterministic merge rules.
+
+### Constraints & Assumptions
+- Mobile clients use SQLite and maintain a durable local op log.
+- Client wall clocks are untrusted.
+- Compliance: PII in forms; encryption at rest/in transit; audit retained 1–7 years (configurable).
+
+---
+
+## Simplified Architecture
+
+```mermaid
+graph TB
+  C["Mobile App"] -->|HTTPS| E["Edge"]
+  E --> A["OIDC Auth"]
+  E --> S["Sync API"]
+  S --> P["Postgres"]
+  C -->|Pre-signed URL| O["Object Storage"]
+  S --> O
+```
+
+### Key Ideas
+- **One server component** (`Sync API`) handles handshake, push, pull, merges, conflicts, and attachment coordination.
+- **One primary database** (Postgres) stores the operation log, materialized entity state, checkpoints, conflicts, and attachment metadata.
+- **Server-issued checkpoints** provide efficient “pull since last known point” without relying on client clocks.
+- **Attachments bypass the Sync API** using pre-signed uploads; the Sync API validates and commits metadata.
+
+---
+
+## Components
+
+## Mobile Client (Offline Engine)
+
+**Responsibilities**
+- Local-first reads/writes on materialized entity tables.
+- Durable local append-only op log for retries, batching, and compaction.
+- Background sync with exponential backoff + jitter and OS-friendly scheduling.
+- Conflict UI for “needs review” items while preserving user intent.
+
+**Key Decisions**
+- Stable IDs generated client-side (`UUIDv7` or `ULID`) so references work offline.
+- Local op log separate from entity tables to support retries and compaction.
+- Server deltas are applied idempotently to local state.
+
+**Client Compaction**
+- After server acknowledges a contiguous `device_seq` range, client purges those ops.
+- Optional local snapshot + tail ops to speed cold start on large datasets.
+
+---
+
+## Edge + Auth
+
+**Edge Responsibilities**
+- TLS termination, basic rate limiting, request size limits, and routing.
+- Optional compression negotiation (zstd/gzip).
+
+**Auth Responsibilities**
+- OIDC/OAuth2 with short-lived access tokens and refresh tokens.
+- Tokens include `tenant_id`, `user_id`, and coarse scopes for authorization decisions.
+
+---
+
+## Sync API (Single Service)
+
+**Responsibilities**
+- Handshake/capability negotiation.
+- Push ingestion: validate, authorize, persist ops, apply deterministic merges, issue checkpoints.
+- Pull: generate deltas since checkpoint with server-side authZ filtering.
+- Conflict classification + “needs review” workflow records.
+- Attachment init/commit (pre-signed URLs; metadata commit).
+
+**Ingestion Semantics**
+- Clients deliver at-least-once; server guarantees exactly-once effects using idempotency keys:
+  - Unique `(tenant_id, device_id, device_seq)` per operation
+  - Optional request `Idempotency-Key` for whole-batch retries
+- Acknowledgment occurs only after ops are durable and their merges are applied.
+
+**Conflict Handling**
+- Field-level merges for safe types.
+- Semantic rules for workflow invariants (state machines, approvals) that produce explicit conflicts.
+
+---
+
+## Storage (Postgres-Only)
+
+Postgres is the single source of truth for:
+- Operation history (append-only).
+- Materialized entity state for fast reads.
+- Checkpoints per device/session.
+- Conflicts and resolution workflow records.
+- Attachment sessions and entity linkage.
+
+### Core Tables (Suggested)
+
+**Devices / Sessions**
+- `devices(tenant_id, device_id) -> user_id, created_at, last_seen_at, app_version, status`
+- `device_checkpoints(tenant_id, device_id) -> checkpoint_blob, updated_at`
+
+**Operations (Append-Only)**
+- `ops(tenant_id, ingest_seq, op_id, device_id, device_seq, entity_type, entity_id, base_version, patch, tombstone, scope_tags, schema_version, payload_hash, ingested_at)`
+  - `ingest_seq` is server-assigned and strictly increasing (cursor basis).
+  - Unique constraints:
+    - `(tenant_id, device_id, device_seq)` for idempotent apply
+    - `(tenant_id, op_id)` for stable operation identity
+  - Index for pull:
+    - `(tenant_id, ingest_seq)` (supports `WHERE ingest_seq > cursor ORDER BY ingest_seq LIMIT N`)
+
+**Materialized Entity State**
+- `entity_state(tenant_id, entity_type, entity_id) -> state_jsonb, version_summary_jsonb, deleted, updated_ingest_seq, updated_at`
+  - `version_summary_jsonb` is a per-actor sequence summary used for causal/concurrent detection.
+
+**Conflicts**
+- `conflicts(tenant_id, conflict_id) -> entity_type, entity_id, detected_at, status, summary, payload_jsonb`
+
+**Attachments**
+- `attachment_sessions(tenant_id, attachment_id) -> sha256, size_bytes, content_type, status, uploader_device_id, entity_ref, created_at, committed_at`
+
+### Partitioning & Retention
+- Partition `ops` by time (e.g., monthly) to keep indexes manageable and retention easy.
+- Retain ops for 30–90 days (tenant-configurable) while preserving longer-lived audit requirements via:
+  - Separate immutable audit export (optional) or longer retention in `ops` for regulated tenants.
+
+---
+
+## Data Model
+
+### Operation Model (Logical)
+- `op_id`: `UUIDv7`
+- `tenant_id`
+- `actor_id`: `device_id` (recommended)
+- `device_id`, `device_seq` (monotonic per device)
+- `entity_type`, `entity_id`
+- `base_version`: per-actor sequence summary (what the editor observed)
+- `ingest_seq`: server-assigned ordering cursor (deterministic tie-breaker)
+- `patch`: JSON Merge Patch / JSON Patch; typed sub-ops for counters/sets where used
+- `tombstone`: delete marker
+- `scope_tags`: authZ boundaries used for filtering
+- `schema_version`
+- `payload_hash`: detects “same op_id with different payload”
+
+### Checkpoints (Opaque, Signed)
+A checkpoint encodes:
+- `tenant_id`
+- `epoch`
+- `cursor`: last applied/pulled `ingest_seq`
+- optional protocol hints (compression, max batch sizes)
+- `sig`: HMAC signature to prevent tampering and cross-tenant substitution
+
+---
+
+## Sync Flow
+
+### Sequence
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as Client
+  participant E as Edge
+  participant S as Sync API
+  participant P as Postgres
+  participant O as Object Store
+
+  C->>E: POST /v1/sync/handshake
+  E->>S: forward (auth context)
+  S->>P: validate device + permissions
+  S-->>C: checkpoint + limits
+
+  C->>E: POST /v1/sync/push (ops batch)
+  E->>S: forward
+  S->>P: insert ops (idempotent)
+  S->>P: merge into entity_state + conflicts
+  S-->>C: acked_device_seq + new_checkpoint
+
+  C->>E: GET /v1/sync/pull?checkpoint=...
+  E->>S: forward
+  S->>P: read ops since cursor (authZ filtered)
+  S-->>C: ops[] + next_checkpoint + has_more
+
+  C->>S: POST /v1/attachments/init
+  S-->>C: pre-signed upload_url + attachment_id
+  C->>O: PUT upload_url (resumable)
+  C->>S: POST /v1/attachments/commit
+  S->>O: HEAD/validate
+  S-->>C: committed
+```
+
+### What Ensures Correctness
+- **Idempotency**: `(tenant_id, device_id, device_seq)` uniquely identifies a causal “dot”.
+- **Causality**: `base_version` is used to detect concurrency at the entity/field level.
+- **Determinism**: merge rules use stable tie-breakers (`ingest_seq`, `op_id`) so replicas converge.
+- **Server cursor**: checkpoints are server-issued and signed; clients never guess offsets.
+
+---
+
+## API Design
+
+### Protocol
+- REST over HTTPS for simplicity and debuggability.
+- Optional upgrade path to gRPC for streaming/batching when needed.
+
+### Endpoints
+- `POST /v1/sync/handshake`
+- `POST /v1/sync/push`
+- `GET /v1/sync/pull?checkpoint=...&limit_ops=...&max_bytes=...`
+- `POST /v1/attachments/init`
+- `POST /v1/attachments/commit`
+
+### Error Handling
+Stable codes:
+- `INVALID_ARGUMENT`, `UNAUTHENTICATED`, `PERMISSION_DENIED`, `RATE_LIMITED`
+- `SCHEMA_INVALID`, `CHECKPOINT_EXPIRED`, `PAYLOAD_HASH_MISMATCH`, `ATTACHMENT_NOT_COMMITTED`
+
+---
+
+## Conflict Resolution
+
+### Merge Strategy by Field Type
+- **Commutative ops (lightweight CRDT-style)**
+  - Counters: store and apply increments/decrements as additive ops.
+  - Tag/checklist sets: apply add/remove ops with dot identifiers for idempotency.
+- **Scalars**
+  - LWW using `(ingest_seq, op_id)` tie-breaker for concurrent edits.
+- **Workflows / Invariants**
+  - State-machine transitions validated on apply; conflicting transitions produce a conflict record rather than overwriting.
+
+### Conflict Records
+When correctness cannot be guaranteed by merge rules:
+- Persist a `conflicts` record with context for resolution.
+- Return conflict summaries in `push` responses.
+- Clients render “Needs review” and guide users through resolution.
+
+---
+
+## Scaling & Performance
+
+### Performance Levers
+- Batching: 200–1,000 ops/request with byte caps (e.g., 5 MB).
+- Compression: zstd preferred; gzip fallback.
+- Backpressure: `429` + `Retry-After` and server hints (`recommended_batch_ops`).
+- Progressive catch-up: small initial pulls for user-visible freshness; then larger batches.
+
+### Postgres Tactics (Practical)
+- Bulk insert ops with `INSERT ... VALUES (...)` batching or `COPY`-style ingestion at the API layer.
+- Partition `ops` by time; keep hot indexes small and cache-friendly.
+- Use read replicas for pull-heavy traffic (handshake/pull) while keeping writes on primary.
+- Keep merges transactionally consistent per operation batch to preserve RPO≈0 for acknowledged ops.
+
+### Growth Path
+- Start with one Postgres cluster (multi-AZ) + read replicas.
+- If tenants outgrow a single cluster, introduce tenant-based database sharding behind the same Sync API contract.
+
+---
+
+## Failure Modes & Mitigations
+
+1) **Client retries the same batch after timeout**
+- Mitigation: unique `(tenant_id, device_id, device_seq)` and optional batch `Idempotency-Key` return consistent ack.
+
+2) **Checkpoint expired (retention window exceeded or epoch change)**
+- Mitigation: `CHECKPOINT_EXPIRED` triggers bounded resync:
+  - server returns a scope-limited snapshot plus a new checkpoint
+  - client preserves unacked local ops and replays them
+
+3) **Conflicting edits to workflow-critical fields**
+- Mitigation: semantic validation creates a conflict record and blocks finalization until resolved.
+
+4) **Partial attachment upload**
+- Mitigation: resumable upload; only allow entity references to `COMMITTED` attachments.
+
+5) **Database degradation**
+- Mitigation: shed load with `429`, reduce pull page sizes, prioritize handshakes and small pulls, and rely on multi-AZ durability for acked ops.
+
+6) **AuthZ changes while offline**
+- Mitigation: next handshake/pull enforces reduced scopes and can send best-effort redaction tombstones; optional hardening via per-scope encryption and key rotation.
+
+---
+
+## Operations
+
+### Observability (SLO-Oriented)
+Track:
+- `push`/`pull` QPS, ops/s, bytes/s, error rate by code, P50/P95/P99 latency.
+- Time-to-catch-up distribution and per-tenant backlog.
+- Conflict rate by entity type/field and resolution time.
+- Postgres health: replication lag, lock time, slow queries, partition bloat.
+- Attachment init/commit success rate and checksum mismatch rate.
+
+### Deployment & Compatibility
+- Backward-compatible protocol evolution via handshake capabilities.
+- Canary releases with dashboards on dedupe anomalies, conflict spikes, and checkpoint errors.
+- Keep checkpoint decoding compatible for the last N epochs.
+
+### Security & Compliance
+- TLS everywhere; encryption at rest (KMS-managed).
+- Minimize PII in logs; store structured audit trails with retention policies.
+- Validate attachment size/type; malware scan via storage hooks/events; enforce tenant quotas.
+- Signed checkpoints (HMAC) to prevent tampering and cross-tenant replay.
+
+---
+
+## Simplification Notes
+
+- Removed: wide-column store; acceptable because the operation log + materialized state fit cleanly in partitioned Postgres with read replicas for pull traffic.
+- Removed: Redis cache; acceptable because checkpoints and device metadata are small and served efficiently from Postgres with normal indexing and connection pooling.
+- Removed: Kafka-derived stream in the core design; acceptable because analytics/search can be fed later from Postgres CDC without affecting sync correctness.
+- Merged: gateway and separate sync service concerns into an Edge + single Sync API; acceptable because sync correctness benefits from a single transactional boundary.
+- Complexity remaining: operation-based replication, signed checkpoints, and deterministic merges; necessary to support long offline periods, idempotent retries, and correct convergence with concurrent edits.
+mcp startup: no servers
+ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Dec 17th, 2025 1:06 AM.
+Warning: no last agent message; wrote empty content to /Users/dominikdabrowski/pr/system-design-atlas/grades/offline-first-application-sync.json

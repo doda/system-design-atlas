@@ -1,0 +1,1609 @@
+==========================================
+Generating (v2): Event Schema Registry
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2c9e-72c2-976f-95ee4a2e56b4
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Event Schema Registry
+**Category**: Strategic Problems
+
+**Problem Statement**:
+Design a governance system for event schemas (Avro/Protobuf) that enforces compatibility rules during CI/CD.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+codex
+```markdown
+---
+title: "Event Schema Registry"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["schemas", "governance", "ci-cd", "avro", "protobuf", "compatibility"]
+---
+
+## Overview
+
+An Event Schema Registry is a governance system that treats event schemas as a shared contract, not a local implementation detail. Teams publish versioned Avro/Protobuf schemas, and every change is automatically checked against explicit compatibility rules before it can ship. The registry becomes the single source of truth for “what events mean”, while CI/CD becomes the enforcement point.
+
+The key insight is to separate **schema storage** from **schema policy**. Storage is boring (immutable versions, simple reads). Policy is the hard part (what counts as compatible, per subject, per environment, per team). By making policy explicit, testable, and auditable, you prevent the two classic failures: (1) teams shipping breaking changes because “it worked locally”, and (2) governance becoming a human bottleneck that teams route around.
+
+This design optimizes for a small platform team: a simple registry service + a CLI/plugin that runs in CI, with a minimal review workflow and strong auditability.
+
+## What Makes This Hard
+
+Naive registries store schemas and expose an API, then hope teams “do the right thing”. The trap is that breakage is usually **cross-team and delayed**: a producer deploys a seemingly harmless change, and a consumer fails days later when it reads a new field shape, enum value, or union branch.
+
+The second trap is assuming “compatibility” is a single global rule. In practice, compatibility is contextual:
+- A topic’s contract differs between raw ingestion events vs curated domain events.
+- Dev/staging needs faster iteration; prod needs strict guarantees.
+- Avro and Protobuf evolve differently (defaults vs field numbers/reserved ranges).
+
+The third trap is operational: when the registry becomes a dependency of CI/CD, an outage can halt deploys. You need a design that fails safe (no silent breaking changes) without turning a transient incident into a company-wide stop-the-world event.
+
+## Requirements
+
+### Functional Requirements
+- Enforce schema compatibility rules (backward/forward/full/none) per **subject** (topic + record/message) during CI/CD, with deterministic pass/fail.
+- Support Avro and Protobuf with correct, type-aware evolution semantics (not text diffs).
+- Immutable schema versioning with provenance (who/what/when), plus an auditable policy change history.
+- Fine-grained authorization: teams can evolve schemas in their namespace; cross-namespace changes require explicit ownership.
+- A “break-glass” path for emergencies that is visible, time-bounded, and leaves an audit trail.
+
+### Scale Targets
+- **Schemas:** 10,000 subjects total (multi-team, multi-env), average 30 versions each → 300k versions stored.
+- **Change rate:** 1,000 schema publish attempts/day; CI compatibility checks on every PR and deploy.
+- **Read traffic:** 2,000 QPS peak for consumers fetching latest compatible schema (cached heavily).
+- **Latency:** CI check < 2s p95 (including auth + policy evaluation + compatibility computation); runtime fetch < 50ms p95 from cache.
+
+These targets drive two choices: store versions immutably (cheap writes, easy audit) and make reads cacheable (most systems read far more than they write).
+
+## Key Design Decisions
+
+- **Decision 1: Compatibility is enforced in CI via a registry-backed check**
+  - What we chose: a `schemactl` CLI (and CI action) that runs `check` and `publish` against the registry, failing builds on violations.
+  - What we rejected: “best effort” checks in a post-deploy job or a runtime-only guard.
+  - Why: breaking changes must be stopped before merge/deploy; runtime guards detect too late and create partial outages.
+
+- **Decision 2: Policy is a first-class, versioned object**
+  - What we chose: per-subject policy (compat mode, allowed transformations, ownership, environments) stored and versioned in the registry (with GitOps support).
+  - What we rejected: a single global compatibility mode, or rules embedded in CI scripts per repo.
+  - Why: teams need clear, stable rules; centralizing policy avoids drift and makes changes reviewable.
+
+- **Decision 3: Use a boring storage core + strong caching**
+  - What we chose: Postgres for metadata + schema blobs, object storage for large artifacts if needed, and a CDN/Redis cache for hot reads.
+  - What we rejected: building on a distributed KV store as the primary system of record.
+  - Why: the registry is governance-heavy, not write-heavy; Postgres gives transactions, constraints, and audit queries without operational heroics.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  Dev["Dev/CI"] --> CLI["schemactl"]
+  CLI --> Reg["Schema Registry API"]
+  Reg --> DB["Postgres"]
+  Reg --> Cache["Redis/CDN"]
+  Bus["Event Bus"] --> Cons["Consumers"]
+  Cons --> Cache
+```
+
+### Components
+
+- **`schemactl` (CLI + CI integration)**: Computes canonical schema fingerprints, calls `check` (no side effects) and `publish` (creates new version). It prints actionable diffs (“field `x` removed”, “enum value added without default”) and links to policy docs.
+- **Schema Registry API**: The policy enforcement point. Owns subject namespaces, versioning, compatibility evaluation, and audit logging. Exposes read APIs for runtime clients.
+- **Postgres**: Source of truth for subjects, versions, policies, ownership, and audit events. Enforces immutability (no updates to schema payloads), and guarantees consistent reads for CI decisions.
+- **Redis/CDN cache**: Serves hot reads (`latest`, `latestCompatible`, `byFingerprint`) and shields Postgres from consumer bursts.
+- **Consumers (runtime client)**: Fetch schemas by ID/fingerprint and cache locally with TTL. They do not publish; they only read.
+- **Event Bus (Kafka/PubSub)**: Not governed by this system, but it’s the blast radius. The registry’s job is to prevent contract drift on it.
+
+## Deep Dive: Compatibility Enforcement in CI/CD
+
+The hardest part is making “compatible” mean the same thing for every team, every language, and every pipeline—without turning schema evolution into a ceremony.
+
+**1) Canonicalization + fingerprinting (stop arguing about whitespace).**  
+The CLI compiles schemas into a canonical form:
+- Avro: parse to AST, normalize names/namespaces, sort JSON object keys where allowed, and compute a canonical string for fingerprinting.
+- Protobuf: compile to a descriptor set, normalize ordering, and fingerprint the descriptor graph (including imports and options that affect wire compatibility).
+
+This fingerprint becomes the immutable identity of a schema payload. It prevents duplicates, makes caching trivial, and lets CI reliably answer “have we seen this exact schema before?”
+
+**2) Subject naming and ownership (compatibility only makes sense within a contract).**  
+A subject is the unit of evolution: `env/topic/message` (or `topic:record` for Avro, `package.Message` for Protobuf) with an explicit owner team. CI fails fast if a repo attempts to publish to a subject it does not own. That one rule eliminates most governance drama.
+
+**3) Compatibility evaluation is type-aware and policy-driven.**  
+For each publish attempt, the registry:
+- Loads the subject policy: compatibility mode (backward/forward/full/none), allowed break-glass, and environment constraints.
+- Chooses the comparison baseline: usually “latest in prod”, not “latest in repo”, so a stale branch can’t accidentally publish an incompatible change.
+- Evaluates evolution semantics:
+  - **Avro**: field removal is breaking unless consumers are tolerant and defaults exist; changing field type is breaking; adding a field requires a default (or union with `null` + default) to maintain backward compatibility.
+  - **Protobuf**: field numbers define compatibility; renames are safe; reusing a field number is breaking; deletions require `reserved` numbers/names to prevent accidental reuse; changing scalar types is breaking unless wire-compatible (and explicitly allowed by policy, usually not).
+- Produces a concrete, human-readable report and a machine-readable result (for CI annotations).
+
+**4) CI workflow that teams can live with.**
+- On PR: `schemactl check` runs and comments on the PR with exact violations and the policy that triggered them.
+- On merge to main: `schemactl publish --dry-run` runs to ensure the merge base is still compatible with current prod head.
+- On deploy: `schemactl publish --env=prod` creates the new immutable version and returns the new schema ID(s) for embedding in artifacts.
+
+**5) Break-glass that doesn’t rot the culture.**  
+Break-glass requires:
+- A ticket/reference, a reason, an expiration, and an approver distinct from the author.
+- Automatic alerts to consumers subscribed to that subject.
+- Forced “compatibility reset” mechanics: the new version becomes a new major contract line (e.g., new subject or explicit incompatible epoch), so consumers opt in intentionally.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Preventing breaking changes before deploy | Some developer friction on schema edits |
+| Explicit, auditable governance | Less “move fast” flexibility in prod |
+| Simple operations (Postgres + cache) | Not the absolute lowest possible latency |
+| Deterministic CI decisions | Extra work to maintain correct semantic checkers |
+
+## Failure Modes
+
+- **Registry outage during CI**
+  - What happens: builds can’t validate/publish schemas; deploys stall.
+  - Detection: CI step failures + registry health alerts.
+  - Recovery: serve `check` from a read-only cache of `{subject, baselineVersion, schemaPayload}` for a short TTL; disallow `publish` without registry write availability to avoid silent drift.
+
+- **Policy misconfiguration blocks legitimate changes**
+  - What happens: teams are stuck; pressure builds to bypass governance.
+  - Detection: spike in failed checks for the same subject/policy version; support tickets.
+  - Recovery: policy is versioned and rollbackable; add a `policy test` endpoint and require policy changes to run against a fixture suite of known evolutions before activation.
+
+- **Cache serves stale “latest”**
+  - What happens: consumers fetch an older schema; CI compares against wrong baseline if it used cache incorrectly.
+  - Detection: mismatch between cache key version and Postgres version; audit anomalies.
+  - Recovery: CI paths read from Postgres (strong consistency); runtime reads are cacheable. Cache keys include `{subject, version}` and `latest` uses short TTL + soft refresh.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move hot reads fully behind a CDN with immutable IDs (`byFingerprint`, `byId`), keep Postgres for writes and policy, and add regional read replicas for latency.
+- **100x scale:** Split metadata and payload storage: Postgres for metadata/audit, object storage for payloads, and a dedicated compatibility worker pool with a queue for heavy checks (large Protobuf graphs, many imports). Also introduce “contract epochs” to manage deliberate incompatibilities without subject sprawl.
+
+## Operational Notes
+
+- Treat Postgres as the control plane: daily backups, point-in-time recovery, and strict immutability constraints on schema versions.
+- Keep CI checks strongly consistent and cache runtime reads aggressively; mixing those two concerns is how teams ship breakage during incidents.
+- Make ownership and policy visible: a `schemactl explain subject` command that prints owner, mode, baseline, and last break-glass events prevents most escalation loops.
+- Emit high-signal alerts: break-glass use, sudden spikes in incompatibility failures, and subjects with rapidly growing versions (often a sign of uncontrolled experimentation).
+```
+tokens used
+3,961
+```markdown
+---
+title: "Event Schema Registry"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["schemas", "governance", "ci-cd", "avro", "protobuf", "compatibility"]
+---
+
+## Overview
+
+An Event Schema Registry is a governance system that treats event schemas as a shared contract, not a local implementation detail. Teams publish versioned Avro/Protobuf schemas, and every change is automatically checked against explicit compatibility rules before it can ship. The registry becomes the single source of truth for “what events mean”, while CI/CD becomes the enforcement point.
+
+The key insight is to separate **schema storage** from **schema policy**. Storage is boring (immutable versions, simple reads). Policy is the hard part (what counts as compatible, per subject, per environment, per team). By making policy explicit, testable, and auditable, you prevent the two classic failures: (1) teams shipping breaking changes because “it worked locally”, and (2) governance becoming a human bottleneck that teams route around.
+
+This design optimizes for a small platform team: a simple registry service + a CLI/plugin that runs in CI, with a minimal review workflow and strong auditability.
+
+## What Makes This Hard
+
+Naive registries store schemas and expose an API, then hope teams “do the right thing”. The trap is that breakage is usually **cross-team and delayed**: a producer deploys a seemingly harmless change, and a consumer fails days later when it reads a new field shape, enum value, or union branch.
+
+The second trap is assuming “compatibility” is a single global rule. In practice, compatibility is contextual:
+- A topic’s contract differs between raw ingestion events vs curated domain events.
+- Dev/staging needs faster iteration; prod needs strict guarantees.
+- Avro and Protobuf evolve differently (defaults vs field numbers/reserved ranges).
+
+The third trap is operational: when the registry becomes a dependency of CI/CD, an outage can halt deploys. You need a design that fails safe (no silent breaking changes) without turning a transient incident into a company-wide stop-the-world event.
+
+## Requirements
+
+### Functional Requirements
+- Enforce schema compatibility rules (backward/forward/full/none) per **subject** (topic + record/message) during CI/CD, with deterministic pass/fail.
+- Support Avro and Protobuf with correct, type-aware evolution semantics (not text diffs).
+- Immutable schema versioning with provenance (who/what/when), plus an auditable policy change history.
+- Fine-grained authorization: teams can evolve schemas in their namespace; cross-namespace changes require explicit ownership.
+- A “break-glass” path for emergencies that is visible, time-bounded, and leaves an audit trail.
+
+### Scale Targets
+- **Schemas:** 10,000 subjects total (multi-team, multi-env), average 30 versions each → 300k versions stored.
+- **Change rate:** 1,000 schema publish attempts/day; CI compatibility checks on every PR and deploy.
+- **Read traffic:** 2,000 QPS peak for consumers fetching latest compatible schema (cached heavily).
+- **Latency:** CI check < 2s p95 (including auth + policy evaluation + compatibility computation); runtime fetch < 50ms p95 from cache.
+
+These targets drive two choices: store versions immutably (cheap writes, easy audit) and make reads cacheable (most systems read far more than they write).
+
+## Key Design Decisions
+
+- **Decision 1: Compatibility is enforced in CI via a registry-backed check**
+  - What we chose: a `schemactl` CLI (and CI action) that runs `check` and `publish` against the registry, failing builds on violations.
+  - What we rejected: “best effort” checks in a post-deploy job or a runtime-only guard.
+  - Why: breaking changes must be stopped before merge/deploy; runtime guards detect too late and create partial outages.
+
+- **Decision 2: Policy is a first-class, versioned object**
+  - What we chose: per-subject policy (compat mode, allowed transformations, ownership, environments) stored and versioned in the registry (with GitOps support).
+  - What we rejected: a single global compatibility mode, or rules embedded in CI scripts per repo.
+  - Why: teams need clear, stable rules; centralizing policy avoids drift and makes changes reviewable.
+
+- **Decision 3: Use a boring storage core + strong caching**
+  - What we chose: Postgres for metadata + schema blobs, object storage for large artifacts if needed, and a CDN/Redis cache for hot reads.
+  - What we rejected: building on a distributed KV store as the primary system of record.
+  - Why: the registry is governance-heavy, not write-heavy; Postgres gives transactions, constraints, and audit queries without operational heroics.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  Dev["Dev/CI"] --> CLI["schemactl"]
+  CLI --> Reg["Schema Registry API"]
+  Reg --> DB["Postgres"]
+  Reg --> Cache["Redis/CDN"]
+  Bus["Event Bus"] --> Cons["Consumers"]
+  Cons --> Cache
+```
+
+### Components
+
+- **`schemactl` (CLI + CI integration)**: Computes canonical schema fingerprints, calls `check` (no side effects) and `publish` (creates new version). It prints actionable diffs (“field `x` removed”, “enum value added without default”) and links to policy docs.
+- **Schema Registry API**: The policy enforcement point. Owns subject namespaces, versioning, compatibility evaluation, and audit logging. Exposes read APIs for runtime clients.
+- **Postgres**: Source of truth for subjects, versions, policies, ownership, and audit events. Enforces immutability (no updates to schema payloads), and guarantees consistent reads for CI decisions.
+- **Redis/CDN cache**: Serves hot reads (`latest`, `latestCompatible`, `byFingerprint`) and shields Postgres from consumer bursts.
+- **Consumers (runtime client)**: Fetch schemas by ID/fingerprint and cache locally with TTL. They do not publish; they only read.
+- **Event Bus (Kafka/PubSub)**: Not governed by this system, but it’s the blast radius. The registry’s job is to prevent contract drift on it.
+
+## Deep Dive: Compatibility Enforcement in CI/CD
+
+The hardest part is making “compatible” mean the same thing for every team, every language, and every pipeline—without turning schema evolution into a ceremony.
+
+**1) Canonicalization + fingerprinting (stop arguing about whitespace).**  
+The CLI compiles schemas into a canonical form:
+- Avro: parse to AST, normalize names/namespaces, sort JSON object keys where allowed, and compute a canonical string for fingerprinting.
+- Protobuf: compile to a descriptor set, normalize ordering, and fingerprint the descriptor graph (including imports and options that affect wire compatibility).
+
+This fingerprint becomes the immutable identity of a schema payload. It prevents duplicates, makes caching trivial, and lets CI reliably answer “have we seen this exact schema before?”
+
+**2) Subject naming and ownership (compatibility only makes sense within a contract).**  
+A subject is the unit of evolution: `env/topic/message` (or `topic:record` for Avro, `package.Message` for Protobuf) with an explicit owner team. CI fails fast if a repo attempts to publish to a subject it does not own. That one rule eliminates most governance drama.
+
+**3) Compatibility evaluation is type-aware and policy-driven.**  
+For each publish attempt, the registry:
+- Loads the subject policy: compatibility mode (backward/forward/full/none), allowed break-glass, and environment constraints.
+- Chooses the comparison baseline: usually “latest in prod”, not “latest in repo”, so a stale branch can’t accidentally publish an incompatible change.
+- Evaluates evolution semantics:
+  - **Avro**: field removal is breaking unless consumers are tolerant and defaults exist; changing field type is breaking; adding a field requires a default (or union with `null` + default) to maintain backward compatibility.
+  - **Protobuf**: field numbers define compatibility; renames are safe; reusing a field number is breaking; deletions require `reserved` numbers/names to prevent accidental reuse; changing scalar types is breaking unless wire-compatible (and explicitly allowed by policy, usually not).
+- Produces a concrete, human-readable report and a machine-readable result (for CI annotations).
+
+**4) CI workflow that teams can live with.**
+- On PR: `schemactl check` runs and comments on the PR with exact violations and the policy that triggered them.
+- On merge to main: `schemactl publish --dry-run` runs to ensure the merge base is still compatible with current prod head.
+- On deploy: `schemactl publish --env=prod` creates the new immutable version and returns the new schema ID(s) for embedding in artifacts.
+
+**5) Break-glass that doesn’t rot the culture.**  
+Break-glass requires:
+- A ticket/reference, a reason, an expiration, and an approver distinct from the author.
+- Automatic alerts to consumers subscribed to that subject.
+- Forced “compatibility reset” mechanics: the new version becomes a new major contract line (e.g., new subject or explicit incompatible epoch), so consumers opt in intentionally.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Preventing breaking changes before deploy | Some developer friction on schema edits |
+| Explicit, auditable governance | Less “move fast” flexibility in prod |
+| Simple operations (Postgres + cache) | Not the absolute lowest possible latency |
+| Deterministic CI decisions | Extra work to maintain correct semantic checkers |
+
+## Failure Modes
+
+- **Registry outage during CI**
+  - What happens: builds can’t validate/publish schemas; deploys stall.
+  - Detection: CI step failures + registry health alerts.
+  - Recovery: serve `check` from a read-only cache of `{subject, baselineVersion, schemaPayload}` for a short TTL; disallow `publish` without registry write availability to avoid silent drift.
+
+- **Policy misconfiguration blocks legitimate changes**
+  - What happens: teams are stuck; pressure builds to bypass governance.
+  - Detection: spike in failed checks for the same subject/policy version; support tickets.
+  - Recovery: policy is versioned and rollbackable; add a `policy test` endpoint and require policy changes to run against a fixture suite of known evolutions before activation.
+
+- **Cache serves stale “latest”**
+  - What happens: consumers fetch an older schema; CI compares against wrong baseline if it used cache incorrectly.
+  - Detection: mismatch between cache key version and Postgres version; audit anomalies.
+  - Recovery: CI paths read from Postgres (strong consistency); runtime reads are cacheable. Cache keys include `{subject, version}` and `latest` uses short TTL + soft refresh.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move hot reads fully behind a CDN with immutable IDs (`byFingerprint`, `byId`), keep Postgres for writes and policy, and add regional read replicas for latency.
+- **100x scale:** Split metadata and payload storage: Postgres for metadata/audit, object storage for payloads, and a dedicated compatibility worker pool with a queue for heavy checks (large Protobuf graphs, many imports). Also introduce “contract epochs” to manage deliberate incompatibilities without subject sprawl.
+
+## Operational Notes
+
+- Treat Postgres as the control plane: daily backups, point-in-time recovery, and strict immutability constraints on schema versions.
+- Keep CI checks strongly consistent and cache runtime reads aggressively; mixing those two concerns is how teams ship breakage during incidents.
+- Make ownership and policy visible: a `schemactl explain subject` command that prints owner, mode, baseline, and last break-glass events prevents most escalation loops.
+- Emit high-signal alerts: break-glass use, sudden spikes in incompatibility failures, and subjects with rapidly growing versions (often a sign of uncontrolled experimentation).
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/event-schema-registry.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-d222-7713-88e1-db35cd6d3a6e
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Event Schema Registry"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["schemas", "governance", "ci-cd", "avro", "protobuf", "compatibility"]
+---
+
+## Overview
+
+An Event Schema Registry is a governance system that treats event schemas as a shared contract, not a local implementation detail. Teams publish versioned Avro/Protobuf schemas, and every change is automatically checked against explicit compatibility rules before it can ship. The registry becomes the single source of truth for “what events mean”, while CI/CD becomes the enforcement point.
+
+The key insight is to separate **schema storage** from **schema policy**. Storage is boring (immutable versions, simple reads). Policy is the hard part (what counts as compatible, per subject, per environment, per team). By making policy explicit, testable, and auditable, you prevent the two classic failures: (1) teams shipping breaking changes because “it worked locally”, and (2) governance becoming a human bottleneck that teams route around.
+
+This design optimizes for a small platform team: a simple registry service + a CLI/plugin that runs in CI, with a minimal review workflow and strong auditability.
+
+## What Makes This Hard
+
+Naive registries store schemas and expose an API, then hope teams “do the right thing”. The trap is that breakage is usually **cross-team and delayed**: a producer deploys a seemingly harmless change, and a consumer fails days later when it reads a new field shape, enum value, or union branch.
+
+The second trap is assuming “compatibility” is a single global rule. In practice, compatibility is contextual:
+- A topic’s contract differs between raw ingestion events vs curated domain events.
+- Dev/staging needs faster iteration; prod needs strict guarantees.
+- Avro and Protobuf evolve differently (defaults vs field numbers/reserved ranges).
+
+The third trap is operational: when the registry becomes a dependency of CI/CD, an outage can halt deploys. You need a design that fails safe (no silent breaking changes) without turning a transient incident into a company-wide stop-the-world event.
+
+## Requirements
+
+### Functional Requirements
+- Enforce schema compatibility rules (backward/forward/full/none) per **subject** (topic + record/message) during CI/CD, with deterministic pass/fail.
+- Support Avro and Protobuf with correct, type-aware evolution semantics (not text diffs).
+- Immutable schema versioning with provenance (who/what/when), plus an auditable policy change history.
+- Fine-grained authorization: teams can evolve schemas in their namespace; cross-namespace changes require explicit ownership.
+- A “break-glass” path for emergencies that is visible, time-bounded, and leaves an audit trail.
+
+### Scale Targets
+- **Schemas:** 10,000 subjects total (multi-team, multi-env), average 30 versions each → 300k versions stored.
+- **Change rate:** 1,000 schema publish attempts/day; CI compatibility checks on every PR and deploy.
+- **Read traffic:** 2,000 QPS peak for consumers fetching latest compatible schema (cached heavily).
+- **Latency:** CI check < 2s p95 (including auth + policy evaluation + compatibility computation); runtime fetch < 50ms p95 from cache.
+
+These targets drive two choices: store versions immutably (cheap writes, easy audit) and make reads cacheable (most systems read far more than they write).
+
+## Key Design Decisions
+
+- **Decision 1: Compatibility is enforced in CI via a registry-backed check**
+  - What we chose: a `schemactl` CLI (and CI action) that runs `check` and `publish` against the registry, failing builds on violations.
+  - What we rejected: “best effort” checks in a post-deploy job or a runtime-only guard.
+  - Why: breaking changes must be stopped before merge/deploy; runtime guards detect too late and create partial outages.
+
+- **Decision 2: Policy is a first-class, versioned object**
+  - What we chose: per-subject policy (compat mode, allowed transformations, ownership, environments) stored and versioned in the registry (with GitOps support).
+  - What we rejected: a single global compatibility mode, or rules embedded in CI scripts per repo.
+  - Why: teams need clear, stable rules; centralizing policy avoids drift and makes changes reviewable.
+
+- **Decision 3: Use a boring storage core + strong caching**
+  - What we chose: Postgres for metadata + schema blobs, object storage for large artifacts if needed, and a CDN/Redis cache for hot reads.
+  - What we rejected: building on a distributed KV store as the primary system of record.
+  - Why: the registry is governance-heavy, not write-heavy; Postgres gives transactions, constraints, and audit queries without operational heroics.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  Dev["Dev/CI"] --> CLI["schemactl"]
+  CLI --> Reg["Schema Registry API"]
+  Reg --> DB["Postgres"]
+  Reg --> Cache["Redis/CDN"]
+  Bus["Event Bus"] --> Cons["Consumers"]
+  Cons --> Cache
+```
+
+### Components
+
+- **`schemactl` (CLI + CI integration)**: Computes canonical schema fingerprints, calls `check` (no side effects) and `publish` (creates new version). It prints actionable diffs (“field `x` removed”, “enum value added without default”) and links to policy docs.
+- **Schema Registry API**: The policy enforcement point. Owns subject namespaces, versioning, compatibility evaluation, and audit logging. Exposes read APIs for runtime clients.
+- **Postgres**: Source of truth for subjects, versions, policies, ownership, and audit events. Enforces immutability (no updates to schema payloads), and guarantees consistent reads for CI decisions.
+- **Redis/CDN cache**: Serves hot reads (`latest`, `latestCompatible`, `byFingerprint`) and shields Postgres from consumer bursts.
+- **Consumers (runtime client)**: Fetch schemas by ID/fingerprint and cache locally with TTL. They do not publish; they only read.
+- **Event Bus (Kafka/PubSub)**: Not governed by this system, but it’s the blast radius. The registry’s job is to prevent contract drift on it.
+
+## Deep Dive: Compatibility Enforcement in CI/CD
+
+The hardest part is making “compatible” mean the same thing for every team, every language, and every pipeline—without turning schema evolution into a ceremony.
+
+**1) Canonicalization + fingerprinting (stop arguing about whitespace).**  
+The CLI compiles schemas into a canonical form:
+- Avro: parse to AST, normalize names/namespaces, sort JSON object keys where allowed, and compute a canonical string for fingerprinting.
+- Protobuf: compile to a descriptor set, normalize ordering, and fingerprint the descriptor graph (including imports and options that affect wire compatibility).
+
+This fingerprint becomes the immutable identity of a schema payload. It prevents duplicates, makes caching trivial, and lets CI reliably answer “have we seen this exact schema before?”
+
+**2) Subject naming and ownership (compatibility only makes sense within a contract).**  
+A subject is the unit of evolution: `env/topic/message` (or `topic:record` for Avro, `package.Message` for Protobuf) with an explicit owner team. CI fails fast if a repo attempts to publish to a subject it does not own. That one rule eliminates most governance drama.
+
+**3) Compatibility evaluation is type-aware and policy-driven.**  
+For each publish attempt, the registry:
+- Loads the subject policy: compatibility mode (backward/forward/full/none), allowed break-glass, and environment constraints.
+- Chooses the comparison baseline: usually “latest in prod”, not “latest in repo”, so a stale branch can’t accidentally publish an incompatible change.
+- Evaluates evolution semantics:
+  - **Avro**: field removal is breaking unless consumers are tolerant and defaults exist; changing field type is breaking; adding a field requires a default (or union with `null` + default) to maintain backward compatibility.
+  - **Protobuf**: field numbers define compatibility; renames are safe; reusing a field number is breaking; deletions require `reserved` numbers/names to prevent accidental reuse; changing scalar types is breaking unless wire-compatible (and explicitly allowed by policy, usually not).
+- Produces a concrete, human-readable report and a machine-readable result (for CI annotations).
+
+**4) CI workflow that teams can live with.**
+- On PR: `schemactl check` runs and comments on the PR with exact violations and the policy that triggered them.
+- On merge to main: `schemactl publish --dry-run` runs to ensure the merge base is still compatible with current prod head.
+- On deploy: `schemactl publish --env=prod` creates the new immutable version and returns the new schema ID(s) for embedding in artifacts.
+
+**5) Break-glass that doesn’t rot the culture.**  
+Break-glass requires:
+- A ticket/reference, a reason, an expiration, and an approver distinct from the author.
+- Automatic alerts to consumers subscribed to that subject.
+- Forced “compatibility reset” mechanics: the new version becomes a new major contract line (e.g., new subject or explicit incompatible epoch), so consumers opt in intentionally.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Preventing breaking changes before deploy | Some developer friction on schema edits |
+| Explicit, auditable governance | Less “move fast” flexibility in prod |
+| Simple operations (Postgres + cache) | Not the absolute lowest possible latency |
+| Deterministic CI decisions | Extra work to maintain correct semantic checkers |
+
+## Failure Modes
+
+- **Registry outage during CI**
+  - What happens: builds can’t validate/publish schemas; deploys stall.
+  - Detection: CI step failures + registry health alerts.
+  - Recovery: serve `check` from a read-only cache of `{subject, baselineVersion, schemaPayload}` for a short TTL; disallow `publish` without registry write availability to avoid silent drift.
+
+- **Policy misconfiguration blocks legitimate changes**
+  - What happens: teams are stuck; pressure builds to bypass governance.
+  - Detection: spike in failed checks for the same subject/policy version; support tickets.
+  - Recovery: policy is versioned and rollbackable; add a `policy test` endpoint and require policy changes to run against a fixture suite of known evolutions before activation.
+
+- **Cache serves stale “latest”**
+  - What happens: consumers fetch an older schema; CI compares against wrong baseline if it used cache incorrectly.
+  - Detection: mismatch between cache key version and Postgres version; audit anomalies.
+  - Recovery: CI paths read from Postgres (strong consistency); runtime reads are cacheable. Cache keys include `{subject, version}` and `latest` uses short TTL + soft refresh.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move hot reads fully behind a CDN with immutable IDs (`byFingerprint`, `byId`), keep Postgres for writes and policy, and add regional read replicas for latency.
+- **100x scale:** Split metadata and payload storage: Postgres for metadata/audit, object storage for payloads, and a dedicated compatibility worker pool with a queue for heavy checks (large Protobuf graphs, many imports). Also introduce “contract epochs” to manage deliberate incompatibilities without subject sprawl.
+
+## Operational Notes
+
+- Treat Postgres as the control plane: daily backups, point-in-time recovery, and strict immutability constraints on schema versions.
+- Keep CI checks strongly consistent and cache runtime reads aggressively; mixing those two concerns is how teams ship breakage during incidents.
+- Make ownership and policy visible: a `schemactl explain subject` command that prints owner, mode, baseline, and last break-glass events prevents most escalation loops.
+- Emit high-signal alerts: break-glass use, sudden spikes in incompatibility failures, and subjects with rapidly growing versions (often a sign of uncontrolled experimentation).
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+thinking
+**Designing a Structured Critique**
+
+I need to create a structured critique without any tools, focusing on being constructive and finding simpler alternatives. I'll make sure to include tables that outline trade-offs and operational complexity since this is a design document. It's essential to address failure scenarios and provide clear recommendations. I’ll also evaluate custom components such as the CLI, registry API, and others. Exploring simpler alternatives like using existing schema registries or Git as a source of truth is crucial. Keeping this concise yet thorough will be key!
+thinking
+**Analyzing Policy and Schema Compatibility**
+
+I’m considering using policy-as-code with tools like OPA/Rego or Cedar, although that might be a bit excessive. I think incorporating PostgreSQL advisory locks can help streamline subject publications without requiring a distributed lock service. I need to stress test scenarios like database downtime, network issues, and simultaneous publishes. It's important to understand the nuances of "latest compatible" semantics, especially with Avro and Protobuf, since their compatibility relies on various consumer versions and schemas. Establishing a production baseline could also be useful.
+thinking
+**Addressing Consumer Lag and Schema Management**
+
+I need to consider the implications of consumer lag, especially when required fields are added. There are differences between development, staging, and production environments, and selecting a baseline like "latest in prod" can create issues if development diverges. I should ensure schemas promote alongside code. Simplifying the check/publish process into a single endpoint would improve efficiency, and I might explore HTTP caching. Planning for a registry outage is important, too; suggestions like implementing a cached baseline or a local CI mirror could help mitigate issues.
+thinking
+**Navigating AuthZ and Schema Evolution**
+
+For authorization, I’m considering how to evolve schemas in a namespace by mapping them to GitHub teams or OIDC claims. I need to be cautious about renaming or moving ownership during transitions. If I suggest a break-glass approach, it might be easier to require a new subject name for incompatible changes, using an automatic suffix like `-v2` instead of making in-place changes. It’s also crucial to ensure that data plane clients don't block on the registry, relying on local caches and fallback mechanisms. I'll also focus on auditability by recording the entire request, results, and the policy version used.
+thinking
+**Exploring Compatibility and Versioning**
+
+In proto3, unknown enum values are preserved but might not be accessible in some languages, making compatibility language-dependent. Policies should be conservative or tailored to each language. Regarding Avro, adding defaults is generally acceptable, but it can break compile-time for consumers using code generation. The registry should focus on wire/read contracts rather than generated code. It's also crucial to embed schema IDs for versioning, and I think integer IDs would simplify the mapping for runtime management. 
+
+Now, let’s capture core insights and recommendations in a structured format!
+codex
+## Elegance Check
+
+### The Core Insight
+Separating “boring immutable storage” from “explicit, testable policy” is the right abstraction boundary: it keeps the registry simple while putting the real complexity (compatibility meaning, baseline choice, ownership) into a versioned control plane that CI can enforce deterministically.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| `schemactl` (CLI/CI action) | Gives teams fast feedback and a consistent workflow; keeps schema checks close to PRs. |
+| Registry API | Central authority for policy + baseline selection + audit; prevents per-repo drift and “it passed locally”. |
+| Postgres (SoT) | Transactions + constraints + audit queries fit governance; 300k versions is well within comfort. |
+| Compatibility engine (Avro/Protobuf aware) | Text diffs are wrong; semantic evolution rules are the product. |
+| Audit log (policy + publish decisions) | Makes governance reversible and defensible; critical for break-glass. |
+| Runtime read path (by ID/fingerprint) | Consumers need a stable, cacheable lookup to decode data safely. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom registry from scratch | Adopt/extend an existing registry (Confluent Schema Registry, Apicurio, Redpanda, AWS Glue) and focus on policy/CI UX | Less control over policy model and break-glass semantics; integration constraints. |
+| Redis + CDN cache tier | Start with HTTP caching + CDN only for immutable `byId/byFingerprint`; add Redis only if proven necessary | Slightly more work in client caching; less “latest” convenience without an origin hit. |
+| “latestCompatible” runtime endpoint | Prefer immutable IDs embedded in messages (or schema ID headers) and use registry only for ID→schema | Requires producer changes and conventions; less magic, more explicit contracts. |
+| Custom policy logic embedded in service | Policy-as-code (OPA/Rego or Cedar) with versioned bundles | Adds a dependency and learning curve; can be overkill for a small team. |
+| Break-glass publishes in-place + “epoch” | Make break-glass require a *new subject* (or mandated `-v2`/`epoch=2` naming) rather than in-place incompatibility | More subjects to manage; much safer operationally and culturally. |
+| Protobuf canonicalization/compilation inside CLI | Centralize compilation in the registry (containerized, pinned `protoc`, pinned include roots) and make CLI a thin submitter | More server CPU; but eliminates “works on my machine” descriptor differences. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Postgres down for 5 minutes**
+   - Design's answer: CI stalls; allow `check` via short TTL read-only cache; disallow `publish`.
+   - Recommendation: **Strengthen** — make the degraded `check` mode an explicit *signed snapshot* (subject→baselineVersion+policyVersion+schema) so CI decisions remain deterministic and auditable during outages.
+
+2. **Two teams/PRs publish concurrently to the same subject**
+   - Design's answer: not addressed.
+   - Recommendation: **Must fix** — add per-subject serialization (Postgres advisory lock or `SELECT … FOR UPDATE` on a subject row) + idempotency keys for `publish` to prevent version races and “last writer wins” surprises.
+
+3. **Network partition: CI can reach cache/CDN but not the registry**
+   - Design's answer: CI reads strongly consistent from Postgres; runtime reads cacheable.
+   - Recommendation: **Strengthen** — document a hard rule: CI must never use CDN “latest”; only use registry snapshot/SoT. If registry is unreachable, CI either fails closed or uses the signed snapshot path.
+
+4. **Bad policy change blocks the org (or silently loosens rules)**
+   - Design's answer: versioned/rollbackable policy + policy test endpoint + fixtures.
+   - Recommendation: **Acceptable but sharpen** — require “policy rollout” as a two-phase activation (draft → canary subjects/environments → activate) and always record `policyVersionUsed` in every check/publish audit row.
+
+5. **Compatibility checker bug (false pass) ships a breaking change**
+   - Design's answer: not addressed.
+   - Recommendation: **Strengthen** — treat checker releases like a compiler: pin checker version in CI, run golden fixture suites per release, and store the checker build/version in audit logs so you can answer “why did this pass then?”.
+
+## Recommendations
+
+### Must Fix
+- Define the precise semantics of `latestCompatible`: compatible with *which* deployed readers/writers (often multiple consumer versions exist); consider dropping it in favor of immutable IDs + explicit baselines.
+- Add concurrency + idempotency controls for `publish` (per-subject locking, request idempotency keys, monotonic version assignment).
+- Make Protobuf descriptor generation fully deterministic (pinned `protoc`, pinned imports, no ambient filesystem/state); otherwise fingerprints will drift across environments.
+- Constrain break-glass so it can’t create silent partial outages: strongly prefer “new subject / new epoch name” over in-place incompatible publishes.
+
+### Should Consider
+- Start with Postgres + CDN (immutable endpoints) and defer Redis until measurements demand it; reduce moving parts for a small platform team.
+- Use Postgres row-level security or a single, simple authz model (OIDC→team claims→namespace) to keep authorization understandable at 3am.
+- Add “promotion” mechanics (dev→staging→prod) so the baseline choice is explicit and reproducible, not just “latest in prod”.
+
+### Nice to Have
+- A small UI/portal for subject ownership, policy, recent publishes, and break-glass history (reduces support load).
+- Consumer-impact notifications wired to ownership (Slack/email hooks per subject) with clear “action required” thresholds.
+- A “schema diff explainer” library shared between CLI and registry so reports are identical everywhere.
+
+## What's Working Well
+- Clear separation of concerns (storage vs policy) and a realistic focus on auditability and small-team operability.
+- Good instinct to keep CI strongly consistent while letting runtime reads be cache-heavy.
+- Ownership-as-a-first-class concept is a high-leverage governance simplifier.
+- The doc is honest about trade-offs and already anticipates the two biggest cultural failure modes: bypass pressure and human bottlenecks.
+tokens used
+5,749
+## Elegance Check
+
+### The Core Insight
+Separating “boring immutable storage” from “explicit, testable policy” is the right abstraction boundary: it keeps the registry simple while putting the real complexity (compatibility meaning, baseline choice, ownership) into a versioned control plane that CI can enforce deterministically.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| `schemactl` (CLI/CI action) | Gives teams fast feedback and a consistent workflow; keeps schema checks close to PRs. |
+| Registry API | Central authority for policy + baseline selection + audit; prevents per-repo drift and “it passed locally”. |
+| Postgres (SoT) | Transactions + constraints + audit queries fit governance; 300k versions is well within comfort. |
+| Compatibility engine (Avro/Protobuf aware) | Text diffs are wrong; semantic evolution rules are the product. |
+| Audit log (policy + publish decisions) | Makes governance reversible and defensible; critical for break-glass. |
+| Runtime read path (by ID/fingerprint) | Consumers need a stable, cacheable lookup to decode data safely. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom registry from scratch | Adopt/extend an existing registry (Confluent Schema Registry, Apicurio, Redpanda, AWS Glue) and focus on policy/CI UX | Less control over policy model and break-glass semantics; integration constraints. |
+| Redis + CDN cache tier | Start with HTTP caching + CDN only for immutable `byId/byFingerprint`; add Redis only if proven necessary | Slightly more work in client caching; less “latest” convenience without an origin hit. |
+| “latestCompatible” runtime endpoint | Prefer immutable IDs embedded in messages (or schema ID headers) and use registry only for ID→schema | Requires producer changes and conventions; less magic, more explicit contracts. |
+| Custom policy logic embedded in service | Policy-as-code (OPA/Rego or Cedar) with versioned bundles | Adds a dependency and learning curve; can be overkill for a small team. |
+| Break-glass publishes in-place + “epoch” | Make break-glass require a *new subject* (or mandated `-v2`/`epoch=2` naming) rather than in-place incompatibility | More subjects to manage; much safer operationally and culturally. |
+| Protobuf canonicalization/compilation inside CLI | Centralize compilation in the registry (containerized, pinned `protoc`, pinned include roots) and make CLI a thin submitter | More server CPU; but eliminates “works on my machine” descriptor differences. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Postgres down for 5 minutes**
+   - Design's answer: CI stalls; allow `check` via short TTL read-only cache; disallow `publish`.
+   - Recommendation: **Strengthen** — make the degraded `check` mode an explicit *signed snapshot* (subject→baselineVersion+policyVersion+schema) so CI decisions remain deterministic and auditable during outages.
+
+2. **Two teams/PRs publish concurrently to the same subject**
+   - Design's answer: not addressed.
+   - Recommendation: **Must fix** — add per-subject serialization (Postgres advisory lock or `SELECT … FOR UPDATE` on a subject row) + idempotency keys for `publish` to prevent version races and “last writer wins” surprises.
+
+3. **Network partition: CI can reach cache/CDN but not the registry**
+   - Design's answer: CI reads strongly consistent from Postgres; runtime reads cacheable.
+   - Recommendation: **Strengthen** — document a hard rule: CI must never use CDN “latest”; only use registry snapshot/SoT. If registry is unreachable, CI either fails closed or uses the signed snapshot path.
+
+4. **Bad policy change blocks the org (or silently loosens rules)**
+   - Design's answer: versioned/rollbackable policy + policy test endpoint + fixtures.
+   - Recommendation: **Acceptable but sharpen** — require “policy rollout” as a two-phase activation (draft → canary subjects/environments → activate) and always record `policyVersionUsed` in every check/publish audit row.
+
+5. **Compatibility checker bug (false pass) ships a breaking change**
+   - Design's answer: not addressed.
+   - Recommendation: **Strengthen** — treat checker releases like a compiler: pin checker version in CI, run golden fixture suites per release, and store the checker build/version in audit logs so you can answer “why did this pass then?”.
+
+## Recommendations
+
+### Must Fix
+- Define the precise semantics of `latestCompatible`: compatible with *which* deployed readers/writers (often multiple consumer versions exist); consider dropping it in favor of immutable IDs + explicit baselines.
+- Add concurrency + idempotency controls for `publish` (per-subject locking, request idempotency keys, monotonic version assignment).
+- Make Protobuf descriptor generation fully deterministic (pinned `protoc`, pinned imports, no ambient filesystem/state); otherwise fingerprints will drift across environments.
+- Constrain break-glass so it can’t create silent partial outages: strongly prefer “new subject / new epoch name” over in-place incompatible publishes.
+
+### Should Consider
+- Start with Postgres + CDN (immutable endpoints) and defer Redis until measurements demand it; reduce moving parts for a small platform team.
+- Use Postgres row-level security or a single, simple authz model (OIDC→team claims→namespace) to keep authorization understandable at 3am.
+- Add “promotion” mechanics (dev→staging→prod) so the baseline choice is explicit and reproducible, not just “latest in prod”.
+
+### Nice to Have
+- A small UI/portal for subject ownership, policy, recent publishes, and break-glass history (reduces support load).
+- Consumer-impact notifications wired to ownership (Slack/email hooks per subject) with clear “action required” thresholds.
+- A “schema diff explainer” library shared between CLI and registry so reports are identical everywhere.
+
+## What's Working Well
+- Clear separation of concerns (storage vs policy) and a realistic focus on auditability and small-team operability.
+- Good instinct to keep CI strongly consistent while letting runtime reads be cache-heavy.
+- Ownership-as-a-first-class concept is a high-leverage governance simplifier.
+- The doc is honest about trade-offs and already anticipates the two biggest cultural failure modes: bypass pressure and human bottlenecks.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/event-schema-registry.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afa-323f-7150-b13c-3e6ec02c2072
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Event Schema Registry"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["schemas", "governance", "ci-cd", "avro", "protobuf", "compatibility"]
+---
+
+## Overview
+
+An Event Schema Registry is a governance system that treats event schemas as a shared contract, not a local implementation detail. Teams publish versioned Avro/Protobuf schemas, and every change is automatically checked against explicit compatibility rules before it can ship. The registry becomes the single source of truth for “what events mean”, while CI/CD becomes the enforcement point.
+
+The key insight is to separate **schema storage** from **schema policy**. Storage is boring (immutable versions, simple reads). Policy is the hard part (what counts as compatible, per subject, per environment, per team). By making policy explicit, testable, and auditable, you prevent the two classic failures: (1) teams shipping breaking changes because “it worked locally”, and (2) governance becoming a human bottleneck that teams route around.
+
+This design optimizes for a small platform team: a simple registry service + a CLI/plugin that runs in CI, with a minimal review workflow and strong auditability.
+
+## What Makes This Hard
+
+Naive registries store schemas and expose an API, then hope teams “do the right thing”. The trap is that breakage is usually **cross-team and delayed**: a producer deploys a seemingly harmless change, and a consumer fails days later when it reads a new field shape, enum value, or union branch.
+
+The second trap is assuming “compatibility” is a single global rule. In practice, compatibility is contextual:
+- A topic’s contract differs between raw ingestion events vs curated domain events.
+- Dev/staging needs faster iteration; prod needs strict guarantees.
+- Avro and Protobuf evolve differently (defaults vs field numbers/reserved ranges).
+
+The third trap is operational: when the registry becomes a dependency of CI/CD, an outage can halt deploys. You need a design that fails safe (no silent breaking changes) without turning a transient incident into a company-wide stop-the-world event.
+
+## Requirements
+
+### Functional Requirements
+- Enforce schema compatibility rules (backward/forward/full/none) per **subject** (topic + record/message) during CI/CD, with deterministic pass/fail.
+- Support Avro and Protobuf with correct, type-aware evolution semantics (not text diffs).
+- Immutable schema versioning with provenance (who/what/when), plus an auditable policy change history.
+- Fine-grained authorization: teams can evolve schemas in their namespace; cross-namespace changes require explicit ownership.
+- A “break-glass” path for emergencies that is visible, time-bounded, and leaves an audit trail.
+
+### Scale Targets
+- **Schemas:** 10,000 subjects total (multi-team, multi-env), average 30 versions each → 300k versions stored.
+- **Change rate:** 1,000 schema publish attempts/day; CI compatibility checks on every PR and deploy.
+- **Read traffic:** 2,000 QPS peak for consumers fetching latest compatible schema (cached heavily).
+- **Latency:** CI check < 2s p95 (including auth + policy evaluation + compatibility computation); runtime fetch < 50ms p95 from cache.
+
+These targets drive two choices: store versions immutably (cheap writes, easy audit) and make reads cacheable (most systems read far more than they write).
+
+## Key Design Decisions
+
+- **Decision 1: Compatibility is enforced in CI via a registry-backed check**
+  - What we chose: a `schemactl` CLI (and CI action) that runs `check` and `publish` against the registry, failing builds on violations.
+  - What we rejected: “best effort” checks in a post-deploy job or a runtime-only guard.
+  - Why: breaking changes must be stopped before merge/deploy; runtime guards detect too late and create partial outages.
+
+- **Decision 2: Policy is a first-class, versioned object**
+  - What we chose: per-subject policy (compat mode, allowed transformations, ownership, environments) stored and versioned in the registry (with GitOps support).
+  - What we rejected: a single global compatibility mode, or rules embedded in CI scripts per repo.
+  - Why: teams need clear, stable rules; centralizing policy avoids drift and makes changes reviewable.
+
+- **Decision 3: Use a boring storage core + strong caching**
+  - What we chose: Postgres for metadata + schema blobs, object storage for large artifacts if needed, and a CDN/Redis cache for hot reads.
+  - What we rejected: building on a distributed KV store as the primary system of record.
+  - Why: the registry is governance-heavy, not write-heavy; Postgres gives transactions, constraints, and audit queries without operational heroics.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  Dev["Dev/CI"] --> CLI["schemactl"]
+  CLI --> Reg["Schema Registry API"]
+  Reg --> DB["Postgres"]
+  Reg --> Cache["Redis/CDN"]
+  Bus["Event Bus"] --> Cons["Consumers"]
+  Cons --> Cache
+```
+
+### Components
+
+- **`schemactl` (CLI + CI integration)**: Computes canonical schema fingerprints, calls `check` (no side effects) and `publish` (creates new version). It prints actionable diffs (“field `x` removed”, “enum value added without default”) and links to policy docs.
+- **Schema Registry API**: The policy enforcement point. Owns subject namespaces, versioning, compatibility evaluation, and audit logging. Exposes read APIs for runtime clients.
+- **Postgres**: Source of truth for subjects, versions, policies, ownership, and audit events. Enforces immutability (no updates to schema payloads), and guarantees consistent reads for CI decisions.
+- **Redis/CDN cache**: Serves hot reads (`latest`, `latestCompatible`, `byFingerprint`) and shields Postgres from consumer bursts.
+- **Consumers (runtime client)**: Fetch schemas by ID/fingerprint and cache locally with TTL. They do not publish; they only read.
+- **Event Bus (Kafka/PubSub)**: Not governed by this system, but it’s the blast radius. The registry’s job is to prevent contract drift on it.
+
+## Deep Dive: Compatibility Enforcement in CI/CD
+
+The hardest part is making “compatible” mean the same thing for every team, every language, and every pipeline—without turning schema evolution into a ceremony.
+
+**1) Canonicalization + fingerprinting (stop arguing about whitespace).**  
+The CLI compiles schemas into a canonical form:
+- Avro: parse to AST, normalize names/namespaces, sort JSON object keys where allowed, and compute a canonical string for fingerprinting.
+- Protobuf: compile to a descriptor set, normalize ordering, and fingerprint the descriptor graph (including imports and options that affect wire compatibility).
+
+This fingerprint becomes the immutable identity of a schema payload. It prevents duplicates, makes caching trivial, and lets CI reliably answer “have we seen this exact schema before?”
+
+**2) Subject naming and ownership (compatibility only makes sense within a contract).**  
+A subject is the unit of evolution: `env/topic/message` (or `topic:record` for Avro, `package.Message` for Protobuf) with an explicit owner team. CI fails fast if a repo attempts to publish to a subject it does not own. That one rule eliminates most governance drama.
+
+**3) Compatibility evaluation is type-aware and policy-driven.**  
+For each publish attempt, the registry:
+- Loads the subject policy: compatibility mode (backward/forward/full/none), allowed break-glass, and environment constraints.
+- Chooses the comparison baseline: usually “latest in prod”, not “latest in repo”, so a stale branch can’t accidentally publish an incompatible change.
+- Evaluates evolution semantics:
+  - **Avro**: field removal is breaking unless consumers are tolerant and defaults exist; changing field type is breaking; adding a field requires a default (or union with `null` + default) to maintain backward compatibility.
+  - **Protobuf**: field numbers define compatibility; renames are safe; reusing a field number is breaking; deletions require `reserved` numbers/names to prevent accidental reuse; changing scalar types is breaking unless wire-compatible (and explicitly allowed by policy, usually not).
+- Produces a concrete, human-readable report and a machine-readable result (for CI annotations).
+
+**4) CI workflow that teams can live with.**
+- On PR: `schemactl check` runs and comments on the PR with exact violations and the policy that triggered them.
+- On merge to main: `schemactl publish --dry-run` runs to ensure the merge base is still compatible with current prod head.
+- On deploy: `schemactl publish --env=prod` creates the new immutable version and returns the new schema ID(s) for embedding in artifacts.
+
+**5) Break-glass that doesn’t rot the culture.**  
+Break-glass requires:
+- A ticket/reference, a reason, an expiration, and an approver distinct from the author.
+- Automatic alerts to consumers subscribed to that subject.
+- Forced “compatibility reset” mechanics: the new version becomes a new major contract line (e.g., new subject or explicit incompatible epoch), so consumers opt in intentionally.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Preventing breaking changes before deploy | Some developer friction on schema edits |
+| Explicit, auditable governance | Less “move fast” flexibility in prod |
+| Simple operations (Postgres + cache) | Not the absolute lowest possible latency |
+| Deterministic CI decisions | Extra work to maintain correct semantic checkers |
+
+## Failure Modes
+
+- **Registry outage during CI**
+  - What happens: builds can’t validate/publish schemas; deploys stall.
+  - Detection: CI step failures + registry health alerts.
+  - Recovery: serve `check` from a read-only cache of `{subject, baselineVersion, schemaPayload}` for a short TTL; disallow `publish` without registry write availability to avoid silent drift.
+
+- **Policy misconfiguration blocks legitimate changes**
+  - What happens: teams are stuck; pressure builds to bypass governance.
+  - Detection: spike in failed checks for the same subject/policy version; support tickets.
+  - Recovery: policy is versioned and rollbackable; add a `policy test` endpoint and require policy changes to run against a fixture suite of known evolutions before activation.
+
+- **Cache serves stale “latest”**
+  - What happens: consumers fetch an older schema; CI compares against wrong baseline if it used cache incorrectly.
+  - Detection: mismatch between cache key version and Postgres version; audit anomalies.
+  - Recovery: CI paths read from Postgres (strong consistency); runtime reads are cacheable. Cache keys include `{subject, version}` and `latest` uses short TTL + soft refresh.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move hot reads fully behind a CDN with immutable IDs (`byFingerprint`, `byId`), keep Postgres for writes and policy, and add regional read replicas for latency.
+- **100x scale:** Split metadata and payload storage: Postgres for metadata/audit, object storage for payloads, and a dedicated compatibility worker pool with a queue for heavy checks (large Protobuf graphs, many imports). Also introduce “contract epochs” to manage deliberate incompatibilities without subject sprawl.
+
+## Operational Notes
+
+- Treat Postgres as the control plane: daily backups, point-in-time recovery, and strict immutability constraints on schema versions.
+- Keep CI checks strongly consistent and cache runtime reads aggressively; mixing those two concerns is how teams ship breakage during incidents.
+- Make ownership and policy visible: a `schemactl explain subject` command that prints owner, mode, baseline, and last break-glass events prevents most escalation loops.
+- Emit high-signal alerts: break-glass use, sudden spikes in incompatibility failures, and subjects with rapidly growing versions (often a sign of uncontrolled experimentation).
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Separating “boring immutable storage” from “explicit, testable policy” is the right abstraction boundary: it keeps the registry simple while putting the real complexity (compatibility meaning, baseline choice, ownership) into a versioned control plane that CI can enforce deterministically.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| `schemactl` (CLI/CI action) | Gives teams fast feedback and a consistent workflow; keeps schema checks close to PRs. |
+| Registry API | Central authority for policy + baseline selection + audit; prevents per-repo drift and “it passed locally”. |
+| Postgres (SoT) | Transactions + constraints + audit queries fit governance; 300k versions is well within comfort. |
+| Compatibility engine (Avro/Protobuf aware) | Text diffs are wrong; semantic evolution rules are the product. |
+| Audit log (policy + publish decisions) | Makes governance reversible and defensible; critical for break-glass. |
+| Runtime read path (by ID/fingerprint) | Consumers need a stable, cacheable lookup to decode data safely. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom registry from scratch | Adopt/extend an existing registry (Confluent Schema Registry, Apicurio, Redpanda, AWS Glue) and focus on policy/CI UX | Less control over policy model and break-glass semantics; integration constraints. |
+| Redis + CDN cache tier | Start with HTTP caching + CDN only for immutable `byId/byFingerprint`; add Redis only if proven necessary | Slightly more work in client caching; less “latest” convenience without an origin hit. |
+| “latestCompatible” runtime endpoint | Prefer immutable IDs embedded in messages (or schema ID headers) and use registry only for ID→schema | Requires producer changes and conventions; less magic, more explicit contracts. |
+| Custom policy logic embedded in service | Policy-as-code (OPA/Rego or Cedar) with versioned bundles | Adds a dependency and learning curve; can be overkill for a small team. |
+| Break-glass publishes in-place + “epoch” | Make break-glass require a *new subject* (or mandated `-v2`/`epoch=2` naming) rather than in-place incompatibility | More subjects to manage; much safer operationally and culturally. |
+| Protobuf canonicalization/compilation inside CLI | Centralize compilation in the registry (containerized, pinned `protoc`, pinned include roots) and make CLI a thin submitter | More server CPU; but eliminates “works on my machine” descriptor differences. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Postgres down for 5 minutes**
+   - Design's answer: CI stalls; allow `check` via short TTL read-only cache; disallow `publish`.
+   - Recommendation: **Strengthen** — make the degraded `check` mode an explicit *signed snapshot* (subject→baselineVersion+policyVersion+schema) so CI decisions remain deterministic and auditable during outages.
+
+2. **Two teams/PRs publish concurrently to the same subject**
+   - Design's answer: not addressed.
+   - Recommendation: **Must fix** — add per-subject serialization (Postgres advisory lock or `SELECT … FOR UPDATE` on a subject row) + idempotency keys for `publish` to prevent version races and “last writer wins” surprises.
+
+3. **Network partition: CI can reach cache/CDN but not the registry**
+   - Design's answer: CI reads strongly consistent from Postgres; runtime reads cacheable.
+   - Recommendation: **Strengthen** — document a hard rule: CI must never use CDN “latest”; only use registry snapshot/SoT. If registry is unreachable, CI either fails closed or uses the signed snapshot path.
+
+4. **Bad policy change blocks the org (or silently loosens rules)**
+   - Design's answer: versioned/rollbackable policy + policy test endpoint + fixtures.
+   - Recommendation: **Acceptable but sharpen** — require “policy rollout” as a two-phase activation (draft → canary subjects/environments → activate) and always record `policyVersionUsed` in every check/publish audit row.
+
+5. **Compatibility checker bug (false pass) ships a breaking change**
+   - Design's answer: not addressed.
+   - Recommendation: **Strengthen** — treat checker releases like a compiler: pin checker version in CI, run golden fixture suites per release, and store the checker build/version in audit logs so you can answer “why did this pass then?”.
+
+## Recommendations
+
+### Must Fix
+- Define the precise semantics of `latestCompatible`: compatible with *which* deployed readers/writers (often multiple consumer versions exist); consider dropping it in favor of immutable IDs + explicit baselines.
+- Add concurrency + idempotency controls for `publish` (per-subject locking, request idempotency keys, monotonic version assignment).
+- Make Protobuf descriptor generation fully deterministic (pinned `protoc`, pinned imports, no ambient filesystem/state); otherwise fingerprints will drift across environments.
+- Constrain break-glass so it can’t create silent partial outages: strongly prefer “new subject / new epoch name” over in-place incompatible publishes.
+
+### Should Consider
+- Start with Postgres + CDN (immutable endpoints) and defer Redis until measurements demand it; reduce moving parts for a small platform team.
+- Use Postgres row-level security or a single, simple authz model (OIDC→team claims→namespace) to keep authorization understandable at 3am.
+- Add “promotion” mechanics (dev→staging→prod) so the baseline choice is explicit and reproducible, not just “latest in prod”.
+
+### Nice to Have
+- A small UI/portal for subject ownership, policy, recent publishes, and break-glass history (reduces support load).
+- Consumer-impact notifications wired to ownership (Slack/email hooks per subject) with clear “action required” thresholds.
+- A “schema diff explainer” library shared between CLI and registry so reports are identical everywhere.
+
+## What's Working Well
+- Clear separation of concerns (storage vs policy) and a realistic focus on auditability and small-team operability.
+- Good instinct to keep CI strongly consistent while letting runtime reads be cache-heavy.
+- Ownership-as-a-first-class concept is a high-leverage governance simplifier.
+- The doc is honest about trade-offs and already anticipates the two biggest cultural failure modes: bypass pressure and human bottlenecks.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+Reconnecting... 1/5
+
+
+
+
+
+
+thinking
+**Simplifying architecture design**
+
+I'm thinking about streamlining the architecture by potentially removing Redis and CDN components. Instead, I could focus on just Postgres, a registry, and maybe a CLI with optional HTTP caching. My plan includes integrating Protobuf compilation features to ensure determinism and concurrency. I need to present a simplified design without any critique sections, focusing solely on the final design documentation. So, the minimal components will be schemactl, registry API, and Postgres, relying on immutable IDs for runtime reads.
+thinking
+**Refining caching and policies**
+
+I'm considering how to meet the requirement for read traffic at 2000 QPS. A client cache might be sufficient here, and I'll include HTTP caching headers. I plan to remove the “latestCompatible” runtime endpoint, using ID or schema-id in messages instead. This does impact producers; however, I won't add new components. 
+
+To simplify policy, I'll keep it versioned in Postgres, applying it per subject or namespace without GitOps. The break-glass policy will require a new subject name suffix (`-v2`). I’ll ensure CI works by using `schemactl` to manage a cached baseline, allowing a system to fall back to the last successful snapshot if there's an outage.
+thinking
+**Strengthening registry design**
+
+I'm considering a minimal approach where the registry exposes a `snapshot` endpoint that returns key details like `{subject, baselineVersion, policyVersion, schemaFingerprint}` along with an ETag and `X-Registry-Snapshot-Id` for auditing purposes. Signing might not be necessary since it's only used within the CI trust boundary. 
+
+In a network partition scenario where CI can access the CDN but not the registry, we've decided CI won't use caches. For concurrency, I plan to implement per-subject locking with Postgres using `SELECT FOR UPDATE`, alongside an idempotency key in publish requests. 
+
+For Protobuf deterministic compilation, the registry should handle this instead of the CLI, simplifying the CLI's role to just submitting schema payloads and printing results while maintaining compatibility features.
+thinking
+**Streamlining architecture requirements**
+
+Simplifying the architecture further is essential. There's a requirement for the CI check to complete in under 2 seconds, which might mean server-side compilation could be heavier, but that's manageable. I think we should focus on supporting one schema type at a time while keeping the existing requirements for both schema types. 
+
+To simplify subject naming, I'll propose using `subject = topic/message`, moving the environment aspect to policy. The scale targets can remain but should be condensed. It's crucial to ensure we don't add components like OPA or Cedar. The documentation will include a minimal architecture section and a "What We Removed" section, listing removed items like Redis, CDN, the latestCompatible endpoint, and CLI compilation differences.
+thinking
+**Crafting the simplified documentation**
+
+I'm working on the trade-offs and failure modes sections to clearly outline what we give up, such as increased origin reads and the reliance on embedding schema IDs. There's a need to revise the failure modes to include scenarios like Postgres downtime and network partitions. 
+
+I’ll produce a markdown document with condensed sections without adding new headers. We will maintain key headings like Overview, Requirements, Architecture, and What We Removed. In "What We Removed," I'll note factual removals like Redis and the CDN without hedging. The registry API will focus on schema and policy management while the schemactl CLI will call registry endpoints, caching snapshots for outages. For policies, I will include versioning and activation phases without introducing new components.
+thinking
+**Design Decisions**
+
+`schemactl check` requires the registry, and if it's down, `schemactl check --snapshot <file>` will use a previously exported snapshot for validation. The snapshot will include a `snapshotId` and a `sha256` signature generated from the registry. 
+
+We'll handle HMAC signing within the registry, with the CLI verifying it without public key distribution to simplify things. Instead of adding new components, I will keep the architecture minimal, ensuring no external dependencies like Redis or GitOps support.
+
+**Architecture**  
+Below is the updated architecture using a mermaid diagram that reflects these changes. It's designed to clearly outline the components while omitting unnecessary elements. 
+
+**Components**  
+Each component has a clear purpose, and I will justify their inclusion in the list. 
+
+**What We Removed**  
+The section formerly known as "What I'd Do Differently At..." will now be titled "What We Removed," outlining removed items.
+
+**Honest Trade-offs**  
+I'll include a table reflecting the trade-offs made regarding baseline semantics, concurrency, determinism, and break-glass policies. I’ll rework "Deep Dive" into concise subsections, maintaining clarity throughout.
+
+The flow will include steps from submitting schemas to ensuring consumers fetch them efficiently while embedding practical requirements in a condensed manner.
+codex
+```markdown
+---
+title: "Event Schema Registry"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["schemas", "governance", "ci-cd", "avro", "protobuf", "compatibility"]
+---
+
+## Overview
+
+An Event Schema Registry is a governance system that treats event schemas as a shared contract. Teams publish immutable, versioned Avro/Protobuf schemas, and every change is checked against explicit compatibility policy before it can ship. The registry is the single source of truth; CI/CD is the enforcement point.
+
+This design keeps one boundary: **immutable schema storage + versioned policy in one place**, evaluated deterministically during CI and recorded for audit.
+
+## What Makes This Hard
+
+Breaking changes are cross-team and delayed: a producer deploys, consumers fail later. “Compatibility” is contextual (subject, environment, schema type). When CI depends on the registry, outages can halt deploys unless failure behavior is explicit and safe.
+
+## Requirements
+
+### Functional Requirements
+- Enforce compatibility rules (backward/forward/full/none) per subject during CI/CD with deterministic pass/fail.
+- Support Avro and Protobuf with correct evolution semantics (type-aware, not text diffs).
+- Immutable schema versioning with provenance, plus auditable policy history.
+- Namespace-based authorization: teams evolve schemas they own.
+- A visible, time-bounded break-glass path with an audit trail.
+
+### Scale Targets
+- 10,000 subjects, ~300k stored versions.
+- ~1,000 publish attempts/day; CI checks on every PR/deploy.
+- Up to 2,000 QPS reads for schema ID lookups (cacheable).
+- CI check < 2s p95.
+
+## Key Design Decisions
+
+- **Decision 1: CI enforces via a registry-backed check**
+  - `schemactl` calls `check` (no side effects) and `publish` (creates a new immutable version). CI fails on violations.
+
+- **Decision 2: Policy is first-class and versioned**
+  - Compatibility mode, baseline rules, ownership, and environment constraints are stored and versioned in the registry and referenced in every check/publish audit row.
+
+- **Decision 3: Runtime uses immutable IDs, not “latest”**
+  - Producers embed a schema ID (or fingerprint) in messages; consumers fetch `id → schema` and cache locally. No runtime “latestCompatible” resolution.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  Dev["Dev/CI"] --> CLI["schemactl"]
+  CLI --> Reg["Schema Registry API"]
+  Reg --> DB["Postgres"]
+  Bus["Event Bus"] --> Cons["Consumers"]
+  Cons --> Reg
+```
+
+### Components
+
+- **`schemactl` (CLI + CI integration)**: Submits schemas for `check`/`publish`, prints a deterministic report (violations + policy version + baseline used), and supports idempotent retries.
+- **Schema Registry API**: Canonicalizes schemas, computes fingerprints, evaluates compatibility, assigns schema IDs, enforces ownership, serializes publishes per subject, and writes audit events.
+- **Postgres**: Source of truth for subjects, versions, policies, ownership, idempotency keys, and audit. Enforces immutability and provides consistent reads for CI decisions.
+- **Consumers (runtime client)**: Fetch schemas by immutable ID/fingerprint and cache locally with TTL; never publish.
+
+## Deep Dive: Compatibility Enforcement in CI/CD
+
+**1) Deterministic inputs.**  
+Canonicalization and fingerprinting happen in the registry so results don’t vary by developer machine:
+- Avro: parse to AST, normalize names/namespaces, canonicalize, fingerprint.
+- Protobuf: compile to a descriptor set with pinned compilation rules, fingerprint the descriptor graph (imports included).
+
+**2) Baseline selection is explicit.**  
+Every `check/publish` specifies `subject` and `env`. The registry chooses the baseline as “latest version in that env” (recorded as `baselineVersionId` in the audit row) so stale branches can’t compare against local history.
+
+**3) Type-aware compatibility, driven by policy.**  
+The registry evaluates evolution semantics against the baseline under the subject’s policy (mode + constraints), and returns:
+- Human-readable violations (what changed, why it fails).
+- Machine-readable result for CI annotations.
+- The `policyVersionUsed` and `engineVersion` that produced the decision.
+
+**4) Publish is serialized and idempotent.**  
+`publish` takes an idempotency key and acquires a per-subject lock in Postgres (row lock or advisory lock) to ensure monotonic version assignment with no “last writer wins” races.
+
+**5) Break-glass is a new subject.**  
+Incompatible changes ship as a new subject name (for example `orders.created-v2`) with fresh policy, so consumers opt in intentionally. The registry records the break-glass request metadata on first publish of the new subject.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Preventing breaking changes before deploy | More friction on schema edits |
+| Deterministic CI decisions | Registry is a CI dependency |
+| Simple operations (one API + Postgres) | Fewer performance “escape hatches” |
+| Safer incompatibility handling (new subject) | More subjects over time |
+| Explicit contracts (schema ID in messages) | Requires producer conventions |
+
+## Failure Modes
+
+- **Registry (or Postgres) outage during CI**
+  - What happens: `check`/`publish` cannot complete; deploys stall.
+  - Recovery: fail closed. `publish` is never allowed without a registry write. (CI stays safe and deterministic; availability is handled operationally via HA Postgres + API replicas.)
+
+- **Two PRs publish concurrently to the same subject**
+  - What happens: version races without controls.
+  - Recovery: per-subject serialization in Postgres + idempotency keys; retries return the original result.
+
+- **Network partition: CI can’t reach the registry**
+  - What happens: schema changes can’t be validated.
+  - Recovery: fail closed (no publish, no “cache-only latest” behavior).
+
+- **Bad policy change blocks teams (or silently loosens rules)**
+  - What happens: org-wide friction or unexpected risk.
+  - Recovery: policy is versioned, activated explicitly per environment, and every check/publish records `policyVersionUsed` for rollback and audit.
+
+- **Compatibility checker bug (false pass)**
+  - What happens: breaking change ships despite checks.
+  - Recovery: every decision records `engineVersion`; roll back the registry release and re-run checks for impacted subjects using the stored baseline + policy versions.
+
+## What We Removed
+
+- Redis/CDN cache tier; runtime relies on immutable schema IDs with client-side caching and HTTP caching headers.
+- Runtime `latestCompatible` endpoints; runtime does `schemaId → schema`.
+- In-place incompatible break-glass with epochs; incompatible changes publish under a new subject name.
+- CLI-side compilation as an authority; the registry canonicalizes and fingerprints so results are consistent everywhere.
+- Object storage for payloads; schemas live in Postgres as the system of record.
+
+## Operational Notes
+
+- Treat Postgres as the control plane: backups, PITR, strict immutability constraints, and clear subject-level locking.
+- Keep CI strongly consistent: CI never consults any “latest” cache; it asks the registry and records baseline/policy/engine versions.
+- Make ownership/policy obvious: `schemactl explain subject` returns owner, mode, environments, and the baseline selection rule.
+```
+tokens used
+9,223
+```markdown
+---
+title: "Event Schema Registry"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["schemas", "governance", "ci-cd", "avro", "protobuf", "compatibility"]
+---
+
+## Overview
+
+An Event Schema Registry is a governance system that treats event schemas as a shared contract. Teams publish immutable, versioned Avro/Protobuf schemas, and every change is checked against explicit compatibility policy before it can ship. The registry is the single source of truth; CI/CD is the enforcement point.
+
+This design keeps one boundary: **immutable schema storage + versioned policy in one place**, evaluated deterministically during CI and recorded for audit.
+
+## What Makes This Hard
+
+Breaking changes are cross-team and delayed: a producer deploys, consumers fail later. “Compatibility” is contextual (subject, environment, schema type). When CI depends on the registry, outages can halt deploys unless failure behavior is explicit and safe.
+
+## Requirements
+
+### Functional Requirements
+- Enforce compatibility rules (backward/forward/full/none) per subject during CI/CD with deterministic pass/fail.
+- Support Avro and Protobuf with correct evolution semantics (type-aware, not text diffs).
+- Immutable schema versioning with provenance, plus auditable policy history.
+- Namespace-based authorization: teams evolve schemas they own.
+- A visible, time-bounded break-glass path with an audit trail.
+
+### Scale Targets
+- 10,000 subjects, ~300k stored versions.
+- ~1,000 publish attempts/day; CI checks on every PR/deploy.
+- Up to 2,000 QPS reads for schema ID lookups (cacheable).
+- CI check < 2s p95.
+
+## Key Design Decisions
+
+- **Decision 1: CI enforces via a registry-backed check**
+  - `schemactl` calls `check` (no side effects) and `publish` (creates a new immutable version). CI fails on violations.
+
+- **Decision 2: Policy is first-class and versioned**
+  - Compatibility mode, baseline rules, ownership, and environment constraints are stored and versioned in the registry and referenced in every check/publish audit row.
+
+- **Decision 3: Runtime uses immutable IDs, not “latest”**
+  - Producers embed a schema ID (or fingerprint) in messages; consumers fetch `id → schema` and cache locally. No runtime “latestCompatible” resolution.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  Dev["Dev/CI"] --> CLI["schemactl"]
+  CLI --> Reg["Schema Registry API"]
+  Reg --> DB["Postgres"]
+  Bus["Event Bus"] --> Cons["Consumers"]
+  Cons --> Reg
+```
+
+### Components
+
+- **`schemactl` (CLI + CI integration)**: Submits schemas for `check`/`publish`, prints a deterministic report (violations + policy version + baseline used), and supports idempotent retries.
+- **Schema Registry API**: Canonicalizes schemas, computes fingerprints, evaluates compatibility, assigns schema IDs, enforces ownership, serializes publishes per subject, and writes audit events.
+- **Postgres**: Source of truth for subjects, versions, policies, ownership, idempotency keys, and audit. Enforces immutability and provides consistent reads for CI decisions.
+- **Consumers (runtime client)**: Fetch schemas by immutable ID/fingerprint and cache locally with TTL; never publish.
+
+## Deep Dive: Compatibility Enforcement in CI/CD
+
+**1) Deterministic inputs.**  
+Canonicalization and fingerprinting happen in the registry so results don’t vary by developer machine:
+- Avro: parse to AST, normalize names/namespaces, canonicalize, fingerprint.
+- Protobuf: compile to a descriptor set with pinned compilation rules, fingerprint the descriptor graph (imports included).
+
+**2) Baseline selection is explicit.**  
+Every `check/publish` specifies `subject` and `env`. The registry chooses the baseline as “latest version in that env” (recorded as `baselineVersionId` in the audit row) so stale branches can’t compare against local history.
+
+**3) Type-aware compatibility, driven by policy.**  
+The registry evaluates evolution semantics against the baseline under the subject’s policy (mode + constraints), and returns:
+- Human-readable violations (what changed, why it fails).
+- Machine-readable result for CI annotations.
+- The `policyVersionUsed` and `engineVersion` that produced the decision.
+
+**4) Publish is serialized and idempotent.**  
+`publish` takes an idempotency key and acquires a per-subject lock in Postgres (row lock or advisory lock) to ensure monotonic version assignment with no “last writer wins” races.
+
+**5) Break-glass is a new subject.**  
+Incompatible changes ship as a new subject name (for example `orders.created-v2`) with fresh policy, so consumers opt in intentionally. The registry records the break-glass request metadata on first publish of the new subject.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Preventing breaking changes before deploy | More friction on schema edits |
+| Deterministic CI decisions | Registry is a CI dependency |
+| Simple operations (one API + Postgres) | Fewer performance “escape hatches” |
+| Safer incompatibility handling (new subject) | More subjects over time |
+| Explicit contracts (schema ID in messages) | Requires producer conventions |
+
+## Failure Modes
+
+- **Registry (or Postgres) outage during CI**
+  - What happens: `check`/`publish` cannot complete; deploys stall.
+  - Recovery: fail closed. `publish` is never allowed without a registry write. (CI stays safe and deterministic; availability is handled operationally via HA Postgres + API replicas.)
+
+- **Two PRs publish concurrently to the same subject**
+  - What happens: version races without controls.
+  - Recovery: per-subject serialization in Postgres + idempotency keys; retries return the original result.
+
+- **Network partition: CI can’t reach the registry**
+  - What happens: schema changes can’t be validated.
+  - Recovery: fail closed (no publish, no “cache-only latest” behavior).
+
+- **Bad policy change blocks teams (or silently loosens rules)**
+  - What happens: org-wide friction or unexpected risk.
+  - Recovery: policy is versioned, activated explicitly per environment, and every check/publish records `policyVersionUsed` for rollback and audit.
+
+- **Compatibility checker bug (false pass)**
+  - What happens: breaking change ships despite checks.
+  - Recovery: every decision records `engineVersion`; roll back the registry release and re-run checks for impacted subjects using the stored baseline + policy versions.
+
+## What We Removed
+
+- Redis/CDN cache tier; runtime relies on immutable schema IDs with client-side caching and HTTP caching headers.
+- Runtime `latestCompatible` endpoints; runtime does `schemaId → schema`.
+- In-place incompatible break-glass with epochs; incompatible changes publish under a new subject name.
+- CLI-side compilation as an authority; the registry canonicalizes and fingerprints so results are consistent everywhere.
+- Object storage for payloads; schemas live in Postgres as the system of record.
+
+## Operational Notes
+
+- Treat Postgres as the control plane: backups, PITR, strict immutability constraints, and clear subject-level locking.
+- Keep CI strongly consistent: CI never consults any “latest” cache; it asks the registry and records baseline/policy/engine versions.
+- Make ownership/policy obvious: `schemactl explain subject` returns owner, mode, environments, and the baseline selection rule.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/10-strategic-problems/event-schema-registry.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Event Schema Registry
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/event-schema-registry.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/event-schema-registry.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/10-strategic-problems/event-schema-registry.md

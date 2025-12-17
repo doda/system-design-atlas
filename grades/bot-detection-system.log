@@ -1,0 +1,369 @@
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2a95-a0bc-7b30-8c85-f97dd9e0001b
+--------
+user
+You are a senior systems architect reviewing a system design document.
+
+Grade this solution on three dimensions (1-10 scale):
+
+1. **Strength** (1-10): How technically sound, complete, and production-ready is the design?
+   - Does it address scalability, reliability, and failure modes?
+   - Are the trade-offs well-reasoned?
+   - Would this actually work at scale?
+
+2. **Interestingness** (1-10): How engaging and educational is the content?
+   - Does it teach useful concepts?
+   - Are there insights that aren't obvious?
+   - Would an engineer learn something valuable?
+
+3. **Novelty** (1-10): How unique or creative is the approach?
+   - Does it go beyond textbook solutions?
+   - Are there clever simplifications or unconventional choices?
+   - Does it challenge common assumptions?
+
+Also note any major issues or particularly strong aspects.
+
+Output ONLY valid JSON in this exact format:
+{
+  "slug": "bot-detection-system",
+  "strength": <1-10>,
+  "interestingness": <1-10>,
+  "novelty": <1-10>,
+  "overall": <average of three scores, 1 decimal>,
+  "summary": "<2-3 sentence summary of the design>",
+  "strengths": ["<strength 1>", "<strength 2>"],
+  "weaknesses": ["<weakness 1>", "<weakness 2>"],
+  "verdict": "<one of: exceptional, strong, adequate, weak>"
+}
+
+---
+
+## Solution to Grade
+
+---
+title: "Bot Detection System"
+category: "Security & Access Control"
+difficulty: "Hard"
+tags: ["bot-detection", "device-fingerprinting", "risk-scoring", "waf", "fraud-prevention"]
+---
+
+## Overview
+
+This system provides real-time bot risk decisions for high-value endpoints (login, signup, checkout, APIs) with low latency and strong auditability. It combines device fingerprinting, short-window behavioral signals, reputation, and policy rules to return an action:
+
+`ALLOW`, `ALLOW_MONITOR`, `RATE_LIMIT`, `CHALLENGE`, `BLOCK`
+
+The design is split into:
+- A **synchronous decision path** (edge → decision API → response) optimized for tail latency.
+- An **asynchronous learning path** that updates reputations/rolling features, powers investigations, and incorporates downstream outcomes.
+
+---
+
+## Requirements
+
+### Functional Requirements
+
+- **Request-time assessment** for protected endpoints returning an action, risk score, and reason codes.
+- **Device fingerprinting** (web JS + mobile SDK + server hints) producing `device_id` and `fp_confidence`.
+- **Behavioral signals**: velocity, sequencing, and anomaly indicators from short rolling windows.
+- **Reputation** for `ip`, `asn`, `cidr`, `device_id`, `account_id`, `session_id`, with decay and evidence counters.
+- **Policy management** per tenant:
+  - Rules by endpoint group, geo, client type, risk band.
+  - Allowlist/blocklist and “lockdown” toggles.
+  - Shadow mode, canary enforcement, versioning, rollback.
+- **Step-up challenges** (CAPTCHA/WebAuthn/OTP), bound to session/device/context.
+- **Investigation & analytics**:
+  - Searchable decision logs with deterministic replay given inputs + policy version.
+  - Cohorts by endpoint/ASN/country/device tag/model version.
+- **Feedback ingestion** (fraud confirmed, ATO, chargebacks, false positives, challenge outcomes) to update reputations and features.
+
+### Non-Functional Requirements
+
+- **Latency (decision path)**: P50 10–20ms, P95 ≤ 40ms, P99 ≤ 75ms (excluding challenge solve).
+- **Availability**:
+  - Decisioning SLO: 99.99% monthly (per region pair).
+  - Telemetry ingest: best-effort with load shedding.
+  - Policies: strongly consistent writes; versioned reads; seconds-level propagation acceptable.
+- **Scale (example targets)**:
+  - Decisioning: 50k sustained, 200k burst.
+  - Telemetry: 80k–150k events/sec average, higher in spikes.
+- **Multi-tenant isolation**: per-tenant quotas, rate limits, and fair resource use.
+- **Privacy/compliance**: minimize PII, configurable retention, hashed identifiers, DSAR deletion workflows.
+
+---
+
+## Simplified Architecture
+
+### High-Level Diagram
+
+```mermaid
+flowchart TB
+  C[Client SDK] --> E[CDN/WAF Plugin]
+  E --> A[Bot Defense API]
+  A --> R[(Redis)]
+  A --> P[(Postgres)]
+  A --> O[(Analytics DB)]
+  A --> S[(Object Storage)]
+  A --> W[Async Workers]
+  W --> R
+  W --> O
+  W --> S
+```
+
+### Request-Time Decision Flow
+
+1. Client SDK attaches lightweight signals (headers/cookies) to protected requests.
+2. Edge validates an existing `decision_token` when present; otherwise it calls `POST /v1/assess`.
+3. Bot Defense API:
+   - Authenticates tenant and enforces quotas.
+   - Normalizes request context (canonical IP, UA parsing, geo, endpoint group).
+   - Loads the compiled policy version for the tenant.
+   - Fetches reputations and rolling counters from Redis (batched).
+   - Evaluates rules (and optional lightweight model) to produce `action`, `risk_score`, `reason_codes`, and `decision_ttl_ms`.
+   - If needed, issues a challenge and binds it to `{tenant_id, session_id, device_id, risk_context_hash}`.
+   - Returns a signed `decision_token` for short-term reuse at the edge.
+4. The API appends a decision event for asynchronous processing (audit, aggregations, feedback linkage).
+
+### Async Learning & Analytics Flow
+
+- Async workers consume decision/telemetry/feedback events to:
+  - Update time-decayed reputations and rolling-window features in Redis.
+  - Write searchable decision logs to the analytics database.
+  - Archive raw events to object storage for retention, offline analysis, and training datasets.
+
+---
+
+## Components
+
+### Client SDK (Web/Mobile)
+
+**Responsibilities**
+- Collect device and session signals in first-party context.
+- Produce a stable `device_id` (where permitted) and `fp_confidence`.
+- Send:
+  - **Inline hints** for request-time assessment (minimal payload).
+  - **Batched telemetry** asynchronously (richer behavioral events).
+
+**Privacy**
+- Hash stable identifiers client-side where feasible.
+- Tenant-configurable collection toggles and retention policies.
+
+### CDN/WAF Plugin (Edge Enforcement)
+
+**Responsibilities**
+- Cheap pre-filters: basic protocol sanity, per-tenant rate limiting, static blocklists.
+- Normalize metadata (canonical client IP, headers, geo).
+- Enforce the action: allow, rate-limit, block, or challenge.
+
+**Decision Tokens**
+- Edge validates signed `decision_token` locally using rotating public keys (JWKS).
+- Short TTL (e.g., 30–120s), scoped to endpoint group + session and bound to a risk context hash.
+
+### Bot Defense API (Single Service)
+
+A single deployable service with internal modules:
+- **Decisioning** (`/v1/assess`)
+- **Policy management** (CRUD, validation, compilation, versioning, rollouts)
+- **Challenge** (issue/verify, proof tokens)
+- **Telemetry ingest** (best-effort batching, sampling)
+- **Feedback ingest** (dedupe, trust-tier weighting)
+
+**Latency Controls**
+- Hard timeouts per dependency; no retries on the critical path.
+- Degraded-mode policies per endpoint group (fail-open/monitor vs challenge-first/fail-closed).
+
+### Redis (Hot Data)
+
+**Purpose**
+- Low-latency lookups and atomic updates for:
+  - Reputations (ip/asn/device/account/session) with decay.
+  - Rolling counters (1m/5m/1h) with TTL-based buckets.
+  - Rate-limit keys and short-lived anti-replay bindings.
+
+### Postgres (Authoritative Data)
+
+**Purpose**
+- Durable, transactional storage for:
+  - Tenants, apps, and quotas.
+  - Policies (versioned compiled blobs, audit history, rollout state).
+  - Challenge records and verification metadata.
+  - Key metadata (key ids, activation windows), if not fully delegated to cloud KMS.
+
+### Analytics DB (Decision Logs & Cohorts)
+
+**Purpose**
+- Fast search and cohort queries over decision logs:
+  - Filters by tenant, endpoint group, ASN, country, device tags, action, reason codes, policy/model version.
+  - Retention via partitioning and TTL policies.
+
+### Object Storage (Event Archive)
+
+**Purpose**
+- Compressed append-only archive for:
+  - Raw telemetry and decision events (tenant-scoped prefixes, time partitions).
+  - Longer retention and offline workflows (including model training data exports).
+
+### Async Workers
+
+**Responsibilities**
+- Consume appended events, apply validation/deduplication, and:
+  - Update Redis reputations/features.
+  - Write decision logs to the analytics database.
+  - Export/compact raw events to object storage.
+
+---
+
+## Data Model (Logical)
+
+### Policy (Postgres)
+
+- `tenant_id`, `policy_id`, `version`
+- `state` (`draft|shadow|enforcing|rolled_back`)
+- `compiled_blob` (validated rules + endpoint groups)
+- `created_by`, `created_at`, `notes`
+
+### Reputation & Rolling Features (Redis)
+
+Keyed by `{tenant_id}:{entity_type}:{entity_id}`:
+- `score` (bounded), `confidence`
+- evidence counters (reason → count)
+- timestamps (`last_evidence_at`, `updated_at`)
+- TTL by entity type (IP shorter, device longer)
+
+Rolling counters via time-bucket keys (TTL enforced):
+- requests per `{ip, device, session, account}` for 1m/5m/1h windows
+- challenge outcomes and success rates
+
+### Decision Log (Analytics DB)
+
+- `tenant_id`, `request_id`, `ts`
+- `endpoint_group`, method/path
+- `ip`, `asn`, `country`
+- `device_id`, `session_id`, `account_id` (nullable)
+- `action`, `risk_score`, `reason_codes`
+- `policy_version`, `model_version` (optional)
+- `challenge_id`, `challenge_result` (nullable)
+- `latency_ms`, `degraded_mode`
+
+### Feedback Event (Postgres + Event Append)
+
+- `tenant_id`, `event_id` (dedupe key), `ts`
+- `type` (`fraud_confirmed|ato|chargeback|false_positive|challenge_pass|challenge_fail|user_report`)
+- links (`request_id`, `device_id`, `account_id`, `ip`)
+- `source_trust_tier`, `metadata`
+
+---
+
+## API
+
+### Authentication & Security
+
+- Server-to-server: mTLS or short-lived signed JWT per tenant.
+- TLS everywhere; strict request size limits; tenant quotas enforced early.
+- Decision tokens: signed with rotating keys; edge validates via JWKS.
+
+### `POST /v1/assess`
+
+**Response fields**
+- `action`, `risk_score`, `decision_ttl_ms`
+- `reason_codes`
+- `policy_version`, `model_version` (when applicable)
+- `decision_token`
+- optional `challenge` descriptor
+
+**Idempotency**
+- `request_id` or `Idempotency-Key` returns the same decision within `decision_ttl_ms` for the same policy version (tenant-configurable re-evaluation on policy change).
+
+**Degraded Mode**
+- Per endpoint group:
+  - low-risk: `ALLOW_MONITOR`
+  - high-risk: `CHALLENGE` or `BLOCK`
+- Always logged with `degraded_mode=true`.
+
+### `POST /v1/telemetry`
+
+- Batched events, `202 Accepted`.
+- Sampling and load shedding under pressure with per-tenant counters.
+
+### `POST /v1/feedback`
+
+- Signed server-to-server auth.
+- Deduplicate by `event_id`.
+- Trust-tier weighting applied by async workers when updating reputations.
+
+### `POST /v1/challenge/verify`
+
+- Verifies completion and issues a short-lived `proof_token` bound to session/device/context.
+
+---
+
+## Scaling & Reliability
+
+### Performance Approach
+
+- **Edge token reuse** removes repeated assessments for short windows.
+- **Redis-first** online lookups keep P99 low (batched reads).
+- **Rules-first** decisioning ensures predictable latency under spikes; optional model inference is gated by policy and risk band.
+
+### Multi-Region
+
+- Active-active Bot Defense API in two regions per geography.
+- Region-local Redis and analytics ingestion for low tail latency.
+- Postgres uses managed HA with cross-region replication/failover; policy propagation is seconds-level with versioned reads.
+- Reputations/features are region-local with asynchronous convergence driven by the event archive.
+
+### Tenant Isolation
+
+- Per-tenant quotas at edge and API.
+- Per-tenant rate-limit keys include `tenant_id`.
+- Dedicated capacity (optional) for large tenants via isolated Redis/analytics resources.
+
+---
+
+## Failure Modes & Mitigations
+
+- **Redis degradation**: hard timeouts; fall back to conservative policy (challenge-first/high-risk); reduced feature set; continue logging decisions.
+- **Analytics ingestion lag**: does not affect decision path; workers catch up; raw event archive preserves durability.
+- **Policy rollout mistake**: versioned policies; canary + shadow; instant rollback to prior version; action-rate and challenge-pass monitors.
+- **Key rotation issues**: overlapping validity windows; JWKS includes activation time; short token TTLs.
+
+---
+
+## Operations
+
+### Observability
+
+Track by tenant, endpoint group, and region:
+- `/v1/assess` P50/P95/P99 and dependency breakdown
+- action rates, challenge pass rate, login success deltas (where available)
+- degraded-mode rate and error budget consumption
+- Redis latency/hit-rate, worker lag, analytics ingest latency
+
+### Retention & Compliance
+
+- Tenant-configurable retention:
+  - decision logs (e.g., 30–90 days in analytics)
+  - device identity/reputation windows (e.g., 90–180 days via TTL/decay)
+- Fingerprints stored as salted hashes; no raw sensitive inputs.
+- DSAR deletion keyed by tenant-scoped user identifiers across Postgres and analytics partitions.
+
+---
+
+## Simplification Notes
+
+- Removed: separate Policy Service, Challenge Service, and Model Serving; policy/challenge/model logic runs inside the `Bot Defense API` for a single deployable surface and consistent versioning.
+- Removed: dedicated event stream + stream processing cluster; async ingestion and feature updates run through `Async Workers` with raw events archived to `Object Storage` for durability.
+- Removed: wide-column KV for reputations; online reputations and rolling counters live in `Redis`, with durable configuration/audit data in `Postgres`.
+- Merged: telemetry ingest, feedback ingest, and decisioning into one API to share auth, tenant controls, schemas, and logging.
+- Complexity that remains: `Redis` is required for predictable P99 in the decision path; an `Analytics DB` is required for fast investigations and cohort queries at high event volumes; multi-region active-active is required to meet the availability target.
+mcp startup: no servers
+ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Dec 17th, 2025 1:06 AM.
+Warning: no last agent message; wrote empty content to /Users/dominikdabrowski/pr/system-design-atlas/grades/bot-detection-system.json

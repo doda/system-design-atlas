@@ -1,0 +1,274 @@
+---
+title: "API Gateway"
+category: "IoT & Edge"
+difficulty: "Hard"
+tags: ["api-gateway", "edge", "rate-limiting", "envoy", "xds", "ddos", "waf"]
+---
+
+## Overview
+
+This API Gateway provides a single, secure entry point for IoT devices, mobile/web apps, and partners to reach backend services. It terminates TLS (optionally mTLS), authenticates and authorizes requests, applies routing and traffic-splitting rules, enforces rate limits/quotas, protects upstreams with resilience controls, and emits consistent observability signals.
+
+The design keeps the runtime path fast and reliable by running a stateless proxy fleet per region/PoP, backed by a small set of regional dependencies. Configuration and credentials are managed centrally with validation, auditability, and staged rollout, while gateways continue serving on last-known-good configuration during control-plane outages.
+
+---
+
+## Requirements
+
+### Functional Requirements
+
+- TLS termination; optional **mTLS** for devices/partners.
+- AuthN/AuthZ: API keys, OAuth2/JWT, device certificates; route-aware authorization (tenant/identity/scopes).
+- Routing by host/path/method/headers; **weighted traffic splitting** (canary/blue-green).
+- Protocol translation where required: HTTP/JSON ↔ gRPC (consistent status mapping, optional schema validation).
+- Rate limits and quotas per tenant/device/API key/route, including bursts.
+- Upstream protection: timeouts, bounded retries, circuit breaking, outlier detection.
+- Safe request/response controls: request IDs, header normalization, CORS, size limits; limited transforms.
+- Observability: structured logs, metrics, distributed traces with correlation IDs.
+- Admin surface for routes, policies, credentials, and rollouts with **audit trail**.
+
+### Non-Functional Targets
+
+- Scale: up to **5M devices**, **150k RPS global peak**, **100k–250k concurrent connections per region**.
+- Latency: gateway-added overhead P50 **≤ 5 ms**, P99 **≤ 25 ms**.
+- Availability: data plane per region **99.99%**; global active-active **99.995%**.
+- Consistency: strong for admin writes/credential lifecycle; config propagation target **≤ 30s** (typical **≤ 5s**).
+- Durability: config and audit **RPO ~ 0**; runtime counters best-effort.
+
+### Constraints & Assumptions
+
+- ≥ 3 regions/PoPs, active-active traffic routing.
+- Kubernetes or managed equivalent.
+- Secure secret storage via KMS-backed secret manager.
+- Gateways must operate on **last-known-good** config when disconnected.
+
+---
+
+## Simplified Architecture
+
+### High-Level Diagram
+
+```mermaid
+flowchart LR
+  C[Clients] --> EP[Edge Protection]
+  EP --> RLB[Regional LB]
+  RLB --> GF[Gateway Fleet]
+  GF --> U[Upstreams]
+  GF --> IDP[OIDC/PKI]
+  GF --> RQ[(Redis Quotas)]
+  GF --> OBS[Observability]
+  GM[Gateway Manager] --> PG[(Postgres)]
+  GM --> KMS[KMS/Secrets]
+  GM -. xDS/config .-> GF
+```
+
+**Key ideas**
+- **Gateway Fleet (data plane)** is the only component on the hot path.
+- **Gateway Manager (control plane)** owns configuration, validation, rollout, and audit, and publishes immutable snapshots to gateways.
+- **Redis Quotas** is optional per-policy and used only when strict regional quotas are required; gateways always enforce a fast local limiter.
+
+---
+
+## Components
+
+## Edge Protection
+
+**What it does**
+- Anycast/geo routing, L3/L4 DDoS filtering, and WAF/bot protection policies.
+- For mTLS-heavy device ingress, this layer forwards TCP/TLS to the gateway without terminating mTLS.
+
+**Implementation**
+- Managed edge (cloud provider or specialized vendor) configured per region with health-based routing to the regional load balancer.
+
+---
+
+## Gateway Fleet (Data Plane)
+
+**Responsibilities**
+- TLS/mTLS termination and connection management (HTTP/1.1, HTTP/2, gRPC).
+- AuthN/AuthZ:
+  - JWT verification using locally cached JWKS.
+  - API key verification via locally cached key metadata (short TTL) or direct lookup when required by policy.
+  - mTLS identity from client certificate subject/SAN + policy mapping.
+- Routing and traffic splitting (weighted clusters; header-based routing).
+- Resilience: per-route timeouts, bounded retries, circuit breaking, outlier detection.
+- Safety controls: request ID injection, header normalization, body/header size limits, CORS.
+- Telemetry: access logs, metrics, traces.
+
+**Recommended implementation**
+- **Envoy** as the gateway proxy, configured via xDS snapshots from Gateway Manager.
+
+**State**
+- In-memory config tables + **last-known-good snapshot persisted to disk** for fast restart and disconnected operation.
+- Proxy-local caches:
+  - JWKS (TTL 5–15 minutes, background refresh).
+  - Optional auth metadata cache for API keys (TTL seconds–minutes, policy-driven).
+
+---
+
+## Rate Limiting & Quotas
+
+**Model**
+- **Tier 1 (always-on, local):** per-proxy token buckets keyed by `(tenant, identity, route)` for burst smoothing and protection.
+- **Tier 2 (policy-driven, centralized):** strict regional quotas stored in **Redis**, used for tenants/routes that require hard caps.
+
+**How requests are decided**
+- Local limiter runs first (sub-millisecond).
+- If a route requires strict quotas, the gateway performs a Redis-backed atomic check (Lua/scripted token bucket or fixed window with burst), then returns `429` with `Retry-After` when denied.
+
+**Failure policy**
+- Per policy: `fail_closed` (default for public/untrusted) or `fail_open` (for trusted/internal).
+- Local limiter remains active even when Redis is degraded.
+
+---
+
+## Gateway Manager (Control Plane)
+
+**Responsibilities**
+- Admin API/UI for routes, upstreams, auth policies, rate-limit policies, and credentials.
+- Validation (schema + semantic checks) and creation of **immutable config snapshots**.
+- Staged rollout (canary → region → global) driven by simple health gates:
+  - gateway ACK/NACK and config apply errors
+  - key SLO signals (5xx, added latency, 429 anomalies)
+  - synthetic probes for critical routes
+- Credential lifecycle:
+  - issuance/rotation/revocation as audited admin actions
+  - secrets stored by reference in KMS/secret manager
+- Audit log for every admin write (who/what/before/after/request_id).
+
+**Config distribution**
+- Gateways maintain a streaming xDS connection to the Gateway Manager in-region when available.
+- Gateways continue serving the last-known-good snapshot during control-plane outages.
+
+---
+
+## Data Model
+
+### Postgres (Source of Truth)
+
+- `routes`, `upstreams`, `auth_policies`, `rate_limit_policies`
+- `identities`, `credentials` (store `secret_ref`, never plaintext secrets)
+- `config_snapshots` (content-addressed hash, immutable payload, status)
+- `audit_log` (append-only)
+
+**Notes**
+- Explicit `tenant_id` on all policy-bearing entities.
+- Snapshots are the unit of rollout and rollback.
+
+### Redis (Runtime Quotas)
+
+- Keys derived from `(tenant_id, scope, policy_id, route_id, identity_id)` depending on policy scope.
+- Short TTLs aligned to the quota window to bound memory growth.
+
+---
+
+## APIs
+
+### Client-Facing (Data Plane)
+
+- `ANY /{path...}`
+  - Auth per route: API key / JWT / mTLS (or combinations).
+  - Rate limit per route/policy; `429` includes `Retry-After`.
+  - Standard errors: `401/403/404/429/503/504`.
+
+### Admin (Gateway Manager)
+
+- `PUT /v1/routes/{route_id}` and related CRUD for upstreams/policies.
+- `POST /v1/snapshots` to validate and create an immutable snapshot.
+- `POST /v1/snapshots/{snapshot_id}:promote` for canary/region/global rollout.
+- `POST /v1/credentials:issue` and `POST /v1/credentials:revoke`.
+
+**Error model**
+- `{ "code": "...", "message": "...", "details": {...}, "request_id": "..." }`
+- `409` for optimistic concurrency/version conflicts.
+
+---
+
+## Data Flows
+
+### Request Path
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant G as Gateway
+  participant R as Redis
+  participant U as Upstream
+
+  C->>G: Request
+  G->>G: TLS/mTLS + Auth + Route
+  G->>G: Local rate limit
+  opt Strict quota policy
+    G->>R: Atomic quota check
+    R-->>G: allow/deny
+  end
+  alt Allowed
+    G->>U: Forward (optional translate)
+    U-->>G: Response
+    G-->>C: Response
+  else Denied
+    G-->>C: 429 + Retry-After
+  end
+```
+
+### Config Rollout
+
+```mermaid
+sequenceDiagram
+  participant A as Admin
+  participant GM as Gateway Manager
+  participant G as Gateways
+
+  A->>GM: Update config/policy
+  GM->>GM: Validate + build snapshot
+  GM->>G: Canary publish (xDS)
+  G-->>GM: ACK/NACK
+  alt Healthy
+    GM->>G: Promote wider
+  else Unhealthy
+    GM->>G: Roll back snapshot
+  end
+```
+
+---
+
+## Scaling & Reliability
+
+- **Gateway Fleet scaling:** autoscale on CPU, active connections, and added-latency/queueing signals; multi-AZ per region; connection draining on rollout.
+- **Redis Quotas scaling:** regional, multi-AZ; shard by tenant/policy; protect hot tenants with per-tenant subkeys and conservative local shaping.
+- **Config propagation:** snapshot sizes optimized by tenant scoping and incremental updates; gateways apply atomically and persist last-known-good.
+
+---
+
+## Failure Modes
+
+1. **Redis quota degradation**
+   - Behavior follows per-policy fail mode; local limiter stays active; alert on Redis latency/error rate and 429 anomalies.
+
+2. **Bad config**
+   - Blocked by validation; canary rollout with automatic rollback on NACK spikes, synthetic failures, or SLO burn.
+
+3. **Upstream instability**
+   - Tight timeouts, bounded retries, circuit breaking/outlier detection; per-upstream bulkheads to prevent gateway exhaustion.
+
+4. **Control-plane outage or disconnect**
+   - Gateways continue serving using persisted last-known-good snapshots; rollout pauses but traffic continues.
+
+---
+
+## Operations & Security
+
+- **Observability:** gateway access logs with stable fields (`request_id`, `tenant_id`, `identity_id`, `route_id`), metrics for added latency/5xx/429/circuit opens, and trace propagation (`traceparent`).
+- **Secrets:** all credentials stored as `secret_ref` in KMS/secret manager; audit every credential event.
+- **mTLS:** short-lived certs + rotation; emergency revocation supported via fast snapshot publish (and optional denylist policy for high-risk identities).
+
+---
+
+## Simplification Notes
+
+- **Removed:** separate config validator service and rollout orchestrator; folded into `Gateway Manager` for one deployment surface and a single snapshot pipeline.
+- **Removed:** dedicated xDS push service; `Gateway Manager` serves xDS directly to gateways to reduce moving parts.
+- **Removed:** per-proxy log/trace collector as a named component; gateways export telemetry directly to the observability backend (agent/collector remains an implementation detail).
+- **Merged:** Anycast DNS, L3/L4 filtering, and WAF/bot protection into `Edge Protection` as one managed front-door capability.
+- **Merged:** rate-limit service into the gateway runtime path by using local limiting plus direct Redis-backed atomic checks for strict quotas.
+- **Complexity kept:** multi-region active-active routing, immutable snapshots with staged rollout, and optional Redis quotas—these are required to hit the stated availability/latency targets under adversarial and bursty traffic.

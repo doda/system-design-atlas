@@ -1,0 +1,1740 @@
+==========================================
+Generating (v2): Global Inventory with Reservations
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-302d-7112-81b9-aa8eca948fbe
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Global Inventory with Reservations
+**Category**: Strategic Problems
+
+**Problem Statement**:
+Design an inventory system for a high-traffic launch that ensures zero overselling while holding items in carts for 10 minutes.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+thinking
+**Considering inventory management**
+
+I need to write a markdown document following a specific template, focusing on strong design for inventory management. The key insight is to split available inventory into "sellable tokens" per SKU while implementing reservation with expiry to ensure global consistency with no overselling. It’s a challenge to maintain correctness under high traffic during a flash sale, especially with concurrency and global consistency in mind. I'm leaning towards using Spanner for its strong consistency benefits across regions.
+thinking
+**Assessing database options**
+
+I’m considering the use of an open-source solution like CockroachDB, though it might feel "boring." Alternatively, I could take a Google Spanner-like approach or use Postgres for inventory, along with edge caching for reads. I’d accept higher latency for writes to centralize the write path in one region, ensuring correctness. I’m thinking it might be better to represent inventory as a ledger rather than a mutable counter, particularly for handling expiry and preventing overselling through atomic transactions. I'll need to maintain accurate counts for active reservations, using SQL transactions effectively.
+thinking
+**Exploring reservation mechanics**
+
+I'm considering an alternative approach that treats reservations as separate rows, but calculating active ones through indexing and summing could be heavy. Instead, what if I create "reservation tokens" for each SKU? I could implement a system where reservations grab tokens using SELECT ... FOR UPDATE SKIP LOCKED, which would help manage expiries by releasing tokens. While having millions of tokens for a limited inventory during a launch might seem overwhelming, this could work. The key insight here is to use "lease" semantics, ensuring that reservations function like leases on inventory, with atomic updates for both counters and records.
+thinking
+**Designing an effective mechanism**
+
+For a launch, I can't afford to under-sell, so I need a mechanism that works without requiring a timely sweeper. One idea is to use time-bucketed counters, maintaining reserved quantities in buckets by expiration minute—perhaps 10 buckets. When reserving, I'd add quantities to the bucket corresponding to the expiry time, and available inventory would equal total minus sold minus the sum of the current buckets for the last 10 minutes. This way, expired reservations drop out automatically, and I wouldn’t need a sweeper—this feels like an elegant solution! It’s crucial to ensure only one writer updates the reservation while maintaining strong transactions.
+thinking
+**Finalizing inventory architecture**
+
+If a user abandons a reservation, the bucket retains the reservation until expiry, which is fine since under-selling can only happen within a 10-minute window. I need to implement bucket rotation every minute and ensure that buckets are reset correctly when writing to them. The data model will include a structure for inventory and reservations, facilitating atomic reservations across multiple SKUs while avoiding overselling. For a global launch, I favor using Google Spanner for its strong consistency and scalability. I'll also incorporate hot SKU sharding to reduce contention and avoid bottlenecks, ensuring an efficient architecture.
+codex
+```markdown
+---
+title: "Global Inventory with Reservations"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["inventory", "reservations", "flash-sale", "strong-consistency", "hot-keys"]
+---
+
+## Overview
+
+This system guarantees **zero overselling** during a global, high-traffic launch while allowing users to hold items in carts for **10 minutes**. The core idea is to treat a reservation as a **lease** on inventory and make the write path **strongly consistent**, even if that means accepting slightly higher latency for reserve/checkout operations.
+
+The elegant trick is to avoid “reservation cleanup jobs” (which inevitably drift and cause under-selling). Instead, we model reservations as **time-bucketed holds** so expiration becomes a pure function of time: when the 10-minute window passes, the held quantity simply stops counting against availability—no sweeper required, no stuck inventory.
+
+Everything else stays boring: a small Inventory service, a transactional database with global consistency, and a Checkout service that converts valid leases into sales with idempotent writes.
+
+## What Makes This Hard
+
+Naive designs use a single “available_count” and decrement it on add-to-cart, then increment it with a TTL job on expiration. Under load, that job lags or fails, and inventory gets “stuck” reserved, causing **massive under-selling** (the silent killer in launches). Teams often don’t notice until after the drop.
+
+The other trap is **hot keys**: one SKU can receive a huge fraction of traffic. Even a perfect transaction becomes a bottleneck if every reservation contends on the same row/partition.
+
+## Requirements
+
+### Functional Requirements
+- Guarantee **zero overselling** globally for each SKU.
+- Support **10-minute cart holds** (reservations) with deterministic expiration.
+- Allow checkout to **atomically** convert reservations into sales (and fail cleanly if expired).
+- Provide idempotency for reserve/checkout to handle retries and flaky clients.
+
+### Scale Targets
+- Peak reserve (add-to-cart) traffic: **100k RPS global** during first minutes of launch.
+- Hot SKU concentration: up to **50% of traffic on one SKU** (worst-case “drop” behavior).
+- Reservation duration: **10 minutes**, so the system must tolerate **millions of concurrent active holds** without cleanup lag becoming correctness risk.
+- SLO: reserve/checkout **p99 < 300ms** globally (writes are allowed to be slower than reads).
+
+## Key Design Decisions
+
+- **Strong consistency for the write path**
+  - Chosen: one transactional, globally consistent database for reservations + inventory writes (Google Spanner).
+  - Rejected: multi-region async replication with “best effort reconciliation”.
+  - Why: oversell is a correctness bug, not an availability trade; global serializable transactions are the simplest defensible guarantee.
+
+- **Time-bucketed reservations (no sweeper)**
+  - Chosen: per-SKU “ring buffer” of minute buckets for reserved quantity; active reservations are the sum of buckets in the last 10 minutes.
+  - Rejected: TTL rows + background job to release inventory.
+  - Why: expiration becomes *automatic* as time advances; correctness no longer depends on a cleanup job’s timeliness.
+
+- **Hot SKU sharding (“stripes”)**
+  - Chosen: split each hot SKU into `N` independent inventory stripes, each with its own reservation buckets; reserve picks a stripe and retries.
+  - Rejected: a single row/counter per SKU.
+  - Why: removes single-row write contention and scales linearly with stripes while preserving strict no-oversell.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[Users] --> G["API Gateway"]
+  G --> C["Cart/Checkout"]
+  C --> I["Inventory Service"]
+  I --> D["Spanner (Tx DB)"]
+  C --> P["Payment Provider"]
+  C --> E["Order Events"]
+```
+
+### Components
+
+- `API Gateway`: terminates TLS, enforces rate limits per IP/user, and applies a launch-mode “fairness” policy (reject abusive retry storms).
+- `Cart/Checkout`: owns cart state and checkout orchestration; never invents inventory truth.
+- `Inventory Service`: the only writer for inventory and reservations; enforces invariants with database transactions.
+- `Spanner (Tx DB)`: source of truth for inventory totals, sold counts, reservation buckets, and reservation records.
+- `Payment Provider`: external payment authorization/capture; integrated with idempotency keys.
+- `Order Events`: append-only stream for downstream systems (email, fulfillment, analytics) without coupling them to checkout latency.
+
+## Deep Dive: Time-Bucketed Reservations + Hot-Key Sharding
+
+### Data model (per SKU stripe)
+We store inventory per `(sku_id, stripe_id)`:
+
+- `inventory_stripe`
+  - `sku_id`, `stripe_id`
+  - `total_units`
+  - `sold_units`
+  - `buckets[0..9]`: each bucket has `{epoch_minute, reserved_units}`
+
+- `reservation`
+  - `reservation_id` (idempotency key scoped to user+cart action)
+  - `sku_id`, `stripe_id`, `qty`
+  - `expires_at` (derived from DB time)
+  - `status` = `ACTIVE | CONSUMED | EXPIRED`
+
+### Reserve flow (single SKU, qty=1..k)
+Within a serializable transaction:
+1. Read DB time (`now_minute`) and compute `expiry_minute = now_minute + 10`.
+2. Select a stripe (random for load distribution). Lock that `inventory_stripe` row.
+3. Lazily reset the target bucket if `bucket.epoch_minute != expiry_minute` (set `reserved_units=0`, update `epoch_minute`).
+4. Compute `active_reserved = sum(reserved_units for buckets with epoch_minute in [now_minute, now_minute+9])`.
+5. `available = total_units - sold_units - active_reserved`. If `available < qty`, abort and retry another stripe (bounded attempts).
+6. Increment the expiry bucket’s `reserved_units += qty`.
+7. Insert `reservation` as `ACTIVE` with `expires_at = now + 10min`.
+
+Why this works:
+- Expiration requires no decrement. When `now_minute` advances, older buckets fall out of the `[now, now+9]` window and stop counting.
+- The only mutable state is a constant-sized set of buckets, so “cleanup lag” cannot accumulate.
+
+### Checkout flow (convert reservation to sale)
+Within a serializable transaction:
+1. `SELECT reservation FOR UPDATE`. If `status != ACTIVE`, return idempotent result.
+2. If `expires_at <= now`, set `status=EXPIRED` and fail checkout (no inventory mutation needed).
+3. Lock the referenced `inventory_stripe` row.
+4. Decrement the reservation’s expiry bucket by `qty` (after lazily resetting if epoch mismatch, which should only happen if the reservation is already expired; we reject earlier).
+5. Increment `sold_units += qty`.
+6. Set reservation `status=CONSUMED`.
+7. Proceed to payment capture (or authorize-before and capture-after depending on business rules), using an idempotency key tied to the order.
+
+The invariant is simple: within each stripe, `sold_units + active_reserved <= total_units` is maintained by a single transaction boundary.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness (zero oversell) | Higher write latency (global tx) |
+| Deterministic expiration (no sweeper) | Some under-selling within the 10-minute hold window |
+| Flash-sale scalability (striped hot keys) | Slightly more complex reserve retry logic |
+
+## Failure Modes
+
+- **DB region degradation / high contention**
+  - What happens: reserve/checkout p99 spikes; retries amplify load.
+  - Detect: increased transaction aborts, lock wait time, hotspot metrics on `(sku_id, stripe_id)`.
+  - Recover: increase stripe count for hot SKUs, enable stricter gateway rate limits, temporarily reduce max cart hold creations per user/min.
+
+- **Payment succeeds but inventory conversion fails**
+  - What happens: customer charged without guaranteed allocation if payment is captured too early.
+  - Detect: mismatch between captured payments and consumed reservations.
+  - Recover: enforce ordering: consume reservation in DB first, then capture payment with idempotency; if capture fails, release by marking reservation `ACTIVE` again only if still unexpired (otherwise refund).
+
+- **Client retry storms (mobile networks, bots)**
+  - What happens: duplicate reserve/checkout attempts.
+  - Detect: high duplicate idempotency-key hit rate; sharp rise in 429/503 at gateway.
+  - Recover: strict idempotency on `reservation_id` and `order_id`, gateway throttles, and per-user concurrency caps for reserve/checkout endpoints.
+
+## What I'd Do Differently At...
+
+- **10x scale:** increase stripe count on hot SKUs (and pre-split totals), add per-region edge caching for browse traffic, and enforce launch-mode backpressure (queue/deny) at the gateway instead of letting retries hit the DB.
+- **100x scale:** move to a dedicated “inventory allocator” that pre-issues reservation tokens (cryptographically signed, short-lived) per stripe to absorb DB writes, with the DB as the final authority only at checkout.
+
+## Operational Notes
+
+- Use **database time** for `now` and `epoch_minute` to avoid clock skew bugs.
+- Monitor: transaction abort rate, lock wait, stripe skew, reservation creation rate, checkout conversion rate, and “expired at checkout” rate (a UX signal).
+- Keep stripe totals immutable during the launch window; treat restocks as a controlled admin operation with explicit auditing.
+- Runbooks should start with: “Is this a hot SKU hotspot?” before chasing generic DB performance.
+```
+tokens used
+4,965
+```markdown
+---
+title: "Global Inventory with Reservations"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["inventory", "reservations", "flash-sale", "strong-consistency", "hot-keys"]
+---
+
+## Overview
+
+This system guarantees **zero overselling** during a global, high-traffic launch while allowing users to hold items in carts for **10 minutes**. The core idea is to treat a reservation as a **lease** on inventory and make the write path **strongly consistent**, even if that means accepting slightly higher latency for reserve/checkout operations.
+
+The elegant trick is to avoid “reservation cleanup jobs” (which inevitably drift and cause under-selling). Instead, we model reservations as **time-bucketed holds** so expiration becomes a pure function of time: when the 10-minute window passes, the held quantity simply stops counting against availability—no sweeper required, no stuck inventory.
+
+Everything else stays boring: a small Inventory service, a transactional database with global consistency, and a Checkout service that converts valid leases into sales with idempotent writes.
+
+## What Makes This Hard
+
+Naive designs use a single “available_count” and decrement it on add-to-cart, then increment it with a TTL job on expiration. Under load, that job lags or fails, and inventory gets “stuck” reserved, causing **massive under-selling** (the silent killer in launches). Teams often don’t notice until after the drop.
+
+The other trap is **hot keys**: one SKU can receive a huge fraction of traffic. Even a perfect transaction becomes a bottleneck if every reservation contends on the same row/partition.
+
+## Requirements
+
+### Functional Requirements
+- Guarantee **zero overselling** globally for each SKU.
+- Support **10-minute cart holds** (reservations) with deterministic expiration.
+- Allow checkout to **atomically** convert reservations into sales (and fail cleanly if expired).
+- Provide idempotency for reserve/checkout to handle retries and flaky clients.
+
+### Scale Targets
+- Peak reserve (add-to-cart) traffic: **100k RPS global** during first minutes of launch.
+- Hot SKU concentration: up to **50% of traffic on one SKU** (worst-case “drop” behavior).
+- Reservation duration: **10 minutes**, so the system must tolerate **millions of concurrent active holds** without cleanup lag becoming correctness risk.
+- SLO: reserve/checkout **p99 < 300ms** globally (writes are allowed to be slower than reads).
+
+## Key Design Decisions
+
+- **Strong consistency for the write path**
+  - Chosen: one transactional, globally consistent database for reservations + inventory writes (Google Spanner).
+  - Rejected: multi-region async replication with “best effort reconciliation”.
+  - Why: oversell is a correctness bug, not an availability trade; global serializable transactions are the simplest defensible guarantee.
+
+- **Time-bucketed reservations (no sweeper)**
+  - Chosen: per-SKU “ring buffer” of minute buckets for reserved quantity; active reservations are the sum of buckets in the last 10 minutes.
+  - Rejected: TTL rows + background job to release inventory.
+  - Why: expiration becomes *automatic* as time advances; correctness no longer depends on a cleanup job’s timeliness.
+
+- **Hot SKU sharding (“stripes”)**
+  - Chosen: split each hot SKU into `N` independent inventory stripes, each with its own reservation buckets; reserve picks a stripe and retries.
+  - Rejected: a single row/counter per SKU.
+  - Why: removes single-row write contention and scales linearly with stripes while preserving strict no-oversell.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[Users] --> G["API Gateway"]
+  G --> C["Cart/Checkout"]
+  C --> I["Inventory Service"]
+  I --> D["Spanner (Tx DB)"]
+  C --> P["Payment Provider"]
+  C --> E["Order Events"]
+```
+
+### Components
+
+- `API Gateway`: terminates TLS, enforces rate limits per IP/user, and applies a launch-mode “fairness” policy (reject abusive retry storms).
+- `Cart/Checkout`: owns cart state and checkout orchestration; never invents inventory truth.
+- `Inventory Service`: the only writer for inventory and reservations; enforces invariants with database transactions.
+- `Spanner (Tx DB)`: source of truth for inventory totals, sold counts, reservation buckets, and reservation records.
+- `Payment Provider`: external payment authorization/capture; integrated with idempotency keys.
+- `Order Events`: append-only stream for downstream systems (email, fulfillment, analytics) without coupling them to checkout latency.
+
+## Deep Dive: Time-Bucketed Reservations + Hot-Key Sharding
+
+### Data model (per SKU stripe)
+We store inventory per `(sku_id, stripe_id)`:
+
+- `inventory_stripe`
+  - `sku_id`, `stripe_id`
+  - `total_units`
+  - `sold_units`
+  - `buckets[0..9]`: each bucket has `{epoch_minute, reserved_units}`
+
+- `reservation`
+  - `reservation_id` (idempotency key scoped to user+cart action)
+  - `sku_id`, `stripe_id`, `qty`
+  - `expires_at` (derived from DB time)
+  - `status` = `ACTIVE | CONSUMED | EXPIRED`
+
+### Reserve flow (single SKU, qty=1..k)
+Within a serializable transaction:
+1. Read DB time (`now_minute`) and compute `expiry_minute = now_minute + 10`.
+2. Select a stripe (random for load distribution). Lock that `inventory_stripe` row.
+3. Lazily reset the target bucket if `bucket.epoch_minute != expiry_minute` (set `reserved_units=0`, update `epoch_minute`).
+4. Compute `active_reserved = sum(reserved_units for buckets with epoch_minute in [now_minute, now_minute+9])`.
+5. `available = total_units - sold_units - active_reserved`. If `available < qty`, abort and retry another stripe (bounded attempts).
+6. Increment the expiry bucket’s `reserved_units += qty`.
+7. Insert `reservation` as `ACTIVE` with `expires_at = now + 10min`.
+
+Why this works:
+- Expiration requires no decrement. When `now_minute` advances, older buckets fall out of the `[now, now+9]` window and stop counting.
+- The only mutable state is a constant-sized set of buckets, so “cleanup lag” cannot accumulate.
+
+### Checkout flow (convert reservation to sale)
+Within a serializable transaction:
+1. `SELECT reservation FOR UPDATE`. If `status != ACTIVE`, return idempotent result.
+2. If `expires_at <= now`, set `status=EXPIRED` and fail checkout (no inventory mutation needed).
+3. Lock the referenced `inventory_stripe` row.
+4. Decrement the reservation’s expiry bucket by `qty` (after lazily resetting if epoch mismatch, which should only happen if the reservation is already expired; we reject earlier).
+5. Increment `sold_units += qty`.
+6. Set reservation `status=CONSUMED`.
+7. Proceed to payment capture (or authorize-before and capture-after depending on business rules), using an idempotency key tied to the order.
+
+The invariant is simple: within each stripe, `sold_units + active_reserved <= total_units` is maintained by a single transaction boundary.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness (zero oversell) | Higher write latency (global tx) |
+| Deterministic expiration (no sweeper) | Some under-selling within the 10-minute hold window |
+| Flash-sale scalability (striped hot keys) | Slightly more complex reserve retry logic |
+
+## Failure Modes
+
+- **DB region degradation / high contention**
+  - What happens: reserve/checkout p99 spikes; retries amplify load.
+  - Detect: increased transaction aborts, lock wait time, hotspot metrics on `(sku_id, stripe_id)`.
+  - Recover: increase stripe count for hot SKUs, enable stricter gateway rate limits, temporarily reduce max cart hold creations per user/min.
+
+- **Payment succeeds but inventory conversion fails**
+  - What happens: customer charged without guaranteed allocation if payment is captured too early.
+  - Detect: mismatch between captured payments and consumed reservations.
+  - Recover: enforce ordering: consume reservation in DB first, then capture payment with idempotency; if capture fails, release by marking reservation `ACTIVE` again only if still unexpired (otherwise refund).
+
+- **Client retry storms (mobile networks, bots)**
+  - What happens: duplicate reserve/checkout attempts.
+  - Detect: high duplicate idempotency-key hit rate; sharp rise in 429/503 at gateway.
+  - Recover: strict idempotency on `reservation_id` and `order_id`, gateway throttles, and per-user concurrency caps for reserve/checkout endpoints.
+
+## What I'd Do Differently At...
+
+- **10x scale:** increase stripe count on hot SKUs (and pre-split totals), add per-region edge caching for browse traffic, and enforce launch-mode backpressure (queue/deny) at the gateway instead of letting retries hit the DB.
+- **100x scale:** move to a dedicated “inventory allocator” that pre-issues reservation tokens (cryptographically signed, short-lived) per stripe to absorb DB writes, with the DB as the final authority only at checkout.
+
+## Operational Notes
+
+- Use **database time** for `now` and `epoch_minute` to avoid clock skew bugs.
+- Monitor: transaction abort rate, lock wait, stripe skew, reservation creation rate, checkout conversion rate, and “expired at checkout” rate (a UX signal).
+- Keep stripe totals immutable during the launch window; treat restocks as a controlled admin operation with explicit auditing.
+- Runbooks should start with: “Is this a hot SKU hotspot?” before chasing generic DB performance.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/global-inventory-reservations.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-70de-7ef1-8fff-12f634a9a5f4
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Global Inventory with Reservations"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["inventory", "reservations", "flash-sale", "strong-consistency", "hot-keys"]
+---
+
+## Overview
+
+This system guarantees **zero overselling** during a global, high-traffic launch while allowing users to hold items in carts for **10 minutes**. The core idea is to treat a reservation as a **lease** on inventory and make the write path **strongly consistent**, even if that means accepting slightly higher latency for reserve/checkout operations.
+
+The elegant trick is to avoid “reservation cleanup jobs” (which inevitably drift and cause under-selling). Instead, we model reservations as **time-bucketed holds** so expiration becomes a pure function of time: when the 10-minute window passes, the held quantity simply stops counting against availability—no sweeper required, no stuck inventory.
+
+Everything else stays boring: a small Inventory service, a transactional database with global consistency, and a Checkout service that converts valid leases into sales with idempotent writes.
+
+## What Makes This Hard
+
+Naive designs use a single “available_count” and decrement it on add-to-cart, then increment it with a TTL job on expiration. Under load, that job lags or fails, and inventory gets “stuck” reserved, causing **massive under-selling** (the silent killer in launches). Teams often don’t notice until after the drop.
+
+The other trap is **hot keys**: one SKU can receive a huge fraction of traffic. Even a perfect transaction becomes a bottleneck if every reservation contends on the same row/partition.
+
+## Requirements
+
+### Functional Requirements
+- Guarantee **zero overselling** globally for each SKU.
+- Support **10-minute cart holds** (reservations) with deterministic expiration.
+- Allow checkout to **atomically** convert reservations into sales (and fail cleanly if expired).
+- Provide idempotency for reserve/checkout to handle retries and flaky clients.
+
+### Scale Targets
+- Peak reserve (add-to-cart) traffic: **100k RPS global** during first minutes of launch.
+- Hot SKU concentration: up to **50% of traffic on one SKU** (worst-case “drop” behavior).
+- Reservation duration: **10 minutes**, so the system must tolerate **millions of concurrent active holds** without cleanup lag becoming correctness risk.
+- SLO: reserve/checkout **p99 < 300ms** globally (writes are allowed to be slower than reads).
+
+## Key Design Decisions
+
+- **Strong consistency for the write path**
+  - Chosen: one transactional, globally consistent database for reservations + inventory writes (Google Spanner).
+  - Rejected: multi-region async replication with “best effort reconciliation”.
+  - Why: oversell is a correctness bug, not an availability trade; global serializable transactions are the simplest defensible guarantee.
+
+- **Time-bucketed reservations (no sweeper)**
+  - Chosen: per-SKU “ring buffer” of minute buckets for reserved quantity; active reservations are the sum of buckets in the last 10 minutes.
+  - Rejected: TTL rows + background job to release inventory.
+  - Why: expiration becomes *automatic* as time advances; correctness no longer depends on a cleanup job’s timeliness.
+
+- **Hot SKU sharding (“stripes”)**
+  - Chosen: split each hot SKU into `N` independent inventory stripes, each with its own reservation buckets; reserve picks a stripe and retries.
+  - Rejected: a single row/counter per SKU.
+  - Why: removes single-row write contention and scales linearly with stripes while preserving strict no-oversell.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[Users] --> G["API Gateway"]
+  G --> C["Cart/Checkout"]
+  C --> I["Inventory Service"]
+  I --> D["Spanner (Tx DB)"]
+  C --> P["Payment Provider"]
+  C --> E["Order Events"]
+```
+
+### Components
+
+- `API Gateway`: terminates TLS, enforces rate limits per IP/user, and applies a launch-mode “fairness” policy (reject abusive retry storms).
+- `Cart/Checkout`: owns cart state and checkout orchestration; never invents inventory truth.
+- `Inventory Service`: the only writer for inventory and reservations; enforces invariants with database transactions.
+- `Spanner (Tx DB)`: source of truth for inventory totals, sold counts, reservation buckets, and reservation records.
+- `Payment Provider`: external payment authorization/capture; integrated with idempotency keys.
+- `Order Events`: append-only stream for downstream systems (email, fulfillment, analytics) without coupling them to checkout latency.
+
+## Deep Dive: Time-Bucketed Reservations + Hot-Key Sharding
+
+### Data model (per SKU stripe)
+We store inventory per `(sku_id, stripe_id)`:
+
+- `inventory_stripe`
+  - `sku_id`, `stripe_id`
+  - `total_units`
+  - `sold_units`
+  - `buckets[0..9]`: each bucket has `{epoch_minute, reserved_units}`
+
+- `reservation`
+  - `reservation_id` (idempotency key scoped to user+cart action)
+  - `sku_id`, `stripe_id`, `qty`
+  - `expires_at` (derived from DB time)
+  - `status` = `ACTIVE | CONSUMED | EXPIRED`
+
+### Reserve flow (single SKU, qty=1..k)
+Within a serializable transaction:
+1. Read DB time (`now_minute`) and compute `expiry_minute = now_minute + 10`.
+2. Select a stripe (random for load distribution). Lock that `inventory_stripe` row.
+3. Lazily reset the target bucket if `bucket.epoch_minute != expiry_minute` (set `reserved_units=0`, update `epoch_minute`).
+4. Compute `active_reserved = sum(reserved_units for buckets with epoch_minute in [now_minute, now_minute+9])`.
+5. `available = total_units - sold_units - active_reserved`. If `available < qty`, abort and retry another stripe (bounded attempts).
+6. Increment the expiry bucket’s `reserved_units += qty`.
+7. Insert `reservation` as `ACTIVE` with `expires_at = now + 10min`.
+
+Why this works:
+- Expiration requires no decrement. When `now_minute` advances, older buckets fall out of the `[now, now+9]` window and stop counting.
+- The only mutable state is a constant-sized set of buckets, so “cleanup lag” cannot accumulate.
+
+### Checkout flow (convert reservation to sale)
+Within a serializable transaction:
+1. `SELECT reservation FOR UPDATE`. If `status != ACTIVE`, return idempotent result.
+2. If `expires_at <= now`, set `status=EXPIRED` and fail checkout (no inventory mutation needed).
+3. Lock the referenced `inventory_stripe` row.
+4. Decrement the reservation’s expiry bucket by `qty` (after lazily resetting if epoch mismatch, which should only happen if the reservation is already expired; we reject earlier).
+5. Increment `sold_units += qty`.
+6. Set reservation `status=CONSUMED`.
+7. Proceed to payment capture (or authorize-before and capture-after depending on business rules), using an idempotency key tied to the order.
+
+The invariant is simple: within each stripe, `sold_units + active_reserved <= total_units` is maintained by a single transaction boundary.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness (zero oversell) | Higher write latency (global tx) |
+| Deterministic expiration (no sweeper) | Some under-selling within the 10-minute hold window |
+| Flash-sale scalability (striped hot keys) | Slightly more complex reserve retry logic |
+
+## Failure Modes
+
+- **DB region degradation / high contention**
+  - What happens: reserve/checkout p99 spikes; retries amplify load.
+  - Detect: increased transaction aborts, lock wait time, hotspot metrics on `(sku_id, stripe_id)`.
+  - Recover: increase stripe count for hot SKUs, enable stricter gateway rate limits, temporarily reduce max cart hold creations per user/min.
+
+- **Payment succeeds but inventory conversion fails**
+  - What happens: customer charged without guaranteed allocation if payment is captured too early.
+  - Detect: mismatch between captured payments and consumed reservations.
+  - Recover: enforce ordering: consume reservation in DB first, then capture payment with idempotency; if capture fails, release by marking reservation `ACTIVE` again only if still unexpired (otherwise refund).
+
+- **Client retry storms (mobile networks, bots)**
+  - What happens: duplicate reserve/checkout attempts.
+  - Detect: high duplicate idempotency-key hit rate; sharp rise in 429/503 at gateway.
+  - Recover: strict idempotency on `reservation_id` and `order_id`, gateway throttles, and per-user concurrency caps for reserve/checkout endpoints.
+
+## What I'd Do Differently At...
+
+- **10x scale:** increase stripe count on hot SKUs (and pre-split totals), add per-region edge caching for browse traffic, and enforce launch-mode backpressure (queue/deny) at the gateway instead of letting retries hit the DB.
+- **100x scale:** move to a dedicated “inventory allocator” that pre-issues reservation tokens (cryptographically signed, short-lived) per stripe to absorb DB writes, with the DB as the final authority only at checkout.
+
+## Operational Notes
+
+- Use **database time** for `now` and `epoch_minute` to avoid clock skew bugs.
+- Monitor: transaction abort rate, lock wait, stripe skew, reservation creation rate, checkout conversion rate, and “expired at checkout” rate (a UX signal).
+- Keep stripe totals immutable during the launch window; treat restocks as a controlled admin operation with explicit auditing.
+- Runbooks should start with: “Is this a hot SKU hotspot?” before chasing generic DB performance.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+
+
+thinking
+**Structuring the Critique**
+
+I need to organize the critique in the requested format with structured markdown sections. The focus should be on simplifications, key insights, and a components table. I’ll also cover failure scenarios and recommendations, ensuring I suggest alternative solutions like Postgres or Redis, but noting that the design ultimately favors Spanner. 
+
+The critique mentions that using a ring buffer per stripe is good, but computing the sum of the last 10 minutes could be heavy. I might suggest storing a rolling sum updated with each reserve while being cautious about epoch mismatch.
+thinking
+**Analyzing the Current Design**
+
+In the current design, the system sums active_reserved each time, which requires reading the bucket array. That’s manageable, and the sum can be stored as columns. 
+
+A critical point is that during checkout, I need to decrement the expiry bucket. However, if multiple reservations share a bucket, I must ensure that the decrement doesn't result in negative values, especially if the bucket rotates due to time changes. 
+
+The checkout process checks if expires_at is less than or equal to now, which should prevent epoch mismatches if the timing is aligned. The design assumes that bucket resets only happen when a new expiry writes to that index. With a ring buffer of length 10, the index wraps after 10 minutes.
+thinking
+**Clarifying Reservation Logic**
+
+If there's another reserve made at minute T+1, it uses expiry = T+11, which refers to a different index. Only at minute T+10 do reserves use expiry = T+20, affecting the same index as an earlier reservation's expiry of T+10. 
+
+At T+10, a new reserve could reset the bucket due to differing epoch and expiry minutes, but that's fine since older reservations just expired. However, if a checkout for a reservation expiring at T+10 happens at minute T+9.5, the bucket hasn't been reset yet. 
+
+If the checkout is a bit late and occurs at minute T+10 while still within a transaction, the system should fail since expires_at will indicate that it’s expired. Now, I need to clarify how Spanner handles read timestamps, especially if transactions commit after the expiry check at minute T+10.
+thinking
+**Deciding on Serializability**
+
+I need to consider serializability and whether accepting a command that commits after its expiry is acceptable. Typically, validity should be based on the commit time, so I wonder if I need to check the commit timestamp or if I can just use the initial timestamp. In Spanner, I can use PENDING_COMMIT_TIMESTAMP to set a consumed_at variable.
+
+I could set `expires_at` as commit timestamp + 10 and later verify with `CURRENT_TIMESTAMP()`, but that timestamp is captured at read time. If the transaction is delayed due to contention, it might cause issues with leases expiring. Perhaps lease validity should align with transaction start or be verified against Spanner's `COMMIT_TIMESTAMP`.
+thinking
+I'm sorry, but I can't assist with that.
+thinking
+I'm sorry, but I can't assist with that.
+thinking
+I'm sorry, but I can't assist with that.
+codex
+```markdown
+## Elegance Check
+
+### The Core Insight
+Modeling reservations as **time-bucketed leases** so expiration becomes a *pure function of time* (not a background process) is the standout idea—clean invariants, bounded state, and no “cleanup lag” correctness risk.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Spanner (global serializable tx) | Makes “zero oversell globally” a single, defensible guarantee instead of a reconciliation story. |
+| Time-bucketed reservation accounting | Eliminates correctness dependence on TTL/sweepers; bounded per-stripe state. |
+| Hot-SKU stripes | The only practical way to reduce single-row contention while keeping strict correctness. |
+| Reservation record + idempotency | Turns retries into safe replays; enables clean checkout semantics. |
+| Gateway fairness / throttling | Prevents retries/bots from becoming a self-inflicted DB outage. |
+| Order Events stream | Decouples downstream work from checkout latency and failure domains. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| “Increase stripe count” during an incident | **Pre-split** hot SKUs into a large fixed max (e.g., 256/1024) and just “activate” more in the picker | More rows up front; much simpler ops (no live reshard). |
+| Random stripe + bounded retries | “Power-of-two choices” + in-memory **stripe fullness hints** (best-effort) | Slightly more logic; materially fewer abort/retry storms near sell-out. |
+| Buckets stored inline as `buckets[0..9]` | Explicit columns (`b0_epoch,b0_qty...`) or a `stripe_bucket` table | Columns: ugly schema but fast; table: more rows/reads, clearer writes. |
+| Reservation expiry logic implied by minutes | Define lease validity precisely on **timestamps**; minute buckets only for accounting | A bit more spec work; prevents boundary bugs and surprises. |
+| Payment “consume then capture, maybe re-activate” | Explicit **saga states** (`ACTIVE -> ALLOCATED -> PAID/FAILED`) + outbox-driven retries | More states, but far fewer edge-case footguns and 3am ambiguity. |
+| “No sweeper” overall | Still use Spanner **TTL** to delete old `reservation` rows (after idempotency window) | Not used for correctness; just keeps tables bounded. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Minute-boundary / lease validity edge (commit delayed past expiry)**
+   - Design's answer: partially addressed (uses DB time; checks `expires_at <= now`)
+   - Recommendation: **Strengthen** — define: “reservation is valid iff `commit_ts < expires_at`” (or equivalent) and align bucket window to `expires_at > now`. As written, the bucket window `[now_minute, now_minute+9]` conflicts with `expiry_minute = now_minute + 10` (off-by-one risk).
+
+2. **Hot SKU contention causes ABORT storms (Spanner serializable retries)**
+   - Design's answer: addressed (stripes, monitoring, rate limits)
+   - Recommendation: **Strengthen** — require client/server exponential backoff with jitter on `ABORTED`, and make the gateway prefer *queue/deny* over “let retries hit DB”. Also call out how many stripes are needed for worst-case (50k RPS on one SKU) and how you’ll avoid “retry amplification” near sell-out.
+
+3. **Stripe scaling mid-launch (ops tries to “increase stripe count”)**
+   - Design's answer: mentioned, but not explained operationally
+   - Recommendation: **Strengthen** — increasing stripes isn’t free if `total_units` is already split. Pre-splitting is the elegant way: allocate units across a large fixed stripe set at T-0; later you only change routing, not data.
+
+4. **Payment/provider outage or partial failure**
+   - Design's answer: addressed conceptually (ordering + idempotency; refund/revert idea)
+   - Recommendation: **Strengthen** — “mark reservation ACTIVE again” after decrementing buckets / incrementing sold is dangerous without a crisp state machine. Prefer: (a) authorize first, (b) transactionally move to `ALLOCATED` (inventory committed), (c) capture async with retries; on capture failure, compensate by releasing allocation if still within policy, otherwise cancel+refund with clear business rule.
+
+5. **Large qty reservations (qty=k) when inventory is fragmented across stripes**
+   - Design's answer: not addressed
+   - Recommendation: **Strengthen** — decide and document: either (a) enforce `qty <= per_stripe_max` (and size stripes accordingly), or (b) allow a single “reservation” to span multiple stripes (more complex but correct), or (c) reject large qty during launch mode.
+
+## Recommendations
+
+### Must Fix
+- Specify exact **time semantics** (timestamp vs minute), including boundary conditions, and make bucket-window math consistent with `expires_at > now` and transaction commit behavior.
+- Define a clear **reservation/checkout state machine** (including payment failure paths) that never relies on “best effort re-activate” after inventory has been mutated.
+- Make stripe ops realistic: adopt **pre-splitting** (or explicitly describe a safe reshard procedure) and include a sizing rule-of-thumb for worst-case hot SKU throughput.
+- Address multi-item carts: whether checkout is **atomic across SKUs**, and if so, specify lock/ordering strategy to avoid deadlocks and tail-latency blowups.
+
+### Should Consider
+- Add an explicit **cancel/release** flow (idempotent) so users removing items don’t cause avoidable under-selling for 10 minutes.
+- Replace random retries with a smarter picker (power-of-two + hints) and make backpressure a first-class “launch mode” feature.
+- Use Spanner TTL (or archival) for old `reservation` rows to keep storage and indexes bounded without reintroducing correctness dependence on cleanup.
+
+### Nice to Have
+- Document invariants formally (per stripe and per reservation) and list the exact queries/rows touched per operation for capacity planning.
+- Add an “oops-proof” runbook for 3am: stripe activation, gateway tightening, and safe kill-switches (disable reserve vs disable checkout vs disable payment capture).
+
+## What's Working Well
+- The design is honest: it prioritizes correctness and explicitly accepts higher write latency—good architectural clarity.
+- The time-bucket lease approach is a genuinely elegant way to avoid the classic “TTL job drift” trap.
+- You isolate inventory truth to one service/DB boundary and treat idempotency as a first-class requirement.
+- You’ve already anticipated the operational reality (hot keys, retry storms, rate limits) instead of pretending they won’t happen.
+```
+tokens used
+10,480
+```markdown
+## Elegance Check
+
+### The Core Insight
+Modeling reservations as **time-bucketed leases** so expiration becomes a *pure function of time* (not a background process) is the standout idea—clean invariants, bounded state, and no “cleanup lag” correctness risk.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Spanner (global serializable tx) | Makes “zero oversell globally” a single, defensible guarantee instead of a reconciliation story. |
+| Time-bucketed reservation accounting | Eliminates correctness dependence on TTL/sweepers; bounded per-stripe state. |
+| Hot-SKU stripes | The only practical way to reduce single-row contention while keeping strict correctness. |
+| Reservation record + idempotency | Turns retries into safe replays; enables clean checkout semantics. |
+| Gateway fairness / throttling | Prevents retries/bots from becoming a self-inflicted DB outage. |
+| Order Events stream | Decouples downstream work from checkout latency and failure domains. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| “Increase stripe count” during an incident | **Pre-split** hot SKUs into a large fixed max (e.g., 256/1024) and just “activate” more in the picker | More rows up front; much simpler ops (no live reshard). |
+| Random stripe + bounded retries | “Power-of-two choices” + in-memory **stripe fullness hints** (best-effort) | Slightly more logic; materially fewer abort/retry storms near sell-out. |
+| Buckets stored inline as `buckets[0..9]` | Explicit columns (`b0_epoch,b0_qty...`) or a `stripe_bucket` table | Columns: ugly schema but fast; table: more rows/reads, clearer writes. |
+| Reservation expiry logic implied by minutes | Define lease validity precisely on **timestamps**; minute buckets only for accounting | A bit more spec work; prevents boundary bugs and surprises. |
+| Payment “consume then capture, maybe re-activate” | Explicit **saga states** (`ACTIVE -> ALLOCATED -> PAID/FAILED`) + outbox-driven retries | More states, but far fewer edge-case footguns and 3am ambiguity. |
+| “No sweeper” overall | Still use Spanner **TTL** to delete old `reservation` rows (after idempotency window) | Not used for correctness; just keeps tables bounded. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Minute-boundary / lease validity edge (commit delayed past expiry)**
+   - Design's answer: partially addressed (uses DB time; checks `expires_at <= now`)
+   - Recommendation: **Strengthen** — define: “reservation is valid iff `commit_ts < expires_at`” (or equivalent) and align bucket window to `expires_at > now`. As written, the bucket window `[now_minute, now_minute+9]` conflicts with `expiry_minute = now_minute + 10` (off-by-one risk).
+
+2. **Hot SKU contention causes ABORT storms (Spanner serializable retries)**
+   - Design's answer: addressed (stripes, monitoring, rate limits)
+   - Recommendation: **Strengthen** — require client/server exponential backoff with jitter on `ABORTED`, and make the gateway prefer *queue/deny* over “let retries hit DB”. Also call out how many stripes are needed for worst-case (50k RPS on one SKU) and how you’ll avoid “retry amplification” near sell-out.
+
+3. **Stripe scaling mid-launch (ops tries to “increase stripe count”)**
+   - Design's answer: mentioned, but not explained operationally
+   - Recommendation: **Strengthen** — increasing stripes isn’t free if `total_units` is already split. Pre-splitting is the elegant way: allocate units across a large fixed stripe set at T-0; later you only change routing, not data.
+
+4. **Payment/provider outage or partial failure**
+   - Design's answer: addressed conceptually (ordering + idempotency; refund/revert idea)
+   - Recommendation: **Strengthen** — “mark reservation ACTIVE again” after decrementing buckets / incrementing sold is dangerous without a crisp state machine. Prefer: (a) authorize first, (b) transactionally move to `ALLOCATED` (inventory committed), (c) capture async with retries; on capture failure, compensate by releasing allocation if still within policy, otherwise cancel+refund with clear business rule.
+
+5. **Large qty reservations (qty=k) when inventory is fragmented across stripes**
+   - Design's answer: not addressed
+   - Recommendation: **Strengthen** — decide and document: either (a) enforce `qty <= per_stripe_max` (and size stripes accordingly), or (b) allow a single “reservation” to span multiple stripes (more complex but correct), or (c) reject large qty during launch mode.
+
+## Recommendations
+
+### Must Fix
+- Specify exact **time semantics** (timestamp vs minute), including boundary conditions, and make bucket-window math consistent with `expires_at > now` and transaction commit behavior.
+- Define a clear **reservation/checkout state machine** (including payment failure paths) that never relies on “best effort re-activate” after inventory has been mutated.
+- Make stripe ops realistic: adopt **pre-splitting** (or explicitly describe a safe reshard procedure) and include a sizing rule-of-thumb for worst-case hot SKU throughput.
+- Address multi-item carts: whether checkout is **atomic across SKUs**, and if so, specify lock/ordering strategy to avoid deadlocks and tail-latency blowups.
+
+### Should Consider
+- Add an explicit **cancel/release** flow (idempotent) so users removing items don’t cause avoidable under-selling for 10 minutes.
+- Replace random retries with a smarter picker (power-of-two + hints) and make backpressure a first-class “launch mode” feature.
+- Use Spanner TTL (or archival) for old `reservation` rows to keep storage and indexes bounded without reintroducing correctness dependence on cleanup.
+
+### Nice to Have
+- Document invariants formally (per stripe and per reservation) and list the exact queries/rows touched per operation for capacity planning.
+- Add an “oops-proof” runbook for 3am: stripe activation, gateway tightening, and safe kill-switches (disable reserve vs disable checkout vs disable payment capture).
+
+## What's Working Well
+- The design is honest: it prioritizes correctness and explicitly accepts higher write latency—good architectural clarity.
+- The time-bucket lease approach is a genuinely elegant way to avoid the classic “TTL job drift” trap.
+- You isolate inventory truth to one service/DB boundary and treat idempotency as a first-class requirement.
+- You’ve already anticipated the operational reality (hot keys, retry storms, rate limits) instead of pretending they won’t happen.
+```
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/global-inventory-reservations.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afc-be88-7b33-b9e3-6c18bf22056d
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Global Inventory with Reservations"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["inventory", "reservations", "flash-sale", "strong-consistency", "hot-keys"]
+---
+
+## Overview
+
+This system guarantees **zero overselling** during a global, high-traffic launch while allowing users to hold items in carts for **10 minutes**. The core idea is to treat a reservation as a **lease** on inventory and make the write path **strongly consistent**, even if that means accepting slightly higher latency for reserve/checkout operations.
+
+The elegant trick is to avoid “reservation cleanup jobs” (which inevitably drift and cause under-selling). Instead, we model reservations as **time-bucketed holds** so expiration becomes a pure function of time: when the 10-minute window passes, the held quantity simply stops counting against availability—no sweeper required, no stuck inventory.
+
+Everything else stays boring: a small Inventory service, a transactional database with global consistency, and a Checkout service that converts valid leases into sales with idempotent writes.
+
+## What Makes This Hard
+
+Naive designs use a single “available_count” and decrement it on add-to-cart, then increment it with a TTL job on expiration. Under load, that job lags or fails, and inventory gets “stuck” reserved, causing **massive under-selling** (the silent killer in launches). Teams often don’t notice until after the drop.
+
+The other trap is **hot keys**: one SKU can receive a huge fraction of traffic. Even a perfect transaction becomes a bottleneck if every reservation contends on the same row/partition.
+
+## Requirements
+
+### Functional Requirements
+- Guarantee **zero overselling** globally for each SKU.
+- Support **10-minute cart holds** (reservations) with deterministic expiration.
+- Allow checkout to **atomically** convert reservations into sales (and fail cleanly if expired).
+- Provide idempotency for reserve/checkout to handle retries and flaky clients.
+
+### Scale Targets
+- Peak reserve (add-to-cart) traffic: **100k RPS global** during first minutes of launch.
+- Hot SKU concentration: up to **50% of traffic on one SKU** (worst-case “drop” behavior).
+- Reservation duration: **10 minutes**, so the system must tolerate **millions of concurrent active holds** without cleanup lag becoming correctness risk.
+- SLO: reserve/checkout **p99 < 300ms** globally (writes are allowed to be slower than reads).
+
+## Key Design Decisions
+
+- **Strong consistency for the write path**
+  - Chosen: one transactional, globally consistent database for reservations + inventory writes (Google Spanner).
+  - Rejected: multi-region async replication with “best effort reconciliation”.
+  - Why: oversell is a correctness bug, not an availability trade; global serializable transactions are the simplest defensible guarantee.
+
+- **Time-bucketed reservations (no sweeper)**
+  - Chosen: per-SKU “ring buffer” of minute buckets for reserved quantity; active reservations are the sum of buckets in the last 10 minutes.
+  - Rejected: TTL rows + background job to release inventory.
+  - Why: expiration becomes *automatic* as time advances; correctness no longer depends on a cleanup job’s timeliness.
+
+- **Hot SKU sharding (“stripes”)**
+  - Chosen: split each hot SKU into `N` independent inventory stripes, each with its own reservation buckets; reserve picks a stripe and retries.
+  - Rejected: a single row/counter per SKU.
+  - Why: removes single-row write contention and scales linearly with stripes while preserving strict no-oversell.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[Users] --> G["API Gateway"]
+  G --> C["Cart/Checkout"]
+  C --> I["Inventory Service"]
+  I --> D["Spanner (Tx DB)"]
+  C --> P["Payment Provider"]
+  C --> E["Order Events"]
+```
+
+### Components
+
+- `API Gateway`: terminates TLS, enforces rate limits per IP/user, and applies a launch-mode “fairness” policy (reject abusive retry storms).
+- `Cart/Checkout`: owns cart state and checkout orchestration; never invents inventory truth.
+- `Inventory Service`: the only writer for inventory and reservations; enforces invariants with database transactions.
+- `Spanner (Tx DB)`: source of truth for inventory totals, sold counts, reservation buckets, and reservation records.
+- `Payment Provider`: external payment authorization/capture; integrated with idempotency keys.
+- `Order Events`: append-only stream for downstream systems (email, fulfillment, analytics) without coupling them to checkout latency.
+
+## Deep Dive: Time-Bucketed Reservations + Hot-Key Sharding
+
+### Data model (per SKU stripe)
+We store inventory per `(sku_id, stripe_id)`:
+
+- `inventory_stripe`
+  - `sku_id`, `stripe_id`
+  - `total_units`
+  - `sold_units`
+  - `buckets[0..9]`: each bucket has `{epoch_minute, reserved_units}`
+
+- `reservation`
+  - `reservation_id` (idempotency key scoped to user+cart action)
+  - `sku_id`, `stripe_id`, `qty`
+  - `expires_at` (derived from DB time)
+  - `status` = `ACTIVE | CONSUMED | EXPIRED`
+
+### Reserve flow (single SKU, qty=1..k)
+Within a serializable transaction:
+1. Read DB time (`now_minute`) and compute `expiry_minute = now_minute + 10`.
+2. Select a stripe (random for load distribution). Lock that `inventory_stripe` row.
+3. Lazily reset the target bucket if `bucket.epoch_minute != expiry_minute` (set `reserved_units=0`, update `epoch_minute`).
+4. Compute `active_reserved = sum(reserved_units for buckets with epoch_minute in [now_minute, now_minute+9])`.
+5. `available = total_units - sold_units - active_reserved`. If `available < qty`, abort and retry another stripe (bounded attempts).
+6. Increment the expiry bucket’s `reserved_units += qty`.
+7. Insert `reservation` as `ACTIVE` with `expires_at = now + 10min`.
+
+Why this works:
+- Expiration requires no decrement. When `now_minute` advances, older buckets fall out of the `[now, now+9]` window and stop counting.
+- The only mutable state is a constant-sized set of buckets, so “cleanup lag” cannot accumulate.
+
+### Checkout flow (convert reservation to sale)
+Within a serializable transaction:
+1. `SELECT reservation FOR UPDATE`. If `status != ACTIVE`, return idempotent result.
+2. If `expires_at <= now`, set `status=EXPIRED` and fail checkout (no inventory mutation needed).
+3. Lock the referenced `inventory_stripe` row.
+4. Decrement the reservation’s expiry bucket by `qty` (after lazily resetting if epoch mismatch, which should only happen if the reservation is already expired; we reject earlier).
+5. Increment `sold_units += qty`.
+6. Set reservation `status=CONSUMED`.
+7. Proceed to payment capture (or authorize-before and capture-after depending on business rules), using an idempotency key tied to the order.
+
+The invariant is simple: within each stripe, `sold_units + active_reserved <= total_units` is maintained by a single transaction boundary.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness (zero oversell) | Higher write latency (global tx) |
+| Deterministic expiration (no sweeper) | Some under-selling within the 10-minute hold window |
+| Flash-sale scalability (striped hot keys) | Slightly more complex reserve retry logic |
+
+## Failure Modes
+
+- **DB region degradation / high contention**
+  - What happens: reserve/checkout p99 spikes; retries amplify load.
+  - Detect: increased transaction aborts, lock wait time, hotspot metrics on `(sku_id, stripe_id)`.
+  - Recover: increase stripe count for hot SKUs, enable stricter gateway rate limits, temporarily reduce max cart hold creations per user/min.
+
+- **Payment succeeds but inventory conversion fails**
+  - What happens: customer charged without guaranteed allocation if payment is captured too early.
+  - Detect: mismatch between captured payments and consumed reservations.
+  - Recover: enforce ordering: consume reservation in DB first, then capture payment with idempotency; if capture fails, release by marking reservation `ACTIVE` again only if still unexpired (otherwise refund).
+
+- **Client retry storms (mobile networks, bots)**
+  - What happens: duplicate reserve/checkout attempts.
+  - Detect: high duplicate idempotency-key hit rate; sharp rise in 429/503 at gateway.
+  - Recover: strict idempotency on `reservation_id` and `order_id`, gateway throttles, and per-user concurrency caps for reserve/checkout endpoints.
+
+## What I'd Do Differently At...
+
+- **10x scale:** increase stripe count on hot SKUs (and pre-split totals), add per-region edge caching for browse traffic, and enforce launch-mode backpressure (queue/deny) at the gateway instead of letting retries hit the DB.
+- **100x scale:** move to a dedicated “inventory allocator” that pre-issues reservation tokens (cryptographically signed, short-lived) per stripe to absorb DB writes, with the DB as the final authority only at checkout.
+
+## Operational Notes
+
+- Use **database time** for `now` and `epoch_minute` to avoid clock skew bugs.
+- Monitor: transaction abort rate, lock wait, stripe skew, reservation creation rate, checkout conversion rate, and “expired at checkout” rate (a UX signal).
+- Keep stripe totals immutable during the launch window; treat restocks as a controlled admin operation with explicit auditing.
+- Runbooks should start with: “Is this a hot SKU hotspot?” before chasing generic DB performance.
+```
+
+---
+
+## Critique to Address
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+Modeling reservations as **time-bucketed leases** so expiration becomes a *pure function of time* (not a background process) is the standout idea—clean invariants, bounded state, and no “cleanup lag” correctness risk.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Spanner (global serializable tx) | Makes “zero oversell globally” a single, defensible guarantee instead of a reconciliation story. |
+| Time-bucketed reservation accounting | Eliminates correctness dependence on TTL/sweepers; bounded per-stripe state. |
+| Hot-SKU stripes | The only practical way to reduce single-row contention while keeping strict correctness. |
+| Reservation record + idempotency | Turns retries into safe replays; enables clean checkout semantics. |
+| Gateway fairness / throttling | Prevents retries/bots from becoming a self-inflicted DB outage. |
+| Order Events stream | Decouples downstream work from checkout latency and failure domains. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| “Increase stripe count” during an incident | **Pre-split** hot SKUs into a large fixed max (e.g., 256/1024) and just “activate” more in the picker | More rows up front; much simpler ops (no live reshard). |
+| Random stripe + bounded retries | “Power-of-two choices” + in-memory **stripe fullness hints** (best-effort) | Slightly more logic; materially fewer abort/retry storms near sell-out. |
+| Buckets stored inline as `buckets[0..9]` | Explicit columns (`b0_epoch,b0_qty...`) or a `stripe_bucket` table | Columns: ugly schema but fast; table: more rows/reads, clearer writes. |
+| Reservation expiry logic implied by minutes | Define lease validity precisely on **timestamps**; minute buckets only for accounting | A bit more spec work; prevents boundary bugs and surprises. |
+| Payment “consume then capture, maybe re-activate” | Explicit **saga states** (`ACTIVE -> ALLOCATED -> PAID/FAILED`) + outbox-driven retries | More states, but far fewer edge-case footguns and 3am ambiguity. |
+| “No sweeper” overall | Still use Spanner **TTL** to delete old `reservation` rows (after idempotency window) | Not used for correctness; just keeps tables bounded. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Minute-boundary / lease validity edge (commit delayed past expiry)**
+   - Design's answer: partially addressed (uses DB time; checks `expires_at <= now`)
+   - Recommendation: **Strengthen** — define: “reservation is valid iff `commit_ts < expires_at`” (or equivalent) and align bucket window to `expires_at > now`. As written, the bucket window `[now_minute, now_minute+9]` conflicts with `expiry_minute = now_minute + 10` (off-by-one risk).
+
+2. **Hot SKU contention causes ABORT storms (Spanner serializable retries)**
+   - Design's answer: addressed (stripes, monitoring, rate limits)
+   - Recommendation: **Strengthen** — require client/server exponential backoff with jitter on `ABORTED`, and make the gateway prefer *queue/deny* over “let retries hit DB”. Also call out how many stripes are needed for worst-case (50k RPS on one SKU) and how you’ll avoid “retry amplification” near sell-out.
+
+3. **Stripe scaling mid-launch (ops tries to “increase stripe count”)**
+   - Design's answer: mentioned, but not explained operationally
+   - Recommendation: **Strengthen** — increasing stripes isn’t free if `total_units` is already split. Pre-splitting is the elegant way: allocate units across a large fixed stripe set at T-0; later you only change routing, not data.
+
+4. **Payment/provider outage or partial failure**
+   - Design's answer: addressed conceptually (ordering + idempotency; refund/revert idea)
+   - Recommendation: **Strengthen** — “mark reservation ACTIVE again” after decrementing buckets / incrementing sold is dangerous without a crisp state machine. Prefer: (a) authorize first, (b) transactionally move to `ALLOCATED` (inventory committed), (c) capture async with retries; on capture failure, compensate by releasing allocation if still within policy, otherwise cancel+refund with clear business rule.
+
+5. **Large qty reservations (qty=k) when inventory is fragmented across stripes**
+   - Design's answer: not addressed
+   - Recommendation: **Strengthen** — decide and document: either (a) enforce `qty <= per_stripe_max` (and size stripes accordingly), or (b) allow a single “reservation” to span multiple stripes (more complex but correct), or (c) reject large qty during launch mode.
+
+## Recommendations
+
+### Must Fix
+- Specify exact **time semantics** (timestamp vs minute), including boundary conditions, and make bucket-window math consistent with `expires_at > now` and transaction commit behavior.
+- Define a clear **reservation/checkout state machine** (including payment failure paths) that never relies on “best effort re-activate” after inventory has been mutated.
+- Make stripe ops realistic: adopt **pre-splitting** (or explicitly describe a safe reshard procedure) and include a sizing rule-of-thumb for worst-case hot SKU throughput.
+- Address multi-item carts: whether checkout is **atomic across SKUs**, and if so, specify lock/ordering strategy to avoid deadlocks and tail-latency blowups.
+
+### Should Consider
+- Add an explicit **cancel/release** flow (idempotent) so users removing items don’t cause avoidable under-selling for 10 minutes.
+- Replace random retries with a smarter picker (power-of-two + hints) and make backpressure a first-class “launch mode” feature.
+- Use Spanner TTL (or archival) for old `reservation` rows to keep storage and indexes bounded without reintroducing correctness dependence on cleanup.
+
+### Nice to Have
+- Document invariants formally (per stripe and per reservation) and list the exact queries/rows touched per operation for capacity planning.
+- Add an “oops-proof” runbook for 3am: stripe activation, gateway tightening, and safe kill-switches (disable reserve vs disable checkout vs disable payment capture).
+
+## What's Working Well
+- The design is honest: it prioritizes correctness and explicitly accepts higher write latency—good architectural clarity.
+- The time-bucket lease approach is a genuinely elegant way to avoid the classic “TTL job drift” trap.
+- You isolate inventory truth to one service/DB boundary and treat idempotency as a first-class requirement.
+- You’ve already anticipated the operational reality (hot keys, retry storms, rate limits) instead of pretending they won’t happen.
+```
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+
+
+
+
+
+
+
+thinking
+**Evaluating service structure**
+
+I’m thinking about merging the Cart/Checkout and Inventory into a single service called "Checkout API" that handles the cart, reservations, checkout, and inventory management. This might still meet our invariants, and could lower RPC failures. However, I need to consider read traffic. 
+
+Should we keep the API gateway, or just rely on a load balancer and WAF? Keeping it as part of the service seems reasonable, although I can't add components. Maybe renaming is an option? Analyzing the architecture further, we could remove the "Order Events" section for the MVP, or store order events in a database instead. This might simplify things, but is it really adding more jobs to process?
+thinking
+**Maintaining system constraints**
+
+I need to ensure we maintain "zero oversell" and idempotency while managing 100k requests per second globally. At this level of traffic, it seems we might not need a queue or event stream. For email and fulfillment, I could handle these asynchronously using the same database with an outbox table and worker, although this adds another component. 
+
+Maybe I can reinterpret “Order Events” as just the DB outbox table, thus removing the stream. I should also eliminate the Order Events component altogether to avoid impacting checkout latency. Regarding pre-splitting stripes, we can simplify operational complexity by keeping a fixed stripe count per SKU. This might increase rows but would overall make things easier. Using power-of-two choices sounds good too!
+thinking
+**Simplifying reservation logic**
+
+I realize that adding complexity may not be necessary. Instead of using a random stripe approach, I could just address abort storms with a backoff and a gateway queue to deny requests. I’ll aim to keep using random or consistent hashing by user ID for stability and try to reduce the number of retries, avoiding extra hints to maintain simplicity. 
+
+I want to define reservation validity with a commit timestamp and create buckets for accounting. The fix for the off-by-one would involve having 10 buckets representing expiry minutes. It might be simpler to store "end_minute" buckets for when reservations expire instead of tracking expiry buckets. This should streamline the process!
+thinking
+**Clarifying reservation calculations**
+
+So, I'm thinking about how to handle active reservations, which should be calculated from buckets where end_minute is greater than now_minute and less than or equal to now_minute plus 10. If a hold is valid for 10 minutes, an item reserved at time t counts until t+10 minutes. 
+
+The expiry bucket is based on the floor of (t+10 minutes). But there might be some boundary challenges here. One alternative could be to store a per-minute "start minute" bucket, but this would require decrementing at checkout. In my original approach, I was summing from the expiry bucket for future minutes. It seems like I need to fix the off-by-one issue; maybe I should set the expiry_minute to now_minute plus 9 instead or rethink how to sum periods!
+thinking
+**Optimizing reservation and payment flow**
+
+I see that having minute-based accounting might create a bit of slack, but the core idea remains time-bucketed holds to avoid sweeper issues. We can simplify our statuses by only keeping ACTIVE and CONSUMED, getting rid of the EXPIRED status by deriving it from expires_at. This means if a reservation expires, we treat it as invalid without updating the status.
+
+For checkout, if expires_at is less than or equal to now, we can return "expired" but maintain idempotency by returning this again upon retry. When handling payments, I think authorizing first, consuming the reservation, and creating the order should be the way to go. We’ll only capture payment afterward, marking orders as payment_failed if needed. I also want to streamline the checkout process for multi-SKU carts, but I’ll limit initial launches to one SKU to avoid deadlocks and keep things simple. Plus, for large quantity reservations, enforcing a limit of 1 per SKU when there's high demand can keep things manageable!
+thinking
+**Refining architectural choices**
+
+To maintain efficiency, I'll keep the quantity limit at 1 or 2 during launch mode, preventing cross-stripe reservations. I think we can also opt to merge components like the "Inventory Service" into the Checkout service to simplify our architecture. We'll use Spanner for our DB choice since achieving global zero oversell is essential. I can eliminate the need for an explicit EXPIRED status, only using ACTIVE or CONSUMED.
+
+For the cart, I see that it can just represent active reservations, so we may drop the cart service outright. I'll ensure we properly document all changes, including a "What We Removed" section to clarify omitted elements. And I definitely want to clarify the need for fixed stripe counts to streamline transactions and manage performance effectively!
+thinking
+**Finalizing design documentation**
+
+I need to ensure the output meets all requirements while simplifying the document. First, I’ll combine the sections strategically to maintain clarity without adding any new sections. I want to rename "What I'd Do Differently At..." to "What We Removed" for better alignment with the format. Also, I’ll remove all critiques and avoid adding any new components, focusing on the final design only. Clear definitions for `reservation` and `order` states will help streamline our architecture while maintaining minimal complexity. Ultimately, I’ll treat consumption as the final sale to keep our invariants intact.
+thinking
+**Evaluating design choices**
+
+I’m considering whether to include a simple release mechanism for ACTIVE reservations before expiry. While it adds complexity, it might be manageable, especially under high load. However, since the requirements didn’t explicitly ask for a cancel feature, I might drop it. For idempotency, I’ll use `order_id` for checkout, while keeping `reservation_id` for the reserve process. 
+
+Considering multi-item carts, I decide to treat each reservation as per SKU, processing them in the checkout. I’ll keep the total design focused and ensure proper handling of time windows and bucket management to avoid overselling, leading to a conservative approach using 11 buckets.
+thinking
+**Determining bucket strategy**
+
+I’m considering a design with 10 buckets using a minute number based on `commit_ts`. By rounding `commit_ts` up to the next minute, I can determine the bucket start. If `commit_ts` is at 12:00:59, it rounds to 12:01, and then I add 10 minutes to set the bucket minute. The active reservation sums the buckets within a specified window. 
+
+To avoid undercounting, I find that using 11 buckets instead of 10 may be more accurate, accommodating time rounding and ensuring proper stock availability without excessive overselling.
+thinking
+**Defining reservation strategy**
+
+I’m opting to use 11 buckets to manage a 10-minute hold duration, allowing for proper adjustments due to rounding. This maintains a constant size while ensuring minimal under-sell. I’ll clarify that buckets will track the upcoming 11-minute marks while keeping documentation streamlined. 
+
+The reserve functionality will include transaction checks for duplicates and proper locking, ensuring we avoid double counting. During checkout, I'll make sure the order creation is idempotent, so it handles partial payment failures effectively. We'll maintain simplicity while implementing a robust approach.
+thinking
+**Finalizing design documentation**
+
+I'm working on condensing the "Failure Modes" section to include minute boundary semantics, payment errors, and other critical points. In "What We Removed," I need to detail the components we’ve cut, like the separate inventory service and dynamic resharding, without excessive language. 
+
+I’ll ensure the time semantics are clear, so the validity of reservations hinges on the commit timestamp. It’s essential to avoid overselling while preventing under-sell due to commit delays. I'll finalize the markdown document, keeping the structure intact and focusing on clarity.
+thinking
+**Refining time semantics for reservations**
+
+I'm working on defining when a reservation is valid by using timestamps. Essentially, I’m saying that if the commit timestamp is less than expires_at, it holds true since commit timestamps are always greater than or equal to the `now_ts`. 
+
+I’ll clarify that `expires_at` is determined by reading the current database timestamp. If a transaction commits after `expires_at`, the reservation will fail at checkout, though the inventory will remain held until the bucket window passes. I also need to ensure proper bucketing alignment to avoid any off-by-one errors while crafting a concise document.
+codex
+```markdown
+---
+title: "Global Inventory with Reservations"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["inventory", "reservations", "flash-sale", "strong-consistency", "hot-keys"]
+---
+
+## Overview
+
+This system guarantees **zero overselling** during a global, high-traffic launch while allowing users to hold items for **10 minutes**. The write path is **strongly consistent** and centralized in one API so the invariants are easy to defend.
+
+Reservations are modeled as **leases** with a hard `expires_at` timestamp. Availability is computed from **time-bucketed reserved totals** so expiration becomes a function of time, not a background job: when time moves forward, old buckets stop counting automatically.
+
+## What Makes This Hard
+
+Naive designs decrement an `available_count` on add-to-cart and rely on TTL cleanup to restore inventory. Under load, cleanup lags and inventory gets “stuck” reserved, causing **under-selling**.
+
+The other trap is **hot keys**: one SKU can receive a huge fraction of traffic. Even a correct transaction bottlenecks if every reservation contends on the same row.
+
+## Requirements
+
+### Functional Requirements
+- Guarantee **zero overselling** globally for each SKU.
+- Support **10-minute cart holds** (reservations) with deterministic expiration at `expires_at`.
+- Allow checkout to **atomically** convert valid reservations into sales (and fail cleanly if expired).
+- Provide idempotency for reserve/checkout to handle retries and flaky clients.
+
+### Scale Targets
+- Peak reserve traffic: **100k RPS global** during first minutes of launch.
+- Hot SKU concentration: up to **50% of traffic on one SKU**.
+- Must tolerate **millions of concurrent active holds** without correctness depending on cleanup.
+- SLO: reserve/checkout **p99 < 300ms** globally.
+
+## Key Design Decisions
+
+- **Single strongly-consistent write boundary**
+  - One API performs reservation + inventory writes using a globally serializable transactional database (Spanner).
+  - Oversell remains a strict invariant, not a reconciliation story.
+
+- **Timestamp leases + time-bucketed accounting**
+  - Each reservation has an exact `expires_at` timestamp.
+  - Availability uses a fixed-size per-stripe bucket ring so expiration never requires decrement jobs.
+
+- **Fixed stripes for hot SKUs**
+  - Each SKU is pre-split into a fixed number of independent stripes.
+  - Reserve picks a stripe and retries a bounded number of times to avoid single-row contention.
+
+- **Retry/backpressure is part of correctness-at-scale**
+  - Server-side retries on `ABORTED` use exponential backoff + jitter.
+  - Launch-mode throttling rejects/limits abusive retry storms before they amplify DB contention.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[Users] --> G["Edge (TLS + rate limits)"]
+  G --> A["Reserve/Checkout API"]
+  A --> D["Spanner (Tx DB)"]
+  A --> P["Payment Provider"]
+```
+
+### Components
+
+- `Edge (TLS + rate limits)`: protects the DB from retry storms and bots; enforces launch-mode throttles.
+- `Reserve/Checkout API`: the only writer for inventory, reservations, and orders; owns all invariants.
+- `Spanner (Tx DB)`: source of truth for inventory totals, sold counts, reservation buckets, reservation records, and orders.
+- `Payment Provider`: external authorization/capture with idempotency keys tied to `order_id`.
+
+## Deep Dive: Time-Bucketed Leases + Hot-Key Sharding
+
+### Data model (per SKU stripe)
+Inventory is stored per `(sku_id, stripe_id)`:
+
+- `inventory_stripe`
+  - `sku_id`, `stripe_id`
+  - `total_units`
+  - `sold_units`
+  - `buckets[0..10]`: each bucket has `{epoch_minute, reserved_units}` (minute-granularity ring)
+
+- `reservation`
+  - `reservation_id` (idempotency key)
+  - `sku_id`, `stripe_id`, `qty`
+  - `expires_at` (DB time + 10 minutes)
+  - `consumed_at` (nullable)
+
+- `order`
+  - `order_id` (idempotency key)
+  - `state = ALLOCATED | PAID | CANCELLED`
+  - `reservation_ids[...]` (or rows per line item)
+
+### Time semantics (crisp and conservative)
+- `expires_at` is computed from **DB time** inside the reservation transaction.
+- A reservation is valid at checkout iff `expires_at > checkout_now` and `consumed_at IS NULL`.
+- Bucket accounting is **conservative** (never increases availability early); it may temporarily reduce availability for up to <1 minute after `expires_at`.
+
+### Reserve flow (single SKU, qty=1..k)
+Within a serializable transaction:
+1. If `reservation_id` already exists, return the stored result (idempotent).
+2. Pick a `stripe_id` and lock `inventory_stripe`.
+3. Compute `active_reserved` as the sum of bucket quantities whose `epoch_minute` falls in the active window.
+4. `available = total_units - sold_units - active_reserved`. If insufficient, abort and retry another stripe (bounded attempts).
+5. Insert `reservation` with `expires_at = now + 10min` and increment the appropriate bucket for that expiry window.
+
+### Checkout flow (convert reservations to sale)
+Checkout is atomic across the provided `reservation_ids` (multi-SKU carts supported).
+Within a serializable transaction:
+1. If `order_id` exists, return its state (idempotent).
+2. Lock reservations in a stable order; fail if any are expired or already consumed.
+3. Lock referenced `inventory_stripe` rows in a stable order; decrement each reservation’s bucket and increment `sold_units`.
+4. Set `consumed_at` on each reservation and create `order` as `ALLOCATED`.
+
+After commit:
+5. Capture payment with idempotency key `order_id`.
+6. Update `order` to `PAID` on success; otherwise set `CANCELLED` and void/refund per policy (inventory remains sold to preserve strict no-oversell).
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness (zero oversell) | Higher write latency (global tx) |
+| No cleanup correctness dependency | Small conservative under-selling (<1 minute) from minute buckets |
+| Flash-sale scalability (striped hot keys) | Stripe selection + bounded retries |
+
+## Failure Modes
+
+- **Minute-boundary / lease edge**
+  - What happens: ambiguity at exact boundaries can cause early release if not specified.
+  - Result: timestamp lease validity (`expires_at > now`) is definitive; buckets are conservative so availability never increases early.
+
+- **Hot SKU contention / `ABORTED` storms**
+  - What happens: retries amplify load and p99 spikes.
+  - Result: fixed stripes reduce contention; server backoff+jitter on abort; edge throttling prefers deny/slowdown over letting retries reach the DB.
+
+- **Stripe ops during launch**
+  - What happens: live resharding is risky when totals are already split.
+  - Result: stripe count is fixed and pre-split for the launch window; operations only adjust throttles and retry policy.
+
+- **Payment succeeds/fails around allocation**
+  - What happens: partial failures can create “charged without inventory” or complex compensations.
+  - Result: inventory allocation commits before capture; capture is idempotent; payment failure cancels the order and refunds/voids without trying to “re-activate” inventory.
+
+- **Large qty reservations with fragmented stripes**
+  - What happens: a single stripe may not have enough units even when the SKU does.
+  - Result: launch mode enforces a small `qty` limit per reservation (or requires `qty` to fit in one stripe).
+
+## What We Removed
+
+- Separate `Inventory Service` and separate `Cart/Checkout` service: one API owns the write path and invariants.
+- `Order Events` stream: orders live in the transactional DB; checkout latency stays bounded without a streaming dependency.
+- Any TTL/sweeper that releases inventory: expiration correctness is time-based in accounting, not job-based.
+- Live “increase stripe count” procedures: stripes are fixed and pre-split for the launch window.
+- “Re-activate reservation after payment failure”: payment failures resolve via order state + refund/void, not inventory rewrites.
+
+## Operational Notes
+
+- Always use **DB time** for `now` and `expires_at`.
+- Configure bounded retries on `ABORTED` with exponential backoff + jitter; surface a clear `429`/`503` policy at the edge.
+- Stripe sizing rule: choose enough stripes that a hot SKU’s peak write RPS is comfortably spread (target low hundreds of writes/sec per stripe).
+- Monitor: transaction abort rate, lock wait, stripe skew, reserve success rate, and “expired at checkout” rate.
+- Use DB retention/TTL only to delete old `reservation` rows after the idempotency window (never for correctness).
+```
+tokens used
+18,040
+```markdown
+---
+title: "Global Inventory with Reservations"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags: ["inventory", "reservations", "flash-sale", "strong-consistency", "hot-keys"]
+---
+
+## Overview
+
+This system guarantees **zero overselling** during a global, high-traffic launch while allowing users to hold items for **10 minutes**. The write path is **strongly consistent** and centralized in one API so the invariants are easy to defend.
+
+Reservations are modeled as **leases** with a hard `expires_at` timestamp. Availability is computed from **time-bucketed reserved totals** so expiration becomes a function of time, not a background job: when time moves forward, old buckets stop counting automatically.
+
+## What Makes This Hard
+
+Naive designs decrement an `available_count` on add-to-cart and rely on TTL cleanup to restore inventory. Under load, cleanup lags and inventory gets “stuck” reserved, causing **under-selling**.
+
+The other trap is **hot keys**: one SKU can receive a huge fraction of traffic. Even a correct transaction bottlenecks if every reservation contends on the same row.
+
+## Requirements
+
+### Functional Requirements
+- Guarantee **zero overselling** globally for each SKU.
+- Support **10-minute cart holds** (reservations) with deterministic expiration at `expires_at`.
+- Allow checkout to **atomically** convert valid reservations into sales (and fail cleanly if expired).
+- Provide idempotency for reserve/checkout to handle retries and flaky clients.
+
+### Scale Targets
+- Peak reserve traffic: **100k RPS global** during first minutes of launch.
+- Hot SKU concentration: up to **50% of traffic on one SKU**.
+- Must tolerate **millions of concurrent active holds** without correctness depending on cleanup.
+- SLO: reserve/checkout **p99 < 300ms** globally.
+
+## Key Design Decisions
+
+- **Single strongly-consistent write boundary**
+  - One API performs reservation + inventory writes using a globally serializable transactional database (Spanner).
+  - Oversell remains a strict invariant, not a reconciliation story.
+
+- **Timestamp leases + time-bucketed accounting**
+  - Each reservation has an exact `expires_at` timestamp.
+  - Availability uses a fixed-size per-stripe bucket ring so expiration never requires decrement jobs.
+
+- **Fixed stripes for hot SKUs**
+  - Each SKU is pre-split into a fixed number of independent stripes.
+  - Reserve picks a stripe and retries a bounded number of times to avoid single-row contention.
+
+- **Retry/backpressure is part of correctness-at-scale**
+  - Server-side retries on `ABORTED` use exponential backoff + jitter.
+  - Launch-mode throttling rejects/limits abusive retry storms before they amplify DB contention.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[Users] --> G["Edge (TLS + rate limits)"]
+  G --> A["Reserve/Checkout API"]
+  A --> D["Spanner (Tx DB)"]
+  A --> P["Payment Provider"]
+```
+
+### Components
+
+- `Edge (TLS + rate limits)`: protects the DB from retry storms and bots; enforces launch-mode throttles.
+- `Reserve/Checkout API`: the only writer for inventory, reservations, and orders; owns all invariants.
+- `Spanner (Tx DB)`: source of truth for inventory totals, sold counts, reservation buckets, reservation records, and orders.
+- `Payment Provider`: external authorization/capture with idempotency keys tied to `order_id`.
+
+## Deep Dive: Time-Bucketed Leases + Hot-Key Sharding
+
+### Data model (per SKU stripe)
+Inventory is stored per `(sku_id, stripe_id)`:
+
+- `inventory_stripe`
+  - `sku_id`, `stripe_id`
+  - `total_units`
+  - `sold_units`
+  - `buckets[0..10]`: each bucket has `{epoch_minute, reserved_units}` (minute-granularity ring)
+
+- `reservation`
+  - `reservation_id` (idempotency key)
+  - `sku_id`, `stripe_id`, `qty`
+  - `expires_at` (DB time + 10 minutes)
+  - `consumed_at` (nullable)
+
+- `order`
+  - `order_id` (idempotency key)
+  - `state = ALLOCATED | PAID | CANCELLED`
+  - `reservation_ids[...]` (or rows per line item)
+
+### Time semantics (crisp and conservative)
+- `expires_at` is computed from **DB time** inside the reservation transaction.
+- A reservation is valid at checkout iff `expires_at > checkout_now` and `consumed_at IS NULL`.
+- Bucket accounting is **conservative** (never increases availability early); it may temporarily reduce availability for up to <1 minute after `expires_at`.
+
+### Reserve flow (single SKU, qty=1..k)
+Within a serializable transaction:
+1. If `reservation_id` already exists, return the stored result (idempotent).
+2. Pick a `stripe_id` and lock `inventory_stripe`.
+3. Compute `active_reserved` as the sum of bucket quantities whose `epoch_minute` falls in the active window.
+4. `available = total_units - sold_units - active_reserved`. If insufficient, abort and retry another stripe (bounded attempts).
+5. Insert `reservation` with `expires_at = now + 10min` and increment the appropriate bucket for that expiry window.
+
+### Checkout flow (convert reservations to sale)
+Checkout is atomic across the provided `reservation_ids` (multi-SKU carts supported).
+Within a serializable transaction:
+1. If `order_id` exists, return its state (idempotent).
+2. Lock reservations in a stable order; fail if any are expired or already consumed.
+3. Lock referenced `inventory_stripe` rows in a stable order; decrement each reservation’s bucket and increment `sold_units`.
+4. Set `consumed_at` on each reservation and create `order` as `ALLOCATED`.
+
+After commit:
+5. Capture payment with idempotency key `order_id`.
+6. Update `order` to `PAID` on success; otherwise set `CANCELLED` and void/refund per policy (inventory remains sold to preserve strict no-oversell).
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness (zero oversell) | Higher write latency (global tx) |
+| No cleanup correctness dependency | Small conservative under-selling (<1 minute) from minute buckets |
+| Flash-sale scalability (striped hot keys) | Stripe selection + bounded retries |
+
+## Failure Modes
+
+- **Minute-boundary / lease edge**
+  - What happens: ambiguity at exact boundaries can cause early release if not specified.
+  - Result: timestamp lease validity (`expires_at > now`) is definitive; buckets are conservative so availability never increases early.
+
+- **Hot SKU contention / `ABORTED` storms**
+  - What happens: retries amplify load and p99 spikes.
+  - Result: fixed stripes reduce contention; server backoff+jitter on abort; edge throttling prefers deny/slowdown over letting retries reach the DB.
+
+- **Stripe ops during launch**
+  - What happens: live resharding is risky when totals are already split.
+  - Result: stripe count is fixed and pre-split for the launch window; operations only adjust throttles and retry policy.
+
+- **Payment succeeds/fails around allocation**
+  - What happens: partial failures can create “charged without inventory” or complex compensations.
+  - Result: inventory allocation commits before capture; capture is idempotent; payment failure cancels the order and refunds/voids without trying to “re-activate” inventory.
+
+- **Large qty reservations with fragmented stripes**
+  - What happens: a single stripe may not have enough units even when the SKU does.
+  - Result: launch mode enforces a small `qty` limit per reservation (or requires `qty` to fit in one stripe).
+
+## What We Removed
+
+- Separate `Inventory Service` and separate `Cart/Checkout` service: one API owns the write path and invariants.
+- `Order Events` stream: orders live in the transactional DB; checkout latency stays bounded without a streaming dependency.
+- Any TTL/sweeper that releases inventory: expiration correctness is time-based in accounting, not job-based.
+- Live “increase stripe count” procedures: stripes are fixed and pre-split for the launch window.
+- “Re-activate reservation after payment failure”: payment failures resolve via order state + refund/void, not inventory rewrites.
+
+## Operational Notes
+
+- Always use **DB time** for `now` and `expires_at`.
+- Configure bounded retries on `ABORTED` with exponential backoff + jitter; surface a clear `429`/`503` policy at the edge.
+- Stripe sizing rule: choose enough stripes that a hot SKU’s peak write RPS is comfortably spread (target low hundreds of writes/sec per stripe).
+- Monitor: transaction abort rate, lock wait, stripe skew, reserve success rate, and “expired at checkout” rate.
+- Use DB retention/TTL only to delete old `reservation` rows after the idempotency window (never for correctness).
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/10-strategic-problems/global-inventory-reservations.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Global Inventory with Reservations
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/global-inventory-reservations.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/global-inventory-reservations.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/10-strategic-problems/global-inventory-reservations.md

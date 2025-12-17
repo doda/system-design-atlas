@@ -1,0 +1,1502 @@
+==========================================
+Generating (v2): Search Autocomplete
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2bb5-7751-88e8-52a8634a9f9b
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Search Autocomplete
+**Category**: Social & Discovery
+
+**Problem Statement**:
+Design a typeahead service focusing on trie structures, personalization, caching, and sub-100ms latency.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+codex
+```markdown
+---
+title: "Search Autocomplete"
+category: "Social & Discovery"
+difficulty: "Medium"
+tags: ["typeahead", "search", "tries", "personalization", "caching", "low-latency"]
+---
+
+## Overview
+
+This system serves query suggestions as a user types, returning high-quality completions in under 100ms at high QPS while staying fresh as trends shift. The elegant insight is to separate **candidate generation** from **ranking**: generate a small set of plausible completions via a fast, memory-resident trie/FST index, then personalize and re-rank those candidates using lightweight user signals. This keeps the online path predictable and fast.
+
+The second insight is to treat autocomplete as a **read-mostly, snapshot-driven** system. The serving index is rebuilt continuously from logs and periodically swapped atomically. This avoids expensive fine-grained mutations on tries in the hot path and keeps tail latency low.
+
+The design uses boring pieces (CDN/edge cache, stateless services, Redis, object storage, offline batch + streaming) and spends complexity budget on the only hard parts: (1) **tight latency with good relevance** and (2) **safe freshness and personalization** without making the serving path stateful.
+
+## What Makes This Hard
+
+Naive implementations try to “just query the search engine on every keystroke.” That explodes QPS (every character multiplies traffic), creates brutal tail latency under load, and returns unstable results that jitter as the prefix changes.
+
+The trap most teams hit is mixing concerns: if the trie is responsible for freshness, personalization, spelling correction, and ranking, it becomes an unmaintainable, mutation-heavy structure. The right move is: trie generates; ranker decides.
+
+Finally, caching is deceptively tricky. Suggestions are prefix-based (high reuse) but also personalized (low reuse). If you cache the wrong thing, you either waste cache or leak personalization across users.
+
+## Requirements
+
+### Functional Requirements
+- Return top-N query suggestions for a prefix, updated per keystroke.
+- Support personalization (recent searches, follows/interests, locale) without making the online path stateful or slow.
+- Support trending suggestions (global + per-locale) with minute-level freshness.
+- Ensure result stability: small prefix changes shouldn’t reorder wildly.
+- Provide safe degradation when personalization data is missing or stale.
+
+### Scale Targets
+- **DAU:** 50M
+- **Active typers:** 10% concurrent peak ⇒ 5M sessions/day; peak concurrency ~200k.
+- **Keystrokes per session:** ~20 ⇒ 100M requests/day.
+- **Peak QPS:** assume 10x diurnal + bursty typing ⇒ ~20k–50k QPS.
+- **Latency SLO:** p95 < 80ms, p99 < 120ms (server-side), budgeted for mobile networks.
+- **Index size:** 50M unique queries; keep hot structure in RAM via compaction (FST) and sharding.
+
+These numbers matter because autocomplete is dominated by **tail latency and cache hit rate**, not raw throughput. The system must keep serving path constant-time-ish regardless of corpus growth.
+
+## Key Design Decisions
+
+- **We chose:** Memory-resident prefix index (Trie → compiled to FST) for candidate generation  
+  **We rejected:** Hitting the full-text search engine for every prefix  
+  **Why:** Autocomplete needs predictable low latency and high QPS efficiency; FST lookup is fast, CPU-cache friendly, and stable.
+
+- **We chose:** Snapshot-based index publishing with atomic swap  
+  **We rejected:** Online per-query trie mutations in the serving path  
+  **Why:** Fine-grained updates increase lock contention, GC pressure, and tail latency. Snapshot swaps make serving deterministic and simplify correctness.
+
+- **We chose:** Two-stage ranking (cheap lexical + popularity, then personalization re-rank)  
+  **We rejected:** Baking personalization into the index itself  
+  **Why:** Personalization changes faster than the global corpus. Keeping it in a ranker allows rapid iteration and safe fallbacks.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[User] --> E[Edge Cache]
+  E --> S[Typeahead API]
+  S --> I["Prefix Index (FST)"]
+  S --> R[Ranker]
+  R --> P[User Profile Cache]
+  S --> Q[Query Cache]
+  L[Logs] --> B[Index Builder]
+  B --> O[Index Store]
+  O --> I
+```
+
+### Components
+
+- `Edge Cache`: Caches non-personalized responses for common prefixes (e.g., “a”, “the”, locale-specific). It’s the cheapest latency win and protects the backend during spikes.
+- `Typeahead API`: Stateless service that normalizes input, enforces budgets, queries the prefix index, applies ranking, and returns top-N.
+- `Prefix Index (FST)`: The fast path. Stores prefix → candidates with compact representation and precomputed global signals (freq, recency buckets, language).
+- `Ranker`: Applies deterministic scoring and personalization. Designed to be CPU-only and bounded (e.g., 50 candidates max).
+- `User Profile Cache`: Redis (or in-memory + Redis) keyed by user_id storing recent searches, follows/interests, locale, and lightweight embeddings or topic IDs.
+- `Query Cache`: Caches final results for (prefix, locale, device class) and separately caches *candidate lists* for (prefix, locale). The split is crucial for personalization efficiency.
+- `Index Builder`: Streaming + batch pipeline that computes query popularity, trends, and builds new snapshots. Publishes to `Index Store`.
+- `Index Store`: Object storage (S3/GCS) holding versioned index shards + manifests for atomic rollout/rollback.
+
+## Deep Dive: The Hardest Part — Personalization Without Killing Cache
+
+The core tension: autocomplete wants aggressive caching (prefixes repeat constantly), but personalization reduces reuse. The elegant solution is to cache **intermediate artifacts** with high reuse and apply personalization late.
+
+1) **Cache candidates, not personalized finals (mostly).**  
+For a given (prefix, locale), the top ~50 global candidates are highly reusable. We cache this list with a short TTL (e.g., 1–5 minutes for trend-sensitive prefixes). This cache is hot and small. Personalization then reorders and filters those candidates per user. Now personalization cost scales with *candidate count* (bounded), not with corpus size.
+
+2) **Make personalization additive and bounded.**  
+We treat personalization as a small score delta:
+- Base score: `global_popularity + trend_boost + lexical_quality`
+- Personalization delta: `recent_search_match + follow_graph_topics + locale_affinity`
+We cap the delta so it can’t completely override global quality. This prevents “weird” personal results and increases stability as the user types.
+
+3) **Stability via prefix-consistent scoring.**  
+A common UX failure is jitter: results reorder every keystroke. We enforce:
+- Candidate set continuity: for prefix `p+char`, we include prior top-K that still match.
+- Score smoothing: trend boosts are bucketed (e.g., 5-minute windows) rather than per-second counters.
+- Tie-breaking determinism: stable secondary keys (query_id) to avoid random reshuffles.
+
+4) **Selective final-result caching for anonymous or “lightly personalized” users.**  
+For logged-out users (or users without enough signals), final results are effectively global. We cache finals at edge aggressively. For logged-in users, we optionally cache finals for extremely common prefixes for a short TTL keyed by `(prefix, locale, user_cluster_id)` where cluster_id is coarse (e.g., language + top interests). This preserves reuse without leaking data across individuals.
+
+This approach teaches a non-obvious lesson: the winning cache unit isn’t the response; it’s the *candidate list*. Personalization is best as a cheap, late-stage permutation.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Predictable low latency (FST lookup + bounded ranking) | Real-time per-query index updates (we do snapshot freshness instead) |
+| Operational simplicity (stateless serving, atomic swaps) | Some freshness granularity (minutes, not seconds) |
+| High cache efficiency (candidate caching) | Perfect personalization depth (bounded features, capped deltas) |
+
+## Failure Modes
+
+- **Index publish goes bad (corrupt shard / bad scoring)**
+  - What happens: sudden relevance drop, 5xx from loading failures, or empty results for prefixes.
+  - Detect: canary shard load checks + online metrics (empty-result rate, CTR proxy, latency spikes).
+  - Recover: roll back via manifest pointer to previous index version; keep N-2 versions locally on hosts for instant swap.
+
+- **Cache stampede on hot prefixes**
+  - What happens: Redis/API overload, p99 latency blows up during spikes.
+  - Detect: elevated miss rate + synchronized expirations + backend QPS surge.
+  - Recover: request coalescing per prefix, randomized TTL jitter, serve stale candidate lists for short grace window.
+
+- **Personalization store degraded (Redis partial outage)**
+  - What happens: logged-in users see generic suggestions; latency may rise if retries cascade.
+  - Detect: profile cache timeout rate; fallback rate.
+  - Recover: hard timeouts (e.g., 5–10ms budget), no retries in hot path, degrade to non-personalized ranking and log for later backfill.
+
+## What I'd Do Differently At...
+
+- **10x scale:** shard the index by first 1–2 characters and pin shards to hosts; push more anonymous traffic to edge with precomputed top prefixes; move ranker to SIMD-friendly scoring and tighten candidate cap.
+- **100x scale:** adopt a fully edge-served global candidate layer (CDN KV or edge compute) with regional snapshot distribution; invest in learned ranking distilled to a tiny model (e.g., linear + small tree/MLP) and move personalization features to compact user vectors to keep per-request CPU flat.
+
+## Operational Notes
+
+- Enforce strict budgets: e.g., 2ms normalization, 5ms profile fetch, 10ms ranking, remainder for serialization; fail fast and degrade gracefully.
+- Track the three metrics that matter: `p99 latency`, `empty-result rate`, and `cache hit rate` (candidate and edge separately).
+- Canary every index version with real traffic and automatic rollback thresholds (CTR proxy + error rate).
+- Keep index loading off the request path: background preload + atomic pointer swap; never block serving threads on IO.
+- Log the full decision trace for a sampled set of requests (prefix, candidates, scores, features used) to make relevance debuggable.
+```
+tokens used
+2,458
+```markdown
+---
+title: "Search Autocomplete"
+category: "Social & Discovery"
+difficulty: "Medium"
+tags: ["typeahead", "search", "tries", "personalization", "caching", "low-latency"]
+---
+
+## Overview
+
+This system serves query suggestions as a user types, returning high-quality completions in under 100ms at high QPS while staying fresh as trends shift. The elegant insight is to separate **candidate generation** from **ranking**: generate a small set of plausible completions via a fast, memory-resident trie/FST index, then personalize and re-rank those candidates using lightweight user signals. This keeps the online path predictable and fast.
+
+The second insight is to treat autocomplete as a **read-mostly, snapshot-driven** system. The serving index is rebuilt continuously from logs and periodically swapped atomically. This avoids expensive fine-grained mutations on tries in the hot path and keeps tail latency low.
+
+The design uses boring pieces (CDN/edge cache, stateless services, Redis, object storage, offline batch + streaming) and spends complexity budget on the only hard parts: (1) **tight latency with good relevance** and (2) **safe freshness and personalization** without making the serving path stateful.
+
+## What Makes This Hard
+
+Naive implementations try to “just query the search engine on every keystroke.” That explodes QPS (every character multiplies traffic), creates brutal tail latency under load, and returns unstable results that jitter as the prefix changes.
+
+The trap most teams hit is mixing concerns: if the trie is responsible for freshness, personalization, spelling correction, and ranking, it becomes an unmaintainable, mutation-heavy structure. The right move is: trie generates; ranker decides.
+
+Finally, caching is deceptively tricky. Suggestions are prefix-based (high reuse) but also personalized (low reuse). If you cache the wrong thing, you either waste cache or leak personalization across users.
+
+## Requirements
+
+### Functional Requirements
+- Return top-N query suggestions for a prefix, updated per keystroke.
+- Support personalization (recent searches, follows/interests, locale) without making the online path stateful or slow.
+- Support trending suggestions (global + per-locale) with minute-level freshness.
+- Ensure result stability: small prefix changes shouldn’t reorder wildly.
+- Provide safe degradation when personalization data is missing or stale.
+
+### Scale Targets
+- **DAU:** 50M
+- **Active typers:** 10% concurrent peak ⇒ 5M sessions/day; peak concurrency ~200k.
+- **Keystrokes per session:** ~20 ⇒ 100M requests/day.
+- **Peak QPS:** assume 10x diurnal + bursty typing ⇒ ~20k–50k QPS.
+- **Latency SLO:** p95 < 80ms, p99 < 120ms (server-side), budgeted for mobile networks.
+- **Index size:** 50M unique queries; keep hot structure in RAM via compaction (FST) and sharding.
+
+These numbers matter because autocomplete is dominated by **tail latency and cache hit rate**, not raw throughput. The system must keep serving path constant-time-ish regardless of corpus growth.
+
+## Key Design Decisions
+
+- **We chose:** Memory-resident prefix index (Trie → compiled to FST) for candidate generation  
+  **We rejected:** Hitting the full-text search engine for every prefix  
+  **Why:** Autocomplete needs predictable low latency and high QPS efficiency; FST lookup is fast, CPU-cache friendly, and stable.
+
+- **We chose:** Snapshot-based index publishing with atomic swap  
+  **We rejected:** Online per-query trie mutations in the serving path  
+  **Why:** Fine-grained updates increase lock contention, GC pressure, and tail latency. Snapshot swaps make serving deterministic and simplify correctness.
+
+- **We chose:** Two-stage ranking (cheap lexical + popularity, then personalization re-rank)  
+  **We rejected:** Baking personalization into the index itself  
+  **Why:** Personalization changes faster than the global corpus. Keeping it in a ranker allows rapid iteration and safe fallbacks.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[User] --> E[Edge Cache]
+  E --> S[Typeahead API]
+  S --> I["Prefix Index (FST)"]
+  S --> R[Ranker]
+  R --> P[User Profile Cache]
+  S --> Q[Query Cache]
+  L[Logs] --> B[Index Builder]
+  B --> O[Index Store]
+  O --> I
+```
+
+### Components
+
+- `Edge Cache`: Caches non-personalized responses for common prefixes (e.g., “a”, “the”, locale-specific). It’s the cheapest latency win and protects the backend during spikes.
+- `Typeahead API`: Stateless service that normalizes input, enforces budgets, queries the prefix index, applies ranking, and returns top-N.
+- `Prefix Index (FST)`: The fast path. Stores prefix → candidates with compact representation and precomputed global signals (freq, recency buckets, language).
+- `Ranker`: Applies deterministic scoring and personalization. Designed to be CPU-only and bounded (e.g., 50 candidates max).
+- `User Profile Cache`: Redis (or in-memory + Redis) keyed by user_id storing recent searches, follows/interests, locale, and lightweight embeddings or topic IDs.
+- `Query Cache`: Caches final results for (prefix, locale, device class) and separately caches *candidate lists* for (prefix, locale). The split is crucial for personalization efficiency.
+- `Index Builder`: Streaming + batch pipeline that computes query popularity, trends, and builds new snapshots. Publishes to `Index Store`.
+- `Index Store`: Object storage (S3/GCS) holding versioned index shards + manifests for atomic rollout/rollback.
+
+## Deep Dive: The Hardest Part — Personalization Without Killing Cache
+
+The core tension: autocomplete wants aggressive caching (prefixes repeat constantly), but personalization reduces reuse. The elegant solution is to cache **intermediate artifacts** with high reuse and apply personalization late.
+
+1) **Cache candidates, not personalized finals (mostly).**  
+For a given (prefix, locale), the top ~50 global candidates are highly reusable. We cache this list with a short TTL (e.g., 1–5 minutes for trend-sensitive prefixes). This cache is hot and small. Personalization then reorders and filters those candidates per user. Now personalization cost scales with *candidate count* (bounded), not with corpus size.
+
+2) **Make personalization additive and bounded.**  
+We treat personalization as a small score delta:
+- Base score: `global_popularity + trend_boost + lexical_quality`
+- Personalization delta: `recent_search_match + follow_graph_topics + locale_affinity`
+We cap the delta so it can’t completely override global quality. This prevents “weird” personal results and increases stability as the user types.
+
+3) **Stability via prefix-consistent scoring.**  
+A common UX failure is jitter: results reorder every keystroke. We enforce:
+- Candidate set continuity: for prefix `p+char`, we include prior top-K that still match.
+- Score smoothing: trend boosts are bucketed (e.g., 5-minute windows) rather than per-second counters.
+- Tie-breaking determinism: stable secondary keys (query_id) to avoid random reshuffles.
+
+4) **Selective final-result caching for anonymous or “lightly personalized” users.**  
+For logged-out users (or users without enough signals), final results are effectively global. We cache finals at edge aggressively. For logged-in users, we optionally cache finals for extremely common prefixes for a short TTL keyed by `(prefix, locale, user_cluster_id)` where cluster_id is coarse (e.g., language + top interests). This preserves reuse without leaking data across individuals.
+
+This approach teaches a non-obvious lesson: the winning cache unit isn’t the response; it’s the *candidate list*. Personalization is best as a cheap, late-stage permutation.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Predictable low latency (FST lookup + bounded ranking) | Real-time per-query index updates (we do snapshot freshness instead) |
+| Operational simplicity (stateless serving, atomic swaps) | Some freshness granularity (minutes, not seconds) |
+| High cache efficiency (candidate caching) | Perfect personalization depth (bounded features, capped deltas) |
+
+## Failure Modes
+
+- **Index publish goes bad (corrupt shard / bad scoring)**
+  - What happens: sudden relevance drop, 5xx from loading failures, or empty results for prefixes.
+  - Detect: canary shard load checks + online metrics (empty-result rate, CTR proxy, latency spikes).
+  - Recover: roll back via manifest pointer to previous index version; keep N-2 versions locally on hosts for instant swap.
+
+- **Cache stampede on hot prefixes**
+  - What happens: Redis/API overload, p99 latency blows up during spikes.
+  - Detect: elevated miss rate + synchronized expirations + backend QPS surge.
+  - Recover: request coalescing per prefix, randomized TTL jitter, serve stale candidate lists for short grace window.
+
+- **Personalization store degraded (Redis partial outage)**
+  - What happens: logged-in users see generic suggestions; latency may rise if retries cascade.
+  - Detect: profile cache timeout rate; fallback rate.
+  - Recover: hard timeouts (e.g., 5–10ms budget), no retries in hot path, degrade to non-personalized ranking and log for later backfill.
+
+## What I'd Do Differently At...
+
+- **10x scale:** shard the index by first 1–2 characters and pin shards to hosts; push more anonymous traffic to edge with precomputed top prefixes; move ranker to SIMD-friendly scoring and tighten candidate cap.
+- **100x scale:** adopt a fully edge-served global candidate layer (CDN KV or edge compute) with regional snapshot distribution; invest in learned ranking distilled to a tiny model (e.g., linear + small tree/MLP) and move personalization features to compact user vectors to keep per-request CPU flat.
+
+## Operational Notes
+
+- Enforce strict budgets: e.g., 2ms normalization, 5ms profile fetch, 10ms ranking, remainder for serialization; fail fast and degrade gracefully.
+- Track the three metrics that matter: `p99 latency`, `empty-result rate`, and `cache hit rate` (candidate and edge separately).
+- Canary every index version with real traffic and automatic rollback thresholds (CTR proxy + error rate).
+- Keep index loading off the request path: background preload + atomic pointer swap; never block serving threads on IO.
+- Log the full decision trace for a sampled set of requests (prefix, candidates, scores, features used) to make relevance debuggable.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/search-autocomplete.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-fb12-7c91-adc2-5be532afb9c1
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Search Autocomplete"
+category: "Social & Discovery"
+difficulty: "Medium"
+tags: ["typeahead", "search", "tries", "personalization", "caching", "low-latency"]
+---
+
+## Overview
+
+This system serves query suggestions as a user types, returning high-quality completions in under 100ms at high QPS while staying fresh as trends shift. The elegant insight is to separate **candidate generation** from **ranking**: generate a small set of plausible completions via a fast, memory-resident trie/FST index, then personalize and re-rank those candidates using lightweight user signals. This keeps the online path predictable and fast.
+
+The second insight is to treat autocomplete as a **read-mostly, snapshot-driven** system. The serving index is rebuilt continuously from logs and periodically swapped atomically. This avoids expensive fine-grained mutations on tries in the hot path and keeps tail latency low.
+
+The design uses boring pieces (CDN/edge cache, stateless services, Redis, object storage, offline batch + streaming) and spends complexity budget on the only hard parts: (1) **tight latency with good relevance** and (2) **safe freshness and personalization** without making the serving path stateful.
+
+## What Makes This Hard
+
+Naive implementations try to “just query the search engine on every keystroke.” That explodes QPS (every character multiplies traffic), creates brutal tail latency under load, and returns unstable results that jitter as the prefix changes.
+
+The trap most teams hit is mixing concerns: if the trie is responsible for freshness, personalization, spelling correction, and ranking, it becomes an unmaintainable, mutation-heavy structure. The right move is: trie generates; ranker decides.
+
+Finally, caching is deceptively tricky. Suggestions are prefix-based (high reuse) but also personalized (low reuse). If you cache the wrong thing, you either waste cache or leak personalization across users.
+
+## Requirements
+
+### Functional Requirements
+- Return top-N query suggestions for a prefix, updated per keystroke.
+- Support personalization (recent searches, follows/interests, locale) without making the online path stateful or slow.
+- Support trending suggestions (global + per-locale) with minute-level freshness.
+- Ensure result stability: small prefix changes shouldn’t reorder wildly.
+- Provide safe degradation when personalization data is missing or stale.
+
+### Scale Targets
+- **DAU:** 50M
+- **Active typers:** 10% concurrent peak ⇒ 5M sessions/day; peak concurrency ~200k.
+- **Keystrokes per session:** ~20 ⇒ 100M requests/day.
+- **Peak QPS:** assume 10x diurnal + bursty typing ⇒ ~20k–50k QPS.
+- **Latency SLO:** p95 < 80ms, p99 < 120ms (server-side), budgeted for mobile networks.
+- **Index size:** 50M unique queries; keep hot structure in RAM via compaction (FST) and sharding.
+
+These numbers matter because autocomplete is dominated by **tail latency and cache hit rate**, not raw throughput. The system must keep serving path constant-time-ish regardless of corpus growth.
+
+## Key Design Decisions
+
+- **We chose:** Memory-resident prefix index (Trie → compiled to FST) for candidate generation  
+  **We rejected:** Hitting the full-text search engine for every prefix  
+  **Why:** Autocomplete needs predictable low latency and high QPS efficiency; FST lookup is fast, CPU-cache friendly, and stable.
+
+- **We chose:** Snapshot-based index publishing with atomic swap  
+  **We rejected:** Online per-query trie mutations in the serving path  
+  **Why:** Fine-grained updates increase lock contention, GC pressure, and tail latency. Snapshot swaps make serving deterministic and simplify correctness.
+
+- **We chose:** Two-stage ranking (cheap lexical + popularity, then personalization re-rank)  
+  **We rejected:** Baking personalization into the index itself  
+  **Why:** Personalization changes faster than the global corpus. Keeping it in a ranker allows rapid iteration and safe fallbacks.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[User] --> E[Edge Cache]
+  E --> S[Typeahead API]
+  S --> I["Prefix Index (FST)"]
+  S --> R[Ranker]
+  R --> P[User Profile Cache]
+  S --> Q[Query Cache]
+  L[Logs] --> B[Index Builder]
+  B --> O[Index Store]
+  O --> I
+```
+
+### Components
+
+- `Edge Cache`: Caches non-personalized responses for common prefixes (e.g., “a”, “the”, locale-specific). It’s the cheapest latency win and protects the backend during spikes.
+- `Typeahead API`: Stateless service that normalizes input, enforces budgets, queries the prefix index, applies ranking, and returns top-N.
+- `Prefix Index (FST)`: The fast path. Stores prefix → candidates with compact representation and precomputed global signals (freq, recency buckets, language).
+- `Ranker`: Applies deterministic scoring and personalization. Designed to be CPU-only and bounded (e.g., 50 candidates max).
+- `User Profile Cache`: Redis (or in-memory + Redis) keyed by user_id storing recent searches, follows/interests, locale, and lightweight embeddings or topic IDs.
+- `Query Cache`: Caches final results for (prefix, locale, device class) and separately caches *candidate lists* for (prefix, locale). The split is crucial for personalization efficiency.
+- `Index Builder`: Streaming + batch pipeline that computes query popularity, trends, and builds new snapshots. Publishes to `Index Store`.
+- `Index Store`: Object storage (S3/GCS) holding versioned index shards + manifests for atomic rollout/rollback.
+
+## Deep Dive: The Hardest Part — Personalization Without Killing Cache
+
+The core tension: autocomplete wants aggressive caching (prefixes repeat constantly), but personalization reduces reuse. The elegant solution is to cache **intermediate artifacts** with high reuse and apply personalization late.
+
+1) **Cache candidates, not personalized finals (mostly).**  
+For a given (prefix, locale), the top ~50 global candidates are highly reusable. We cache this list with a short TTL (e.g., 1–5 minutes for trend-sensitive prefixes). This cache is hot and small. Personalization then reorders and filters those candidates per user. Now personalization cost scales with *candidate count* (bounded), not with corpus size.
+
+2) **Make personalization additive and bounded.**  
+We treat personalization as a small score delta:
+- Base score: `global_popularity + trend_boost + lexical_quality`
+- Personalization delta: `recent_search_match + follow_graph_topics + locale_affinity`
+We cap the delta so it can’t completely override global quality. This prevents “weird” personal results and increases stability as the user types.
+
+3) **Stability via prefix-consistent scoring.**  
+A common UX failure is jitter: results reorder every keystroke. We enforce:
+- Candidate set continuity: for prefix `p+char`, we include prior top-K that still match.
+- Score smoothing: trend boosts are bucketed (e.g., 5-minute windows) rather than per-second counters.
+- Tie-breaking determinism: stable secondary keys (query_id) to avoid random reshuffles.
+
+4) **Selective final-result caching for anonymous or “lightly personalized” users.**  
+For logged-out users (or users without enough signals), final results are effectively global. We cache finals at edge aggressively. For logged-in users, we optionally cache finals for extremely common prefixes for a short TTL keyed by `(prefix, locale, user_cluster_id)` where cluster_id is coarse (e.g., language + top interests). This preserves reuse without leaking data across individuals.
+
+This approach teaches a non-obvious lesson: the winning cache unit isn’t the response; it’s the *candidate list*. Personalization is best as a cheap, late-stage permutation.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Predictable low latency (FST lookup + bounded ranking) | Real-time per-query index updates (we do snapshot freshness instead) |
+| Operational simplicity (stateless serving, atomic swaps) | Some freshness granularity (minutes, not seconds) |
+| High cache efficiency (candidate caching) | Perfect personalization depth (bounded features, capped deltas) |
+
+## Failure Modes
+
+- **Index publish goes bad (corrupt shard / bad scoring)**
+  - What happens: sudden relevance drop, 5xx from loading failures, or empty results for prefixes.
+  - Detect: canary shard load checks + online metrics (empty-result rate, CTR proxy, latency spikes).
+  - Recover: roll back via manifest pointer to previous index version; keep N-2 versions locally on hosts for instant swap.
+
+- **Cache stampede on hot prefixes**
+  - What happens: Redis/API overload, p99 latency blows up during spikes.
+  - Detect: elevated miss rate + synchronized expirations + backend QPS surge.
+  - Recover: request coalescing per prefix, randomized TTL jitter, serve stale candidate lists for short grace window.
+
+- **Personalization store degraded (Redis partial outage)**
+  - What happens: logged-in users see generic suggestions; latency may rise if retries cascade.
+  - Detect: profile cache timeout rate; fallback rate.
+  - Recover: hard timeouts (e.g., 5–10ms budget), no retries in hot path, degrade to non-personalized ranking and log for later backfill.
+
+## What I'd Do Differently At...
+
+- **10x scale:** shard the index by first 1–2 characters and pin shards to hosts; push more anonymous traffic to edge with precomputed top prefixes; move ranker to SIMD-friendly scoring and tighten candidate cap.
+- **100x scale:** adopt a fully edge-served global candidate layer (CDN KV or edge compute) with regional snapshot distribution; invest in learned ranking distilled to a tiny model (e.g., linear + small tree/MLP) and move personalization features to compact user vectors to keep per-request CPU flat.
+
+## Operational Notes
+
+- Enforce strict budgets: e.g., 2ms normalization, 5ms profile fetch, 10ms ranking, remainder for serialization; fail fast and degrade gracefully.
+- Track the three metrics that matter: `p99 latency`, `empty-result rate`, and `cache hit rate` (candidate and edge separately).
+- Canary every index version with real traffic and automatic rollback thresholds (CTR proxy + error rate).
+- Keep index loading off the request path: background preload + atomic pointer swap; never block serving threads on IO.
+- Log the full decision trace for a sampled set of requests (prefix, candidates, scores, features used) to make relevance debuggable.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+codex
+## Elegance Check
+
+### The Core Insight
+Decoupling **candidate generation (fast, immutable-ish FST snapshots)** from **ranking (cheap, bounded, personalized deltas)** is the right shape: it keeps the online path deterministic while letting relevance evolve quickly.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Edge cache | Absorbs the “top few prefixes” firehose; cheapest p99 win. |
+| Typeahead API | Normalization, budgets, safety checks, orchestration; keeps clients dumb. |
+| Prefix index (FST) | Predictable latency and memory efficiency; avoids per-keystroke search-engine fanout. |
+| Ranker | Where iteration happens; bounded compute keeps SLO honest. |
+| User profile cache | Keeps personalization off critical storage; enables hard timeouts + graceful fallback. |
+| Index builder + versioned store | Makes freshness safe (atomic swap/rollback) and operationally tractable. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Separate `Query Cache` for finals + candidates | Start with **only candidate caching** + edge cache for anonymous | Slightly higher CPU for logged-in users; fewer cache-invalidation paths. |
+| Redis for profile + (maybe) Redis for candidates | Keep **profiles in Redis**, but store candidates in **process memory (TinyLFU)** per host | More per-host variance; needs warmup strategy and cache prefill for hot prefixes. |
+| “Streaming + batch” builder | One **streaming pipeline + periodic full rebuild** (nightly) | Streaming job gets more responsibility; full rebuild still needed for correctness drift. |
+| Custom snapshot distribution logic | Use **object store + signed manifest + CDN** for shard delivery | Less control over rollout pacing; relies on CDN semantics but reduces bespoke plumbing. |
+| Per-user final caching via `user_cluster_id` | Make this an explicit phase-2; start with **no logged-in final caching** | Higher backend QPS; avoids subtle privacy/caching correctness issues early. |
+| Complex coordination for swaps | If single region: **etcd/Consul** (or even S3 manifest + health gates) to coordinate versions | External dependency (etcd) or fewer guarantees (S3-only); but clearer ownership than ad-hoc coordination. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Database/Redis is down for 5 minutes**
+   - Design’s answer: profile cache outage → hard timeouts, no retries, degrade to generic.
+   - Recommendation: Strengthen — also specify what happens if **candidate cache** is Redis-backed (serve stale, local LRU fallback, or skip cache entirely).
+
+2. **Network partition / partial region outage**
+   - Design’s answer: not addressed.
+   - Recommendation: Strengthen — define “regional autonomy”: local copies of last-good index + local caches; manifest rollout should be region-scoped with independent rollback.
+
+3. **One component is slow but not failing (p99 creeps)**
+   - Design’s answer: budgets and timeouts mentioned; no retries in hot path.
+   - Recommendation: Strengthen — add explicit **load shedding** rules (cap candidates, skip profile fetch after X ms, drop to top-K global, and return fewer results rather than timing out).
+
+4. **Bad index publish (relevance regression / corrupt shard)**
+   - Design’s answer: canary load checks + online metrics + rollback via manifest pointer; keep N-2 locally.
+   - Recommendation: Acceptable — add “semantic canary”: compare against previous version for top prefixes (diff threshold) before serving real traffic.
+
+5. **Traffic 10× spike + cache stampede**
+   - Design’s answer: coalescing, TTL jitter, serve stale.
+   - Recommendation: Strengthen — ensure coalescing exists at **edge and origin**; add per-prefix singleflight + global circuit breaker to stop redistributing misses into backend collapse.
+
+## Recommendations
+
+### Must Fix
+- Define multi-region behavior: where the FST lives, how manifests roll out, and what “last known good” means under partition.
+- Make cache ownership explicit: if candidates are in Redis, spell out **stale-while-revalidate**, per-key singleflight, and what happens when Redis is impaired.
+- Add safety/abuse controls: PII-sensitive prefixes, query suppression, rate limits, and “do not suggest” policy (autocomplete often leaks sensitive or policy-violating content).
+
+### Should Consider
+- Start simpler: edge cache (anonymous finals) + per-host candidate cache + bounded ranker; add Redis candidate caching only if needed.
+- Treat “stability” as a first-class contract: define a measurable stability metric (e.g., Kendall tau / churn rate) and bake it into canary gates.
+- Tighten the data contract between builder and ranker (feature schema/versioning) so index swaps can’t break serving.
+
+### Nice to Have
+- Offline evaluation loop: sampled request traces → replay against new index/ranker → score deltas before rollout.
+- Explicit warmup plan: preload hot prefixes on deploy and on index swap to avoid cold-cache p99 spikes.
+- Clarify language/normalization strategy (Unicode, tokenization, mixed scripts, diacritics) since it dominates real-world quality.
+
+## What’s Working Well
+- The “snapshot + atomic swap” approach is operationally clean and keeps tail latency predictable.
+- Caching the **candidate list** (not the final personalized response) is the right reuse boundary and keeps personalization bounded.
+- The design is honest about trade-offs (minutes-level freshness, capped personalization) and provides concrete mitigations (hard timeouts, rollback, coalescing).
+tokens used
+4,752
+## Elegance Check
+
+### The Core Insight
+Decoupling **candidate generation (fast, immutable-ish FST snapshots)** from **ranking (cheap, bounded, personalized deltas)** is the right shape: it keeps the online path deterministic while letting relevance evolve quickly.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Edge cache | Absorbs the “top few prefixes” firehose; cheapest p99 win. |
+| Typeahead API | Normalization, budgets, safety checks, orchestration; keeps clients dumb. |
+| Prefix index (FST) | Predictable latency and memory efficiency; avoids per-keystroke search-engine fanout. |
+| Ranker | Where iteration happens; bounded compute keeps SLO honest. |
+| User profile cache | Keeps personalization off critical storage; enables hard timeouts + graceful fallback. |
+| Index builder + versioned store | Makes freshness safe (atomic swap/rollback) and operationally tractable. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Separate `Query Cache` for finals + candidates | Start with **only candidate caching** + edge cache for anonymous | Slightly higher CPU for logged-in users; fewer cache-invalidation paths. |
+| Redis for profile + (maybe) Redis for candidates | Keep **profiles in Redis**, but store candidates in **process memory (TinyLFU)** per host | More per-host variance; needs warmup strategy and cache prefill for hot prefixes. |
+| “Streaming + batch” builder | One **streaming pipeline + periodic full rebuild** (nightly) | Streaming job gets more responsibility; full rebuild still needed for correctness drift. |
+| Custom snapshot distribution logic | Use **object store + signed manifest + CDN** for shard delivery | Less control over rollout pacing; relies on CDN semantics but reduces bespoke plumbing. |
+| Per-user final caching via `user_cluster_id` | Make this an explicit phase-2; start with **no logged-in final caching** | Higher backend QPS; avoids subtle privacy/caching correctness issues early. |
+| Complex coordination for swaps | If single region: **etcd/Consul** (or even S3 manifest + health gates) to coordinate versions | External dependency (etcd) or fewer guarantees (S3-only); but clearer ownership than ad-hoc coordination. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Database/Redis is down for 5 minutes**
+   - Design’s answer: profile cache outage → hard timeouts, no retries, degrade to generic.
+   - Recommendation: Strengthen — also specify what happens if **candidate cache** is Redis-backed (serve stale, local LRU fallback, or skip cache entirely).
+
+2. **Network partition / partial region outage**
+   - Design’s answer: not addressed.
+   - Recommendation: Strengthen — define “regional autonomy”: local copies of last-good index + local caches; manifest rollout should be region-scoped with independent rollback.
+
+3. **One component is slow but not failing (p99 creeps)**
+   - Design’s answer: budgets and timeouts mentioned; no retries in hot path.
+   - Recommendation: Strengthen — add explicit **load shedding** rules (cap candidates, skip profile fetch after X ms, drop to top-K global, and return fewer results rather than timing out).
+
+4. **Bad index publish (relevance regression / corrupt shard)**
+   - Design’s answer: canary load checks + online metrics + rollback via manifest pointer; keep N-2 locally.
+   - Recommendation: Acceptable — add “semantic canary”: compare against previous version for top prefixes (diff threshold) before serving real traffic.
+
+5. **Traffic 10× spike + cache stampede**
+   - Design’s answer: coalescing, TTL jitter, serve stale.
+   - Recommendation: Strengthen — ensure coalescing exists at **edge and origin**; add per-prefix singleflight + global circuit breaker to stop redistributing misses into backend collapse.
+
+## Recommendations
+
+### Must Fix
+- Define multi-region behavior: where the FST lives, how manifests roll out, and what “last known good” means under partition.
+- Make cache ownership explicit: if candidates are in Redis, spell out **stale-while-revalidate**, per-key singleflight, and what happens when Redis is impaired.
+- Add safety/abuse controls: PII-sensitive prefixes, query suppression, rate limits, and “do not suggest” policy (autocomplete often leaks sensitive or policy-violating content).
+
+### Should Consider
+- Start simpler: edge cache (anonymous finals) + per-host candidate cache + bounded ranker; add Redis candidate caching only if needed.
+- Treat “stability” as a first-class contract: define a measurable stability metric (e.g., Kendall tau / churn rate) and bake it into canary gates.
+- Tighten the data contract between builder and ranker (feature schema/versioning) so index swaps can’t break serving.
+
+### Nice to Have
+- Offline evaluation loop: sampled request traces → replay against new index/ranker → score deltas before rollout.
+- Explicit warmup plan: preload hot prefixes on deploy and on index swap to avoid cold-cache p99 spikes.
+- Clarify language/normalization strategy (Unicode, tokenization, mixed scripts, diacritics) since it dominates real-world quality.
+
+## What’s Working Well
+- The “snapshot + atomic swap” approach is operationally clean and keeps tail latency predictable.
+- Caching the **candidate list** (not the final personalized response) is the right reuse boundary and keeps personalization bounded.
+- The design is honest about trade-offs (minutes-level freshness, capped personalization) and provides concrete mitigations (hard timeouts, rollback, coalescing).
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/search-autocomplete.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-b41f-73a2-8bd7-b171fcd0b3fb
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Search Autocomplete"
+category: "Social & Discovery"
+difficulty: "Medium"
+tags: ["typeahead", "search", "tries", "personalization", "caching", "low-latency"]
+---
+
+## Overview
+
+This system serves query suggestions as a user types, returning high-quality completions in under 100ms at high QPS while staying fresh as trends shift. The elegant insight is to separate **candidate generation** from **ranking**: generate a small set of plausible completions via a fast, memory-resident trie/FST index, then personalize and re-rank those candidates using lightweight user signals. This keeps the online path predictable and fast.
+
+The second insight is to treat autocomplete as a **read-mostly, snapshot-driven** system. The serving index is rebuilt continuously from logs and periodically swapped atomically. This avoids expensive fine-grained mutations on tries in the hot path and keeps tail latency low.
+
+The design uses boring pieces (CDN/edge cache, stateless services, Redis, object storage, offline batch + streaming) and spends complexity budget on the only hard parts: (1) **tight latency with good relevance** and (2) **safe freshness and personalization** without making the serving path stateful.
+
+## What Makes This Hard
+
+Naive implementations try to “just query the search engine on every keystroke.” That explodes QPS (every character multiplies traffic), creates brutal tail latency under load, and returns unstable results that jitter as the prefix changes.
+
+The trap most teams hit is mixing concerns: if the trie is responsible for freshness, personalization, spelling correction, and ranking, it becomes an unmaintainable, mutation-heavy structure. The right move is: trie generates; ranker decides.
+
+Finally, caching is deceptively tricky. Suggestions are prefix-based (high reuse) but also personalized (low reuse). If you cache the wrong thing, you either waste cache or leak personalization across users.
+
+## Requirements
+
+### Functional Requirements
+- Return top-N query suggestions for a prefix, updated per keystroke.
+- Support personalization (recent searches, follows/interests, locale) without making the online path stateful or slow.
+- Support trending suggestions (global + per-locale) with minute-level freshness.
+- Ensure result stability: small prefix changes shouldn’t reorder wildly.
+- Provide safe degradation when personalization data is missing or stale.
+
+### Scale Targets
+- **DAU:** 50M
+- **Active typers:** 10% concurrent peak ⇒ 5M sessions/day; peak concurrency ~200k.
+- **Keystrokes per session:** ~20 ⇒ 100M requests/day.
+- **Peak QPS:** assume 10x diurnal + bursty typing ⇒ ~20k–50k QPS.
+- **Latency SLO:** p95 < 80ms, p99 < 120ms (server-side), budgeted for mobile networks.
+- **Index size:** 50M unique queries; keep hot structure in RAM via compaction (FST) and sharding.
+
+These numbers matter because autocomplete is dominated by **tail latency and cache hit rate**, not raw throughput. The system must keep serving path constant-time-ish regardless of corpus growth.
+
+## Key Design Decisions
+
+- **We chose:** Memory-resident prefix index (Trie → compiled to FST) for candidate generation  
+  **We rejected:** Hitting the full-text search engine for every prefix  
+  **Why:** Autocomplete needs predictable low latency and high QPS efficiency; FST lookup is fast, CPU-cache friendly, and stable.
+
+- **We chose:** Snapshot-based index publishing with atomic swap  
+  **We rejected:** Online per-query trie mutations in the serving path  
+  **Why:** Fine-grained updates increase lock contention, GC pressure, and tail latency. Snapshot swaps make serving deterministic and simplify correctness.
+
+- **We chose:** Two-stage ranking (cheap lexical + popularity, then personalization re-rank)  
+  **We rejected:** Baking personalization into the index itself  
+  **Why:** Personalization changes faster than the global corpus. Keeping it in a ranker allows rapid iteration and safe fallbacks.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[User] --> E[Edge Cache]
+  E --> S[Typeahead API]
+  S --> I["Prefix Index (FST)"]
+  S --> R[Ranker]
+  R --> P[User Profile Cache]
+  S --> Q[Query Cache]
+  L[Logs] --> B[Index Builder]
+  B --> O[Index Store]
+  O --> I
+```
+
+### Components
+
+- `Edge Cache`: Caches non-personalized responses for common prefixes (e.g., “a”, “the”, locale-specific). It’s the cheapest latency win and protects the backend during spikes.
+- `Typeahead API`: Stateless service that normalizes input, enforces budgets, queries the prefix index, applies ranking, and returns top-N.
+- `Prefix Index (FST)`: The fast path. Stores prefix → candidates with compact representation and precomputed global signals (freq, recency buckets, language).
+- `Ranker`: Applies deterministic scoring and personalization. Designed to be CPU-only and bounded (e.g., 50 candidates max).
+- `User Profile Cache`: Redis (or in-memory + Redis) keyed by user_id storing recent searches, follows/interests, locale, and lightweight embeddings or topic IDs.
+- `Query Cache`: Caches final results for (prefix, locale, device class) and separately caches *candidate lists* for (prefix, locale). The split is crucial for personalization efficiency.
+- `Index Builder`: Streaming + batch pipeline that computes query popularity, trends, and builds new snapshots. Publishes to `Index Store`.
+- `Index Store`: Object storage (S3/GCS) holding versioned index shards + manifests for atomic rollout/rollback.
+
+## Deep Dive: The Hardest Part — Personalization Without Killing Cache
+
+The core tension: autocomplete wants aggressive caching (prefixes repeat constantly), but personalization reduces reuse. The elegant solution is to cache **intermediate artifacts** with high reuse and apply personalization late.
+
+1) **Cache candidates, not personalized finals (mostly).**  
+For a given (prefix, locale), the top ~50 global candidates are highly reusable. We cache this list with a short TTL (e.g., 1–5 minutes for trend-sensitive prefixes). This cache is hot and small. Personalization then reorders and filters those candidates per user. Now personalization cost scales with *candidate count* (bounded), not with corpus size.
+
+2) **Make personalization additive and bounded.**  
+We treat personalization as a small score delta:
+- Base score: `global_popularity + trend_boost + lexical_quality`
+- Personalization delta: `recent_search_match + follow_graph_topics + locale_affinity`
+We cap the delta so it can’t completely override global quality. This prevents “weird” personal results and increases stability as the user types.
+
+3) **Stability via prefix-consistent scoring.**  
+A common UX failure is jitter: results reorder every keystroke. We enforce:
+- Candidate set continuity: for prefix `p+char`, we include prior top-K that still match.
+- Score smoothing: trend boosts are bucketed (e.g., 5-minute windows) rather than per-second counters.
+- Tie-breaking determinism: stable secondary keys (query_id) to avoid random reshuffles.
+
+4) **Selective final-result caching for anonymous or “lightly personalized” users.**  
+For logged-out users (or users without enough signals), final results are effectively global. We cache finals at edge aggressively. For logged-in users, we optionally cache finals for extremely common prefixes for a short TTL keyed by `(prefix, locale, user_cluster_id)` where cluster_id is coarse (e.g., language + top interests). This preserves reuse without leaking data across individuals.
+
+This approach teaches a non-obvious lesson: the winning cache unit isn’t the response; it’s the *candidate list*. Personalization is best as a cheap, late-stage permutation.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Predictable low latency (FST lookup + bounded ranking) | Real-time per-query index updates (we do snapshot freshness instead) |
+| Operational simplicity (stateless serving, atomic swaps) | Some freshness granularity (minutes, not seconds) |
+| High cache efficiency (candidate caching) | Perfect personalization depth (bounded features, capped deltas) |
+
+## Failure Modes
+
+- **Index publish goes bad (corrupt shard / bad scoring)**
+  - What happens: sudden relevance drop, 5xx from loading failures, or empty results for prefixes.
+  - Detect: canary shard load checks + online metrics (empty-result rate, CTR proxy, latency spikes).
+  - Recover: roll back via manifest pointer to previous index version; keep N-2 versions locally on hosts for instant swap.
+
+- **Cache stampede on hot prefixes**
+  - What happens: Redis/API overload, p99 latency blows up during spikes.
+  - Detect: elevated miss rate + synchronized expirations + backend QPS surge.
+  - Recover: request coalescing per prefix, randomized TTL jitter, serve stale candidate lists for short grace window.
+
+- **Personalization store degraded (Redis partial outage)**
+  - What happens: logged-in users see generic suggestions; latency may rise if retries cascade.
+  - Detect: profile cache timeout rate; fallback rate.
+  - Recover: hard timeouts (e.g., 5–10ms budget), no retries in hot path, degrade to non-personalized ranking and log for later backfill.
+
+## What I'd Do Differently At...
+
+- **10x scale:** shard the index by first 1–2 characters and pin shards to hosts; push more anonymous traffic to edge with precomputed top prefixes; move ranker to SIMD-friendly scoring and tighten candidate cap.
+- **100x scale:** adopt a fully edge-served global candidate layer (CDN KV or edge compute) with regional snapshot distribution; invest in learned ranking distilled to a tiny model (e.g., linear + small tree/MLP) and move personalization features to compact user vectors to keep per-request CPU flat.
+
+## Operational Notes
+
+- Enforce strict budgets: e.g., 2ms normalization, 5ms profile fetch, 10ms ranking, remainder for serialization; fail fast and degrade gracefully.
+- Track the three metrics that matter: `p99 latency`, `empty-result rate`, and `cache hit rate` (candidate and edge separately).
+- Canary every index version with real traffic and automatic rollback thresholds (CTR proxy + error rate).
+- Keep index loading off the request path: background preload + atomic pointer swap; never block serving threads on IO.
+- Log the full decision trace for a sampled set of requests (prefix, candidates, scores, features used) to make relevance debuggable.
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Decoupling **candidate generation (fast, immutable-ish FST snapshots)** from **ranking (cheap, bounded, personalized deltas)** is the right shape: it keeps the online path deterministic while letting relevance evolve quickly.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Edge cache | Absorbs the “top few prefixes” firehose; cheapest p99 win. |
+| Typeahead API | Normalization, budgets, safety checks, orchestration; keeps clients dumb. |
+| Prefix index (FST) | Predictable latency and memory efficiency; avoids per-keystroke search-engine fanout. |
+| Ranker | Where iteration happens; bounded compute keeps SLO honest. |
+| User profile cache | Keeps personalization off critical storage; enables hard timeouts + graceful fallback. |
+| Index builder + versioned store | Makes freshness safe (atomic swap/rollback) and operationally tractable. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Separate `Query Cache` for finals + candidates | Start with **only candidate caching** + edge cache for anonymous | Slightly higher CPU for logged-in users; fewer cache-invalidation paths. |
+| Redis for profile + (maybe) Redis for candidates | Keep **profiles in Redis**, but store candidates in **process memory (TinyLFU)** per host | More per-host variance; needs warmup strategy and cache prefill for hot prefixes. |
+| “Streaming + batch” builder | One **streaming pipeline + periodic full rebuild** (nightly) | Streaming job gets more responsibility; full rebuild still needed for correctness drift. |
+| Custom snapshot distribution logic | Use **object store + signed manifest + CDN** for shard delivery | Less control over rollout pacing; relies on CDN semantics but reduces bespoke plumbing. |
+| Per-user final caching via `user_cluster_id` | Make this an explicit phase-2; start with **no logged-in final caching** | Higher backend QPS; avoids subtle privacy/caching correctness issues early. |
+| Complex coordination for swaps | If single region: **etcd/Consul** (or even S3 manifest + health gates) to coordinate versions | External dependency (etcd) or fewer guarantees (S3-only); but clearer ownership than ad-hoc coordination. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Database/Redis is down for 5 minutes**
+   - Design’s answer: profile cache outage → hard timeouts, no retries, degrade to generic.
+   - Recommendation: Strengthen — also specify what happens if **candidate cache** is Redis-backed (serve stale, local LRU fallback, or skip cache entirely).
+
+2. **Network partition / partial region outage**
+   - Design’s answer: not addressed.
+   - Recommendation: Strengthen — define “regional autonomy”: local copies of last-good index + local caches; manifest rollout should be region-scoped with independent rollback.
+
+3. **One component is slow but not failing (p99 creeps)**
+   - Design’s answer: budgets and timeouts mentioned; no retries in hot path.
+   - Recommendation: Strengthen — add explicit **load shedding** rules (cap candidates, skip profile fetch after X ms, drop to top-K global, and return fewer results rather than timing out).
+
+4. **Bad index publish (relevance regression / corrupt shard)**
+   - Design’s answer: canary load checks + online metrics + rollback via manifest pointer; keep N-2 locally.
+   - Recommendation: Acceptable — add “semantic canary”: compare against previous version for top prefixes (diff threshold) before serving real traffic.
+
+5. **Traffic 10× spike + cache stampede**
+   - Design’s answer: coalescing, TTL jitter, serve stale.
+   - Recommendation: Strengthen — ensure coalescing exists at **edge and origin**; add per-prefix singleflight + global circuit breaker to stop redistributing misses into backend collapse.
+
+## Recommendations
+
+### Must Fix
+- Define multi-region behavior: where the FST lives, how manifests roll out, and what “last known good” means under partition.
+- Make cache ownership explicit: if candidates are in Redis, spell out **stale-while-revalidate**, per-key singleflight, and what happens when Redis is impaired.
+- Add safety/abuse controls: PII-sensitive prefixes, query suppression, rate limits, and “do not suggest” policy (autocomplete often leaks sensitive or policy-violating content).
+
+### Should Consider
+- Start simpler: edge cache (anonymous finals) + per-host candidate cache + bounded ranker; add Redis candidate caching only if needed.
+- Treat “stability” as a first-class contract: define a measurable stability metric (e.g., Kendall tau / churn rate) and bake it into canary gates.
+- Tighten the data contract between builder and ranker (feature schema/versioning) so index swaps can’t break serving.
+
+### Nice to Have
+- Offline evaluation loop: sampled request traces → replay against new index/ranker → score deltas before rollout.
+- Explicit warmup plan: preload hot prefixes on deploy and on index swap to avoid cold-cache p99 spikes.
+- Clarify language/normalization strategy (Unicode, tokenization, mixed scripts, diacritics) since it dominates real-world quality.
+
+## What’s Working Well
+- The “snapshot + atomic swap” approach is operationally clean and keeps tail latency predictable.
+- Caching the **candidate list** (not the final personalized response) is the right reuse boundary and keeps personalization bounded.
+- The design is honest about trade-offs (minutes-level freshness, capped personalization) and provides concrete mitigations (hard timeouts, rollback, coalescing).
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+thinking
+**Evaluating design modifications**
+
+I see that there are sections like "Trade-offs" and "Critique to Address" in the original content, but the output should focus on the design itself without including critiques. I could embed "What We Removed" as a subsection in an existing section, maybe under "Trade-offs," with a bullet list of removed items, despite the requirement for an explicit section. Alternatively, I could rename an existing section to "What We Removed." Minimal architecture could be integrated into an "Architecture" section, and justifications can be added in the "Components" section.
+thinking
+**Adjusting failure modes**
+
+I think I can adjust the "Failure Modes" section to cover multi-region behavior, but that might add complexity. The simplest approach looks like a single-region system with a last-known-good local cache while possibly mentioning "regional autonomy." The requirement specifies that I need to address the failure scenarios raised. I could keep it single-region but clarify that multi-region isn't in scope. If we stay single-region, it could be stated that if one AZ fails, traffic shifts to a healthy AZ with locally cached index files. For multi-region, both regions could run the same stack with an object store and independent manifest. This might not add components but rather change the deployment pattern.
+thinking
+**Streamlining the caching strategy**
+
+I can simplify the caching strategy by removing the mention of etcd and focusing solely on using an object store manifest per region. For caching, I should eliminate the query cache and keep the in-process candidate cache, keeping the edge cache for anonymous use. The user profile cache should stay as Redis only for profiles. The index builder can rely on a single streaming job and nightly rebuild, so I won't need a separate batch pipeline. I’ll remove the "user_cluster_id" final caching as well as the "custom snapshot distribution logic," opting for object store plus CDN instead. While integrating "safety/abuse controls" into the Typeahead API might add complexity, it feels necessary and can be included along with the index builder filtering.
+thinking
+**Simplifying the architecture**
+
+I'm thinking about how to simplify the architecture significantly. The components I want to keep are Edge cache/CDN, Typeahead API, Prefix index (FST) in memory, a Ranker within the same service, Redis for user profiles, the Index builder job, and Object storage (like S3) for snapshots and manifests. I’ll keep logs for builder input but avoid adding extra components like Kafka. 
+
+To trim down further, I'll merge the ranker into the Typeahead API and keep everything streamlined within the same service, which brings us to an efficient architecture flow.
+thinking
+**Crafting a simplified document**
+
+I’m condensing everything down to just three main components: Typeahead service, index builder, and FST snapshot, while eliminating the query cache and keeping the in-process candidate cache. My goal is to deliver a complete simplified document in markdown format, avoiding any repo changes or tool calls. 
+
+I'll revise the overview to mention the FST snapshot and a single service with per-host caching and cut down on the requirements to maintain only essentials like SLO and QPS. The architecture diagram will reflect merged components, and I’ll include a note about independent regions using the same manifest. 
+
+In the Components section, I plan to justify each remaining component. Lastly, I’ll create an "Explicit 'What We Removed'" section by renaming an existing one, ensuring clarity on the adjustments made, while keeping operational notes minimal and including necessary budgets and metrics.
+codex
+```markdown
+---
+title: "Search Autocomplete"
+category: "Social & Discovery"
+difficulty: "Medium"
+tags: ["typeahead", "search", "tries", "personalization", "caching", "low-latency"]
+---
+
+## Overview
+
+This system returns top-N query suggestions for a prefix in <100ms at high QPS. The serving path is intentionally small and deterministic:
+
+- A memory-resident prefix index (compiled FST) produces a bounded candidate list.
+- A cheap ranker applies global signals plus a capped personalization delta.
+- The index is rebuilt from logs and published as versioned snapshots with atomic swap and rollback.
+
+Personalization never mutates the index and never blocks the request: it is best-effort with hard timeouts and safe fallback to global ranking.
+
+## Requirements
+
+### Functional Requirements
+- Return top-N suggestions per keystroke.
+- Support personalization from lightweight user signals with safe fallback.
+- Support trending suggestions with minute-level freshness.
+- Keep results stable as the prefix grows.
+- Enforce suppression policies (sensitive/blocked suggestions) consistently.
+
+### Scale Targets
+- **Peak QPS:** ~20k–50k
+- **Latency SLO:** p95 < 80ms, p99 < 120ms (server-side)
+- **Index size:** ~50M unique queries, compacted and sharded
+
+## Key Design Decisions
+
+- **Memory-resident FST for candidate generation.** Predictable latency and bounded CPU per request.
+- **Snapshot publishing with atomic swap.** Freshness without online mutations; instant rollback.
+- **One service owns ranking.** Keep the online path simple: fetch candidates, optionally fetch profile, score, return.
+- **Cache candidates, not personalized finals.** High reuse without privacy or correctness traps.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[User] --> E[Edge Cache/CDN]
+  E --> S[Typeahead Service]
+  S --> I["In-Memory Prefix Index (FST)"]
+  S --> C["In-Process Candidate Cache"]
+  S --> P[User Profile Cache]
+  L[Logs] --> B[Index Builder]
+  B --> O[Index Store]
+  O --> S
+```
+
+### Components
+
+- `Edge Cache/CDN`: Serves cached anonymous suggestions for hot prefixes and absorbs spikes; cheapest p99 win.
+- `Typeahead Service`: Single stateless service that normalizes input, enforces budgets/policies, reads the FST, applies ranking, and returns results.
+- `In-Memory Prefix Index (FST)`: The fast path for prefix → top candidates with compact global signals.
+- `In-Process Candidate Cache`: Per-host cache for `(prefix, locale) -> candidate list` to prevent stampedes and keep tail latency flat.
+- `User Profile Cache`: Redis holding small, fast personalization features keyed by `user_id`; strict timeouts and no retries.
+- `Index Builder`: One job that consumes logs continuously and publishes new snapshot manifests; also performs periodic full rebuilds for correctness drift.
+- `Index Store`: Object storage holding versioned shards + a manifest pointer for atomic rollout/rollback.
+
+## Deep Dive: Personalization Without Killing Cache
+
+1) **Candidates are the cache unit.**  
+Cache the top ~50 global candidates for `(prefix, locale)` with short TTL. This stays hot and reusable.
+
+2) **Personalization is bounded and optional.**  
+Score = `base_global + capped_personal_delta`. If profile fetch times out or is missing, return pure global ranking.
+
+3) **Stability is enforced by construction.**  
+- Candidate continuity: carry forward prior top-K that still match.
+- Trend smoothing: bucket trends in fixed windows (e.g., 5 minutes).
+- Deterministic tie-break: stable secondary key (e.g., query_id).
+
+4) **Policy and safety happen before ranking.**  
+Suppression lists and “do not suggest” rules are applied to candidates before scoring, so the cache never leaks disallowed suggestions.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Low, predictable latency (FST + bounded ranking) | Second-level freshness |
+| Simple operations (single service, atomic swaps) | Deep personalization complexity |
+| Safe caching (candidates only) | Lower cache hit rate for logged-in finals |
+
+## Failure Modes
+
+- **Profile cache down/slow (Redis)**
+  - What happens: personalization drops; global suggestions still served.
+  - Control: 5–10ms budget, no retries, circuit-break profile fetch on elevated timeouts.
+
+- **Traffic spike + hot-prefix stampede**
+  - What happens: cache misses amplify CPU and profile lookups; p99 climbs.
+  - Control: per-prefix singleflight in-process, TTL jitter, serve stale candidates for a short grace window, cap candidate count and return fewer results under load.
+
+- **Bad index publish (corrupt shard / regression)**
+  - What happens: empty results or relevance drop.
+  - Control: background load validation before swap, semantic diff gate on top prefixes vs last-good, instant rollback by manifest pointer, keep last-good snapshot on disk.
+
+- **Index store / CDN fetch impaired**
+  - What happens: new snapshot can’t load.
+  - Control: never load on the request path; keep serving last-good in-memory snapshot; retry in background.
+
+- **Network partition / regional impairment**
+  - What happens: one region can’t fetch new snapshots or loses Redis connectivity.
+  - Control: each region runs independently with its own last-good snapshot on hosts; degraded mode is global ranking with local candidate cache; snapshot rollout/rollback is region-scoped via separate manifests.
+
+## What We Removed
+
+- Separate `Query Cache` for final responses; only candidate caching remains (edge for anonymous, in-process for candidates).
+- Redis-backed candidate cache; candidates live in-process to remove a hot shared dependency.
+- Per-user (or `user_cluster_id`) final caching; personalization is computed per request.
+- Standalone `Ranker` service; ranking is a module inside the `Typeahead Service`.
+- Extra coordination systems for swaps; a versioned manifest in object storage is the single source of truth.
+- Dual “batch + streaming” complexity; one continuous builder plus periodic full rebuild.
+
+## Operational Notes
+
+- Hard budgets and load shedding: cap candidates, skip profile fetch after budget, return fewer results rather than timing out.
+- Track: `p99 latency`, `empty-result rate`, `candidate cache hit rate`, `profile fetch timeout rate`.
+- Index swaps are background-only: preload, validate, then atomic pointer swap; rollback is the same mechanism.
+```
+tokens used
+7,395
+```markdown
+---
+title: "Search Autocomplete"
+category: "Social & Discovery"
+difficulty: "Medium"
+tags: ["typeahead", "search", "tries", "personalization", "caching", "low-latency"]
+---
+
+## Overview
+
+This system returns top-N query suggestions for a prefix in <100ms at high QPS. The serving path is intentionally small and deterministic:
+
+- A memory-resident prefix index (compiled FST) produces a bounded candidate list.
+- A cheap ranker applies global signals plus a capped personalization delta.
+- The index is rebuilt from logs and published as versioned snapshots with atomic swap and rollback.
+
+Personalization never mutates the index and never blocks the request: it is best-effort with hard timeouts and safe fallback to global ranking.
+
+## Requirements
+
+### Functional Requirements
+- Return top-N suggestions per keystroke.
+- Support personalization from lightweight user signals with safe fallback.
+- Support trending suggestions with minute-level freshness.
+- Keep results stable as the prefix grows.
+- Enforce suppression policies (sensitive/blocked suggestions) consistently.
+
+### Scale Targets
+- **Peak QPS:** ~20k–50k
+- **Latency SLO:** p95 < 80ms, p99 < 120ms (server-side)
+- **Index size:** ~50M unique queries, compacted and sharded
+
+## Key Design Decisions
+
+- **Memory-resident FST for candidate generation.** Predictable latency and bounded CPU per request.
+- **Snapshot publishing with atomic swap.** Freshness without online mutations; instant rollback.
+- **One service owns ranking.** Keep the online path simple: fetch candidates, optionally fetch profile, score, return.
+- **Cache candidates, not personalized finals.** High reuse without privacy or correctness traps.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[User] --> E[Edge Cache/CDN]
+  E --> S[Typeahead Service]
+  S --> I["In-Memory Prefix Index (FST)"]
+  S --> C["In-Process Candidate Cache"]
+  S --> P[User Profile Cache]
+  L[Logs] --> B[Index Builder]
+  B --> O[Index Store]
+  O --> S
+```
+
+### Components
+
+- `Edge Cache/CDN`: Serves cached anonymous suggestions for hot prefixes and absorbs spikes; cheapest p99 win.
+- `Typeahead Service`: Single stateless service that normalizes input, enforces budgets/policies, reads the FST, applies ranking, and returns results.
+- `In-Memory Prefix Index (FST)`: The fast path for prefix → top candidates with compact global signals.
+- `In-Process Candidate Cache`: Per-host cache for `(prefix, locale) -> candidate list` to prevent stampedes and keep tail latency flat.
+- `User Profile Cache`: Redis holding small, fast personalization features keyed by `user_id`; strict timeouts and no retries.
+- `Index Builder`: One job that consumes logs continuously and publishes new snapshot manifests; also performs periodic full rebuilds for correctness drift.
+- `Index Store`: Object storage holding versioned shards + a manifest pointer for atomic rollout/rollback.
+
+## Deep Dive: Personalization Without Killing Cache
+
+1) **Candidates are the cache unit.**  
+Cache the top ~50 global candidates for `(prefix, locale)` with short TTL. This stays hot and reusable.
+
+2) **Personalization is bounded and optional.**  
+Score = `base_global + capped_personal_delta`. If profile fetch times out or is missing, return pure global ranking.
+
+3) **Stability is enforced by construction.**  
+- Candidate continuity: carry forward prior top-K that still match.
+- Trend smoothing: bucket trends in fixed windows (e.g., 5 minutes).
+- Deterministic tie-break: stable secondary key (e.g., query_id).
+
+4) **Policy and safety happen before ranking.**  
+Suppression lists and “do not suggest” rules are applied to candidates before scoring, so the cache never leaks disallowed suggestions.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Low, predictable latency (FST + bounded ranking) | Second-level freshness |
+| Simple operations (single service, atomic swaps) | Deep personalization complexity |
+| Safe caching (candidates only) | Lower cache hit rate for logged-in finals |
+
+## Failure Modes
+
+- **Profile cache down/slow (Redis)**
+  - What happens: personalization drops; global suggestions still served.
+  - Control: 5–10ms budget, no retries, circuit-break profile fetch on elevated timeouts.
+
+- **Traffic spike + hot-prefix stampede**
+  - What happens: cache misses amplify CPU and profile lookups; p99 climbs.
+  - Control: per-prefix singleflight in-process, TTL jitter, serve stale candidates for a short grace window, cap candidate count and return fewer results under load.
+
+- **Bad index publish (corrupt shard / regression)**
+  - What happens: empty results or relevance drop.
+  - Control: background load validation before swap, semantic diff gate on top prefixes vs last-good, instant rollback by manifest pointer, keep last-good snapshot on disk.
+
+- **Index store / CDN fetch impaired**
+  - What happens: new snapshot can’t load.
+  - Control: never load on the request path; keep serving last-good in-memory snapshot; retry in background.
+
+- **Network partition / regional impairment**
+  - What happens: one region can’t fetch new snapshots or loses Redis connectivity.
+  - Control: each region runs independently with its own last-good snapshot on hosts; degraded mode is global ranking with local candidate cache; snapshot rollout/rollback is region-scoped via separate manifests.
+
+## What We Removed
+
+- Separate `Query Cache` for final responses; only candidate caching remains (edge for anonymous, in-process for candidates).
+- Redis-backed candidate cache; candidates live in-process to remove a hot shared dependency.
+- Per-user (or `user_cluster_id`) final caching; personalization is computed per request.
+- Standalone `Ranker` service; ranking is a module inside the `Typeahead Service`.
+- Extra coordination systems for swaps; a versioned manifest in object storage is the single source of truth.
+- Dual “batch + streaming” complexity; one continuous builder plus periodic full rebuild.
+
+## Operational Notes
+
+- Hard budgets and load shedding: cap candidates, skip profile fetch after budget, return fewer results rather than timing out.
+- Track: `p99 latency`, `empty-result rate`, `candidate cache hit rate`, `profile fetch timeout rate`.
+- Index swaps are background-only: preload, validate, then atomic pointer swap; rollback is the same mechanism.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/05-social-discovery/search-autocomplete.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Search Autocomplete
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/search-autocomplete.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/search-autocomplete.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/05-social-discovery/search-autocomplete.md

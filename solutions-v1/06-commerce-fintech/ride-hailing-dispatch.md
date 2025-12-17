@@ -1,0 +1,260 @@
+---
+title: "Ride-Hailing Dispatch"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["dispatch", "geospatial", "pricing", "real-time", "marketplace", "workflows"]
+---
+
+## Overview
+
+Ride-hailing dispatch is a real-time marketplace that continuously matches riders to nearby eligible drivers under tight latency constraints and unreliable mobile networks. The core system must (1) ingest frequent driver location updates, (2) discover and rank candidates quickly, and (3) execute a correct trip state machine that prevents double-matching, supports cancellations/fees, and produces an auditable history.
+
+This design uses a small set of primitives:
+- **Redis** as an ephemeral, low-latency **supply index** for nearby-candidate discovery and short-lived reservations.
+- **Postgres** as the durable **system of record** for trip state, idempotency, and immutable trip events.
+- A single **Dispatch API** (modular monolith) that serves rider/driver APIs, runs the matching workflow, and streams realtime updates.
+- A small **worker process** for background dispatch retries and periodic surge snapshot updates.
+
+## Requirements
+
+### Functional Requirements
+- Rider requests a ride with pickup/dropoff, product, and payment method.
+- System returns a quote (ETA + price range + surge version) and creates a trip request.
+- System matches a rider to an eligible driver based on proximity/ETA, constraints, and marketplace policies.
+- Driver can accept/decline; system retries on timeout/rejection.
+- Trip lifecycle with reason codes and audit:
+  `REQUESTED → OFFERING → MATCHED → ENROUTE → ARRIVED → IN_TRIP → COMPLETED/CANCELED`.
+- Real-time driver location ingestion and live trip updates to rider/driver.
+- Surge pricing by geo-region: attach a versioned snapshot to quotes; enforce at trip start.
+- Cancellations and fees with grace periods and no-show rules.
+- Compliance hooks: immutable event log for state transitions and financial references.
+
+### Non-Functional Requirements (Targets)
+- Quote P50 150ms, P99 800ms (region-local).
+- Time to first offer sent (server-side) P50 150ms, P99 400ms.
+- Driver location ingest → queryable in index P50 100ms, P99 500ms.
+- Availability target for dispatch critical path: 99.99% per region (multi-AZ).
+- Trip state is strongly consistent per trip; supply index is eventually consistent with 2–5s staleness tolerance.
+
+## Simplified Architecture
+
+### High-Level Diagram
+
+```mermaid
+flowchart LR
+  R[Rider App]
+  D[Driver App]
+  API["Dispatch API (REST + Realtime)"]
+  PG[(Postgres)]
+  RD[(Redis)]
+  PUSH[Push Provider]
+
+  R --> API
+  D --> API
+  API --> PG
+  API --> RD
+  API --> PUSH
+```
+
+### What Each Piece Does
+- **Dispatch API**: authentication, idempotent write APIs, trip state machine, matching workflow, realtime (WebSocket/SSE), and notification fanout.
+- **Redis**: geospatial supply index + short-lived offer/driver reservations + surge snapshots.
+- **Postgres**: trip state, immutable trip events, idempotency records, and a small durable work queue for retries.
+- **Push Provider**: last-mile delivery for driver offers and key trip updates (with realtime used when connected).
+
+## Components
+
+### Dispatch API (Modular Monolith)
+
+**Responsibilities**
+- Serve rider/driver HTTP APIs and realtime channel.
+- Run the trip state machine with strict transition validation and optimistic concurrency.
+- Execute the matching workflow (candidate discovery → rank → offer → accept/decline/timeout).
+- Enforce idempotency on all write endpoints.
+- Apply cancellation and fee policies with explicit, auditable outcomes.
+
+**Key Correctness Mechanisms**
+- **Per-trip optimistic concurrency**: `trips.version` increments on every durable transition; updates are `WHERE trip_id=? AND version=?`.
+- **Driver reservation lease** (best-effort): short TTL key in Redis prevents most double-offers.
+- **Authoritative match**: only the `MATCHED` transition in Postgres decides the final driver for a trip.
+
+### Driver Location Ingest (Within Dispatch API)
+
+**Responsibilities**
+- Accept high-rate GPS pings from drivers.
+- Validate timestamps and coordinates; rate-limit per driver; dedupe by movement threshold/cell change.
+- Update Redis supply index with TTL-based expiry.
+
+**Operational Behavior**
+- Drops/sheds telemetry under overload to protect dispatch latency.
+- Rejects obviously invalid pings (impossible jumps/speeds, excessively stale timestamps).
+
+### Redis Supply Index (Geospatial + Availability)
+
+**Responsibilities**
+- Answer “eligible drivers near pickup” queries quickly.
+- Track ephemeral availability with TTL expiration.
+
+**Implementation (Simple, Fast, Rebuildable)**
+- Use H3 (or geohash) cells with bounded expansion.
+- Store only discovery fields in Redis:
+  - `cell:{h3}:{product}` → sorted set of `driver_id` scored by `last_seen_epoch`
+  - `driver:{driver_id}` → hash with cell, lat/lng, products, availability, last_seen
+- Reservations:
+  - `reserve:{driver_id}` → `trip_id` with TTL 8–12s
+  - `offer:{offer_id}` → hash with `trip_id`, `driver_id`, `expires_at`, `status` (TTL)
+
+### Postgres Trip Store + Durable Work Queue
+
+**Responsibilities**
+- Store the authoritative trip row and immutable trip event history.
+- Store idempotency keys for rider/driver write APIs.
+- Drive reliable background retries via a minimal queue table.
+
+**Queue Model**
+- `dispatch_jobs(trip_id, run_at, attempts, locked_at, lock_owner)` with workers using `FOR UPDATE SKIP LOCKED`.
+- Jobs are created on `REQUESTED` and re-scheduled on offer timeout/rejection.
+
+### Surge + ETA (Pragmatic Defaults)
+
+**Surge**
+- Maintain per-zone rolling counters in Redis (requests, available drivers, accepts).
+- A small worker periodically computes a **versioned snapshot** per zone and writes:
+  - `surge:{zone_id}` → `{version, multiplier, updated_at, max_age_seconds}`
+
+**ETA**
+- Quote-time ETA uses fast heuristics:
+  - distance-based travel time with city-level speed profiles
+  - optional refinement using current supply density (penalty when sparse)
+
+## Data Model
+
+### Postgres Tables
+
+**`trips`**
+- `trip_id` (UUID, PK)
+- `rider_id` (UUID, index)
+- `driver_id` (UUID, nullable, index)
+- `status` (enum)
+- `pickup_lat`, `pickup_lng`, `dropoff_lat`, `dropoff_lng`
+- `product`, `region`, `requested_at`, `updated_at`
+- `version` (bigint)
+- `quote_id` (UUID)
+- `surge_multiplier` (numeric)
+- `surge_version` (text)
+- `cancel_reason` (text, nullable)
+
+**`trip_events`** (append-only, immutable)
+- `event_id` (UUID, PK)
+- `trip_id` (UUID, index)
+- `type` (text)
+- `created_at` (timestamp)
+- `actor` (text)
+- `payload` (jsonb)
+- `idempotency_key` (text, nullable)
+- Unique: `(trip_id, type, idempotency_key)` when `idempotency_key` is present
+
+**`idempotency_keys`**
+- `scope` (text) — e.g., `rider:{rider_id}`, `driver:{driver_id}`
+- `key` (text)
+- `request_hash` (text)
+- `response_blob` (jsonb)
+- `created_at` (timestamp)
+- Unique: `(scope, key)`
+
+**`dispatch_jobs`**
+- `job_id` (UUID, PK)
+- `trip_id` (UUID, index)
+- `run_at` (timestamp, index)
+- `attempts` (int)
+- `locked_at` (timestamp, nullable)
+- `lock_owner` (text, nullable)
+
+### Redis Keys (Ephemeral)
+- `cell:{h3}:{product}` → ZSET of `driver_id` scored by `last_seen_epoch`
+- `driver:{driver_id}` → HASH: cell, lat, lng, products, availability, last_seen
+- `reserve:{driver_id}` → string `trip_id` TTL 8–12s
+- `offer:{offer_id}` → HASH: trip_id, driver_id, expires_at, status TTL
+- `surge:{zone_id}` → HASH: version, multiplier, updated_at, max_age_seconds TTL
+
+## Core Workflows
+
+### Matching (Request → Offer → Match)
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant R as Rider App
+  participant API as Dispatch API
+  participant PG as Postgres
+  participant RD as Redis
+  participant D as Driver App
+
+  R->>API: POST /v1/trips (Idempotency-Key)
+  API->>RD: Read surge + estimate ETA
+  API->>PG: INSERT trip + trip_event (REQUESTED)
+  API-->>R: 201 trip_id + quote
+  API->>PG: Enqueue dispatch_jobs(trip_id)
+
+  API->>RD: Query nearby candidates (cell expansion)
+  API->>RD: SET reserve:{driver_id}=trip_id (TTL)
+  API-->>D: Offer via realtime/push
+
+  D->>API: POST /v1/offers/{offer_id}/accept
+  API->>PG: CAS update trip to MATCHED(driver_id)
+  API-->>D: 200 MATCHED
+  API-->>R: Realtime trip update (MATCHED)
+```
+
+### Cancellations & Fees
+- Cancellation is a single idempotent write:
+  - validate current trip status
+  - evaluate policy (grace/no-show) based on timestamps and state
+  - persist `CANCELED` transition + fee decision in `trip_events` payload
+- The fee assessment is derived from the durable event record to keep reconciliation simple.
+
+## API Design (Minimal)
+
+- `POST /v1/trips` (idempotent): creates trip + returns quote.
+- `POST /v1/drivers/me/location`: accepts GPS ping, returns `202`.
+- `POST /v1/offers/{offer_id}/accept|decline`: idempotent by `offer_id`.
+- `GET /v1/trips/{trip_id}`: current trip status + summary.
+- `POST /v1/trips/{trip_id}/cancel` (idempotent): returns cancellation outcome.
+
+Realtime:
+- One authenticated WebSocket/SSE channel per user for trip state changes and (during active trips) driver position updates.
+
+## Scaling & Performance
+
+- **Regional isolation**: route by pickup region; each region runs its own Postgres + Redis (multi-AZ).
+- **Redis**: shard/cluster per region; cap per-cell cardinality; TTL-based expiry keeps memory bounded.
+- **Postgres**:
+  - partition `trip_events` by time (and optionally region) to keep indexes small
+  - strict connection pooling; short transactions for CAS updates
+- **Dispatch concurrency**:
+  - workers consume `dispatch_jobs` with `SKIP LOCKED`
+  - bound fanout (top-N candidates), strict timeouts, and exponential backoff for retries
+
+## Failure Modes (Key Handling)
+
+- **Redis latency/outage**: dispatch retries via `dispatch_jobs`; ranking degrades to last-known candidates; quote uses last-known surge snapshot within `max_age_seconds`.
+- **Double-offer race**: reservation lease reduces conflicts; Postgres CAS enforces a single durable match; stale offers are marked expired.
+- **Postgres degradation**: prioritize state transitions; backpressure via explicit error responses; keep non-critical derived updates out of the critical path.
+- **Push delays**: realtime channel delivers when connected; offer TTL and retry logic handles missed notifications.
+
+## Observability (Minimum Set)
+
+- Dispatch latency (quote, first offer), match rate, time-to-match percentiles.
+- Redis command latency/error rate, memory, hot keys, cell cardinality distribution.
+- Postgres write latency, lock waits, connection pool saturation.
+- Offer metrics: timeout rate, accept/decline rate, reservation conflict rate.
+- Surge snapshot age and multiplier distribution vs guardrails.
+
+## Simplification Notes
+
+- Removed `API Gateway`, separate `Auth/Rate Limits`, and separate `Realtime Gateway`; handled inside `Dispatch API` to keep the request path and realtime delivery in one deployable unit.
+- Merged `Trip Service`, `Dispatch Service`, `ETA Service`, `Pricing/Surge Service`, `Policy Service`, and `Notifications` into `Dispatch API` modules to reduce cross-service latency and operational overhead while keeping clear internal boundaries.
+- Removed `Event Bus`, `DLQ`, `Stream Processor`, and `Warehouse/Lake`; durable audit and reconciliation rely on `trip_events` in Postgres, and surge uses periodic snapshots computed from Redis counters.
+- Removed `Outbox`; event durability and ordering are provided by the Postgres write path (`trips` + `trip_events`) and the `dispatch_jobs` table for reliable retries.
+- Kept `Redis` because ultra-low-latency candidate discovery and short-lived reservations benefit from an in-memory ephemeral store.
+- Kept strong per-trip consistency and optimistic concurrency in `Postgres` because correctness (single match, valid transitions, auditable history) requires a clear source of truth.

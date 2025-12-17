@@ -1,0 +1,2812 @@
+==========================================
+Generating (v2): Retrieval-Augmented Generation (RAG)
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2bfa-7bf0-ba63-31c7a5f2261e
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Retrieval-Augmented Generation (RAG)
+**Category**: AI/ML Infrastructure
+
+**Problem Statement**:
+Design a system that retrieves relevant contexts from a vector store to augment LLM prompts with freshness guarantees.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+thinking
+**Designing a system document**
+
+The user wants a system design document in markdown format, focusing on freshness guarantees for RAG. This needs to be thorough yet concise, with a maximum of eight nodes in a mermaid diagram. I'll outline key design decisions, components, potential failure modes, and operational notes. I'll provide concrete scaling targets and avoid hedging. The design should include aspects like dual-write change data capture and consider using Postgres for metadata, S3 for raw documents, or possibly a managed vector DB like Pinecone for larger scales.
+thinking
+**Ensuring data freshness**
+
+I need to focus on freshness in the design. I'll use Kafka alongside embedding workers and a vector index, incorporating an index watermark. The query path will check the watermark, and if freshness requirements aren't met, I can do on-demand embeddings for a small set or revert to keyword searches over the document store. The key is ensuring that retrieved contexts reflect updates within one minute, aiming for guarantees rather than eventual consistency. The ingestion service needs to track changes meticulously, with updates stored effectively.
+thinking
+**Designing a freshness strategy**
+
+In this design, I'll check the current high-watermark. If it's behind, I might need to wait, blocking on a condition using pub/sub. If not, I can either fetch changed documents directly from the doc store with lexical search or asynchronously generate embeddings for top documents. The key here is to guarantee freshness. I can enforce "read-your-writes" with per-user write tokens to ensure that queries reflect the latest updates without excessive waiting, using a two-tier index approach for efficiency.
+thinking
+**Ensuring query freshness**
+
+Next, I'll have queries search both indices and merge the results. This should provide a freshness guarantee for the last few minutes. For older documents, I'll rely on the main index, considering sharding for scalability. To implement this, I can use a "Recent Index" with Redis and RediSearch or a small in-memory Faiss service, updating it at write time by generating embeddings synchronously. However, this can add latency. I could explore using an approximate embedding on write and later re-embed for accuracy, balancing speed and cost effectively.
+thinking
+**Defining subproblems and architecture**
+
+I need to focus on two key subproblems for the design: freshness and consistency between the source and vector index, and preventing prompt stuffing while maintaining recall. My primary focus will be on freshness. The architecture will include elements like "watermarked retrieval" and a dual-index, ensuring semantics like read-after-write and max staleness. 
+
+I'll estimate requirements for 10k tenants handling 100M chunks with a QPS of 500, aiming for 300ms at p95. The architecture will consist of multiple nodes working together in a streamlined process while avoiding any vague language. I'll format it all in crisp markdown with a YAML frontmatter.
+codex
+```markdown
+---
+title: "Retrieval-Augmented Generation (RAG) with Freshness Guarantees"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["rag", "vector-search", "freshness", "consistency", "indexing", "llm-infra"]
+---
+
+## Overview
+
+This system augments LLM prompts with retrieved context, but with a strict freshness contract: when a document changes, retrieval reflects that change within a bounded window (and supports read-after-write). The elegant move is to stop pretending the vector index is strongly consistent and instead **design an explicit “freshness layer”** that makes freshness a first-class query constraint.
+
+The core idea is a **two-tier retrieval index**: a durable vector store for the bulk of history, plus a small “recent changes” vector index that is updated immediately and queried on every request. This avoids blocking queries on asynchronous pipelines and turns freshness from “best effort” into an enforceable SLA.
+
+Everything else stays boring: Postgres for metadata, object storage for raw docs/chunks, a managed vector DB for main similarity search, and a simple async embedding pipeline for throughput and cost control.
+
+## What Makes This Hard
+
+Naive RAG systems silently serve stale context because the write path (documents) and the read path (vector index) are decoupled by an async embedding pipeline. Teams ship “eventual” freshness, then get paged when users ask “why doesn’t it know what I just changed?”
+
+The trap: trying to “make the vector DB consistent” by adding retries and delays. You end up with tail-latency spikes, unpredictable correctness, and an on-call nightmare when the embedding pipeline lags. Freshness needs an explicit contract, a measurable watermark, and a plan for when the pipeline is behind.
+
+## Requirements
+
+### Functional Requirements
+- Retrieve top-K relevant chunks for a query with **max staleness ≤ 60s** for updated documents.
+- Support **read-after-write**: after a successful write, subsequent queries from that user reflect it immediately.
+- Provide citations (document id, chunk id, version) for every returned chunk.
+- Prevent mixing incompatible embedding spaces (model/version changes) in a single retrieval.
+
+### Scale Targets
+- Corpus: 10M documents, ~200M chunks (avg 20 chunks/doc).
+- Online traffic: 500 QPS sustained, 2k QPS peak; p95 retrieval+prompt build ≤ 250ms (excluding LLM).
+- Writes/updates: 200 updates/sec burst (import jobs), 10 updates/sec steady.
+- Freshness SLA: 99.9% of queries satisfy max staleness; read-after-write is strict (not probabilistic).
+
+## Key Design Decisions
+
+- **Two-tier index (Main + Recent)**
+  - Chose: main vector DB for history + “recent changes” vector index updated immediately.
+  - Rejected: blocking reads until async pipeline catches up.
+  - Why: guarantees freshness without turning indexing lag into user latency.
+
+- **Watermark-based freshness contract**
+  - Chose: every doc change emits a monotonically increasing `change_seq`; indexes publish `indexed_seq`.
+  - Rejected: “timestamp-based” freshness inferred from clocks across services.
+  - Why: sequence numbers are auditable, composable, and don’t fail under clock skew.
+
+- **Versioned chunks and embeddings**
+  - Chose: chunk ids include `doc_version`; retrieval filters by latest version and embedding model id.
+  - Rejected: in-place updates in the vector store.
+  - Why: avoids “split brain” retrieval where old and new chunks coexist and leak into prompts.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> A[RAG API]
+  A --> R[Retriever]
+  R --> V[Vector DB]
+  R --> X[Recent Index]
+  R --> D[Doc Store]
+  A --> L[LLM]
+  W[Ingest+Embed Pipeline] --> D
+  W --> V
+  W --> X
+```
+
+### Components
+
+- `RAG API`
+  - Owns the request contract: query, tenant, freshness requirements (`max_staleness`, optional `write_token`), and response citations.
+
+- `Retriever`
+  - Runs hybrid retrieval across `Recent Index` and `Vector DB`, merges results, fetches chunk text from `Doc Store`, and enforces freshness/version filters.
+
+- `Vector DB` (main index)
+  - Stores the bulk embedding index (HNSW/IVF), optimized for recall and cost. Updates arrive asynchronously via the pipeline.
+
+- `Recent Index`
+  - Small, fast index covering the last N minutes/hours of updates (time-bounded or size-bounded). It exists solely to satisfy freshness without waiting.
+  - Practical implementation: a dedicated service running FAISS/HNSW in memory with WAL to disk; shard by tenant.
+
+- `Doc Store`
+  - Object storage for chunk text + Postgres for metadata (`doc_id`, `doc_version`, `change_seq`, ACLs, chunk mapping).
+  - This is the source of truth; indexes are derived.
+
+- `Ingest+Embed Pipeline`
+  - Consumes document changes, chunks content, computes embeddings, and upserts into `Vector DB`. Also backfills/evicts in `Recent Index`.
+
+- `LLM`
+  - Receives a prompt built from retrieved chunks plus system instructions, returns completion with citations.
+
+## Deep Dive: Freshness Guarantees
+
+Freshness is enforced by a **sequence-based contract**:
+
+1. **Write path produces a durable sequence**
+   - Every document mutation commits to Postgres with an incrementing `change_seq` (global or per-tenant).
+   - The write response returns a `write_token = (tenant_id, change_seq, doc_id, doc_version)`.
+
+2. **Recent Index gives immediate visibility**
+   - On write, the system synchronously computes embeddings for the new/changed chunks and inserts them into `Recent Index` keyed by `(doc_id, doc_version, chunk_id, model_id)`.
+   - This is the only “synchronous ML” in the system, and it’s intentionally narrow: it only covers the delta that makes freshness hard.
+
+3. **Async pipeline backfills the main index**
+   - The pipeline processes the same change events, computes embeddings (same model id), and upserts into `Vector DB`.
+   - Once a change is present in `Vector DB`, the pipeline marks it indexed by advancing `indexed_seq` and eventually removes it from `Recent Index` (or lets TTL expire).
+
+4. **Query-time enforcement**
+   - For a request with `max_staleness` and/or a `write_token`, the Retriever:
+     - Always queries both indexes.
+     - Filters results to the **latest `doc_version`** and the correct `model_id`.
+     - If a `write_token` exists, it requires that any chunks from that `doc_id` come from `doc_version >= token.doc_version` (the Recent Index guarantees this immediately).
+     - If the Recent Index is unavailable, the system fails closed for strict read-after-write (returns an explicit freshness error) rather than silently serving stale context.
+
+5. **Why this is elegant**
+   - Freshness is not “waiting for eventually consistent infrastructure.” It’s a deliberately small, bounded surface area: recent updates only.
+   - When indexing lags (imports, outages), correctness stays stable; only capacity pressure grows in `Recent Index`, which is observable and controllable.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Freshness with bounded latency | Higher write latency (sync embed) |
+| Auditable correctness (seq/version) | More moving parts (Recent Index) |
+| Stable p95 during indexing lag | Extra memory/ops for delta index |
+
+## Failure Modes
+
+- **Embedding pipeline lag spikes (backlog)**
+  - What happens: `Vector DB` becomes stale; `Recent Index` grows.
+  - Detect: `vector_index_lag = change_seq - indexed_seq`, Recent Index size/TTL pressure.
+  - Recover: autoscale embedding workers; apply ingestion backpressure; temporarily extend Recent Index retention.
+
+- **Recent Index outage**
+  - What happens: freshness guarantee breaks for read-after-write.
+  - Detect: health checks + query path “freshness_required_but_unavailable” counter.
+  - Recover: fail closed for strict queries; route writes to a degraded mode (queue writes until Recent Index returns) or accept writes but warn clients that read-after-write is unavailable.
+
+- **Embedding model upgrade**
+  - What happens: mixed embedding spaces destroy retrieval quality.
+  - Detect: requests retrieving across multiple `model_id`s; sudden recall drop.
+  - Recover: dual-write embeddings to new `model_id`, run parallel retrieval + A/B, cut over by tenant, then garbage-collect old index.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Shard `Recent Index` by tenant and move it to a dedicated service tier with WAL + fast restarts.
+  - Add ANN prefiltering by ACL/namespace to cut candidate sets early.
+
+- **100x scale:**
+  - Replace “sync embed on write” with a streaming, low-latency embedding tier (GPU pool) and strict admission control.
+  - Partition the main `Vector DB` by tenant/namespace and introduce per-partition watermarks to avoid global head-of-line blocking during reindexing.
+
+## Operational Notes
+
+- Track three numbers per tenant: `change_seq`, `indexed_seq`, and `recent_index_oldest_seq`; alerts trigger on sustained divergence.
+- Make freshness explicit in APIs: `max_staleness_ms` and `write_token`; log them so correctness bugs are debuggable.
+- Keep `Recent Index` bounded by policy (TTL + max bytes). When it hits limits, reject bulk imports or relax freshness for non-interactive workloads—never silently drop recent updates.
+```
+tokens used
+4,390
+```markdown
+---
+title: "Retrieval-Augmented Generation (RAG) with Freshness Guarantees"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["rag", "vector-search", "freshness", "consistency", "indexing", "llm-infra"]
+---
+
+## Overview
+
+This system augments LLM prompts with retrieved context, but with a strict freshness contract: when a document changes, retrieval reflects that change within a bounded window (and supports read-after-write). The elegant move is to stop pretending the vector index is strongly consistent and instead **design an explicit “freshness layer”** that makes freshness a first-class query constraint.
+
+The core idea is a **two-tier retrieval index**: a durable vector store for the bulk of history, plus a small “recent changes” vector index that is updated immediately and queried on every request. This avoids blocking queries on asynchronous pipelines and turns freshness from “best effort” into an enforceable SLA.
+
+Everything else stays boring: Postgres for metadata, object storage for raw docs/chunks, a managed vector DB for main similarity search, and a simple async embedding pipeline for throughput and cost control.
+
+## What Makes This Hard
+
+Naive RAG systems silently serve stale context because the write path (documents) and the read path (vector index) are decoupled by an async embedding pipeline. Teams ship “eventual” freshness, then get paged when users ask “why doesn’t it know what I just changed?”
+
+The trap: trying to “make the vector DB consistent” by adding retries and delays. You end up with tail-latency spikes, unpredictable correctness, and an on-call nightmare when the embedding pipeline lags. Freshness needs an explicit contract, a measurable watermark, and a plan for when the pipeline is behind.
+
+## Requirements
+
+### Functional Requirements
+- Retrieve top-K relevant chunks for a query with **max staleness ≤ 60s** for updated documents.
+- Support **read-after-write**: after a successful write, subsequent queries from that user reflect it immediately.
+- Provide citations (document id, chunk id, version) for every returned chunk.
+- Prevent mixing incompatible embedding spaces (model/version changes) in a single retrieval.
+
+### Scale Targets
+- Corpus: 10M documents, ~200M chunks (avg 20 chunks/doc).
+- Online traffic: 500 QPS sustained, 2k QPS peak; p95 retrieval+prompt build ≤ 250ms (excluding LLM).
+- Writes/updates: 200 updates/sec burst (import jobs), 10 updates/sec steady.
+- Freshness SLA: 99.9% of queries satisfy max staleness; read-after-write is strict (not probabilistic).
+
+## Key Design Decisions
+
+- **Two-tier index (Main + Recent)**
+  - Chose: main vector DB for history + “recent changes” vector index updated immediately.
+  - Rejected: blocking reads until async pipeline catches up.
+  - Why: guarantees freshness without turning indexing lag into user latency.
+
+- **Watermark-based freshness contract**
+  - Chose: every doc change emits a monotonically increasing `change_seq`; indexes publish `indexed_seq`.
+  - Rejected: “timestamp-based” freshness inferred from clocks across services.
+  - Why: sequence numbers are auditable, composable, and don’t fail under clock skew.
+
+- **Versioned chunks and embeddings**
+  - Chose: chunk ids include `doc_version`; retrieval filters by latest version and embedding model id.
+  - Rejected: in-place updates in the vector store.
+  - Why: avoids “split brain” retrieval where old and new chunks coexist and leak into prompts.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> A[RAG API]
+  A --> R[Retriever]
+  R --> V[Vector DB]
+  R --> X[Recent Index]
+  R --> D[Doc Store]
+  A --> L[LLM]
+  W[Ingest+Embed Pipeline] --> D
+  W --> V
+  W --> X
+```
+
+### Components
+
+- `RAG API`
+  - Owns the request contract: query, tenant, freshness requirements (`max_staleness`, optional `write_token`), and response citations.
+
+- `Retriever`
+  - Runs hybrid retrieval across `Recent Index` and `Vector DB`, merges results, fetches chunk text from `Doc Store`, and enforces freshness/version filters.
+
+- `Vector DB` (main index)
+  - Stores the bulk embedding index (HNSW/IVF), optimized for recall and cost. Updates arrive asynchronously via the pipeline.
+
+- `Recent Index`
+  - Small, fast index covering the last N minutes/hours of updates (time-bounded or size-bounded). It exists solely to satisfy freshness without waiting.
+  - Practical implementation: a dedicated service running FAISS/HNSW in memory with WAL to disk; shard by tenant.
+
+- `Doc Store`
+  - Object storage for chunk text + Postgres for metadata (`doc_id`, `doc_version`, `change_seq`, ACLs, chunk mapping).
+  - This is the source of truth; indexes are derived.
+
+- `Ingest+Embed Pipeline`
+  - Consumes document changes, chunks content, computes embeddings, and upserts into `Vector DB`. Also backfills/evicts in `Recent Index`.
+
+- `LLM`
+  - Receives a prompt built from retrieved chunks plus system instructions, returns completion with citations.
+
+## Deep Dive: Freshness Guarantees
+
+Freshness is enforced by a **sequence-based contract**:
+
+1. **Write path produces a durable sequence**
+   - Every document mutation commits to Postgres with an incrementing `change_seq` (global or per-tenant).
+   - The write response returns a `write_token = (tenant_id, change_seq, doc_id, doc_version)`.
+
+2. **Recent Index gives immediate visibility**
+   - On write, the system synchronously computes embeddings for the new/changed chunks and inserts them into `Recent Index` keyed by `(doc_id, doc_version, chunk_id, model_id)`.
+   - This is the only “synchronous ML” in the system, and it’s intentionally narrow: it only covers the delta that makes freshness hard.
+
+3. **Async pipeline backfills the main index**
+   - The pipeline processes the same change events, computes embeddings (same model id), and upserts into `Vector DB`.
+   - Once a change is present in `Vector DB`, the pipeline marks it indexed by advancing `indexed_seq` and eventually removes it from `Recent Index` (or lets TTL expire).
+
+4. **Query-time enforcement**
+   - For a request with `max_staleness` and/or a `write_token`, the Retriever:
+     - Always queries both indexes.
+     - Filters results to the **latest `doc_version`** and the correct `model_id`.
+     - If a `write_token` exists, it requires that any chunks from that `doc_id` come from `doc_version >= token.doc_version` (the Recent Index guarantees this immediately).
+     - If the Recent Index is unavailable, the system fails closed for strict read-after-write (returns an explicit freshness error) rather than silently serving stale context.
+
+5. **Why this is elegant**
+   - Freshness is not “waiting for eventually consistent infrastructure.” It’s a deliberately small, bounded surface area: recent updates only.
+   - When indexing lags (imports, outages), correctness stays stable; only capacity pressure grows in `Recent Index`, which is observable and controllable.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Freshness with bounded latency | Higher write latency (sync embed) |
+| Auditable correctness (seq/version) | More moving parts (Recent Index) |
+| Stable p95 during indexing lag | Extra memory/ops for delta index |
+
+## Failure Modes
+
+- **Embedding pipeline lag spikes (backlog)**
+  - What happens: `Vector DB` becomes stale; `Recent Index` grows.
+  - Detect: `vector_index_lag = change_seq - indexed_seq`, Recent Index size/TTL pressure.
+  - Recover: autoscale embedding workers; apply ingestion backpressure; temporarily extend Recent Index retention.
+
+- **Recent Index outage**
+  - What happens: freshness guarantee breaks for read-after-write.
+  - Detect: health checks + query path “freshness_required_but_unavailable” counter.
+  - Recover: fail closed for strict queries; route writes to a degraded mode (queue writes until Recent Index returns) or accept writes but warn clients that read-after-write is unavailable.
+
+- **Embedding model upgrade**
+  - What happens: mixed embedding spaces destroy retrieval quality.
+  - Detect: requests retrieving across multiple `model_id`s; sudden recall drop.
+  - Recover: dual-write embeddings to new `model_id`, run parallel retrieval + A/B, cut over by tenant, then garbage-collect old index.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Shard `Recent Index` by tenant and move it to a dedicated service tier with WAL + fast restarts.
+  - Add ANN prefiltering by ACL/namespace to cut candidate sets early.
+
+- **100x scale:**
+  - Replace “sync embed on write” with a streaming, low-latency embedding tier (GPU pool) and strict admission control.
+  - Partition the main `Vector DB` by tenant/namespace and introduce per-partition watermarks to avoid global head-of-line blocking during reindexing.
+
+## Operational Notes
+
+- Track three numbers per tenant: `change_seq`, `indexed_seq`, and `recent_index_oldest_seq`; alerts trigger on sustained divergence.
+- Make freshness explicit in APIs: `max_staleness_ms` and `write_token`; log them so correctness bugs are debuggable.
+- Keep `Recent Index` bounded by policy (TTL + max bytes). When it hits limits, reject bulk imports or relax freshness for non-interactive workloads—never silently drop recent updates.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/retrieval-augmented-generation.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afe-84ae-78f3-a283-1ed879c979db
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Retrieval-Augmented Generation (RAG) with Freshness Guarantees"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["rag", "vector-search", "freshness", "consistency", "indexing", "llm-infra"]
+---
+
+## Overview
+
+This system augments LLM prompts with retrieved context, but with a strict freshness contract: when a document changes, retrieval reflects that change within a bounded window (and supports read-after-write). The elegant move is to stop pretending the vector index is strongly consistent and instead **design an explicit “freshness layer”** that makes freshness a first-class query constraint.
+
+The core idea is a **two-tier retrieval index**: a durable vector store for the bulk of history, plus a small “recent changes” vector index that is updated immediately and queried on every request. This avoids blocking queries on asynchronous pipelines and turns freshness from “best effort” into an enforceable SLA.
+
+Everything else stays boring: Postgres for metadata, object storage for raw docs/chunks, a managed vector DB for main similarity search, and a simple async embedding pipeline for throughput and cost control.
+
+## What Makes This Hard
+
+Naive RAG systems silently serve stale context because the write path (documents) and the read path (vector index) are decoupled by an async embedding pipeline. Teams ship “eventual” freshness, then get paged when users ask “why doesn’t it know what I just changed?”
+
+The trap: trying to “make the vector DB consistent” by adding retries and delays. You end up with tail-latency spikes, unpredictable correctness, and an on-call nightmare when the embedding pipeline lags. Freshness needs an explicit contract, a measurable watermark, and a plan for when the pipeline is behind.
+
+## Requirements
+
+### Functional Requirements
+- Retrieve top-K relevant chunks for a query with **max staleness ≤ 60s** for updated documents.
+- Support **read-after-write**: after a successful write, subsequent queries from that user reflect it immediately.
+- Provide citations (document id, chunk id, version) for every returned chunk.
+- Prevent mixing incompatible embedding spaces (model/version changes) in a single retrieval.
+
+### Scale Targets
+- Corpus: 10M documents, ~200M chunks (avg 20 chunks/doc).
+- Online traffic: 500 QPS sustained, 2k QPS peak; p95 retrieval+prompt build ≤ 250ms (excluding LLM).
+- Writes/updates: 200 updates/sec burst (import jobs), 10 updates/sec steady.
+- Freshness SLA: 99.9% of queries satisfy max staleness; read-after-write is strict (not probabilistic).
+
+## Key Design Decisions
+
+- **Two-tier index (Main + Recent)**
+  - Chose: main vector DB for history + “recent changes” vector index updated immediately.
+  - Rejected: blocking reads until async pipeline catches up.
+  - Why: guarantees freshness without turning indexing lag into user latency.
+
+- **Watermark-based freshness contract**
+  - Chose: every doc change emits a monotonically increasing `change_seq`; indexes publish `indexed_seq`.
+  - Rejected: “timestamp-based” freshness inferred from clocks across services.
+  - Why: sequence numbers are auditable, composable, and don’t fail under clock skew.
+
+- **Versioned chunks and embeddings**
+  - Chose: chunk ids include `doc_version`; retrieval filters by latest version and embedding model id.
+  - Rejected: in-place updates in the vector store.
+  - Why: avoids “split brain” retrieval where old and new chunks coexist and leak into prompts.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> A[RAG API]
+  A --> R[Retriever]
+  R --> V[Vector DB]
+  R --> X[Recent Index]
+  R --> D[Doc Store]
+  A --> L[LLM]
+  W[Ingest+Embed Pipeline] --> D
+  W --> V
+  W --> X
+```
+
+### Components
+
+- `RAG API`
+  - Owns the request contract: query, tenant, freshness requirements (`max_staleness`, optional `write_token`), and response citations.
+
+- `Retriever`
+  - Runs hybrid retrieval across `Recent Index` and `Vector DB`, merges results, fetches chunk text from `Doc Store`, and enforces freshness/version filters.
+
+- `Vector DB` (main index)
+  - Stores the bulk embedding index (HNSW/IVF), optimized for recall and cost. Updates arrive asynchronously via the pipeline.
+
+- `Recent Index`
+  - Small, fast index covering the last N minutes/hours of updates (time-bounded or size-bounded). It exists solely to satisfy freshness without waiting.
+  - Practical implementation: a dedicated service running FAISS/HNSW in memory with WAL to disk; shard by tenant.
+
+- `Doc Store`
+  - Object storage for chunk text + Postgres for metadata (`doc_id`, `doc_version`, `change_seq`, ACLs, chunk mapping).
+  - This is the source of truth; indexes are derived.
+
+- `Ingest+Embed Pipeline`
+  - Consumes document changes, chunks content, computes embeddings, and upserts into `Vector DB`. Also backfills/evicts in `Recent Index`.
+
+- `LLM`
+  - Receives a prompt built from retrieved chunks plus system instructions, returns completion with citations.
+
+## Deep Dive: Freshness Guarantees
+
+Freshness is enforced by a **sequence-based contract**:
+
+1. **Write path produces a durable sequence**
+   - Every document mutation commits to Postgres with an incrementing `change_seq` (global or per-tenant).
+   - The write response returns a `write_token = (tenant_id, change_seq, doc_id, doc_version)`.
+
+2. **Recent Index gives immediate visibility**
+   - On write, the system synchronously computes embeddings for the new/changed chunks and inserts them into `Recent Index` keyed by `(doc_id, doc_version, chunk_id, model_id)`.
+   - This is the only “synchronous ML” in the system, and it’s intentionally narrow: it only covers the delta that makes freshness hard.
+
+3. **Async pipeline backfills the main index**
+   - The pipeline processes the same change events, computes embeddings (same model id), and upserts into `Vector DB`.
+   - Once a change is present in `Vector DB`, the pipeline marks it indexed by advancing `indexed_seq` and eventually removes it from `Recent Index` (or lets TTL expire).
+
+4. **Query-time enforcement**
+   - For a request with `max_staleness` and/or a `write_token`, the Retriever:
+     - Always queries both indexes.
+     - Filters results to the **latest `doc_version`** and the correct `model_id`.
+     - If a `write_token` exists, it requires that any chunks from that `doc_id` come from `doc_version >= token.doc_version` (the Recent Index guarantees this immediately).
+     - If the Recent Index is unavailable, the system fails closed for strict read-after-write (returns an explicit freshness error) rather than silently serving stale context.
+
+5. **Why this is elegant**
+   - Freshness is not “waiting for eventually consistent infrastructure.” It’s a deliberately small, bounded surface area: recent updates only.
+   - When indexing lags (imports, outages), correctness stays stable; only capacity pressure grows in `Recent Index`, which is observable and controllable.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Freshness with bounded latency | Higher write latency (sync embed) |
+| Auditable correctness (seq/version) | More moving parts (Recent Index) |
+| Stable p95 during indexing lag | Extra memory/ops for delta index |
+
+## Failure Modes
+
+- **Embedding pipeline lag spikes (backlog)**
+  - What happens: `Vector DB` becomes stale; `Recent Index` grows.
+  - Detect: `vector_index_lag = change_seq - indexed_seq`, Recent Index size/TTL pressure.
+  - Recover: autoscale embedding workers; apply ingestion backpressure; temporarily extend Recent Index retention.
+
+- **Recent Index outage**
+  - What happens: freshness guarantee breaks for read-after-write.
+  - Detect: health checks + query path “freshness_required_but_unavailable” counter.
+  - Recover: fail closed for strict queries; route writes to a degraded mode (queue writes until Recent Index returns) or accept writes but warn clients that read-after-write is unavailable.
+
+- **Embedding model upgrade**
+  - What happens: mixed embedding spaces destroy retrieval quality.
+  - Detect: requests retrieving across multiple `model_id`s; sudden recall drop.
+  - Recover: dual-write embeddings to new `model_id`, run parallel retrieval + A/B, cut over by tenant, then garbage-collect old index.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Shard `Recent Index` by tenant and move it to a dedicated service tier with WAL + fast restarts.
+  - Add ANN prefiltering by ACL/namespace to cut candidate sets early.
+
+- **100x scale:**
+  - Replace “sync embed on write” with a streaming, low-latency embedding tier (GPU pool) and strict admission control.
+  - Partition the main `Vector DB` by tenant/namespace and introduce per-partition watermarks to avoid global head-of-line blocking during reindexing.
+
+## Operational Notes
+
+- Track three numbers per tenant: `change_seq`, `indexed_seq`, and `recent_index_oldest_seq`; alerts trigger on sustained divergence.
+- Make freshness explicit in APIs: `max_staleness_ms` and `write_token`; log them so correctness bugs are debuggable.
+- Keep `Recent Index` bounded by policy (TTL + max bytes). When it hits limits, reject bulk imports or relax freshness for non-interactive workloads—never silently drop recent updates.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+thinking
+**Evaluating database options**
+
+I need to provide a critique using the specified markdown format, focusing on core insights and components. I’ll list simplification opportunities and stress test 3-5 scenarios. Recommendations should include musts, shoulds, and nice-to-haves, along with what's currently working well.  
+
+I’m considering alternatives like Postgres LISTEN/NOTIFY or Redis. I’ll think about the recent index custom service and potential use of Redis vector similarity or PG vector. There are challenges with scaling, especially for large chunks. It might be simpler to use one vector DB with two collections rather than a custom solution.
+thinking
+**Addressing query gating concerns**
+
+I need to figure out how to avoid read query gating on indexed sequences when there's no write token. To minimize staleness to a maximum of 60 seconds, queries must include all documents with a change sequence from the last 60 seconds. This means that any updated document should reflect changes within that time frame. 
+
+I’ll implement a hot index immediately and ensure embedding sync for all changed chunks. It's important to consider write latency and possibly allow drafts or pre-chunking. I’ll also focus on idempotency and ensure old versions are excluded from retrieval, utilizing tombstones to manage deletions and applying ACLs consistently.
+thinking
+**Identifying failure modes**
+
+I’m considering potential failure modes like Postgres downtime, network issues between the API and recent index, or slowdowns in the embedding service. Other possibilities include vector DB returning partial results or hot index size increases, as well as issues like duplicate writes or schema migrations.
+
+It’s also important to note operational complexities with custom services and whether a small team can handle everything. I might explore replacing this with managed solutions like Redis or Elastic. Read-after-write semantics need to ensure relevance, meaning the retrieval logic must match expected documents. If a query is relevant, the document should appear, but retrieval quality relies on the right embeddings.
+thinking
+**Defining contract details**
+
+The contract could be interpreted to mean that if a document is retrieved, it should be the latest one available. Users might need an option to include specific documents using a doc_id filter. I’m considering the sequence numbers to be monotonic per tenant to avoid global contention, either with a Postgres sequence or ULID/time. They've previously rejected timestamps due to clock skew. 
+
+Using a central Postgres sequence could allow for managing updates effectively while providing `change_seq` for auditing. I also need to publish `indexed_seq` for each tenant's index and consider recent index WAL storage for determinism.  My plan could involve using Postgres for primary storage and vector DB for recent embeddings with limited retention to support quick updates and queries.
+thinking
+**Exploring simplification options**
+
+I'm thinking about some simplification suggestions, like unifying embedding computation. To avoid syncing embeddings on write, I could use precomputed embeddings. Maybe it’s alright to implement a lightweight approximate embedding model for the hot index and later recompute with the full model. 
+
+I also need to clarify the behaviors related to the "write_token" and "max_staleness," especially when the token is missing or older. Regarding hot index eviction, I must ensure proper deletions from the hot index after backfilling into the main index. Defining a commit point with per-document acknowledgments is vital.   
+
+Let’s create a structured critique with markdown tables that include core insights, simplification opportunities, and stress test scenarios. Recommendations and what's working well will also be part of the output.
+codex
+## Elegance Check
+
+### The Core Insight
+Treat “freshness” as a query constraint with an explicit, auditable contract (`change_seq`/`indexed_seq` + `write_token`), instead of trying to coerce an eventually-consistent vector index into behaving like a transactional database.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Postgres metadata + `change_seq` | Single source of truth for versions/ACLs/watermarks; debuggable correctness. |
+| Versioned chunks + `model_id` | Prevents split-brain retrieval and embedding-space mixing during upgrades. |
+| Async ingest/embed pipeline | Throughput/cost control for the 200M chunk bulk index and backfills. |
+| Query-time merge + filters | Only place you can reliably enforce “latest version + correct model + ACL”. |
+| “Recent changes” index (concept) | The only robust way to make read-after-write independent of async lag. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom in-memory FAISS/HNSW service with WAL for `Recent Index` | Use a managed store for the hot tier: (a) a second collection/namespace in the same vector DB, (b) Redis/RediSearch vector index, or (c) Postgres `pgvector` for “last N minutes” | Less bespoke ops; may cost more and/or have lower recall/throughput vs hand-tuned FAISS. |
+| Global `change_seq` watermark | Per-tenant (or per-namespace) sequences stored in Postgres; publish per-tenant `indexed_seq` | Avoids global contention and head-of-line blocking; slightly more bookkeeping. |
+| “Remove from Recent Index when indexed” based on advancing `indexed_seq` | Track per-document (or per-chunk-batch) “indexed” acknowledgements; only evict hot entries once that doc_version is fully present in main | More state, but avoids correctness gaps where `indexed_seq` advances while some chunks are missing. |
+| Strict read-after-write depends on Recent Index availability | Make RA-W satisfiable by durable storage: write embeddings to Postgres/Redis first, then replicate into hot ANN; retrieval can fall back to exact/limited scan for that doc_id when hot ANN is down | Higher tail latency in degraded mode, but avoids hard “freshness error” for interactive users. |
+| ACL filtering only at retrieval time | Pre-partition indexes by tenant/namespace (and maybe coarse ACL groups) so ANN search never considers obviously-ineligible chunks | More partitions/indexes to manage; much better latency/cost predictability at 2k QPS. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres is down for 5 minutes**
+   - Design’s answer: not addressed (Postgres is the write-path truth + seq generator).
+   - Recommendation: Strengthen (define write behavior: reject writes vs accept into a durable queue; define read behavior/caching and how `write_token` is issued).
+
+2. **Recent Index is slow (not down), causing synchronous write latency spikes**
+   - Design’s answer: not addressed (only covers outage).
+   - Recommendation: Strengthen (add admission control: max doc size for sync path, per-tenant rate limits, “async write with explicit freshness_pending status”, and SLOs for write p95).
+
+3. **Network partition between RAG API and Recent Index**
+   - Design’s answer: “fail closed for strict read-after-write”.
+   - Recommendation: Acceptable for correctness, but add a degraded fallback for the specific doc in `write_token` (fetch chunk text by doc_id/version directly; optionally run exact embedding match or bypass retrieval with “pinned doc context” for that user).
+
+4. **Async pipeline processes out-of-order / duplicates / partial failures**
+   - Design’s answer: implied via idempotent upserts, but not specified.
+   - Recommendation: Strengthen (define event IDs, idempotency keys, per-doc “complete” markers, and how you prevent `indexed_seq` from advancing past missing work).
+
+5. **Hot tier growth during backlog exceeds memory/TTL policy**
+   - Design’s answer: “never silently drop; reject bulk imports or relax freshness”.
+   - Recommendation: Strengthen (make the policy mechanical: per-tenant budgets, backpressure signals to writers, and an explicit “freshness class” so imports can degrade without impacting interactive RA-W).
+
+## Recommendations
+
+### Must Fix
+- Define the **durable correctness point** for eviction: don’t evict hot entries based solely on a global `indexed_seq`; require per-doc/per-version completeness or you risk freshness gaps.
+- Specify **idempotency + ordering** in the pipeline (event IDs, dedupe, replay semantics, and how to handle partial chunk failures).
+- Add a **write-path latency budget and admission control** for sync embedding (max doc/chunk delta size, per-tenant rate limits, and an explicit degraded mode).
+
+### Should Consider
+- Replace the bespoke `Recent Index` service with a **managed hot index** (second collection in vector DB, Redis vector, or `pgvector` for recent-only) unless you have a clear SLO/cost reason to own FAISS+WAL.
+- Partition watermarks by tenant/namespace to avoid global coupling and simplify multi-tenant isolation.
+- Add an API affordance for the user intent behind RA-W: **“pin/include doc_id(s)”** (or “must-use write_token doc”) so correctness doesn’t depend on the ANN recall of a freshly embedded doc.
+
+### Nice to Have
+- A documented **degraded-read playbook** (what clients should do on freshness errors; retry/backoff; UI messaging).
+- A clear **model rollout contract** (dual-write duration, cutover criteria, and how queries choose `model_id` during migration).
+- Operational SLO dashboards that tie `vector_index_lag` and hot-tier pressure to **user-visible freshness compliance**.
+
+## What's Working Well
+- The design is honest that strong consistency in vector search is the wrong battle; the “freshness layer” is a clean abstraction.
+- Sequence-number watermarks + versioned chunks make correctness debuggable (you can explain *why* a chunk appeared).
+- Failing closed for strict RA-W is the right default for trust; you’re not hiding staleness behind “best effort”.
+- The hot/cold split keeps the interesting part (freshness) bounded, and lets the bulk index stay cost-optimized.
+tokens used
+5,402
+## Elegance Check
+
+### The Core Insight
+Treat “freshness” as a query constraint with an explicit, auditable contract (`change_seq`/`indexed_seq` + `write_token`), instead of trying to coerce an eventually-consistent vector index into behaving like a transactional database.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Postgres metadata + `change_seq` | Single source of truth for versions/ACLs/watermarks; debuggable correctness. |
+| Versioned chunks + `model_id` | Prevents split-brain retrieval and embedding-space mixing during upgrades. |
+| Async ingest/embed pipeline | Throughput/cost control for the 200M chunk bulk index and backfills. |
+| Query-time merge + filters | Only place you can reliably enforce “latest version + correct model + ACL”. |
+| “Recent changes” index (concept) | The only robust way to make read-after-write independent of async lag. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom in-memory FAISS/HNSW service with WAL for `Recent Index` | Use a managed store for the hot tier: (a) a second collection/namespace in the same vector DB, (b) Redis/RediSearch vector index, or (c) Postgres `pgvector` for “last N minutes” | Less bespoke ops; may cost more and/or have lower recall/throughput vs hand-tuned FAISS. |
+| Global `change_seq` watermark | Per-tenant (or per-namespace) sequences stored in Postgres; publish per-tenant `indexed_seq` | Avoids global contention and head-of-line blocking; slightly more bookkeeping. |
+| “Remove from Recent Index when indexed” based on advancing `indexed_seq` | Track per-document (or per-chunk-batch) “indexed” acknowledgements; only evict hot entries once that doc_version is fully present in main | More state, but avoids correctness gaps where `indexed_seq` advances while some chunks are missing. |
+| Strict read-after-write depends on Recent Index availability | Make RA-W satisfiable by durable storage: write embeddings to Postgres/Redis first, then replicate into hot ANN; retrieval can fall back to exact/limited scan for that doc_id when hot ANN is down | Higher tail latency in degraded mode, but avoids hard “freshness error” for interactive users. |
+| ACL filtering only at retrieval time | Pre-partition indexes by tenant/namespace (and maybe coarse ACL groups) so ANN search never considers obviously-ineligible chunks | More partitions/indexes to manage; much better latency/cost predictability at 2k QPS. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres is down for 5 minutes**
+   - Design’s answer: not addressed (Postgres is the write-path truth + seq generator).
+   - Recommendation: Strengthen (define write behavior: reject writes vs accept into a durable queue; define read behavior/caching and how `write_token` is issued).
+
+2. **Recent Index is slow (not down), causing synchronous write latency spikes**
+   - Design’s answer: not addressed (only covers outage).
+   - Recommendation: Strengthen (add admission control: max doc size for sync path, per-tenant rate limits, “async write with explicit freshness_pending status”, and SLOs for write p95).
+
+3. **Network partition between RAG API and Recent Index**
+   - Design’s answer: “fail closed for strict read-after-write”.
+   - Recommendation: Acceptable for correctness, but add a degraded fallback for the specific doc in `write_token` (fetch chunk text by doc_id/version directly; optionally run exact embedding match or bypass retrieval with “pinned doc context” for that user).
+
+4. **Async pipeline processes out-of-order / duplicates / partial failures**
+   - Design’s answer: implied via idempotent upserts, but not specified.
+   - Recommendation: Strengthen (define event IDs, idempotency keys, per-doc “complete” markers, and how you prevent `indexed_seq` from advancing past missing work).
+
+5. **Hot tier growth during backlog exceeds memory/TTL policy**
+   - Design’s answer: “never silently drop; reject bulk imports or relax freshness”.
+   - Recommendation: Strengthen (make the policy mechanical: per-tenant budgets, backpressure signals to writers, and an explicit “freshness class” so imports can degrade without impacting interactive RA-W).
+
+## Recommendations
+
+### Must Fix
+- Define the **durable correctness point** for eviction: don’t evict hot entries based solely on a global `indexed_seq`; require per-doc/per-version completeness or you risk freshness gaps.
+- Specify **idempotency + ordering** in the pipeline (event IDs, dedupe, replay semantics, and how to handle partial chunk failures).
+- Add a **write-path latency budget and admission control** for sync embedding (max doc/chunk delta size, per-tenant rate limits, and an explicit degraded mode).
+
+### Should Consider
+- Replace the bespoke `Recent Index` service with a **managed hot index** (second collection in vector DB, Redis vector, or `pgvector` for recent-only) unless you have a clear SLO/cost reason to own FAISS+WAL.
+- Partition watermarks by tenant/namespace to avoid global coupling and simplify multi-tenant isolation.
+- Add an API affordance for the user intent behind RA-W: **“pin/include doc_id(s)”** (or “must-use write_token doc”) so correctness doesn’t depend on the ANN recall of a freshly embedded doc.
+
+### Nice to Have
+- A documented **degraded-read playbook** (what clients should do on freshness errors; retry/backoff; UI messaging).
+- A clear **model rollout contract** (dual-write duration, cutover criteria, and how queries choose `model_id` during migration).
+- Operational SLO dashboards that tie `vector_index_lag` and hot-tier pressure to **user-visible freshness compliance**.
+
+## What's Working Well
+- The design is honest that strong consistency in vector search is the wrong battle; the “freshness layer” is a clean abstraction.
+- Sequence-number watermarks + versioned chunks make correctness debuggable (you can explain *why* a chunk appeared).
+- Failing closed for strict RA-W is the right default for trust; you’re not hiding staleness behind “best effort”.
+- The hot/cold split keeps the interesting part (freshness) bounded, and lets the bulk index stay cost-optimized.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/retrieval-augmented-generation.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2aff-50ec-77d2-b2a7-5374fce7c155
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Retrieval-Augmented Generation (RAG) with Freshness Guarantees"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["rag", "vector-search", "freshness", "consistency", "indexing", "llm-infra"]
+---
+
+## Overview
+
+This system augments LLM prompts with retrieved context, but with a strict freshness contract: when a document changes, retrieval reflects that change within a bounded window (and supports read-after-write). The elegant move is to stop pretending the vector index is strongly consistent and instead **design an explicit “freshness layer”** that makes freshness a first-class query constraint.
+
+The core idea is a **two-tier retrieval index**: a durable vector store for the bulk of history, plus a small “recent changes” vector index that is updated immediately and queried on every request. This avoids blocking queries on asynchronous pipelines and turns freshness from “best effort” into an enforceable SLA.
+
+Everything else stays boring: Postgres for metadata, object storage for raw docs/chunks, a managed vector DB for main similarity search, and a simple async embedding pipeline for throughput and cost control.
+
+## What Makes This Hard
+
+Naive RAG systems silently serve stale context because the write path (documents) and the read path (vector index) are decoupled by an async embedding pipeline. Teams ship “eventual” freshness, then get paged when users ask “why doesn’t it know what I just changed?”
+
+The trap: trying to “make the vector DB consistent” by adding retries and delays. You end up with tail-latency spikes, unpredictable correctness, and an on-call nightmare when the embedding pipeline lags. Freshness needs an explicit contract, a measurable watermark, and a plan for when the pipeline is behind.
+
+## Requirements
+
+### Functional Requirements
+- Retrieve top-K relevant chunks for a query with **max staleness ≤ 60s** for updated documents.
+- Support **read-after-write**: after a successful write, subsequent queries from that user reflect it immediately.
+- Provide citations (document id, chunk id, version) for every returned chunk.
+- Prevent mixing incompatible embedding spaces (model/version changes) in a single retrieval.
+
+### Scale Targets
+- Corpus: 10M documents, ~200M chunks (avg 20 chunks/doc).
+- Online traffic: 500 QPS sustained, 2k QPS peak; p95 retrieval+prompt build ≤ 250ms (excluding LLM).
+- Writes/updates: 200 updates/sec burst (import jobs), 10 updates/sec steady.
+- Freshness SLA: 99.9% of queries satisfy max staleness; read-after-write is strict (not probabilistic).
+
+## Key Design Decisions
+
+- **Two-tier index (Main + Recent)**
+  - Chose: main vector DB for history + “recent changes” vector index updated immediately.
+  - Rejected: blocking reads until async pipeline catches up.
+  - Why: guarantees freshness without turning indexing lag into user latency.
+
+- **Watermark-based freshness contract**
+  - Chose: every doc change emits a monotonically increasing `change_seq`; indexes publish `indexed_seq`.
+  - Rejected: “timestamp-based” freshness inferred from clocks across services.
+  - Why: sequence numbers are auditable, composable, and don’t fail under clock skew.
+
+- **Versioned chunks and embeddings**
+  - Chose: chunk ids include `doc_version`; retrieval filters by latest version and embedding model id.
+  - Rejected: in-place updates in the vector store.
+  - Why: avoids “split brain” retrieval where old and new chunks coexist and leak into prompts.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> A[RAG API]
+  A --> R[Retriever]
+  R --> V[Vector DB]
+  R --> X[Recent Index]
+  R --> D[Doc Store]
+  A --> L[LLM]
+  W[Ingest+Embed Pipeline] --> D
+  W --> V
+  W --> X
+```
+
+### Components
+
+- `RAG API`
+  - Owns the request contract: query, tenant, freshness requirements (`max_staleness`, optional `write_token`), and response citations.
+
+- `Retriever`
+  - Runs hybrid retrieval across `Recent Index` and `Vector DB`, merges results, fetches chunk text from `Doc Store`, and enforces freshness/version filters.
+
+- `Vector DB` (main index)
+  - Stores the bulk embedding index (HNSW/IVF), optimized for recall and cost. Updates arrive asynchronously via the pipeline.
+
+- `Recent Index`
+  - Small, fast index covering the last N minutes/hours of updates (time-bounded or size-bounded). It exists solely to satisfy freshness without waiting.
+  - Practical implementation: a dedicated service running FAISS/HNSW in memory with WAL to disk; shard by tenant.
+
+- `Doc Store`
+  - Object storage for chunk text + Postgres for metadata (`doc_id`, `doc_version`, `change_seq`, ACLs, chunk mapping).
+  - This is the source of truth; indexes are derived.
+
+- `Ingest+Embed Pipeline`
+  - Consumes document changes, chunks content, computes embeddings, and upserts into `Vector DB`. Also backfills/evicts in `Recent Index`.
+
+- `LLM`
+  - Receives a prompt built from retrieved chunks plus system instructions, returns completion with citations.
+
+## Deep Dive: Freshness Guarantees
+
+Freshness is enforced by a **sequence-based contract**:
+
+1. **Write path produces a durable sequence**
+   - Every document mutation commits to Postgres with an incrementing `change_seq` (global or per-tenant).
+   - The write response returns a `write_token = (tenant_id, change_seq, doc_id, doc_version)`.
+
+2. **Recent Index gives immediate visibility**
+   - On write, the system synchronously computes embeddings for the new/changed chunks and inserts them into `Recent Index` keyed by `(doc_id, doc_version, chunk_id, model_id)`.
+   - This is the only “synchronous ML” in the system, and it’s intentionally narrow: it only covers the delta that makes freshness hard.
+
+3. **Async pipeline backfills the main index**
+   - The pipeline processes the same change events, computes embeddings (same model id), and upserts into `Vector DB`.
+   - Once a change is present in `Vector DB`, the pipeline marks it indexed by advancing `indexed_seq` and eventually removes it from `Recent Index` (or lets TTL expire).
+
+4. **Query-time enforcement**
+   - For a request with `max_staleness` and/or a `write_token`, the Retriever:
+     - Always queries both indexes.
+     - Filters results to the **latest `doc_version`** and the correct `model_id`.
+     - If a `write_token` exists, it requires that any chunks from that `doc_id` come from `doc_version >= token.doc_version` (the Recent Index guarantees this immediately).
+     - If the Recent Index is unavailable, the system fails closed for strict read-after-write (returns an explicit freshness error) rather than silently serving stale context.
+
+5. **Why this is elegant**
+   - Freshness is not “waiting for eventually consistent infrastructure.” It’s a deliberately small, bounded surface area: recent updates only.
+   - When indexing lags (imports, outages), correctness stays stable; only capacity pressure grows in `Recent Index`, which is observable and controllable.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Freshness with bounded latency | Higher write latency (sync embed) |
+| Auditable correctness (seq/version) | More moving parts (Recent Index) |
+| Stable p95 during indexing lag | Extra memory/ops for delta index |
+
+## Failure Modes
+
+- **Embedding pipeline lag spikes (backlog)**
+  - What happens: `Vector DB` becomes stale; `Recent Index` grows.
+  - Detect: `vector_index_lag = change_seq - indexed_seq`, Recent Index size/TTL pressure.
+  - Recover: autoscale embedding workers; apply ingestion backpressure; temporarily extend Recent Index retention.
+
+- **Recent Index outage**
+  - What happens: freshness guarantee breaks for read-after-write.
+  - Detect: health checks + query path “freshness_required_but_unavailable” counter.
+  - Recover: fail closed for strict queries; route writes to a degraded mode (queue writes until Recent Index returns) or accept writes but warn clients that read-after-write is unavailable.
+
+- **Embedding model upgrade**
+  - What happens: mixed embedding spaces destroy retrieval quality.
+  - Detect: requests retrieving across multiple `model_id`s; sudden recall drop.
+  - Recover: dual-write embeddings to new `model_id`, run parallel retrieval + A/B, cut over by tenant, then garbage-collect old index.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Shard `Recent Index` by tenant and move it to a dedicated service tier with WAL + fast restarts.
+  - Add ANN prefiltering by ACL/namespace to cut candidate sets early.
+
+- **100x scale:**
+  - Replace “sync embed on write” with a streaming, low-latency embedding tier (GPU pool) and strict admission control.
+  - Partition the main `Vector DB` by tenant/namespace and introduce per-partition watermarks to avoid global head-of-line blocking during reindexing.
+
+## Operational Notes
+
+- Track three numbers per tenant: `change_seq`, `indexed_seq`, and `recent_index_oldest_seq`; alerts trigger on sustained divergence.
+- Make freshness explicit in APIs: `max_staleness_ms` and `write_token`; log them so correctness bugs are debuggable.
+- Keep `Recent Index` bounded by policy (TTL + max bytes). When it hits limits, reject bulk imports or relax freshness for non-interactive workloads—never silently drop recent updates.
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Treat “freshness” as a query constraint with an explicit, auditable contract (`change_seq`/`indexed_seq` + `write_token`), instead of trying to coerce an eventually-consistent vector index into behaving like a transactional database.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Postgres metadata + `change_seq` | Single source of truth for versions/ACLs/watermarks; debuggable correctness. |
+| Versioned chunks + `model_id` | Prevents split-brain retrieval and embedding-space mixing during upgrades. |
+| Async ingest/embed pipeline | Throughput/cost control for the 200M chunk bulk index and backfills. |
+| Query-time merge + filters | Only place you can reliably enforce “latest version + correct model + ACL”. |
+| “Recent changes” index (concept) | The only robust way to make read-after-write independent of async lag. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom in-memory FAISS/HNSW service with WAL for `Recent Index` | Use a managed store for the hot tier: (a) a second collection/namespace in the same vector DB, (b) Redis/RediSearch vector index, or (c) Postgres `pgvector` for “last N minutes” | Less bespoke ops; may cost more and/or have lower recall/throughput vs hand-tuned FAISS. |
+| Global `change_seq` watermark | Per-tenant (or per-namespace) sequences stored in Postgres; publish per-tenant `indexed_seq` | Avoids global contention and head-of-line blocking; slightly more bookkeeping. |
+| “Remove from Recent Index when indexed” based on advancing `indexed_seq` | Track per-document (or per-chunk-batch) “indexed” acknowledgements; only evict hot entries once that doc_version is fully present in main | More state, but avoids correctness gaps where `indexed_seq` advances while some chunks are missing. |
+| Strict read-after-write depends on Recent Index availability | Make RA-W satisfiable by durable storage: write embeddings to Postgres/Redis first, then replicate into hot ANN; retrieval can fall back to exact/limited scan for that doc_id when hot ANN is down | Higher tail latency in degraded mode, but avoids hard “freshness error” for interactive users. |
+| ACL filtering only at retrieval time | Pre-partition indexes by tenant/namespace (and maybe coarse ACL groups) so ANN search never considers obviously-ineligible chunks | More partitions/indexes to manage; much better latency/cost predictability at 2k QPS. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres is down for 5 minutes**
+   - Design’s answer: not addressed (Postgres is the write-path truth + seq generator).
+   - Recommendation: Strengthen (define write behavior: reject writes vs accept into a durable queue; define read behavior/caching and how `write_token` is issued).
+
+2. **Recent Index is slow (not down), causing synchronous write latency spikes**
+   - Design’s answer: not addressed (only covers outage).
+   - Recommendation: Strengthen (add admission control: max doc size for sync path, per-tenant rate limits, “async write with explicit freshness_pending status”, and SLOs for write p95).
+
+3. **Network partition between RAG API and Recent Index**
+   - Design’s answer: “fail closed for strict read-after-write”.
+   - Recommendation: Acceptable for correctness, but add a degraded fallback for the specific doc in `write_token` (fetch chunk text by doc_id/version directly; optionally run exact embedding match or bypass retrieval with “pinned doc context” for that user).
+
+4. **Async pipeline processes out-of-order / duplicates / partial failures**
+   - Design’s answer: implied via idempotent upserts, but not specified.
+   - Recommendation: Strengthen (define event IDs, idempotency keys, per-doc “complete” markers, and how you prevent `indexed_seq` from advancing past missing work).
+
+5. **Hot tier growth during backlog exceeds memory/TTL policy**
+   - Design’s answer: “never silently drop; reject bulk imports or relax freshness”.
+   - Recommendation: Strengthen (make the policy mechanical: per-tenant budgets, backpressure signals to writers, and an explicit “freshness class” so imports can degrade without impacting interactive RA-W).
+
+## Recommendations
+
+### Must Fix
+- Define the **durable correctness point** for eviction: don’t evict hot entries based solely on a global `indexed_seq`; require per-doc/per-version completeness or you risk freshness gaps.
+- Specify **idempotency + ordering** in the pipeline (event IDs, dedupe, replay semantics, and how to handle partial chunk failures).
+- Add a **write-path latency budget and admission control** for sync embedding (max doc/chunk delta size, per-tenant rate limits, and an explicit degraded mode).
+
+### Should Consider
+- Replace the bespoke `Recent Index` service with a **managed hot index** (second collection in vector DB, Redis vector, or `pgvector` for recent-only) unless you have a clear SLO/cost reason to own FAISS+WAL.
+- Partition watermarks by tenant/namespace to avoid global coupling and simplify multi-tenant isolation.
+- Add an API affordance for the user intent behind RA-W: **“pin/include doc_id(s)”** (or “must-use write_token doc”) so correctness doesn’t depend on the ANN recall of a freshly embedded doc.
+
+### Nice to Have
+- A documented **degraded-read playbook** (what clients should do on freshness errors; retry/backoff; UI messaging).
+- A clear **model rollout contract** (dual-write duration, cutover criteria, and how queries choose `model_id` during migration).
+- Operational SLO dashboards that tie `vector_index_lag` and hot-tier pressure to **user-visible freshness compliance**.
+
+## What's Working Well
+- The design is honest that strong consistency in vector search is the wrong battle; the “freshness layer” is a clean abstraction.
+- Sequence-number watermarks + versioned chunks make correctness debuggable (you can explain *why* a chunk appeared).
+- Failing closed for strict RA-W is the right default for trust; you’re not hiding staleness behind “best effort”.
+- The hot/cold split keeps the interesting part (freshness) bounded, and lets the bulk index stay cost-optimized.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+
+thinking
+**Resolving output format conflicts**
+
+I see that the user has conflicting instructions for rewriting their document. They want to keep the format including sections like "Minimal architecture, justification, What We Removed, trade-offs," but they also said not to add sections—only to cut or condense. I'll need to repurpose existing section headings instead of creating new ones. For example, I could combine "Architecture" with "justification." It’s a balancing act, but I think I can manage it!
+thinking
+**Clarifying section modifications**
+
+I’m looking to incorporate "What We Removed" into existing sections like "Key Design Decisions," "Trade-offs," or "Operational Notes," but there’s a requirement for an explicit section on this. It feels tricky since I can't add sections, but maybe I can rename an existing section without modifying the title or structure too much. 
+
+I can consider embedding "What We Removed" as a bolded label within the "Trade-offs" section. The user hasn’t restricted renaming, but it’s safer to keep it as is while still satisfying the requirement!
+thinking
+**Incorporating simplifications from critique**
+
+I’m considering simplifications based on the critique regarding the architecture. For the recent index, I could use a managed service, keeping the same vector DB but creating a separate collection for recent data. I can replace the custom Recent Index service with "Recent Index (same vector DB)" to merge components.
+
+So the new architecture would include the RAG API (with retriever), Postgres, object store, and vector DB with two namespaces. I plan to streamline it by removing the standalone Retriever service and simplifying how we handle sequences for eviction correctness. This should make everything cleaner!
+thinking
+**Addressing data freshness and pipeline management**
+
+I need to ensure there's no stale data, as read-after-write depends on embedding data into a recent namespace synchronously. If the pipeline lags, recent data might retain longer than the desired staleness. 
+
+To manage this, I can set a retention policy and apply backpressure on writes. If Postgres is down, writes will fail, and I need a clear plan for reads. I’m considering failing reads or serving with cached metadata for simplicity. I think it’s best for the RAG API to return a 503 error if Postgres is down—that feels more honest and straightforward!
+thinking
+**Finalizing the design document**
+
+I'm working to simplify and finalize the design document based on user instructions. I’ll incorporate elements like network partitioning and the pinned document context for retrieval if the recent index isn't reachable, but without adding new components.
+
+The architecture will use the same vector DB with two namespaces and a Postgres table as a queue. I'll ensure to condense sections like Recommendations and critique, focusing on the final design. I’ll also include an explicit section listing what we've removed, but keep it concise and clear. It’s all about presenting a straightforward, effective design!
+thinking
+**Structuring the simplified design document**
+
+I’m working on a minimal design for the RAG API that includes the retriever, Postgres, Doc Store, Vector DB with two indexes, an Embed Worker, and an LLM—that gives me five or six components.
+
+In the "Deep Dive: Freshness Guarantees," I’ll outline steps for the write path and query path while simplifying the language. I’ll include clear sections for "Trade-offs" and "Failure Modes," presenting trade-offs openly.
+
+I’ll remove unnecessary sections like "What Makes This Hard" and "What I’d Do Differently," while still keeping the required headers intact! This should make everything clear and concise.
+codex
+```markdown
+---
+title: "Retrieval-Augmented Generation (RAG) with Freshness Guarantees"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["rag", "vector-search", "freshness", "consistency", "indexing", "llm-infra"]
+---
+
+## Overview
+
+This RAG system guarantees freshness by making it a first-class query constraint with an auditable contract: Postgres assigns a per-tenant monotonic `change_seq`, and the API returns a `write_token` on successful writes for strict read-after-write.
+
+Retrieval uses a two-tier index, implemented as two namespaces in the same managed vector DB:
+- `recent`: written synchronously on document updates to make changes immediately visible.
+- `main`: filled asynchronously for throughput and cost.
+
+Postgres is the source of truth for document versions, ACLs, active embedding model, and watermarks. Object storage holds chunk text. The API always queries both indexes, merges results, and enforces version/model/ACL constraints at query time.
+
+## Requirements
+
+### Functional Requirements
+- Retrieve top-K relevant chunks for a query with max staleness ≤ 60s for updated documents.
+- Support strict read-after-write via `write_token`.
+- Provide citations (document id, chunk id, version) for every returned chunk.
+- Prevent mixing incompatible embedding spaces (model/version changes) in a single retrieval.
+
+### Scale Targets
+- Corpus: 10M documents, ~200M chunks (avg 20 chunks/doc).
+- Online traffic: 500 QPS sustained, 2k QPS peak; p95 retrieval+prompt build ≤ 250ms (excluding LLM).
+- Writes/updates: 200 updates/sec burst (import jobs), 10 updates/sec steady.
+- Freshness SLA: 99.9% of queries satisfy max staleness; read-after-write is strict.
+
+## Key Design Decisions
+
+- **Two-tier index (Main + Recent)**
+  - `recent` is updated synchronously on writes; `main` is updated asynchronously.
+  - Queries always hit both and merge.
+
+- **Sequence-based freshness contract**
+  - Postgres assigns `change_seq` per tenant and tracks `indexed_seq` for the async worker.
+  - `write_token = (tenant_id, change_seq, doc_id, doc_version, model_id)` is the read-after-write anchor.
+
+- **Versioned chunks and a single active `model_id`**
+  - Chunk ids include `(doc_id, doc_version, chunk_id, model_id)`.
+  - Each tenant has exactly one `active_model_id` used for retrieval.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> A[RAG API]
+  A --> P[Postgres]
+  A --> S[Doc Store]
+  A --> V[Vector DB<br/>(main + recent)]
+  A --> L[LLM]
+  W[Embed Worker] --> P
+  W --> S
+  W --> V
+```
+
+### Components
+
+- `RAG API`
+  - Owns read/write contracts, sync embedding for strict writes, retrieval, merge, filtering, and prompt assembly.
+  - Justification: the only custom surface area; it defines correctness.
+
+- `Postgres`
+  - Stores docs/chunk metadata, ACLs, `change_seq`, per-tenant `indexed_seq`, and `active_model_id`.
+  - Justification: the durable truth needed for debuggable freshness and version/ACL enforcement.
+
+- `Doc Store`
+  - Object storage for chunk text and document payloads.
+  - Justification: cheapest durable store for the content the model actually reads.
+
+- `Vector DB (main + recent namespaces)`
+  - Stores embeddings for similarity search; `recent` is small and fast, `main` is large and cost-optimized.
+  - Justification: the only ANN dependency; two-tiering is how freshness stays independent of async lag.
+
+- `Embed Worker`
+  - Pulls unprocessed changes from Postgres, computes embeddings, upserts into `main`, and advances `indexed_seq` when complete.
+  - Justification: separates throughput/cost from interactive latency.
+
+- `LLM`
+  - Generates the final response with citations.
+  - Justification: core product output.
+
+## Deep Dive: Freshness Guarantees
+
+Freshness is enforced by a write token plus a fail-closed check when freshness is requested.
+
+1. **Write path: durable change + token**
+   - A document mutation commits in Postgres with a new `doc_version` and per-tenant `change_seq`.
+   - The response returns `write_token = (tenant_id, change_seq, doc_id, doc_version, model_id)`.
+
+2. **Strict read-after-write: sync embed to `recent`**
+   - For strict writes, the API chunks the delta, computes embeddings, and upserts them into the vector DB `recent` namespace.
+   - The same chunks’ text is written to the Doc Store and mapped in Postgres.
+
+3. **Async fill: worker upserts to `main`**
+   - The worker reads pending changes from Postgres (idempotency key: `(tenant_id, change_seq)`).
+   - It computes embeddings and upserts into `main`.
+   - It advances `indexed_seq` only after all chunks for that `change_seq` succeed.
+
+4. **Query path: always merge + enforce**
+   - The API queries both `recent` and `main`, merges, fetches chunk text from Doc Store, and filters by:
+     - tenant, ACLs, `active_model_id`, and latest `doc_version`.
+   - With a `write_token`, results for `token.doc_id` must be from `doc_version >= token.doc_version`.
+
+5. **Freshness when infrastructure is behind**
+   - If a request includes `write_token` or `max_staleness_ms`, and the vector DB `recent` namespace is unavailable, the API:
+     - Pins the `write_token` document by fetching its latest chunks directly from Doc Store/metadata and includes them in context (bounded by a strict size limit).
+     - If it still cannot satisfy the request, it returns an explicit freshness error (no silent staleness).
+
+6. **Admission control**
+   - Strict writes have a hard cap (max delta chunks / max bytes) and per-tenant rate limits.
+   - Bulk imports use non-strict writes (no sync embed, no `write_token`), so they cannot degrade interactive freshness.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Freshness without query delays | Higher latency on strict writes (sync embed) |
+| Simple ops (managed vector DB only) | Hot tier costs for `recent` retention |
+| Auditable correctness (seq/version/token) | Some strict requests fail closed under dependency loss |
+
+**What We Removed**
+- Standalone `Retriever` service (merged into `RAG API`).
+- Custom in-memory FAISS/HNSW + WAL `Recent Index` service (replaced by `recent` namespace in the managed vector DB).
+- Eviction correctness logic tied to global watermarks (replaced by TTL/size-bounded `recent` retention plus version filtering).
+
+## Failure Modes
+
+- **Postgres down**
+  - Writes and reads return 503 (no partial correctness mode).
+
+- **Vector DB `recent` slow**
+  - Strict writes are rate-limited or rejected; bulk writes continue.
+
+- **Network partition to vector DB**
+  - Freshness-required queries return freshness errors; `write_token` requests include pinned doc context when possible.
+
+- **Async worker duplicates / out-of-order**
+  - Changes are idempotent by `(tenant_id, change_seq)`; `indexed_seq` advances only after complete success per change.
+
+- **Hot tier growth exceeds policy**
+  - Strict writes reject with backpressure; bulk mode continues.
+
+- **Embedding model upgrade**
+  - `active_model_id` is switched only after backfill; retrieval uses exactly one model per tenant.
+
+## Operational Notes
+
+- Track per tenant: `change_seq`, `indexed_seq`, and `recent_retention_minutes` (effective TTL under load).
+- Alert on: sustained `change_seq - indexed_seq` growth, and `recent` retention falling below the freshness window.
+- Log on every request: `tenant_id`, `active_model_id`, `max_staleness_ms`, presence of `write_token`, and whether pinned-doc fallback was used.
+- Enforce bounded prompts: strict caps on pinned doc inclusion and total retrieved context bytes.
+```
+tokens used
+8,732
+```markdown
+---
+title: "Retrieval-Augmented Generation (RAG) with Freshness Guarantees"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["rag", "vector-search", "freshness", "consistency", "indexing", "llm-infra"]
+---
+
+## Overview
+
+This RAG system guarantees freshness by making it a first-class query constraint with an auditable contract: Postgres assigns a per-tenant monotonic `change_seq`, and the API returns a `write_token` on successful writes for strict read-after-write.
+
+Retrieval uses a two-tier index, implemented as two namespaces in the same managed vector DB:
+- `recent`: written synchronously on document updates to make changes immediately visible.
+- `main`: filled asynchronously for throughput and cost.
+
+Postgres is the source of truth for document versions, ACLs, active embedding model, and watermarks. Object storage holds chunk text. The API always queries both indexes, merges results, and enforces version/model/ACL constraints at query time.
+
+## Requirements
+
+### Functional Requirements
+- Retrieve top-K relevant chunks for a query with max staleness ≤ 60s for updated documents.
+- Support strict read-after-write via `write_token`.
+- Provide citations (document id, chunk id, version) for every returned chunk.
+- Prevent mixing incompatible embedding spaces (model/version changes) in a single retrieval.
+
+### Scale Targets
+- Corpus: 10M documents, ~200M chunks (avg 20 chunks/doc).
+- Online traffic: 500 QPS sustained, 2k QPS peak; p95 retrieval+prompt build ≤ 250ms (excluding LLM).
+- Writes/updates: 200 updates/sec burst (import jobs), 10 updates/sec steady.
+- Freshness SLA: 99.9% of queries satisfy max staleness; read-after-write is strict.
+
+## Key Design Decisions
+
+- **Two-tier index (Main + Recent)**
+  - `recent` is updated synchronously on writes; `main` is updated asynchronously.
+  - Queries always hit both and merge.
+
+- **Sequence-based freshness contract**
+  - Postgres assigns `change_seq` per tenant and tracks `indexed_seq` for the async worker.
+  - `write_token = (tenant_id, change_seq, doc_id, doc_version, model_id)` is the read-after-write anchor.
+
+- **Versioned chunks and a single active `model_id`**
+  - Chunk ids include `(doc_id, doc_version, chunk_id, model_id)`.
+  - Each tenant has exactly one `active_model_id` used for retrieval.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> A[RAG API]
+  A --> P[Postgres]
+  A --> S[Doc Store]
+  A --> V[Vector DB<br/>(main + recent)]
+  A --> L[LLM]
+  W[Embed Worker] --> P
+  W --> S
+  W --> V
+```
+
+### Components
+
+- `RAG API`
+  - Owns read/write contracts, sync embedding for strict writes, retrieval, merge, filtering, and prompt assembly.
+  - Justification: the only custom surface area; it defines correctness.
+
+- `Postgres`
+  - Stores docs/chunk metadata, ACLs, `change_seq`, per-tenant `indexed_seq`, and `active_model_id`.
+  - Justification: the durable truth needed for debuggable freshness and version/ACL enforcement.
+
+- `Doc Store`
+  - Object storage for chunk text and document payloads.
+  - Justification: cheapest durable store for the content the model actually reads.
+
+- `Vector DB (main + recent namespaces)`
+  - Stores embeddings for similarity search; `recent` is small and fast, `main` is large and cost-optimized.
+  - Justification: the only ANN dependency; two-tiering is how freshness stays independent of async lag.
+
+- `Embed Worker`
+  - Pulls unprocessed changes from Postgres, computes embeddings, upserts into `main`, and advances `indexed_seq` when complete.
+  - Justification: separates throughput/cost from interactive latency.
+
+- `LLM`
+  - Generates the final response with citations.
+  - Justification: core product output.
+
+## Deep Dive: Freshness Guarantees
+
+Freshness is enforced by a write token plus a fail-closed check when freshness is requested.
+
+1. **Write path: durable change + token**
+   - A document mutation commits in Postgres with a new `doc_version` and per-tenant `change_seq`.
+   - The response returns `write_token = (tenant_id, change_seq, doc_id, doc_version, model_id)`.
+
+2. **Strict read-after-write: sync embed to `recent`**
+   - For strict writes, the API chunks the delta, computes embeddings, and upserts them into the vector DB `recent` namespace.
+   - The same chunks’ text is written to the Doc Store and mapped in Postgres.
+
+3. **Async fill: worker upserts to `main`**
+   - The worker reads pending changes from Postgres (idempotency key: `(tenant_id, change_seq)`).
+   - It computes embeddings and upserts into `main`.
+   - It advances `indexed_seq` only after all chunks for that `change_seq` succeed.
+
+4. **Query path: always merge + enforce**
+   - The API queries both `recent` and `main`, merges, fetches chunk text from Doc Store, and filters by:
+     - tenant, ACLs, `active_model_id`, and latest `doc_version`.
+   - With a `write_token`, results for `token.doc_id` must be from `doc_version >= token.doc_version`.
+
+5. **Freshness when infrastructure is behind**
+   - If a request includes `write_token` or `max_staleness_ms`, and the vector DB `recent` namespace is unavailable, the API:
+     - Pins the `write_token` document by fetching its latest chunks directly from Doc Store/metadata and includes them in context (bounded by a strict size limit).
+     - If it still cannot satisfy the request, it returns an explicit freshness error (no silent staleness).
+
+6. **Admission control**
+   - Strict writes have a hard cap (max delta chunks / max bytes) and per-tenant rate limits.
+   - Bulk imports use non-strict writes (no sync embed, no `write_token`), so they cannot degrade interactive freshness.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Freshness without query delays | Higher latency on strict writes (sync embed) |
+| Simple ops (managed vector DB only) | Hot tier costs for `recent` retention |
+| Auditable correctness (seq/version/token) | Some strict requests fail closed under dependency loss |
+
+**What We Removed**
+- Standalone `Retriever` service (merged into `RAG API`).
+- Custom in-memory FAISS/HNSW + WAL `Recent Index` service (replaced by `recent` namespace in the managed vector DB).
+- Eviction correctness logic tied to global watermarks (replaced by TTL/size-bounded `recent` retention plus version filtering).
+
+## Failure Modes
+
+- **Postgres down**
+  - Writes and reads return 503 (no partial correctness mode).
+
+- **Vector DB `recent` slow**
+  - Strict writes are rate-limited or rejected; bulk writes continue.
+
+- **Network partition to vector DB**
+  - Freshness-required queries return freshness errors; `write_token` requests include pinned doc context when possible.
+
+- **Async worker duplicates / out-of-order**
+  - Changes are idempotent by `(tenant_id, change_seq)`; `indexed_seq` advances only after complete success per change.
+
+- **Hot tier growth exceeds policy**
+  - Strict writes reject with backpressure; bulk mode continues.
+
+- **Embedding model upgrade**
+  - `active_model_id` is switched only after backfill; retrieval uses exactly one model per tenant.
+
+## Operational Notes
+
+- Track per tenant: `change_seq`, `indexed_seq`, and `recent_retention_minutes` (effective TTL under load).
+- Alert on: sustained `change_seq - indexed_seq` growth, and `recent` retention falling below the freshness window.
+- Log on every request: `tenant_id`, `active_model_id`, `max_staleness_ms`, presence of `write_token`, and whether pinned-doc fallback was used.
+- Enforce bounded prompts: strict caps on pinned doc inclusion and total retrieved context bytes.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+Found invalid Mermaid diagrams, fixing...
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2b00-b2d4-7ea2-b370-c46ba17c31a8
+--------
+user
+Fix these Mermaid syntax errors:
+
+
+--- Block 1 ---
+flowchart LR
+  C[Client] --> A[RAG API]
+  A --> P[Postgres]
+  A --> S[Doc Store]
+  A --> V[Vector DB<br/>(main + recent)]
+  A --> L[LLM]
+  W[Embed Worker] --> P
+  W --> S
+  W --> V
+--- Error ---
+Generating single mermaid chart
+
+Error: Parse error on line 5:
+
+
+Common fixes:
+- Quote labels with special characters: A["Label (with parens)"]
+- Use short labels (2-4 words max)
+- Remove HTML tags
+- Keep diagrams simple (max 8 nodes)
+
+Output the complete fixed document.
+
+---
+
+```markdown
+---
+title: "Retrieval-Augmented Generation (RAG) with Freshness Guarantees"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["rag", "vector-search", "freshness", "consistency", "indexing", "llm-infra"]
+---
+
+## Overview
+
+This RAG system guarantees freshness by making it a first-class query constraint with an auditable contract: Postgres assigns a per-tenant monotonic `change_seq`, and the API returns a `write_token` on successful writes for strict read-after-write.
+
+Retrieval uses a two-tier index, implemented as two namespaces in the same managed vector DB:
+- `recent`: written synchronously on document updates to make changes immediately visible.
+- `main`: filled asynchronously for throughput and cost.
+
+Postgres is the source of truth for document versions, ACLs, active embedding model, and watermarks. Object storage holds chunk text. The API always queries both indexes, merges results, and enforces version/model/ACL constraints at query time.
+
+## Requirements
+
+### Functional Requirements
+- Retrieve top-K relevant chunks for a query with max staleness ≤ 60s for updated documents.
+- Support strict read-after-write via `write_token`.
+- Provide citations (document id, chunk id, version) for every returned chunk.
+- Prevent mixing incompatible embedding spaces (model/version changes) in a single retrieval.
+
+### Scale Targets
+- Corpus: 10M documents, ~200M chunks (avg 20 chunks/doc).
+- Online traffic: 500 QPS sustained, 2k QPS peak; p95 retrieval+prompt build ≤ 250ms (excluding LLM).
+- Writes/updates: 200 updates/sec burst (import jobs), 10 updates/sec steady.
+- Freshness SLA: 99.9% of queries satisfy max staleness; read-after-write is strict.
+
+## Key Design Decisions
+
+- **Two-tier index (Main + Recent)**
+  - `recent` is updated synchronously on writes; `main` is updated asynchronously.
+  - Queries always hit both and merge.
+
+- **Sequence-based freshness contract**
+  - Postgres assigns `change_seq` per tenant and tracks `indexed_seq` for the async worker.
+  - `write_token = (tenant_id, change_seq, doc_id, doc_version, model_id)` is the read-after-write anchor.
+
+- **Versioned chunks and a single active `model_id`**
+  - Chunk ids include `(doc_id, doc_version, chunk_id, model_id)`.
+  - Each tenant has exactly one `active_model_id` used for retrieval.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> A[RAG API]
+  A --> P[Postgres]
+  A --> S[Doc Store]
+  A --> V[Vector DB<br/>(main + recent)]
+  A --> L[LLM]
+  W[Embed Worker] --> P
+  W --> S
+  W --> V
+```
+
+### Components
+
+- `RAG API`
+  - Owns read/write contracts, sync embedding for strict writes, retrieval, merge, filtering, and prompt assembly.
+  - Justification: the only custom surface area; it defines correctness.
+
+- `Postgres`
+  - Stores docs/chunk metadata, ACLs, `change_seq`, per-tenant `indexed_seq`, and `active_model_id`.
+  - Justification: the durable truth needed for debuggable freshness and version/ACL enforcement.
+
+- `Doc Store`
+  - Object storage for chunk text and document payloads.
+  - Justification: cheapest durable store for the content the model actually reads.
+
+- `Vector DB (main + recent namespaces)`
+  - Stores embeddings for similarity search; `recent` is small and fast, `main` is large and cost-optimized.
+  - Justification: the only ANN dependency; two-tiering is how freshness stays independent of async lag.
+
+- `Embed Worker`
+  - Pulls unprocessed changes from Postgres, computes embeddings, upserts into `main`, and advances `indexed_seq` when complete.
+  - Justification: separates throughput/cost from interactive latency.
+
+- `LLM`
+  - Generates the final response with citations.
+  - Justification: core product output.
+
+## Deep Dive: Freshness Guarantees
+
+Freshness is enforced by a write token plus a fail-closed check when freshness is requested.
+
+1. **Write path: durable change + token**
+   - A document mutation commits in Postgres with a new `doc_version` and per-tenant `change_seq`.
+   - The response returns `write_token = (tenant_id, change_seq, doc_id, doc_version, model_id)`.
+
+2. **Strict read-after-write: sync embed to `recent`**
+   - For strict writes, the API chunks the delta, computes embeddings, and upserts them into the vector DB `recent` namespace.
+   - The same chunks’ text is written to the Doc Store and mapped in Postgres.
+
+3. **Async fill: worker upserts to `main`**
+   - The worker reads pending changes from Postgres (idempotency key: `(tenant_id, change_seq)`).
+   - It computes embeddings and upserts into `main`.
+   - It advances `indexed_seq` only after all chunks for that `change_seq` succeed.
+
+4. **Query path: always merge + enforce**
+   - The API queries both `recent` and `main`, merges, fetches chunk text from Doc Store, and filters by:
+     - tenant, ACLs, `active_model_id`, and latest `doc_version`.
+   - With a `write_token`, results for `token.doc_id` must be from `doc_version >= token.doc_version`.
+
+5. **Freshness when infrastructure is behind**
+   - If a request includes `write_token` or `max_staleness_ms`, and the vector DB `recent` namespace is unavailable, the API:
+     - Pins the `write_token` document by fetching its latest chunks directly from Doc Store/metadata and includes them in context (bounded by a strict size limit).
+     - If it still cannot satisfy the request, it returns an explicit freshness error (no silent staleness).
+
+6. **Admission control**
+   - Strict writes have a hard cap (max delta chunks / max bytes) and per-tenant rate limits.
+   - Bulk imports use non-strict writes (no sync embed, no `write_token`), so they cannot degrade interactive freshness.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Freshness without query delays | Higher latency on strict writes (sync embed) |
+| Simple ops (managed vector DB only) | Hot tier costs for `recent` retention |
+| Auditable correctness (seq/version/token) | Some strict requests fail closed under dependency loss |
+
+**What We Removed**
+- Standalone `Retriever` service (merged into `RAG API`).
+- Custom in-memory FAISS/HNSW + WAL `Recent Index` service (replaced by `recent` namespace in the managed vector DB).
+- Eviction correctness logic tied to global watermarks (replaced by TTL/size-bounded `recent` retention plus version filtering).
+
+## Failure Modes
+
+- **Postgres down**
+  - Writes and reads return 503 (no partial correctness mode).
+
+- **Vector DB `recent` slow**
+  - Strict writes are rate-limited or rejected; bulk writes continue.
+
+- **Network partition to vector DB**
+  - Freshness-required queries return freshness errors; `write_token` requests include pinned doc context when possible.
+
+- **Async worker duplicates / out-of-order**
+  - Changes are idempotent by `(tenant_id, change_seq)`; `indexed_seq` advances only after complete success per change.
+
+- **Hot tier growth exceeds policy**
+  - Strict writes reject with backpressure; bulk mode continues.
+
+- **Embedding model upgrade**
+  - `active_model_id` is switched only after backfill; retrieval uses exactly one model per tenant.
+
+## Operational Notes
+
+- Track per tenant: `change_seq`, `indexed_seq`, and `recent_retention_minutes` (effective TTL under load).
+- Alert on: sustained `change_seq - indexed_seq` growth, and `recent` retention falling below the freshness window.
+- Log on every request: `tenant_id`, `active_model_id`, `max_staleness_ms`, presence of `write_token`, and whether pinned-doc fallback was used.
+- Enforce bounded prompts: strict caps on pinned doc inclusion and total retrieved context bytes.
+```
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+exec
+/bin/zsh -lc "rg -n \"Retrieval-Augmented Generation \\(RAG\\) with Freshness Guarantees\" -S ." in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 61ms:
+./drafts-v2/retrieval-augmented-generation.md:3:title: "Retrieval-Augmented Generation (RAG) with Freshness Guarantees"
+./logs/v2/retrieval-augmented-generation.log:183:title: "Retrieval-Augmented Generation (RAG) with Freshness Guarantees"
+./logs/v2/retrieval-augmented-generation.log:346:title: "Retrieval-Augmented Generation (RAG) with Freshness Guarantees"
+./logs/v2/retrieval-augmented-generation.log:630:title: "Retrieval-Augmented Generation (RAG) with Freshness Guarantees"
+./logs/v2/retrieval-augmented-generation.log:1082:title: "Retrieval-Augmented Generation (RAG) with Freshness Guarantees"
+./logs/v2/retrieval-augmented-generation.log:1375:title: "Retrieval-Augmented Generation (RAG) with Freshness Guarantees"
+./logs/v2/retrieval-augmented-generation.log:1534:title: "Retrieval-Augmented Generation (RAG) with Freshness Guarantees"
+./logs/v2/retrieval-augmented-generation.log:1738:title: "Retrieval-Augmented Generation (RAG) with Freshness Guarantees"
+./solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md:3:title: "Retrieval-Augmented Generation (RAG) with Freshness Guarantees"
+
+thinking
+**Checking document solutions**
+
+I need to ensure that there are fixes in both drafts and solutions. The user mentioned wanting a complete and fixed document, probably referring to the solutions file. I'll open that file to review it. Additionally, I should check the AGENTS instructions to see if I need to read the root AGENTS included. I wonder if I need to search in relevant directories, so I’ll look for AGENTS.md.
+exec
+/bin/zsh -lc 'find .. -name AGENTS.md -print' in /Users/dominikdabrowski/pr/system-design-atlas exited 124 in 10.00s:
+
+exec
+/bin/zsh -lc 'find . -name AGENTS.md -print' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 778ms:
+
+exec
+/bin/zsh -lc "sed -n '1,160p' solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 66ms:
+```markdown
+---
+title: "Retrieval-Augmented Generation (RAG) with Freshness Guarantees"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["rag", "vector-search", "freshness", "consistency", "indexing", "llm-infra"]
+---
+
+## Overview
+
+This RAG system guarantees freshness by making it a first-class query constraint with an auditable contract: Postgres assigns a per-tenant monotonic `change_seq`, and the API returns a `write_token` on successful writes for strict read-after-write.
+
+Retrieval uses a two-tier index, implemented as two namespaces in the same managed vector DB:
+- `recent`: written synchronously on document updates to make changes immediately visible.
+- `main`: filled asynchronously for throughput and cost.
+
+Postgres is the source of truth for document versions, ACLs, active embedding model, and watermarks. Object storage holds chunk text. The API always queries both indexes, merges results, and enforces version/model/ACL constraints at query time.
+
+## Requirements
+
+
+thinking
+**Updating documentation**
+
+I need to think about whether to patch the draft file and possibly include logs. The user is looking for a fixed document output, which is likely just in the solutions file or the shown snippet. I’ll update both the `drafts-v2/retrieval-augmented-generation.md` and `solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md`. It seems logs might not be necessary, but I'm a bit unsure if the tool generating them uses the draft. I’ll check the `drafts-v2` file.
+exec
+/bin/zsh -lc "sed -n '1,120p' drafts-v2/retrieval-augmented-generation.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 74ms:
+```markdown
+---
+title: "Retrieval-Augmented Generation (RAG) with Freshness Guarantees"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["rag", "vector-search", "freshness", "consistency", "indexing", "llm-infra"]
+---
+
+## Overview
+
+This system augments LLM prompts with retrieved context, but with a strict freshness contract: when a document changes, retrieval reflects that change within a bounded window (and supports read-after-write). The elegant move is to stop pretending the vector index is strongly consistent and instead **design an explicit “freshness layer”** that makes freshness a first-class query constraint.
+
+The core idea is a **two-tier retrieval index**: a durable vector store for the bulk of history, plus a small “recent changes” vector index that is updated immediately and queried on every request. This avoids blocking queries on asynchronous pipelines and turns freshness from “best effort” into an enforceable SLA.
+
+Everything else stays boring: Postgres for metadata, object storage for raw docs/chunks, a managed vector DB for main similarity search, and a simple async embedding pipeline for throughput and cost control.
+
+## What Makes This Hard
+
+Naive RAG systems silently serve stale context because the write path (documents) and the read path (vector index) are decoupled by an async embedding pipeline. Teams ship “eventual” freshness, then get paged when users ask “why doesn’t it know what I just changed?”
+
+exec
+/bin/zsh -lc "rg -n \"<br\\s*/>\" -S solutions-v2 drafts-v2 || true" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 81ms:
+drafts-v2/distributed-key-value-store.md:62:  LB --> N1[Any Node<br/>Coordinator]
+drafts-v2/distributed-key-value-store.md:75:  A <--> AE[Anti-Entropy<br/>(Merkle Repair)]
+solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md:54:  A --> V[Vector DB<br/>(main + recent)]
+exec
+/bin/zsh -lc 'ls -la' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 85ms:
+total 64
+drwxr-xr-x@  15 dominikdabrowski  staff    480 Dec 17 01:07 .
+drwxr-xr-x@  43 dominikdabrowski  staff   1376 Dec 16 17:40 ..
+drwxr-xr-x@   9 dominikdabrowski  staff    288 Dec 17 01:31 .git
+drwxr-xr-x@ 100 dominikdabrowski  staff   3200 Dec 17 01:31 challenges
+drwxr-xr-x@ 102 dominikdabrowski  staff   3264 Dec 16 22:34 drafts
+drwxr-xr-x@ 100 dominikdabrowski  staff   3200 Dec 17 01:30 drafts-v2
+drwxr-xr-x@  16 dominikdabrowski  staff    512 Dec 16 22:10 frontend
+drwxr-xr-x@ 203 dominikdabrowski  staff   6496 Dec 16 23:33 grades
+drwxr-xr-x@ 110 dominikdabrowski  staff   3520 Dec 17 01:19 logs
+-rw-------@   1 dominikdabrowski  staff  31640 Dec 16 21:23 problems.yaml
+drwxr-xr-x@   7 dominikdabrowski  staff    224 Dec 16 23:46 prompts
+drwxr-xr-x@ 102 dominikdabrowski  staff   3264 Dec 16 22:53 reviewed
+drwxr-xr-x@  13 dominikdabrowski  staff    416 Dec 17 01:19 scripts
+drwxr-xr-x@  12 dominikdabrowski  staff    384 Dec 16 21:36 solutions
+drwxr-xr-x@  12 dominikdabrowski  staff    384 Dec 17 01:19 solutions-v2
+
+thinking
+I'm thinking about searching for some scripts related to mermaid generation. I wonder if Python has something useful for this. I might look into the code, perhaps by using something like `rg` to search through the scripts for any mention of mermaids. It's exciting to see what I might find! I'll keep it focused and see what the search turns up.
+exec
+/bin/zsh -lc 'rg -n "mermaid" scripts -S' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 77ms:
+scripts/generate-solution-v2.sh:10:#   4. Validate: Check Mermaid diagrams
+scripts/generate-solution-v2.sh:157:# Pass 4: Validate Mermaid Diagrams
+scripts/generate-solution-v2.sh:160:echo "[Pass 4/4] Validating Mermaid diagrams..."
+scripts/generate-solution-v2.sh:165:    echo "Warning: mermaid-cli not found, skipping validation"
+scripts/generate-solution-v2.sh:172:    in_mermaid=false
+scripts/generate-solution-v2.sh:176:        if [[ "$line" == '```mermaid' ]]; then
+scripts/generate-solution-v2.sh:177:            in_mermaid=true
+scripts/generate-solution-v2.sh:182:        if [[ "$in_mermaid" == true && "$line" == '```' ]]; then
+scripts/generate-solution-v2.sh:183:            in_mermaid=false
+scripts/generate-solution-v2.sh:202:        if [[ "$in_mermaid" == true ]]; then
+scripts/generate-solution-v2.sh:212:        echo "Found invalid Mermaid diagrams, fixing..."
+scripts/generate-solution-v2.sh:216:        FIX_PROMPT="Fix these Mermaid syntax errors:
+scripts/generate-solution-v2.sh:239:        echo "[Pass 4/4] Mermaid diagrams fixed"
+scripts/generate-solution-v2.sh:241:        echo "[Pass 4/4] All Mermaid diagrams valid"
+scripts/validate-mermaid.mjs:3: * Validate Mermaid diagrams in markdown files
+scripts/validate-mermaid.mjs:4: * Run from frontend directory: node ../scripts/validate-mermaid.mjs
+scripts/validate-mermaid.mjs:5: * Or: cd frontend && node ../scripts/validate-mermaid.mjs [files...] [--fix]
+scripts/validate-mermaid.mjs:16:// We'll use mermaid's parse function via dynamic import
+scripts/validate-mermaid.mjs:17:let mermaid;
+scripts/validate-mermaid.mjs:19:function extractMermaidBlocks(content, filePath) {
+
+thinking
+**Updating document and patches**
+
+I’m considering how to patch the solutions file while generating logs. The user wants a complete fixed document output, which means I should include the whole markdown document with corrected mermaid syntax, along with the frontmatter. Since the provided snippet already has the triple backticks, I think it’s best to keep those in my output. I'll also update the file in the repo to maintain consistency and ensure the mermaid line is fixed in the document!
+file update
+M /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
+@@ -53,3 +53,3 @@
+   A --> S[Doc Store]
+-  A --> V[Vector DB<br/>(main + recent)]
++  A --> V["Vector DB (main + recent)"]
+   A --> L[LLM]
+@@ -156,2 +156,2 @@
+ - Enforce bounded prompts: strict caps on pinned doc inclusion and total retrieved context bytes.
+-```
+\ No newline at end of file
++```
+apply_patch(auto_approved=true) exited 0 in 24ms:
+Success. Updated the following files:
+M solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
+file update:
+diff --git a/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md b/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
+index f769b70518c7728ab0bcf2745ea20224cc72533c..9d2ebd7abff247c33e70a2dbf80070328e920bce
+--- a/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
++++ b/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
+@@ -51,7 +51,7 @@
+   C[Client] --> A[RAG API]
+   A --> P[Postgres]
+   A --> S[Doc Store]
+-  A --> V[Vector DB<br/>(main + recent)]
++  A --> V["Vector DB (main + recent)"]
+   A --> L[LLM]
+   W[Embed Worker] --> P
+   W --> S
+@@ -154,4 +154,4 @@
+ - Alert on: sustained `change_seq - indexed_seq` growth, and `recent` retention falling below the freshness window.
+ - Log on every request: `tenant_id`, `active_model_id`, `max_staleness_ms`, presence of `write_token`, and whether pinned-doc fallback was used.
+ - Enforce bounded prompts: strict caps on pinned doc inclusion and total retrieved context bytes.
+-```
+\ No newline at end of file
++```
+
+
+thinking
+**Validating diagram**
+
+I need to ensure that the diagram is valid. I could run a validation script, but I may need npm dependencies. It seems like I can run `scripts/validate-mermaid.mjs`, which probably uses the mermaid package installed in the frontend. I should check if it's already installed by looking into `frontend/package.json`. I’ll attempt to run the validator from the frontend directory; let's see if `node_modules` are present by checking with `ls frontend`.
+file update:
+diff --git a/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md b/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
+index f769b70518c7728ab0bcf2745ea20224cc72533c..9d2ebd7abff247c33e70a2dbf80070328e920bce
+--- a/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
++++ b/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
+@@ -51,7 +51,7 @@
+   C[Client] --> A[RAG API]
+   A --> P[Postgres]
+   A --> S[Doc Store]
+-  A --> V[Vector DB<br/>(main + recent)]
++  A --> V["Vector DB (main + recent)"]
+   A --> L[LLM]
+   W[Embed Worker] --> P
+   W --> S
+@@ -154,4 +154,4 @@
+ - Alert on: sustained `change_seq - indexed_seq` growth, and `recent` retention falling below the freshness window.
+ - Log on every request: `tenant_id`, `active_model_id`, `max_staleness_ms`, presence of `write_token`, and whether pinned-doc fallback was used.
+ - Enforce bounded prompts: strict caps on pinned doc inclusion and total retrieved context bytes.
+-```
+\ No newline at end of file
++```
+
+exec
+/bin/zsh -lc 'ls -la frontend | head' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 60ms:
+total 800
+drwxr-xr-x@  16 dominikdabrowski  staff     512 Dec 16 22:10 .
+drwxr-xr-x@  15 dominikdabrowski  staff     480 Dec 17 01:07 ..
+drwxr-xr-x@   9 dominikdabrowski  staff     288 Dec 16 21:59 .astro
+-rw-r--r--@   1 dominikdabrowski  staff      39 Dec 16 20:22 .gitignore
+-rw-r--r--@   1 dominikdabrowski  staff     715 Dec 16 21:59 astro.config.mjs
+drwxr-xr-x@  10 dominikdabrowski  staff     320 Dec 16 22:57 dist
+drwxr-xr-x@ 576 dominikdabrowski  staff   18432 Dec 16 21:11 node_modules
+-rw-r--r--@   1 dominikdabrowski  staff  380816 Dec 16 21:12 package-lock.json
+-rw-r--r--@   1 dominikdabrowski  staff     742 Dec 16 21:59 package.json
+file update:
+diff --git a/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md b/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
+index f769b70518c7728ab0bcf2745ea20224cc72533c..9d2ebd7abff247c33e70a2dbf80070328e920bce
+--- a/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
++++ b/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
+@@ -51,7 +51,7 @@
+   C[Client] --> A[RAG API]
+   A --> P[Postgres]
+   A --> S[Doc Store]
+-  A --> V[Vector DB<br/>(main + recent)]
++  A --> V["Vector DB (main + recent)"]
+   A --> L[LLM]
+   W[Embed Worker] --> P
+   W --> S
+@@ -154,4 +154,4 @@
+ - Alert on: sustained `change_seq - indexed_seq` growth, and `recent` retention falling below the freshness window.
+ - Log on every request: `tenant_id`, `active_model_id`, `max_staleness_ms`, presence of `write_token`, and whether pinned-doc fallback was used.
+ - Enforce bounded prompts: strict caps on pinned doc inclusion and total retrieved context bytes.
+-```
+\ No newline at end of file
++```
+
+exec
+/bin/zsh -lc 'node ../scripts/validate-mermaid.mjs ../solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md' in /Users/dominikdabrowski/pr/system-design-atlas/frontend exited 1 in 70ms:
+Validation failed: Cannot find package 'mermaid' imported from /Users/dominikdabrowski/pr/system-design-atlas/scripts/validate-mermaid.mjs
+
+thinking
+**Investigating package dependencies**
+
+I'm noticing that the system can't find 'mermaid', even though the node_modules folder is there. That makes me think maybe 'mermaid' isn't actually a dependency listed in the package.json file. To clarify this, I need to inspect the frontend/package.json file and see if 'mermaid' is listed as a dependency. Checking these details will ensure I'm on the right track to resolving this issue!
+file update:
+diff --git a/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md b/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
+index f769b70518c7728ab0bcf2745ea20224cc72533c..9d2ebd7abff247c33e70a2dbf80070328e920bce
+--- a/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
++++ b/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
+@@ -51,7 +51,7 @@
+   C[Client] --> A[RAG API]
+   A --> P[Postgres]
+   A --> S[Doc Store]
+-  A --> V[Vector DB<br/>(main + recent)]
++  A --> V["Vector DB (main + recent)"]
+   A --> L[LLM]
+   W[Embed Worker] --> P
+   W --> S
+@@ -154,4 +154,4 @@
+ - Alert on: sustained `change_seq - indexed_seq` growth, and `recent` retention falling below the freshness window.
+ - Log on every request: `tenant_id`, `active_model_id`, `max_staleness_ms`, presence of `write_token`, and whether pinned-doc fallback was used.
+ - Enforce bounded prompts: strict caps on pinned doc inclusion and total retrieved context bytes.
+-```
+\ No newline at end of file
++```
+
+exec
+/bin/zsh -lc 'cat package.json' in /Users/dominikdabrowski/pr/system-design-atlas/frontend succeeded in 50ms:
+{
+  "name": "system-design-atlas-frontend",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev",
+    "prebuild": "node scripts/strip-wrappers.js",
+    "build": "astro build",
+    "preview": "astro preview",
+    "check": "astro check"
+  },
+  "dependencies": {
+    "@astrojs/tailwind": "^6.0.2",
+    "astro": "^5.0.0",
+    "mermaid": "^11.4.0",
+    "rehype-slug": "^6.0.0"
+  },
+  "devDependencies": {
+    "@astrojs/check": "^0.9.4",
+file update:
+diff --git a/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md b/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
+index f769b70518c7728ab0bcf2745ea20224cc72533c..9d2ebd7abff247c33e70a2dbf80070328e920bce
+--- a/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
++++ b/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
+@@ -51,7 +51,7 @@
+   C[Client] --> A[RAG API]
+   A --> P[Postgres]
+   A --> S[Doc Store]
+-  A --> V[Vector DB<br/>(main + recent)]
++  A --> V["Vector DB (main + recent)"]
+   A --> L[LLM]
+   W[Embed Worker] --> P
+   W --> S
+@@ -154,4 +154,4 @@
+ - Alert on: sustained `change_seq - indexed_seq` growth, and `recent` retention falling below the freshness window.
+ - Log on every request: `tenant_id`, `active_model_id`, `max_staleness_ms`, presence of `write_token`, and whether pinned-doc fallback was used.
+ - Enforce bounded prompts: strict caps on pinned doc inclusion and total retrieved context bytes.
+-```
+\ No newline at end of file
++```
+
+exec
+/bin/zsh -lc "sed -n '1,140p' scripts/validate-mermaid.sh" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 59ms:
+#!/bin/bash
+# Validate Mermaid diagrams in markdown files
+# Usage: ./scripts/validate-mermaid.sh [--fix]
+# Run from project root or frontend directory
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+FRONTEND_DIR="$PROJECT_DIR/frontend"
+
+# Find mmdc
+MMDC="$FRONTEND_DIR/node_modules/.bin/mmdc"
+if [[ ! -x "$MMDC" ]]; then
+    echo "Error: mermaid-cli not found. Run: cd frontend && npm install"
+    exit 1
+fi
+
+SOLUTIONS_DIR="$PROJECT_DIR/solutions"
+TEMP_DIR=$(mktemp -d)
+file update:
+diff --git a/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md b/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
+index f769b70518c7728ab0bcf2745ea20224cc72533c..9d2ebd7abff247c33e70a2dbf80070328e920bce
+--- a/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
++++ b/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
+@@ -51,7 +51,7 @@
+   C[Client] --> A[RAG API]
+   A --> P[Postgres]
+   A --> S[Doc Store]
+-  A --> V[Vector DB<br/>(main + recent)]
++  A --> V["Vector DB (main + recent)"]
+   A --> L[LLM]
+   W[Embed Worker] --> P
+   W --> S
+@@ -154,4 +154,4 @@
+ - Alert on: sustained `change_seq - indexed_seq` growth, and `recent` retention falling below the freshness window.
+ - Log on every request: `tenant_id`, `active_model_id`, `max_staleness_ms`, presence of `write_token`, and whether pinned-doc fallback was used.
+ - Enforce bounded prompts: strict caps on pinned doc inclusion and total retrieved context bytes.
+-```
+\ No newline at end of file
++```
+
+exec
+/bin/zsh -lc 'tmpdir=$(mktemp -d ./tmp-mermaid-XXXXXX)
+cat > $tmpdir/diagram.mmd <<'"'EOF'
+flowchart LR
+  C[Client] --> A[RAG API]
+  A --> P[Postgres]
+  A --> S[Doc Store]
+  A --> V[\"Vector DB (main + recent)\"]
+  A --> L[LLM]
+  W[Embed Worker] --> P
+  W --> S
+  W --> V
+EOF
+./frontend/node_modules/.bin/mmdc -i "'$tmpdir/diagram.mmd -o $tmpdir/out.svg >/dev/null
+status=$?
+rm -rf $tmpdir
+exit $status
+' in /Users/dominikdabrowski/pr/system-design-atlas exited 1 in 196ms:
+
+Error: Failed to launch the browser process!
+[1217/013239.092505:ERROR:thermal_state_observer_mac.mm(88)] ThermalStateObserverMac unable to register to power notifications. Result: 9
+[1217/013239.093314:ERROR:dns_config_service_posix.cc(142)] DNS config watch failed to start.
+[1217/013239.093632:WARNING:dns_config_service_posix.cc(201)] Failed to read DnsConfig.
+[1217/013239.094057:FATAL:sandbox_parameters_mac.mm(68)] Check failed: . : Input/output error (5)
+
+
+TROUBLESHOOTING: https://pptr.dev/troubleshooting
+
+    at Interface.onClose (file:///Users/dominikdabrowski/pr/system-design-atlas/frontend/node_modules/@puppeteer/browsers/lib/esm/launch.js:303:24)
+    at Interface.emit (node:events:536:35)
+    at Interface.close (node:internal/readline/interface:527:10)
+    at Socket.onend (node:internal/readline/interface:253:10)
+    at Socket.emit (node:events:536:35)
+    at endReadableNT (node:internal/streams/readable:1698:12)
+    at process.processTicksAndRejections (node:internal/process/task_queues:82:21)
+
+zsh:14: read-only variable: status
+file update:
+diff --git a/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md b/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
+index f769b70518c7728ab0bcf2745ea20224cc72533c..9d2ebd7abff247c33e70a2dbf80070328e920bce
+--- a/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
++++ b/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
+@@ -51,7 +51,7 @@
+   C[Client] --> A[RAG API]
+   A --> P[Postgres]
+   A --> S[Doc Store]
+-  A --> V[Vector DB<br/>(main + recent)]
++  A --> V["Vector DB (main + recent)"]
+   A --> L[LLM]
+   W[Embed Worker] --> P
+   W --> S
+@@ -154,4 +154,4 @@
+ - Alert on: sustained `change_seq - indexed_seq` growth, and `recent` retention falling below the freshness window.
+ - Log on every request: `tenant_id`, `active_model_id`, `max_staleness_ms`, presence of `write_token`, and whether pinned-doc fallback was used.
+ - Enforce bounded prompts: strict caps on pinned doc inclusion and total retrieved context bytes.
+-```
+\ No newline at end of file
++```
+
+exec
+/bin/zsh -lc "node <<'NODE'
+import mermaid from 'mermaid';
+
+const code = "'`flowchart LR
+  C[Client] --> A[RAG API]
+  A --> P[Postgres]
+  A --> S[Doc Store]
+  A --> V["Vector DB (main + recent)"]
+  A --> L[LLM]
+  W[Embed Worker] --> P
+  W --> S
+  W --> V
+`;
+
+try {
+  mermaid.initialize({ startOnLoad: false });
+  await mermaid.parse(code);
+  console.log('"'OK');
+} catch (e) {
+  console.error(String(e?.message ?? e));
+  process.exit(1);
+}
+NODE" in /Users/dominikdabrowski/pr/system-design-atlas/frontend exited 1 in 226ms:
+DOMPurify.addHook is not a function
+
+thinking
+**Investigating Mermaid issues**
+
+I'm dealing with a problem where Mermaid import is failing due to DOMPurify in a Node environment. It seems like Mermaid expects a DOM, which you typically find in a browser, not in Node. I’m thinking about using `@mermaid-js/mermaid-cli` for parsing, but that involves Puppeteer. There’s also the option of using the `mermaidAPI` to parse. It could require DOMPurify. Maybe JSDOM can help? I should check out `scripts/validate-mermaid.mjs` for how they handle this.
+file update:
+diff --git a/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md b/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
+index f769b70518c7728ab0bcf2745ea20224cc72533c..9d2ebd7abff247c33e70a2dbf80070328e920bce
+--- a/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
++++ b/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
+@@ -51,7 +51,7 @@
+   C[Client] --> A[RAG API]
+   A --> P[Postgres]
+   A --> S[Doc Store]
+-  A --> V[Vector DB<br/>(main + recent)]
++  A --> V["Vector DB (main + recent)"]
+   A --> L[LLM]
+   W[Embed Worker] --> P
+   W --> S
+@@ -154,4 +154,4 @@
+ - Alert on: sustained `change_seq - indexed_seq` growth, and `recent` retention falling below the freshness window.
+ - Log on every request: `tenant_id`, `active_model_id`, `max_staleness_ms`, presence of `write_token`, and whether pinned-doc fallback was used.
+ - Enforce bounded prompts: strict caps on pinned doc inclusion and total retrieved context bytes.
+-```
+\ No newline at end of file
++```
+
+exec
+/bin/zsh -lc "sed -n '1,220p' scripts/validate-mermaid.mjs" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 51ms:
+#!/usr/bin/env node
+/**
+ * Validate Mermaid diagrams in markdown files
+ * Run from frontend directory: node ../scripts/validate-mermaid.mjs
+ * Or: cd frontend && node ../scripts/validate-mermaid.mjs [files...] [--fix]
+ */
+
+import { readFileSync, writeFileSync, readdirSync, statSync } from 'fs';
+import { join, relative, dirname } from 'path';
+import { fileURLToPath } from 'url';
+import { createRequire } from 'module';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const require = createRequire(import.meta.url);
+
+// We'll use mermaid's parse function via dynamic import
+let mermaid;
+
+function extractMermaidBlocks(content, filePath) {
+  const blocks = [];
+file update:
+diff --git a/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md b/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
+index f769b70518c7728ab0bcf2745ea20224cc72533c..9d2ebd7abff247c33e70a2dbf80070328e920bce
+--- a/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
++++ b/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
+@@ -51,7 +51,7 @@
+   C[Client] --> A[RAG API]
+   A --> P[Postgres]
+   A --> S[Doc Store]
+-  A --> V[Vector DB<br/>(main + recent)]
++  A --> V["Vector DB (main + recent)"]
+   A --> L[LLM]
+   W[Embed Worker] --> P
+   W --> S
+@@ -154,4 +154,4 @@
+ - Alert on: sustained `change_seq - indexed_seq` growth, and `recent` retention falling below the freshness window.
+ - Log on every request: `tenant_id`, `active_model_id`, `max_staleness_ms`, presence of `write_token`, and whether pinned-doc fallback was used.
+ - Enforce bounded prompts: strict caps on pinned doc inclusion and total retrieved context bytes.
+-```
+\ No newline at end of file
++```
+
+exec
+/bin/zsh -lc "sed -n '130,260p' scripts/generate-solution-v2.sh" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 49ms:
+
+$CHALLENGE_CONTENT
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think \"that's surprisingly simple\" not \"very thorough.\"
+
+Output the complete, final markdown document."
+
+codex exec \
+    -m "$MODEL" \
+    --full-auto \
+
+
+thinking
+**Considering document output**
+
+I'll focus on the fact that they use mmdc to validate, which didn't launch in our environment but likely works in theirs. So, I won't need to validate here, and I've updated the file. The user wants the complete fixed document, which means I need to provide the full content exactly as requested, with the necessary markdown formatting. The file is long, but I’ll ensure it includes the triple backticks at the top and bottom.
+thinking
+**Preparing document output**
+
+It looks like the file acts as a code block and might be used in a pipeline. Since the user wants the complete fixed document and included fences, I’ll match those as requested. I’ll make sure that the corrected mermaid line uses quotes correctly within the label and parentheses. Since the markdown document is within triple backticks, the quotes will be safe. I’ll read through the rest of the file to confirm that the closing backticks are present. I'll output the entire content accordingly.
+file update:
+diff --git a/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md b/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
+index f769b70518c7728ab0bcf2745ea20224cc72533c..9d2ebd7abff247c33e70a2dbf80070328e920bce
+--- a/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
++++ b/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
+@@ -51,7 +51,7 @@
+   C[Client] --> A[RAG API]
+   A --> P[Postgres]
+   A --> S[Doc Store]
+-  A --> V[Vector DB<br/>(main + recent)]
++  A --> V["Vector DB (main + recent)"]
+   A --> L[LLM]
+   W[Embed Worker] --> P
+   W --> S
+@@ -154,4 +154,4 @@
+ - Alert on: sustained `change_seq - indexed_seq` growth, and `recent` retention falling below the freshness window.
+ - Log on every request: `tenant_id`, `active_model_id`, `max_staleness_ms`, presence of `write_token`, and whether pinned-doc fallback was used.
+ - Enforce bounded prompts: strict caps on pinned doc inclusion and total retrieved context bytes.
+-```
+\ No newline at end of file
++```
+
+exec
+/bin/zsh -lc 'cat solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 52ms:
+```markdown
+---
+title: "Retrieval-Augmented Generation (RAG) with Freshness Guarantees"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["rag", "vector-search", "freshness", "consistency", "indexing", "llm-infra"]
+---
+
+## Overview
+
+This RAG system guarantees freshness by making it a first-class query constraint with an auditable contract: Postgres assigns a per-tenant monotonic `change_seq`, and the API returns a `write_token` on successful writes for strict read-after-write.
+
+Retrieval uses a two-tier index, implemented as two namespaces in the same managed vector DB:
+- `recent`: written synchronously on document updates to make changes immediately visible.
+- `main`: filled asynchronously for throughput and cost.
+
+Postgres is the source of truth for document versions, ACLs, active embedding model, and watermarks. Object storage holds chunk text. The API always queries both indexes, merges results, and enforces version/model/ACL constraints at query time.
+
+## Requirements
+
+codex
+```markdown
+---
+title: "Retrieval-Augmented Generation (RAG) with Freshness Guarantees"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["rag", "vector-search", "freshness", "consistency", "indexing", "llm-infra"]
+---
+
+## Overview
+
+This RAG system guarantees freshness by making it a first-class query constraint with an auditable contract: Postgres assigns a per-tenant monotonic `change_seq`, and the API returns a `write_token` on successful writes for strict read-after-write.
+
+Retrieval uses a two-tier index, implemented as two namespaces in the same managed vector DB:
+- `recent`: written synchronously on document updates to make changes immediately visible.
+- `main`: filled asynchronously for throughput and cost.
+
+Postgres is the source of truth for document versions, ACLs, active embedding model, and watermarks. Object storage holds chunk text. The API always queries both indexes, merges results, and enforces version/model/ACL constraints at query time.
+
+## Requirements
+
+### Functional Requirements
+- Retrieve top-K relevant chunks for a query with max staleness ≤ 60s for updated documents.
+- Support strict read-after-write via `write_token`.
+- Provide citations (document id, chunk id, version) for every returned chunk.
+- Prevent mixing incompatible embedding spaces (model/version changes) in a single retrieval.
+
+### Scale Targets
+- Corpus: 10M documents, ~200M chunks (avg 20 chunks/doc).
+- Online traffic: 500 QPS sustained, 2k QPS peak; p95 retrieval+prompt build ≤ 250ms (excluding LLM).
+- Writes/updates: 200 updates/sec burst (import jobs), 10 updates/sec steady.
+- Freshness SLA: 99.9% of queries satisfy max staleness; read-after-write is strict.
+
+## Key Design Decisions
+
+- **Two-tier index (Main + Recent)**
+  - `recent` is updated synchronously on writes; `main` is updated asynchronously.
+  - Queries always hit both and merge.
+
+- **Sequence-based freshness contract**
+  - Postgres assigns `change_seq` per tenant and tracks `indexed_seq` for the async worker.
+  - `write_token = (tenant_id, change_seq, doc_id, doc_version, model_id)` is the read-after-write anchor.
+
+- **Versioned chunks and a single active `model_id`**
+  - Chunk ids include `(doc_id, doc_version, chunk_id, model_id)`.
+  - Each tenant has exactly one `active_model_id` used for retrieval.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> A[RAG API]
+  A --> P[Postgres]
+  A --> S[Doc Store]
+  A --> V["Vector DB (main + recent)"]
+  A --> L[LLM]
+  W[Embed Worker] --> P
+  W --> S
+  W --> V
+```
+
+### Components
+
+- `RAG API`
+  - Owns read/write contracts, sync embedding for strict writes, retrieval, merge, filtering, and prompt assembly.
+  - Justification: the only custom surface area; it defines correctness.
+
+- `Postgres`
+  - Stores docs/chunk metadata, ACLs, `change_seq`, per-tenant `indexed_seq`, and `active_model_id`.
+  - Justification: the durable truth needed for debuggable freshness and version/ACL enforcement.
+
+- `Doc Store`
+  - Object storage for chunk text and document payloads.
+  - Justification: cheapest durable store for the content the model actually reads.
+
+- `Vector DB (main + recent namespaces)`
+  - Stores embeddings for similarity search; `recent` is small and fast, `main` is large and cost-optimized.
+  - Justification: the only ANN dependency; two-tiering is how freshness stays independent of async lag.
+
+- `Embed Worker`
+  - Pulls unprocessed changes from Postgres, computes embeddings, upserts into `main`, and advances `indexed_seq` when complete.
+  - Justification: separates throughput/cost from interactive latency.
+
+- `LLM`
+  - Generates the final response with citations.
+  - Justification: core product output.
+
+## Deep Dive: Freshness Guarantees
+
+Freshness is enforced by a write token plus a fail-closed check when freshness is requested.
+
+1. **Write path: durable change + token**
+   - A document mutation commits in Postgres with a new `doc_version` and per-tenant `change_seq`.
+   - The response returns `write_token = (tenant_id, change_seq, doc_id, doc_version, model_id)`.
+
+2. **Strict read-after-write: sync embed to `recent`**
+   - For strict writes, the API chunks the delta, computes embeddings, and upserts them into the vector DB `recent` namespace.
+   - The same chunks’ text is written to the Doc Store and mapped in Postgres.
+
+3. **Async fill: worker upserts to `main`**
+   - The worker reads pending changes from Postgres (idempotency key: `(tenant_id, change_seq)`).
+   - It computes embeddings and upserts into `main`.
+   - It advances `indexed_seq` only after all chunks for that `change_seq` succeed.
+
+4. **Query path: always merge + enforce**
+   - The API queries both `recent` and `main`, merges, fetches chunk text from Doc Store, and filters by:
+     - tenant, ACLs, `active_model_id`, and latest `doc_version`.
+   - With a `write_token`, results for `token.doc_id` must be from `doc_version >= token.doc_version`.
+
+5. **Freshness when infrastructure is behind**
+   - If a request includes `write_token` or `max_staleness_ms`, and the vector DB `recent` namespace is unavailable, the API:
+     - Pins the `write_token` document by fetching its latest chunks directly from Doc Store/metadata and includes them in context (bounded by a strict size limit).
+     - If it still cannot satisfy the request, it returns an explicit freshness error (no silent staleness).
+
+6. **Admission control**
+   - Strict writes have a hard cap (max delta chunks / max bytes) and per-tenant rate limits.
+   - Bulk imports use non-strict writes (no sync embed, no `write_token`), so they cannot degrade interactive freshness.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Freshness without query delays | Higher latency on strict writes (sync embed) |
+| Simple ops (managed vector DB only) | Hot tier costs for `recent` retention |
+| Auditable correctness (seq/version/token) | Some strict requests fail closed under dependency loss |
+
+**What We Removed**
+- Standalone `Retriever` service (merged into `RAG API`).
+- Custom in-memory FAISS/HNSW + WAL `Recent Index` service (replaced by `recent` namespace in the managed vector DB).
+- Eviction correctness logic tied to global watermarks (replaced by TTL/size-bounded `recent` retention plus version filtering).
+
+## Failure Modes
+
+- **Postgres down**
+  - Writes and reads return 503 (no partial correctness mode).
+
+- **Vector DB `recent` slow**
+  - Strict writes are rate-limited or rejected; bulk writes continue.
+
+- **Network partition to vector DB**
+  - Freshness-required queries return freshness errors; `write_token` requests include pinned doc context when possible.
+
+- **Async worker duplicates / out-of-order**
+  - Changes are idempotent by `(tenant_id, change_seq)`; `indexed_seq` advances only after complete success per change.
+
+- **Hot tier growth exceeds policy**
+  - Strict writes reject with backpressure; bulk mode continues.
+
+- **Embedding model upgrade**
+  - `active_model_id` is switched only after backfill; retrieval uses exactly one model per tenant.
+
+## Operational Notes
+
+- Track per tenant: `change_seq`, `indexed_seq`, and `recent_retention_minutes` (effective TTL under load).
+- Alert on: sustained `change_seq - indexed_seq` growth, and `recent` retention falling below the freshness window.
+- Log on every request: `tenant_id`, `active_model_id`, `max_staleness_ms`, presence of `write_token`, and whether pinned-doc fallback was used.
+- Enforce bounded prompts: strict caps on pinned doc inclusion and total retrieved context bytes.
+```
+file update:
+diff --git a/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md b/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
+index f769b70518c7728ab0bcf2745ea20224cc72533c..9d2ebd7abff247c33e70a2dbf80070328e920bce
+--- a/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
++++ b/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md
+@@ -51,7 +51,7 @@
+   C[Client] --> A[RAG API]
+   A --> P[Postgres]
+   A --> S[Doc Store]
+-  A --> V[Vector DB<br/>(main + recent)]
++  A --> V["Vector DB (main + recent)"]
+   A --> L[LLM]
+   W[Embed Worker] --> P
+   W --> S
+@@ -154,4 +154,4 @@
+ - Alert on: sustained `change_seq - indexed_seq` growth, and `recent` retention falling below the freshness window.
+ - Log on every request: `tenant_id`, `active_model_id`, `max_staleness_ms`, presence of `write_token`, and whether pinned-doc fallback was used.
+ - Enforce bounded prompts: strict caps on pinned doc inclusion and total retrieved context bytes.
+-```
+\ No newline at end of file
++```
+
+tokens used
+42,320
+```markdown
+---
+title: "Retrieval-Augmented Generation (RAG) with Freshness Guarantees"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["rag", "vector-search", "freshness", "consistency", "indexing", "llm-infra"]
+---
+
+## Overview
+
+This RAG system guarantees freshness by making it a first-class query constraint with an auditable contract: Postgres assigns a per-tenant monotonic `change_seq`, and the API returns a `write_token` on successful writes for strict read-after-write.
+
+Retrieval uses a two-tier index, implemented as two namespaces in the same managed vector DB:
+- `recent`: written synchronously on document updates to make changes immediately visible.
+- `main`: filled asynchronously for throughput and cost.
+
+Postgres is the source of truth for document versions, ACLs, active embedding model, and watermarks. Object storage holds chunk text. The API always queries both indexes, merges results, and enforces version/model/ACL constraints at query time.
+
+## Requirements
+
+### Functional Requirements
+- Retrieve top-K relevant chunks for a query with max staleness ≤ 60s for updated documents.
+- Support strict read-after-write via `write_token`.
+- Provide citations (document id, chunk id, version) for every returned chunk.
+- Prevent mixing incompatible embedding spaces (model/version changes) in a single retrieval.
+
+### Scale Targets
+- Corpus: 10M documents, ~200M chunks (avg 20 chunks/doc).
+- Online traffic: 500 QPS sustained, 2k QPS peak; p95 retrieval+prompt build ≤ 250ms (excluding LLM).
+- Writes/updates: 200 updates/sec burst (import jobs), 10 updates/sec steady.
+- Freshness SLA: 99.9% of queries satisfy max staleness; read-after-write is strict.
+
+## Key Design Decisions
+
+- **Two-tier index (Main + Recent)**
+  - `recent` is updated synchronously on writes; `main` is updated asynchronously.
+  - Queries always hit both and merge.
+
+- **Sequence-based freshness contract**
+  - Postgres assigns `change_seq` per tenant and tracks `indexed_seq` for the async worker.
+  - `write_token = (tenant_id, change_seq, doc_id, doc_version, model_id)` is the read-after-write anchor.
+
+- **Versioned chunks and a single active `model_id`**
+  - Chunk ids include `(doc_id, doc_version, chunk_id, model_id)`.
+  - Each tenant has exactly one `active_model_id` used for retrieval.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> A[RAG API]
+  A --> P[Postgres]
+  A --> S[Doc Store]
+  A --> V["Vector DB (main + recent)"]
+  A --> L[LLM]
+  W[Embed Worker] --> P
+  W --> S
+  W --> V
+```
+
+### Components
+
+- `RAG API`
+  - Owns read/write contracts, sync embedding for strict writes, retrieval, merge, filtering, and prompt assembly.
+  - Justification: the only custom surface area; it defines correctness.
+
+- `Postgres`
+  - Stores docs/chunk metadata, ACLs, `change_seq`, per-tenant `indexed_seq`, and `active_model_id`.
+  - Justification: the durable truth needed for debuggable freshness and version/ACL enforcement.
+
+- `Doc Store`
+  - Object storage for chunk text and document payloads.
+  - Justification: cheapest durable store for the content the model actually reads.
+
+- `Vector DB (main + recent namespaces)`
+  - Stores embeddings for similarity search; `recent` is small and fast, `main` is large and cost-optimized.
+  - Justification: the only ANN dependency; two-tiering is how freshness stays independent of async lag.
+
+- `Embed Worker`
+  - Pulls unprocessed changes from Postgres, computes embeddings, upserts into `main`, and advances `indexed_seq` when complete.
+  - Justification: separates throughput/cost from interactive latency.
+
+- `LLM`
+  - Generates the final response with citations.
+  - Justification: core product output.
+
+## Deep Dive: Freshness Guarantees
+
+Freshness is enforced by a write token plus a fail-closed check when freshness is requested.
+
+1. **Write path: durable change + token**
+   - A document mutation commits in Postgres with a new `doc_version` and per-tenant `change_seq`.
+   - The response returns `write_token = (tenant_id, change_seq, doc_id, doc_version, model_id)`.
+
+2. **Strict read-after-write: sync embed to `recent`**
+   - For strict writes, the API chunks the delta, computes embeddings, and upserts them into the vector DB `recent` namespace.
+   - The same chunks’ text is written to the Doc Store and mapped in Postgres.
+
+3. **Async fill: worker upserts to `main`**
+   - The worker reads pending changes from Postgres (idempotency key: `(tenant_id, change_seq)`).
+   - It computes embeddings and upserts into `main`.
+   - It advances `indexed_seq` only after all chunks for that `change_seq` succeed.
+
+4. **Query path: always merge + enforce**
+   - The API queries both `recent` and `main`, merges, fetches chunk text from Doc Store, and filters by:
+     - tenant, ACLs, `active_model_id`, and latest `doc_version`.
+   - With a `write_token`, results for `token.doc_id` must be from `doc_version >= token.doc_version`.
+
+5. **Freshness when infrastructure is behind**
+   - If a request includes `write_token` or `max_staleness_ms`, and the vector DB `recent` namespace is unavailable, the API:
+     - Pins the `write_token` document by fetching its latest chunks directly from Doc Store/metadata and includes them in context (bounded by a strict size limit).
+     - If it still cannot satisfy the request, it returns an explicit freshness error (no silent staleness).
+
+6. **Admission control**
+   - Strict writes have a hard cap (max delta chunks / max bytes) and per-tenant rate limits.
+   - Bulk imports use non-strict writes (no sync embed, no `write_token`), so they cannot degrade interactive freshness.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Freshness without query delays | Higher latency on strict writes (sync embed) |
+| Simple ops (managed vector DB only) | Hot tier costs for `recent` retention |
+| Auditable correctness (seq/version/token) | Some strict requests fail closed under dependency loss |
+
+**What We Removed**
+- Standalone `Retriever` service (merged into `RAG API`).
+- Custom in-memory FAISS/HNSW + WAL `Recent Index` service (replaced by `recent` namespace in the managed vector DB).
+- Eviction correctness logic tied to global watermarks (replaced by TTL/size-bounded `recent` retention plus version filtering).
+
+## Failure Modes
+
+- **Postgres down**
+  - Writes and reads return 503 (no partial correctness mode).
+
+- **Vector DB `recent` slow**
+  - Strict writes are rate-limited or rejected; bulk writes continue.
+
+- **Network partition to vector DB**
+  - Freshness-required queries return freshness errors; `write_token` requests include pinned doc context when possible.
+
+- **Async worker duplicates / out-of-order**
+  - Changes are idempotent by `(tenant_id, change_seq)`; `indexed_seq` advances only after complete success per change.
+
+- **Hot tier growth exceeds policy**
+  - Strict writes reject with backpressure; bulk mode continues.
+
+- **Embedding model upgrade**
+  - `active_model_id` is switched only after backfill; retrieval uses exactly one model per tenant.
+
+## Operational Notes
+
+- Track per tenant: `change_seq`, `indexed_seq`, and `recent_retention_minutes` (effective TTL under load).
+- Alert on: sustained `change_seq - indexed_seq` growth, and `recent` retention falling below the freshness window.
+- Log on every request: `tenant_id`, `active_model_id`, `max_staleness_ms`, presence of `write_token`, and whether pinned-doc fallback was used.
+- Enforce bounded prompts: strict caps on pinned doc inclusion and total retrieved context bytes.
+```
+[Pass 4/4] Mermaid diagrams fixed
+
+==========================================
+Completed (v2): Retrieval-Augmented Generation (RAG)
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/retrieval-augmented-generation.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/retrieval-augmented-generation.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/07-ai-ml-infrastructure/retrieval-augmented-generation.md

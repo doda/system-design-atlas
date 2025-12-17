@@ -1,0 +1,353 @@
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2a94-b537-75e1-baf4-5982891f6555
+--------
+user
+You are a senior systems architect reviewing a system design document.
+
+Grade this solution on three dimensions (1-10 scale):
+
+1. **Strength** (1-10): How technically sound, complete, and production-ready is the design?
+   - Does it address scalability, reliability, and failure modes?
+   - Are the trade-offs well-reasoned?
+   - Would this actually work at scale?
+
+2. **Interestingness** (1-10): How engaging and educational is the content?
+   - Does it teach useful concepts?
+   - Are there insights that aren't obvious?
+   - Would an engineer learn something valuable?
+
+3. **Novelty** (1-10): How unique or creative is the approach?
+   - Does it go beyond textbook solutions?
+   - Are there clever simplifications or unconventional choices?
+   - Does it challenge common assumptions?
+
+Also note any major issues or particularly strong aspects.
+
+Output ONLY valid JSON in this exact format:
+{
+  "slug": "service-discovery",
+  "strength": <1-10>,
+  "interestingness": <1-10>,
+  "novelty": <1-10>,
+  "overall": <average of three scores, 1 decimal>,
+  "summary": "<2-3 sentence summary of the design>",
+  "strengths": ["<strength 1>", "<strength 2>"],
+  "weaknesses": ["<weakness 1>", "<weakness 2>"],
+  "verdict": "<one of: exceptional, strong, adequate, weak>"
+}
+
+---
+
+## Solution to Grade
+
+---
+title: "Service Discovery"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["service-discovery", "kubernetes", "multi-cluster", "routing", "consistency"]
+---
+
+## Overview
+
+This system provides multi-cluster service discovery for Kubernetes by turning continuously changing endpoint state into proxy-ready routing configuration. Cluster-local agents watch `EndpointSlice` and stream normalized updates to a small global control plane. Proxies (sidecars and gateways) receive updates over Envoy xDS and route using local configuration with no per-request dependency on the control plane.
+
+Global state is intentionally **eventually consistent** with explicit **bounded staleness**. Proxies continue routing with the last-known-good configuration during control-plane or network failures, and degrade deterministically when configuration expires.
+
+---
+
+## Requirements
+
+### Functional Requirements
+- Register and discover services across multiple Kubernetes clusters (hundreds+).
+- Support endpoint-level and cluster/region-level routing (locality preference, weights, priorities, failover).
+- Distribute high-churn endpoint updates efficiently (incremental updates and watches).
+- Support multiple consumers: ingress gateways, sidecars, L7 proxies, and internal clients.
+- Incorporate health signals:
+  - Kubernetes readiness
+  - Optional active probing (blackhole detection)
+  - Passive health from data plane (outlier detection / success rate / latency)
+- Provide explicit behavior under staleness and partitions (bounded staleness + safe defaults).
+- Multi-tenant isolation (tenants/namespaces/projects), RBAC, and policy enforcement.
+- Operational tooling:
+  - “Why did I route here?” debugging
+  - Audit logs for policy changes
+  - Snapshot export for incident forensics
+
+### Non-Functional Requirements
+
+#### Scale (Target Capacity)
+- Up to **200 clusters** across **3–10 regions**
+- Up to **20k services** globally
+- Up to **2M endpoints** globally
+- Peak churn:
+  - **Sustained**: **5k endpoint updates/sec**
+  - **Burst**: **50k endpoint updates/sec**
+- Control-plane APIs (policy + debug + ingestion): **5k QPS** sustained (burstable)
+
+#### Latency (Targets)
+- Endpoint change → proxy convergence: **P50 ≤ 2s**, **P99 ≤ 15s**
+- Proxy routing overhead: **P99 < 2ms** added per request
+
+#### Availability & Durability
+- Data plane availability: **99.99%** (routing continues during control-plane outages)
+- Control plane availability: **99.9%** (stale operation is acceptable within staleness bounds)
+- Durability:
+  - Endpoint state is **reconstructable** from Kubernetes sources
+  - Policy/audit data: **RPO ≤ 1 minute**, retained **90 days**
+
+#### Consistency
+- Within a cluster: Kubernetes API is the source of truth.
+- Globally: **eventual consistency** with **bounded staleness**.
+- Per-proxy session monotonicity: a proxy must not observe decreasing config versions on the same xDS stream.
+
+---
+
+## Simplified Architecture
+
+```mermaid
+flowchart TB
+  K8s["Kubernetes API"]
+  Agent["Cluster Agent"]
+  CP["Discovery Control Plane"]
+  DB["PostgreSQL"]
+  Proxy["Envoy Proxy"]
+
+  K8s --> Agent
+  Agent --> CP
+  CP <--> DB
+  CP --> Proxy
+```
+
+### Responsibilities
+- **Cluster Agent (per cluster)**: watches Kubernetes, normalizes endpoint updates, streams deltas.
+- **Discovery Control Plane (global)**: validates updates, applies policy, combines health signals, publishes xDS.
+- **PostgreSQL**: durable policy + audit, plus lightweight coordination/state needed for safe operation.
+- **Envoy Proxies**: route locally using xDS config, enforce fast local ejection and bounded staleness behavior.
+
+---
+
+## Components
+
+### 1) Cluster Agent
+**Responsibility**
+- Watch `EndpointSlice` and stream normalized endpoint deltas to the control plane.
+
+**Key behaviors**
+- At-least-once delivery with idempotency keys: `(tenant_id, cluster_id, service_key, k8s_resource_version)`.
+- Batching + compression (coalescing windows like 200–500ms under burst).
+- Periodic resync (10–30 minutes) and heartbeats.
+
+**Technology**
+- Go + `client-go` informers, gRPC with mTLS identity.
+
+---
+
+### 2) Discovery Control Plane (single service, modular)
+This is one deployable service with clear internal modules (not separate services).
+
+**Modules**
+- **Ingestion**: mTLS authn, RBAC authz, schema validation, backpressure.
+- **Policy**: reads routing policy, validates updates, writes audit events.
+- **Discovery Engine**: merges endpoint state, applies routing policy (weights, priorities, locality, failover).
+- **Health**: combines Kubernetes readiness, passive health summaries, and optional probe results.
+- **xDS Server**: serves ADS (Delta xDS preferred) to gateways and sidecars.
+
+**Backpressure**
+- If the control plane cannot keep up with churn, it coalesces per `(tenant_id, service_key, cluster_id)` and admits updates with `retry_after_ms` for agents.
+
+**Versioning**
+- Per xDS stream, versions are monotonic.
+- Reconnects receive a consistent snapshot before deltas.
+
+---
+
+### 3) PostgreSQL (policy + audit + minimal shared state)
+**Durable**
+- Policies, service metadata, and audit logs (90-day retention).
+
+**Optional shared state**
+- Small coordination primitives (e.g., leader/lease rows) and compact snapshots for faster control-plane restarts (derived data is still rebuildable from Kubernetes).
+
+---
+
+### 4) Envoy Proxy (sidecar / gateway)
+**Routing**
+- Uses xDS resources (EDS + CDS; optionally RDS/LDS for gateways).
+- Enforces local outlier detection/circuit breaking.
+
+**Bounded staleness**
+- Uses xDS resource TTL where supported, so endpoints/config can expire locally when not refreshed, enabling deterministic degradation even if the control plane is unreachable.
+
+---
+
+## Data Model
+
+### Policy Store (PostgreSQL)
+- `services(service_id, tenant_id, namespace, name, ports_jsonb, created_at, updated_at)`
+- `routing_policies(policy_id, tenant_id, service_id, mode, cluster_weights_jsonb, failover_order_jsonb, max_staleness_seconds, health_mode, etag, updated_by, updated_at)`
+- `audit_log(event_id, tenant_id, actor, action, resource, before_jsonb, after_jsonb, ts)`
+
+### Ephemeral / Derived State
+- Endpoint sets and computed routing views are derived from Kubernetes + policy.
+- The control plane keeps hot state in memory and can optionally persist compact per-service snapshots to speed restart and failover.
+
+---
+
+## APIs
+
+### Agent → Control Plane (gRPC)
+- `UpsertEndpoints(tenant_id, cluster_id, service_key, k8s_resource_version, delta, timestamp_unix_ms)`
+- Errors:
+  - `UNAUTHENTICATED` / `PERMISSION_DENIED` for identity/RBAC failures
+  - `RESOURCE_EXHAUSTED` with `retry_after_ms` for backpressure
+  - `FAILED_PRECONDITION` for incompatible schema
+
+### Policy/Admin API (HTTP)
+- `PUT /v1/tenants/{tenantId}/services/{serviceKey}/policy` with `If-Match: "{etag}"`
+- `POST /v1/tenants/{tenantId}/debug/route` to explain routing decisions (“why routed?”)
+
+### Discovery → Data Plane (xDS)
+- ADS over gRPC
+- Resources: EDS + CDS (and RDS/LDS when needed)
+- Delta xDS preferred to minimize payload during churn
+
+---
+
+## Data Flows
+
+### Endpoint updates (watch → xDS)
+```mermaid
+sequenceDiagram
+  participant K8s as K8s API
+  participant A as Agent
+  participant CP as Control Plane
+  participant DB as Postgres
+  participant P as Envoy
+
+  K8s->>A: EndpointSlice event
+  A->>CP: UpsertEndpoints(delta)
+  CP->>DB: Read policy / write audit if needed
+  CP->>P: xDS push (EDS/CDS)
+```
+
+### Policy updates (admin → xDS)
+```mermaid
+sequenceDiagram
+  participant Admin as Admin
+  participant CP as Control Plane
+  participant DB as Postgres
+  participant P as Envoy
+
+  Admin->>CP: PUT policy (If-Match)
+  CP->>DB: Validate + write + audit
+  CP->>P: xDS push (new routing)
+```
+
+---
+
+## Consistency, Staleness, and Safety Rules
+
+### Freshness and expiry
+- Agents include `k8s_resource_version` ordering and periodic heartbeats.
+- The control plane treats missing refreshes as stale after an `endpoint_ttl_seconds` window (e.g., 30–120s).
+
+### Proxy behavior under staleness
+Per-policy `maxStalenessSeconds`:
+- While config is fresh: normal routing with locality and weights.
+- After TTL expiration: proxies deterministically reduce eligible targets (prefer same-cluster/same-region based on policy) and fail fast when no safe targets remain.
+
+### Health inputs
+- Kubernetes readiness gates endpoints quickly.
+- Passive proxy outlier detection ejects bad endpoints immediately under real traffic.
+- Optional active probes are rate-limited per service/cluster and time-decayed to reduce flapping.
+
+---
+
+## Scaling & Performance
+
+- **High churn**: agents batch and coalesce deltas; control plane coalesces per service and pushes Delta xDS.
+- **Fanout**: scale the control plane horizontally by xDS connection count; computed views and serialization are cached per service.
+- **Hot services**: apply per-service update rate caps and coalescing windows to prevent update storms.
+- **State size**: endpoint sets are stored compactly in memory (compressed representations) and rebuilt from Kubernetes on restart.
+
+---
+
+## Failure Modes & Mitigations
+
+- **Control plane outage**: proxies keep last-known-good config and continue routing; bounded staleness TTL drives deterministic degradation when refreshes stop.
+- **Cross-region partitions**: locality preference and failover order keep traffic stable; health signals are time-decayed to avoid oscillations.
+- **Stale endpoints / blackholes**: local outlier detection handles fast failures; optional probes raise confidence for critical services.
+- **Bad policy**: schema + invariant validation; ETag concurrency; audit logs enable rapid rollback.
+- **Invalid config to proxies**: pre-publish validation and capability gating based on proxy metadata; observe NACK rates.
+
+---
+
+## Operations
+
+### SLIs / SLOs
+- Convergence latency: endpoint event → proxy ACK (P50/P99).
+- Staleness rate: % proxies with expired/near-expired config TTL.
+- xDS health: active streams, disconnects, ACK/NACK ratio.
+- Agent health: watch lag, heartbeat age, rejected updates.
+- Routing health: upstream success rate, timeouts, outlier ejections.
+
+### Debugging and forensics
+- Route explain API returns chosen targets, policy inputs, health/staleness state, and reason codes.
+- Snapshot export per service and per proxy (last ACKed version, TTL state, inputs used).
+
+### Durability
+- PostgreSQL WAL-based backups and point-in-time restore for policy/audit (RPO ≤ 1 minute).
+
+---
+
+## Simplification Notes
+
+- **Merged**
+  - Ingestion API, policy service, view builder, health processor, and xDS publisher are implemented as one `Discovery Control Plane` deployable with internal modules, keeping one operational surface while preserving the same external behaviors.
+- **Removed**
+  - Separate “local xDS cache” component: proxies rely on built-in last-known-good xDS handling and resource TTL for bounded staleness.
+  - External queues/streams and additional datastores: churn handling uses batching, coalescing, and Delta xDS; durable needs are covered by PostgreSQL.
+- **Complexity kept (necessary)**
+  - xDS (ADS) push distribution for proxy-local routing performance and rich routing semantics.
+  - Bounded staleness with deterministic degradation to keep routing safe through control-plane and network failures.
+  - Multi-signal health (readiness + passive, optional probes) to reduce blackholes under partial failures.
+mcp startup: no servers
+
+thinking
+**Evaluating system strengths and weaknesses**
+
+I'm weighing some weaknesses here, like the CP bottleneck, missing sharding, reliance on Postgres, and no durable queue for resilience. Also, TTL support and behavior seem unclear. On the strengths side, I see clear requirements and scaling targets, as well as good bounded staleness and health signals. I need to summarize this briefly and ensure I'm outputting valid JSON with properly escaped strings in arrays with two items each.
+codex
+{
+  "slug": "service-discovery",
+  "strength": 8,
+  "interestingness": 7,
+  "novelty": 6,
+  "overall": 7.0,
+  "summary": "A solid multi-cluster Kubernetes service discovery design that streams EndpointSlice deltas via per-cluster agents to a global control plane that publishes Envoy xDS, avoiding per-request control-plane dependencies. The explicit bounded-staleness model and deterministic degradation, combined with passive/optional active health signals and strong operational tooling, makes it credible for production with further detail on scaling and deployment topology.",
+  "strengths": ["Clear requirements/targets with pragmatic eventual consistency and bounded staleness to keep the data plane available during outages/partitions", "Good operational maturity: backpressure, monotonic xDS versioning, debug/forensics APIs, and multi-signal health integration (readiness + outlier detection + optional probes)"],
+  "weaknesses": ["Control-plane scalability and topology are under-specified for the stated peak churn (50k updates/sec) and 2M endpoints: needs concrete sharding/partitioning, multi-region active-active strategy, and failure/consistency behavior across control-plane replicas", "Durability/ingestion resilience is optimistic without a queue/log: relying on in-memory hot state + coalescing risks data loss of transient updates and slow rebuilds under large-scale restarts or Kubernetes API throttling; also xDS TTL support/capability constraints need sharper guarantees"],
+  "verdict": "strong"
+}
+tokens used
+3,978
+{
+  "slug": "service-discovery",
+  "strength": 8,
+  "interestingness": 7,
+  "novelty": 6,
+  "overall": 7.0,
+  "summary": "A solid multi-cluster Kubernetes service discovery design that streams EndpointSlice deltas via per-cluster agents to a global control plane that publishes Envoy xDS, avoiding per-request control-plane dependencies. The explicit bounded-staleness model and deterministic degradation, combined with passive/optional active health signals and strong operational tooling, makes it credible for production with further detail on scaling and deployment topology.",
+  "strengths": ["Clear requirements/targets with pragmatic eventual consistency and bounded staleness to keep the data plane available during outages/partitions", "Good operational maturity: backpressure, monotonic xDS versioning, debug/forensics APIs, and multi-signal health integration (readiness + outlier detection + optional probes)"],
+  "weaknesses": ["Control-plane scalability and topology are under-specified for the stated peak churn (50k updates/sec) and 2M endpoints: needs concrete sharding/partitioning, multi-region active-active strategy, and failure/consistency behavior across control-plane replicas", "Durability/ingestion resilience is optimistic without a queue/log: relying on in-memory hot state + coalescing risks data loss of transient updates and slow rebuilds under large-scale restarts or Kubernetes API throttling; also xDS TTL support/capability constraints need sharper guarantees"],
+  "verdict": "strong"
+}
+Graded: service-discovery

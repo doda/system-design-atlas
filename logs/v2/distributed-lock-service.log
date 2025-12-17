@@ -1,0 +1,2865 @@
+==========================================
+Generating (v2): Distributed Lock Service
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-185b-7733-a2fa-ceaa3eefa03c
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Distributed Lock Service
+**Category**: Foundational Infrastructure
+
+**Problem Statement**:
+Design a coordination service (like Chubby/ZooKeeper) focusing on lease management, fencing tokens, and client failure detection.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+thinking
+**Designing a Coordination Service**
+
+The user wants a markdown design document focused on a coordination service, possibly based on etcd. The service should emphasize lease management, fencing, and client failure detection. Key challenges include linearizability and managing leases during partitions. I'll set requirements like the number of clients and target QPS, decide on a consensus algorithm like Raft, and implement a gRPC API. The design will incorporate unique fencing tokens and a strategy to handle clock drift and lease expiry based on the leader's clock.
+thinking
+**Defining Read/Write Semantics**
+
+I'm outlining the read/write semantics for the coordination service. Linearizable operations will require a leader, while allowing reads to be stale for watches. Lock acquisition should remain linearizable, incorporating the concept of ephemeral nodes. When a lease expires, locks are released. To manage waiting clients and avoid system overload, I'll use a sequential lock queue. The API should return a wait channel for lock acquisition. Addressing fair lock acquisition and preventing stampedes will be crucial, possibly by implementing a FIFO system with token increments.
+thinking
+**Addressing Partitions and Lease Safety**
+
+I need to consider how partitions impact clients — those disconnected from the quorum might mistakenly believe their lease is still valid. So, I’ll ensure guidance is clear: if clients can't renew their lease or reach quorum, they must stop using the lock. The architecture diagram will include clients, API gateways, leaders, followers, storage, and monitoring elements. I'll add operational notes on compaction and leader election and draft the document with YAML front matter, outlining failure modes like network partitions or clock jumps. I'll keep the writing concise and to the point.
+codex
+```markdown
+---
+title: "Distributed Lock Service"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["coordination", "distributed-systems", "raft", "leases", "fencing-tokens"]
+---
+
+## Overview
+
+This system is a small, strongly-consistent coordination service for distributed locks and lightweight metadata—purpose-built around **leases**, **fencing tokens**, and **client failure detection**. The key idea is to treat “lock ownership” as nothing more than “a replicated fact attached to a lease”, and to make every externally-visible ownership change (acquire/release/expire) a **single linearizable write** through a consensus leader.
+
+The elegance comes from keeping the surface area narrow: one consensus group, one keyspace, one correctness model (linearizability for lock state), and one way to recover from ambiguity (lease expiry + fencing). Leases answer “who still has the lock?”, fencing answers “who gets to act?”, and failure detection becomes “who can keep renewing through quorum?”.
+
+## What Makes This Hard
+
+Naive lock services confuse **liveness** with **safety**. They detect dead clients via heartbeats, but miss the real problem: in partitions or slow networks, *two clients can both believe they own the lock*. If the protected system accepts requests from both, you get split-brain writes, corrupted state, and bugs that only appear under partial failure.
+
+The trap is thinking that “the lock service says I own it” is enough. It isn’t. You need a **monotonic fencing token** that downstream systems can validate, so that even if a former owner is still running (or resumes after a pause), its actions are rejected.
+
+## Requirements
+
+### Functional Requirements
+- **Linearizable lock acquisition and release**: exactly one owner at a time in the committed log.
+- **Leases**: lock ownership is bound to a lease; if the lease expires, the lock is automatically released.
+- **Fencing tokens**: each successful acquisition yields a strictly increasing token per lock key; clients must present it to the protected resource.
+- **Client failure detection**: server-side expiry via missed renewals; client-side self-fencing when it cannot renew.
+- **Watch/notify** for lock availability to avoid polling storms.
+
+### Scale Targets
+- **Cluster size**: 3 nodes (Raft), tolerate 1 failure; 5 nodes when you optimize for read availability and maintenance windows.
+- **Clients**: 10k concurrent clients, 50k active leases.
+- **Locks**: 1–5 million lock keys (sparse, not all active).
+- **Write QPS**: 2k–5k (acquire/release/renew dominate), p99 commit latency < 50ms intra-region.
+- **Watchers**: up to 100k concurrent watches (the real memory pressure), with bounded fanout per hot key.
+
+These numbers force you to care about: (1) commit latency and write amplification, and (2) watch scalability without turning “one lock release” into “100k wakeups”.
+
+## Key Design Decisions
+
+- **What we chose:** Raft-based single-writer replication (one leader) with a simple KV + lock API.
+  - **What we rejected:** gossip-based ownership, multi-leader writes, or “best-effort” locks.
+  - **Why:** locks are small but correctness is binary; linearizable writes are the simplest way to be right.
+
+- **What we chose:** Leases are server-authoritative TTLs on a monotonic clock, renewed only through the current leader.
+  - **What we rejected:** client-side timers as truth, follower-accepted renewals, or “extend-on-read”.
+  - **Why:** it removes clock-sync assumptions and ensures all lease decisions flow through one serialization point.
+
+- **What we chose:** Fencing tokens are per-lock monotonically increasing integers stored in the replicated state and issued on acquisition.
+  - **What we rejected:** “lock ID is enough”, timestamps, or relying on lease expiry alone.
+  - **Why:** fencing is the only practical defense against clients that are alive but unsafe (GC pauses, partitions, scheduler stalls).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Clients] --> L4["L7 LB"]
+  L4 --> API["Coord API (gRPC)"]
+  API --> R["Raft Leader"]
+  R <--> F["Raft Followers"]
+  R --> SM["State Machine (KV+Leases)"]
+  SM --> W["Watch Fanout"]
+  R --> M["Metrics/Tracing"]
+```
+
+### Components
+
+- **Coord API (gRPC)**: the only public interface; all mutating calls route to the leader (followers proxy).
+- **Raft Leader / Followers**: replicate a log of state transitions; leader is the single serialization point for leases and tokens.
+- **State Machine (KV+Leases)**: applies committed log entries; maintains lock ownership, lease records, and token counters.
+- **Watch Fanout**: turns committed state changes into notifications; designed to be bounded and backpressured.
+- **Metrics/Tracing**: p99 commit latency, leader churn, log size, watch backlog—these are the truth in production.
+
+## Deep Dive: Fencing Tokens (The Hardest Part)
+
+Fencing tokens solve the “zombie owner” problem: a client can lose the ability to safely coordinate (partition, long GC pause) yet continue issuing writes to the protected system. A lease alone doesn’t stop it, because the client can’t reliably know when it became unsafe, and downstream systems often can’t query the lock service on every operation.
+
+**Token model**
+- Each lock key `K` maintains a **token counter** `T[K]` in replicated state.
+- On successful acquisition of `K`, the leader commits:
+  1) `T[K] = T[K] + 1`
+  2) `Owner[K] = (lease_id, holder_id, token=T[K])`
+- The API returns `(lease_id, token)` to the client.
+
+**Downstream enforcement**
+- Every write to the protected resource must include `(K, token)`.
+- The protected resource stores `MaxToken[K]` and rejects any request with `token < MaxToken[K]`.
+- On accept, it updates `MaxToken[K] = token` (or uses a compare-and-set if it’s replicated).
+
+This turns coordination into a one-way safety gate: even if an old owner keeps running, its token is stale and it cannot cause damage. You’ve moved correctness to the place that matters: the system being protected.
+
+**Edge cases that break teams**
+- **Leader change during acquire**: the client may see a timeout. It must treat the attempt as “unknown” and retry; duplicate acquires are safe because token issuance is serialized in the log.
+- **Client pause**: if renewals stop, the lease expires server-side. The client must self-fence by refusing to use the lock if it cannot renew within a bounded window.
+- **Hot lock**: on a single key, fairness and wakeups matter more than raw throughput; you optimize watch behavior, not Raft.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Strong correctness (linearizable ownership) | Cross-region latency for writes |
+| Simple mental model (leader decides) | Single-consensus-group write ceiling |
+| Safety under partial failure (fencing) | Requires downstream token enforcement |
+| Operational predictability | Some availability during quorum loss |
+
+## Failure Modes
+
+- **Network partition (client ↔ quorum)**
+  - **What happens:** client can’t renew; server expires lease and releases locks; client may still be running.
+  - **Detect:** renew RPC failures / keepalive acks stop; server emits lease-expiry counters.
+  - **Recover:** client self-fences immediately (stop acting), then reacquires; downstream rejects stale-token writes.
+
+- **Leader crash during high churn**
+  - **What happens:** brief unavailability for writes; some clients see timeouts and retry.
+  - **Detect:** leader election events, commit latency spike, increased retry rate.
+  - **Recover:** new leader resumes; idempotent acquire via “unknown result → retry” rule; watches replay from committed index.
+
+- **Watch overload on hot keys**
+  - **What happens:** release triggers a notification storm, starving commits and increasing tail latency.
+  - **Detect:** watch queue depth, per-key watcher counts, notification lag.
+  - **Recover:** enforce per-key watcher limits, add backpressure (drop/compact watch events to “latest state”), and encourage FIFO locking (watch predecessor, not the lock).
+
+## What I'd Do Differently At...
+
+- **10x scale:** shard by key prefix into multiple Raft groups (each with its own leader) and keep leases local to a shard; clients map lock key → shard deterministically.
+- **100x scale:** redesign watches as a separate, horizontally-scaled notification plane fed by committed indices, and split “lease/lock writes” from “read-heavy metadata” (different consistency tiers).
+
+## Operational Notes
+
+- **Lease safety rule:** if a client can’t renew and confirm within `TTL/2`, it must assume it no longer owns the lock and self-fence.
+- **Time handling:** base lease expiry on the leader’s monotonic clock; never trust wall-clock time for correctness.
+- **Snapshots/compaction:** required to cap log growth; watchers must anchor to a committed index and recover via snapshot + subsequent log.
+- **SLO dashboards:** commit p99, election rate, pending proposals, expired leases, watch lag, and per-key contention are the five graphs that predict incidents.
+```
+tokens used
+3,677
+```markdown
+---
+title: "Distributed Lock Service"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["coordination", "distributed-systems", "raft", "leases", "fencing-tokens"]
+---
+
+## Overview
+
+This system is a small, strongly-consistent coordination service for distributed locks and lightweight metadata—purpose-built around **leases**, **fencing tokens**, and **client failure detection**. The key idea is to treat “lock ownership” as nothing more than “a replicated fact attached to a lease”, and to make every externally-visible ownership change (acquire/release/expire) a **single linearizable write** through a consensus leader.
+
+The elegance comes from keeping the surface area narrow: one consensus group, one keyspace, one correctness model (linearizability for lock state), and one way to recover from ambiguity (lease expiry + fencing). Leases answer “who still has the lock?”, fencing answers “who gets to act?”, and failure detection becomes “who can keep renewing through quorum?”.
+
+## What Makes This Hard
+
+Naive lock services confuse **liveness** with **safety**. They detect dead clients via heartbeats, but miss the real problem: in partitions or slow networks, *two clients can both believe they own the lock*. If the protected system accepts requests from both, you get split-brain writes, corrupted state, and bugs that only appear under partial failure.
+
+The trap is thinking that “the lock service says I own it” is enough. It isn’t. You need a **monotonic fencing token** that downstream systems can validate, so that even if a former owner is still running (or resumes after a pause), its actions are rejected.
+
+## Requirements
+
+### Functional Requirements
+- **Linearizable lock acquisition and release**: exactly one owner at a time in the committed log.
+- **Leases**: lock ownership is bound to a lease; if the lease expires, the lock is automatically released.
+- **Fencing tokens**: each successful acquisition yields a strictly increasing token per lock key; clients must present it to the protected resource.
+- **Client failure detection**: server-side expiry via missed renewals; client-side self-fencing when it cannot renew.
+- **Watch/notify** for lock availability to avoid polling storms.
+
+### Scale Targets
+- **Cluster size**: 3 nodes (Raft), tolerate 1 failure; 5 nodes when you optimize for read availability and maintenance windows.
+- **Clients**: 10k concurrent clients, 50k active leases.
+- **Locks**: 1–5 million lock keys (sparse, not all active).
+- **Write QPS**: 2k–5k (acquire/release/renew dominate), p99 commit latency < 50ms intra-region.
+- **Watchers**: up to 100k concurrent watches (the real memory pressure), with bounded fanout per hot key.
+
+These numbers force you to care about: (1) commit latency and write amplification, and (2) watch scalability without turning “one lock release” into “100k wakeups”.
+
+## Key Design Decisions
+
+- **What we chose:** Raft-based single-writer replication (one leader) with a simple KV + lock API.
+  - **What we rejected:** gossip-based ownership, multi-leader writes, or “best-effort” locks.
+  - **Why:** locks are small but correctness is binary; linearizable writes are the simplest way to be right.
+
+- **What we chose:** Leases are server-authoritative TTLs on a monotonic clock, renewed only through the current leader.
+  - **What we rejected:** client-side timers as truth, follower-accepted renewals, or “extend-on-read”.
+  - **Why:** it removes clock-sync assumptions and ensures all lease decisions flow through one serialization point.
+
+- **What we chose:** Fencing tokens are per-lock monotonically increasing integers stored in the replicated state and issued on acquisition.
+  - **What we rejected:** “lock ID is enough”, timestamps, or relying on lease expiry alone.
+  - **Why:** fencing is the only practical defense against clients that are alive but unsafe (GC pauses, partitions, scheduler stalls).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Clients] --> L4["L7 LB"]
+  L4 --> API["Coord API (gRPC)"]
+  API --> R["Raft Leader"]
+  R <--> F["Raft Followers"]
+  R --> SM["State Machine (KV+Leases)"]
+  SM --> W["Watch Fanout"]
+  R --> M["Metrics/Tracing"]
+```
+
+### Components
+
+- **Coord API (gRPC)**: the only public interface; all mutating calls route to the leader (followers proxy).
+- **Raft Leader / Followers**: replicate a log of state transitions; leader is the single serialization point for leases and tokens.
+- **State Machine (KV+Leases)**: applies committed log entries; maintains lock ownership, lease records, and token counters.
+- **Watch Fanout**: turns committed state changes into notifications; designed to be bounded and backpressured.
+- **Metrics/Tracing**: p99 commit latency, leader churn, log size, watch backlog—these are the truth in production.
+
+## Deep Dive: Fencing Tokens (The Hardest Part)
+
+Fencing tokens solve the “zombie owner” problem: a client can lose the ability to safely coordinate (partition, long GC pause) yet continue issuing writes to the protected system. A lease alone doesn’t stop it, because the client can’t reliably know when it became unsafe, and downstream systems often can’t query the lock service on every operation.
+
+**Token model**
+- Each lock key `K` maintains a **token counter** `T[K]` in replicated state.
+- On successful acquisition of `K`, the leader commits:
+  1) `T[K] = T[K] + 1`
+  2) `Owner[K] = (lease_id, holder_id, token=T[K])`
+- The API returns `(lease_id, token)` to the client.
+
+**Downstream enforcement**
+- Every write to the protected resource must include `(K, token)`.
+- The protected resource stores `MaxToken[K]` and rejects any request with `token < MaxToken[K]`.
+- On accept, it updates `MaxToken[K] = token` (or uses a compare-and-set if it’s replicated).
+
+This turns coordination into a one-way safety gate: even if an old owner keeps running, its token is stale and it cannot cause damage. You’ve moved correctness to the place that matters: the system being protected.
+
+**Edge cases that break teams**
+- **Leader change during acquire**: the client may see a timeout. It must treat the attempt as “unknown” and retry; duplicate acquires are safe because token issuance is serialized in the log.
+- **Client pause**: if renewals stop, the lease expires server-side. The client must self-fence by refusing to use the lock if it cannot renew within a bounded window.
+- **Hot lock**: on a single key, fairness and wakeups matter more than raw throughput; you optimize watch behavior, not Raft.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Strong correctness (linearizable ownership) | Cross-region latency for writes |
+| Simple mental model (leader decides) | Single-consensus-group write ceiling |
+| Safety under partial failure (fencing) | Requires downstream token enforcement |
+| Operational predictability | Some availability during quorum loss |
+
+## Failure Modes
+
+- **Network partition (client ↔ quorum)**
+  - **What happens:** client can’t renew; server expires lease and releases locks; client may still be running.
+  - **Detect:** renew RPC failures / keepalive acks stop; server emits lease-expiry counters.
+  - **Recover:** client self-fences immediately (stop acting), then reacquires; downstream rejects stale-token writes.
+
+- **Leader crash during high churn**
+  - **What happens:** brief unavailability for writes; some clients see timeouts and retry.
+  - **Detect:** leader election events, commit latency spike, increased retry rate.
+  - **Recover:** new leader resumes; idempotent acquire via “unknown result → retry” rule; watches replay from committed index.
+
+- **Watch overload on hot keys**
+  - **What happens:** release triggers a notification storm, starving commits and increasing tail latency.
+  - **Detect:** watch queue depth, per-key watcher counts, notification lag.
+  - **Recover:** enforce per-key watcher limits, add backpressure (drop/compact watch events to “latest state”), and encourage FIFO locking (watch predecessor, not the lock).
+
+## What I'd Do Differently At...
+
+- **10x scale:** shard by key prefix into multiple Raft groups (each with its own leader) and keep leases local to a shard; clients map lock key → shard deterministically.
+- **100x scale:** redesign watches as a separate, horizontally-scaled notification plane fed by committed indices, and split “lease/lock writes” from “read-heavy metadata” (different consistency tiers).
+
+## Operational Notes
+
+- **Lease safety rule:** if a client can’t renew and confirm within `TTL/2`, it must assume it no longer owns the lock and self-fence.
+- **Time handling:** base lease expiry on the leader’s monotonic clock; never trust wall-clock time for correctness.
+- **Snapshots/compaction:** required to cap log growth; watchers must anchor to a committed index and recover via snapshot + subsequent log.
+- **SLO dashboards:** commit p99, election rate, pending proposals, expired leases, watch lag, and per-key contention are the five graphs that predict incidents.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/distributed-lock-service.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-aa0f-72f1-bd01-36ec0c100049
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Distributed Lock Service"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["coordination", "distributed-systems", "raft", "leases", "fencing-tokens"]
+---
+
+## Overview
+
+This system is a small, strongly-consistent coordination service for distributed locks and lightweight metadata—purpose-built around **leases**, **fencing tokens**, and **client failure detection**. The key idea is to treat “lock ownership” as nothing more than “a replicated fact attached to a lease”, and to make every externally-visible ownership change (acquire/release/expire) a **single linearizable write** through a consensus leader.
+
+The elegance comes from keeping the surface area narrow: one consensus group, one keyspace, one correctness model (linearizability for lock state), and one way to recover from ambiguity (lease expiry + fencing). Leases answer “who still has the lock?”, fencing answers “who gets to act?”, and failure detection becomes “who can keep renewing through quorum?”.
+
+## What Makes This Hard
+
+Naive lock services confuse **liveness** with **safety**. They detect dead clients via heartbeats, but miss the real problem: in partitions or slow networks, *two clients can both believe they own the lock*. If the protected system accepts requests from both, you get split-brain writes, corrupted state, and bugs that only appear under partial failure.
+
+The trap is thinking that “the lock service says I own it” is enough. It isn’t. You need a **monotonic fencing token** that downstream systems can validate, so that even if a former owner is still running (or resumes after a pause), its actions are rejected.
+
+## Requirements
+
+### Functional Requirements
+- **Linearizable lock acquisition and release**: exactly one owner at a time in the committed log.
+- **Leases**: lock ownership is bound to a lease; if the lease expires, the lock is automatically released.
+- **Fencing tokens**: each successful acquisition yields a strictly increasing token per lock key; clients must present it to the protected resource.
+- **Client failure detection**: server-side expiry via missed renewals; client-side self-fencing when it cannot renew.
+- **Watch/notify** for lock availability to avoid polling storms.
+
+### Scale Targets
+- **Cluster size**: 3 nodes (Raft), tolerate 1 failure; 5 nodes when you optimize for read availability and maintenance windows.
+- **Clients**: 10k concurrent clients, 50k active leases.
+- **Locks**: 1–5 million lock keys (sparse, not all active).
+- **Write QPS**: 2k–5k (acquire/release/renew dominate), p99 commit latency < 50ms intra-region.
+- **Watchers**: up to 100k concurrent watches (the real memory pressure), with bounded fanout per hot key.
+
+These numbers force you to care about: (1) commit latency and write amplification, and (2) watch scalability without turning “one lock release” into “100k wakeups”.
+
+## Key Design Decisions
+
+- **What we chose:** Raft-based single-writer replication (one leader) with a simple KV + lock API.
+  - **What we rejected:** gossip-based ownership, multi-leader writes, or “best-effort” locks.
+  - **Why:** locks are small but correctness is binary; linearizable writes are the simplest way to be right.
+
+- **What we chose:** Leases are server-authoritative TTLs on a monotonic clock, renewed only through the current leader.
+  - **What we rejected:** client-side timers as truth, follower-accepted renewals, or “extend-on-read”.
+  - **Why:** it removes clock-sync assumptions and ensures all lease decisions flow through one serialization point.
+
+- **What we chose:** Fencing tokens are per-lock monotonically increasing integers stored in the replicated state and issued on acquisition.
+  - **What we rejected:** “lock ID is enough”, timestamps, or relying on lease expiry alone.
+  - **Why:** fencing is the only practical defense against clients that are alive but unsafe (GC pauses, partitions, scheduler stalls).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Clients] --> L4["L7 LB"]
+  L4 --> API["Coord API (gRPC)"]
+  API --> R["Raft Leader"]
+  R <--> F["Raft Followers"]
+  R --> SM["State Machine (KV+Leases)"]
+  SM --> W["Watch Fanout"]
+  R --> M["Metrics/Tracing"]
+```
+
+### Components
+
+- **Coord API (gRPC)**: the only public interface; all mutating calls route to the leader (followers proxy).
+- **Raft Leader / Followers**: replicate a log of state transitions; leader is the single serialization point for leases and tokens.
+- **State Machine (KV+Leases)**: applies committed log entries; maintains lock ownership, lease records, and token counters.
+- **Watch Fanout**: turns committed state changes into notifications; designed to be bounded and backpressured.
+- **Metrics/Tracing**: p99 commit latency, leader churn, log size, watch backlog—these are the truth in production.
+
+## Deep Dive: Fencing Tokens (The Hardest Part)
+
+Fencing tokens solve the “zombie owner” problem: a client can lose the ability to safely coordinate (partition, long GC pause) yet continue issuing writes to the protected system. A lease alone doesn’t stop it, because the client can’t reliably know when it became unsafe, and downstream systems often can’t query the lock service on every operation.
+
+**Token model**
+- Each lock key `K` maintains a **token counter** `T[K]` in replicated state.
+- On successful acquisition of `K`, the leader commits:
+  1) `T[K] = T[K] + 1`
+  2) `Owner[K] = (lease_id, holder_id, token=T[K])`
+- The API returns `(lease_id, token)` to the client.
+
+**Downstream enforcement**
+- Every write to the protected resource must include `(K, token)`.
+- The protected resource stores `MaxToken[K]` and rejects any request with `token < MaxToken[K]`.
+- On accept, it updates `MaxToken[K] = token` (or uses a compare-and-set if it’s replicated).
+
+This turns coordination into a one-way safety gate: even if an old owner keeps running, its token is stale and it cannot cause damage. You’ve moved correctness to the place that matters: the system being protected.
+
+**Edge cases that break teams**
+- **Leader change during acquire**: the client may see a timeout. It must treat the attempt as “unknown” and retry; duplicate acquires are safe because token issuance is serialized in the log.
+- **Client pause**: if renewals stop, the lease expires server-side. The client must self-fence by refusing to use the lock if it cannot renew within a bounded window.
+- **Hot lock**: on a single key, fairness and wakeups matter more than raw throughput; you optimize watch behavior, not Raft.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Strong correctness (linearizable ownership) | Cross-region latency for writes |
+| Simple mental model (leader decides) | Single-consensus-group write ceiling |
+| Safety under partial failure (fencing) | Requires downstream token enforcement |
+| Operational predictability | Some availability during quorum loss |
+
+## Failure Modes
+
+- **Network partition (client ↔ quorum)**
+  - **What happens:** client can’t renew; server expires lease and releases locks; client may still be running.
+  - **Detect:** renew RPC failures / keepalive acks stop; server emits lease-expiry counters.
+  - **Recover:** client self-fences immediately (stop acting), then reacquires; downstream rejects stale-token writes.
+
+- **Leader crash during high churn**
+  - **What happens:** brief unavailability for writes; some clients see timeouts and retry.
+  - **Detect:** leader election events, commit latency spike, increased retry rate.
+  - **Recover:** new leader resumes; idempotent acquire via “unknown result → retry” rule; watches replay from committed index.
+
+- **Watch overload on hot keys**
+  - **What happens:** release triggers a notification storm, starving commits and increasing tail latency.
+  - **Detect:** watch queue depth, per-key watcher counts, notification lag.
+  - **Recover:** enforce per-key watcher limits, add backpressure (drop/compact watch events to “latest state”), and encourage FIFO locking (watch predecessor, not the lock).
+
+## What I'd Do Differently At...
+
+- **10x scale:** shard by key prefix into multiple Raft groups (each with its own leader) and keep leases local to a shard; clients map lock key → shard deterministically.
+- **100x scale:** redesign watches as a separate, horizontally-scaled notification plane fed by committed indices, and split “lease/lock writes” from “read-heavy metadata” (different consistency tiers).
+
+## Operational Notes
+
+- **Lease safety rule:** if a client can’t renew and confirm within `TTL/2`, it must assume it no longer owns the lock and self-fence.
+- **Time handling:** base lease expiry on the leader’s monotonic clock; never trust wall-clock time for correctness.
+- **Snapshots/compaction:** required to cap log growth; watchers must anchor to a committed index and recover via snapshot + subsequent log.
+- **SLO dashboards:** commit p99, election rate, pending proposals, expired leases, watch lag, and per-key contention are the five graphs that predict incidents.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+thinking
+**Considering token expiry and safety**
+
+I’m thinking that early expiry could let a new client acquire a fresh token while the old owner might still have a valid one. Now, downstream systems would see the old token as less than the new one, keeping things safe. However, early expiry might lead to extra churn. 
+
+I realize that if downstream systems don’t strictly enforce tokens, this could lead to issues. Ensuring that tokens are mandatory for operations is crucial to maintaining safety and consistency across the service.
+thinking
+**Exploring lease sessions and operational concerns**
+
+I’m considering using "lease sessions" for each client, where we create a session with a keepalive and tie locks to that session. The release process needs to be safe, ensuring only the owner can release a lease, and that requires a lease_id and token verification by the server. 
+
+Handling millions of keys with per-key token counters and storing lock states is also critical. We need to address edge cases like reacquiring after expiry, cluster membership changes, and operational snapshots. 
+
+I must remember to craft my critique in the specified format while keeping the content clear but concise.
+codex
+## Elegance Check
+
+### The Core Insight
+You correctly separate **safety** from **liveness** by making “ownership” a linearizable fact *and* requiring **fencing tokens** so downstream systems can reject zombie owners even when clients are alive-but-unsafe.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Raft (single leader) | The simplest way to get linearizable acquire/release/renew semantics without hand-wavy race conditions. |
+| Lease-bound ownership | Converts ambiguous client failure into a server-authoritative rule: no renew → eventually not owner. |
+| Fencing tokens | The only robust safety mechanism against pauses/partitions where a client keeps acting. |
+| Snapshot/compaction | Required for long-lived clusters; also the only sane way to make watch recovery practical. |
+| Backpressured watch delivery | Without it, “release” becomes an unbounded amplification vector and kills tail latency. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom Raft-based lock service | Use **etcd** (leases + concurrency/lock + watch) or **Consul sessions** | Less custom control, but dramatically lower correctness/ops risk for a small team. |
+| Custom watch fanout subsystem | Reuse proven **watch-by-revision** model (etcd-style): clients track a revision and resume | Requires careful API design, but avoids bespoke per-key fanout complexity. |
+| Per-lock watcher storms | Use **queueing semantics**: only notify “next waiter” (predecessor watch / FIFO) | More state per lock (wait nodes), but turns O(N) wakeups into O(1). |
+| Leader-only renew + monotonic clock TTL | Store lease “deadline” as replicated data using **wall clock + NTP** *or* accept **conservative expiry on leader change** | Wall clock adds ops dependency; conservative expiry preserves safety but may hurt liveness after failover. |
+| “Retry on unknown” described informally | Add explicit **idempotency keys** for acquire/renew/release | Slightly more API surface, much easier client correctness and incident handling. |
+| One Raft group for everything | Split **metadata reads** (eventually consistent) from **lock writes** (linearizable) | More moving parts, but keeps the “interesting” lock path clean under load. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Quorum loss for 5 minutes (2/3 down or partitioned)**
+   - Design’s answer: partially addressed (“some availability during quorum loss”)
+   - Recommendation: **Strengthen** — be explicit: *writes stop*, leases stop renewing, clients must self-fence; clarify whether reads/watches are served (and with what guarantees).
+
+2. **Leader change while many leases near expiry**
+   - Design’s answer: not addressed (time/TTL semantics across leadership change are hand-waved)
+   - Recommendation: **Must strengthen** — specify the lease-timer model on failover (e.g., conservative extension on new leader, or replicated deadlines with bounded clock skew) and how that impacts correctness/liveness.
+
+3. **Slow component: watch delivery lags but Raft commits are healthy**
+   - Design’s answer: addressed (watch backlog + compaction + “drop/compact to latest”)
+   - Recommendation: **Strengthen** — define watch semantics under backpressure (at-least-once? coalesced state-only? per-key ordering?) so clients don’t accidentally build correctness on “every event”.
+
+4. **Bad config deploy (TTL too low, watcher limits too strict, keepalive interval mismatch)**
+   - Design’s answer: not addressed
+   - Recommendation: **Strengthen** — add config validation + safe defaults + staged rollout guidance; this is a very real 3am failure mode.
+
+5. **Traffic 10x unexpectedly (renew storms + hot key contention)**
+   - Design’s answer: partially addressed (“10x scale → shard”, “hot lock → optimize watch”)
+   - Recommendation: **Acceptable but clarify** — quantify ceilings (max renew QPS per leader, max watchers per key/node), and define overload behavior (reject fast vs queue).
+
+## Recommendations
+
+### Must Fix
+- **Lease time semantics on leader change**: define exactly how expiry is computed and ensure it can’t create “two owners” unless downstream fencing is mandatory (and then state that loudly).
+- **API idempotency + conditional operations**: require `request_id` and make `release/renew` conditional on `(lease_id, token)` to make retries safe and operator tooling reliable.
+- **Overload behavior**: specify what happens when watcher/renew limits are hit (errors, shedding, coalescing), and how clients should back off.
+
+### Should Consider
+- **Adopt etcd/Consul unless “build vs buy” is explicitly justified**: your design is basically “etcd leases + lock + fencing discipline”; if the goal is elegance for a small team, standing on a mature coordination system is often the most elegant move.
+- **Make fencing non-optional in the story**: call out that leases alone are insufficient; if a protected resource can’t validate tokens, this service can’t provide safety for that resource.
+- **Clarify watch contract**: recommend “state-based notifications” (current owner/token at revision R) rather than “event stream”, which reduces client foot-guns.
+
+### Nice to Have
+- **Fairness policy** (FIFO vs best-effort) per lock key, and how it interacts with hot keys and watcher limits.
+- **Operational runbooks**: “quorum loss”, “leader churn”, “watch lag”, “compaction caught up” with concrete thresholds.
+- **Multi-tenant controls**: authn/z, per-tenant quotas, and blast-radius limits (especially for watchers).
+
+## What's Working Well
+- The design is honest about the real problem: **zombie owners**, not just “dead clients”.
+- The core model is clean: *single linearizable write path* for ownership transitions and monotonic fencing for safety.
+- You already anticipate the real scalability trap: **watch amplification**, not just Raft throughput.
+- The “unknown result → retry” guidance is directionally correct; with idempotency keys it becomes production-grade.
+tokens used
+5,622
+## Elegance Check
+
+### The Core Insight
+You correctly separate **safety** from **liveness** by making “ownership” a linearizable fact *and* requiring **fencing tokens** so downstream systems can reject zombie owners even when clients are alive-but-unsafe.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Raft (single leader) | The simplest way to get linearizable acquire/release/renew semantics without hand-wavy race conditions. |
+| Lease-bound ownership | Converts ambiguous client failure into a server-authoritative rule: no renew → eventually not owner. |
+| Fencing tokens | The only robust safety mechanism against pauses/partitions where a client keeps acting. |
+| Snapshot/compaction | Required for long-lived clusters; also the only sane way to make watch recovery practical. |
+| Backpressured watch delivery | Without it, “release” becomes an unbounded amplification vector and kills tail latency. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom Raft-based lock service | Use **etcd** (leases + concurrency/lock + watch) or **Consul sessions** | Less custom control, but dramatically lower correctness/ops risk for a small team. |
+| Custom watch fanout subsystem | Reuse proven **watch-by-revision** model (etcd-style): clients track a revision and resume | Requires careful API design, but avoids bespoke per-key fanout complexity. |
+| Per-lock watcher storms | Use **queueing semantics**: only notify “next waiter” (predecessor watch / FIFO) | More state per lock (wait nodes), but turns O(N) wakeups into O(1). |
+| Leader-only renew + monotonic clock TTL | Store lease “deadline” as replicated data using **wall clock + NTP** *or* accept **conservative expiry on leader change** | Wall clock adds ops dependency; conservative expiry preserves safety but may hurt liveness after failover. |
+| “Retry on unknown” described informally | Add explicit **idempotency keys** for acquire/renew/release | Slightly more API surface, much easier client correctness and incident handling. |
+| One Raft group for everything | Split **metadata reads** (eventually consistent) from **lock writes** (linearizable) | More moving parts, but keeps the “interesting” lock path clean under load. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Quorum loss for 5 minutes (2/3 down or partitioned)**
+   - Design’s answer: partially addressed (“some availability during quorum loss”)
+   - Recommendation: **Strengthen** — be explicit: *writes stop*, leases stop renewing, clients must self-fence; clarify whether reads/watches are served (and with what guarantees).
+
+2. **Leader change while many leases near expiry**
+   - Design’s answer: not addressed (time/TTL semantics across leadership change are hand-waved)
+   - Recommendation: **Must strengthen** — specify the lease-timer model on failover (e.g., conservative extension on new leader, or replicated deadlines with bounded clock skew) and how that impacts correctness/liveness.
+
+3. **Slow component: watch delivery lags but Raft commits are healthy**
+   - Design’s answer: addressed (watch backlog + compaction + “drop/compact to latest”)
+   - Recommendation: **Strengthen** — define watch semantics under backpressure (at-least-once? coalesced state-only? per-key ordering?) so clients don’t accidentally build correctness on “every event”.
+
+4. **Bad config deploy (TTL too low, watcher limits too strict, keepalive interval mismatch)**
+   - Design’s answer: not addressed
+   - Recommendation: **Strengthen** — add config validation + safe defaults + staged rollout guidance; this is a very real 3am failure mode.
+
+5. **Traffic 10x unexpectedly (renew storms + hot key contention)**
+   - Design’s answer: partially addressed (“10x scale → shard”, “hot lock → optimize watch”)
+   - Recommendation: **Acceptable but clarify** — quantify ceilings (max renew QPS per leader, max watchers per key/node), and define overload behavior (reject fast vs queue).
+
+## Recommendations
+
+### Must Fix
+- **Lease time semantics on leader change**: define exactly how expiry is computed and ensure it can’t create “two owners” unless downstream fencing is mandatory (and then state that loudly).
+- **API idempotency + conditional operations**: require `request_id` and make `release/renew` conditional on `(lease_id, token)` to make retries safe and operator tooling reliable.
+- **Overload behavior**: specify what happens when watcher/renew limits are hit (errors, shedding, coalescing), and how clients should back off.
+
+### Should Consider
+- **Adopt etcd/Consul unless “build vs buy” is explicitly justified**: your design is basically “etcd leases + lock + fencing discipline”; if the goal is elegance for a small team, standing on a mature coordination system is often the most elegant move.
+- **Make fencing non-optional in the story**: call out that leases alone are insufficient; if a protected resource can’t validate tokens, this service can’t provide safety for that resource.
+- **Clarify watch contract**: recommend “state-based notifications” (current owner/token at revision R) rather than “event stream”, which reduces client foot-guns.
+
+### Nice to Have
+- **Fairness policy** (FIFO vs best-effort) per lock key, and how it interacts with hot keys and watcher limits.
+- **Operational runbooks**: “quorum loss”, “leader churn”, “watch lag”, “compaction caught up” with concrete thresholds.
+- **Multi-tenant controls**: authn/z, per-tenant quotas, and blast-radius limits (especially for watchers).
+
+## What's Working Well
+- The design is honest about the real problem: **zombie owners**, not just “dead clients”.
+- The core model is clean: *single linearizable write path* for ownership transitions and monotonic fencing for safety.
+- You already anticipate the real scalability trap: **watch amplification**, not just Raft throughput.
+- The “unknown result → retry” guidance is directionally correct; with idempotency keys it becomes production-grade.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/distributed-lock-service.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afd-22d3-7f73-9f61-bd1beab0a19f
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Distributed Lock Service"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["coordination", "distributed-systems", "raft", "leases", "fencing-tokens"]
+---
+
+## Overview
+
+This system is a small, strongly-consistent coordination service for distributed locks and lightweight metadata—purpose-built around **leases**, **fencing tokens**, and **client failure detection**. The key idea is to treat “lock ownership” as nothing more than “a replicated fact attached to a lease”, and to make every externally-visible ownership change (acquire/release/expire) a **single linearizable write** through a consensus leader.
+
+The elegance comes from keeping the surface area narrow: one consensus group, one keyspace, one correctness model (linearizability for lock state), and one way to recover from ambiguity (lease expiry + fencing). Leases answer “who still has the lock?”, fencing answers “who gets to act?”, and failure detection becomes “who can keep renewing through quorum?”.
+
+## What Makes This Hard
+
+Naive lock services confuse **liveness** with **safety**. They detect dead clients via heartbeats, but miss the real problem: in partitions or slow networks, *two clients can both believe they own the lock*. If the protected system accepts requests from both, you get split-brain writes, corrupted state, and bugs that only appear under partial failure.
+
+The trap is thinking that “the lock service says I own it” is enough. It isn’t. You need a **monotonic fencing token** that downstream systems can validate, so that even if a former owner is still running (or resumes after a pause), its actions are rejected.
+
+## Requirements
+
+### Functional Requirements
+- **Linearizable lock acquisition and release**: exactly one owner at a time in the committed log.
+- **Leases**: lock ownership is bound to a lease; if the lease expires, the lock is automatically released.
+- **Fencing tokens**: each successful acquisition yields a strictly increasing token per lock key; clients must present it to the protected resource.
+- **Client failure detection**: server-side expiry via missed renewals; client-side self-fencing when it cannot renew.
+- **Watch/notify** for lock availability to avoid polling storms.
+
+### Scale Targets
+- **Cluster size**: 3 nodes (Raft), tolerate 1 failure; 5 nodes when you optimize for read availability and maintenance windows.
+- **Clients**: 10k concurrent clients, 50k active leases.
+- **Locks**: 1–5 million lock keys (sparse, not all active).
+- **Write QPS**: 2k–5k (acquire/release/renew dominate), p99 commit latency < 50ms intra-region.
+- **Watchers**: up to 100k concurrent watches (the real memory pressure), with bounded fanout per hot key.
+
+These numbers force you to care about: (1) commit latency and write amplification, and (2) watch scalability without turning “one lock release” into “100k wakeups”.
+
+## Key Design Decisions
+
+- **What we chose:** Raft-based single-writer replication (one leader) with a simple KV + lock API.
+  - **What we rejected:** gossip-based ownership, multi-leader writes, or “best-effort” locks.
+  - **Why:** locks are small but correctness is binary; linearizable writes are the simplest way to be right.
+
+- **What we chose:** Leases are server-authoritative TTLs on a monotonic clock, renewed only through the current leader.
+  - **What we rejected:** client-side timers as truth, follower-accepted renewals, or “extend-on-read”.
+  - **Why:** it removes clock-sync assumptions and ensures all lease decisions flow through one serialization point.
+
+- **What we chose:** Fencing tokens are per-lock monotonically increasing integers stored in the replicated state and issued on acquisition.
+  - **What we rejected:** “lock ID is enough”, timestamps, or relying on lease expiry alone.
+  - **Why:** fencing is the only practical defense against clients that are alive but unsafe (GC pauses, partitions, scheduler stalls).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Clients] --> L4["L7 LB"]
+  L4 --> API["Coord API (gRPC)"]
+  API --> R["Raft Leader"]
+  R <--> F["Raft Followers"]
+  R --> SM["State Machine (KV+Leases)"]
+  SM --> W["Watch Fanout"]
+  R --> M["Metrics/Tracing"]
+```
+
+### Components
+
+- **Coord API (gRPC)**: the only public interface; all mutating calls route to the leader (followers proxy).
+- **Raft Leader / Followers**: replicate a log of state transitions; leader is the single serialization point for leases and tokens.
+- **State Machine (KV+Leases)**: applies committed log entries; maintains lock ownership, lease records, and token counters.
+- **Watch Fanout**: turns committed state changes into notifications; designed to be bounded and backpressured.
+- **Metrics/Tracing**: p99 commit latency, leader churn, log size, watch backlog—these are the truth in production.
+
+## Deep Dive: Fencing Tokens (The Hardest Part)
+
+Fencing tokens solve the “zombie owner” problem: a client can lose the ability to safely coordinate (partition, long GC pause) yet continue issuing writes to the protected system. A lease alone doesn’t stop it, because the client can’t reliably know when it became unsafe, and downstream systems often can’t query the lock service on every operation.
+
+**Token model**
+- Each lock key `K` maintains a **token counter** `T[K]` in replicated state.
+- On successful acquisition of `K`, the leader commits:
+  1) `T[K] = T[K] + 1`
+  2) `Owner[K] = (lease_id, holder_id, token=T[K])`
+- The API returns `(lease_id, token)` to the client.
+
+**Downstream enforcement**
+- Every write to the protected resource must include `(K, token)`.
+- The protected resource stores `MaxToken[K]` and rejects any request with `token < MaxToken[K]`.
+- On accept, it updates `MaxToken[K] = token` (or uses a compare-and-set if it’s replicated).
+
+This turns coordination into a one-way safety gate: even if an old owner keeps running, its token is stale and it cannot cause damage. You’ve moved correctness to the place that matters: the system being protected.
+
+**Edge cases that break teams**
+- **Leader change during acquire**: the client may see a timeout. It must treat the attempt as “unknown” and retry; duplicate acquires are safe because token issuance is serialized in the log.
+- **Client pause**: if renewals stop, the lease expires server-side. The client must self-fence by refusing to use the lock if it cannot renew within a bounded window.
+- **Hot lock**: on a single key, fairness and wakeups matter more than raw throughput; you optimize watch behavior, not Raft.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Strong correctness (linearizable ownership) | Cross-region latency for writes |
+| Simple mental model (leader decides) | Single-consensus-group write ceiling |
+| Safety under partial failure (fencing) | Requires downstream token enforcement |
+| Operational predictability | Some availability during quorum loss |
+
+## Failure Modes
+
+- **Network partition (client ↔ quorum)**
+  - **What happens:** client can’t renew; server expires lease and releases locks; client may still be running.
+  - **Detect:** renew RPC failures / keepalive acks stop; server emits lease-expiry counters.
+  - **Recover:** client self-fences immediately (stop acting), then reacquires; downstream rejects stale-token writes.
+
+- **Leader crash during high churn**
+  - **What happens:** brief unavailability for writes; some clients see timeouts and retry.
+  - **Detect:** leader election events, commit latency spike, increased retry rate.
+  - **Recover:** new leader resumes; idempotent acquire via “unknown result → retry” rule; watches replay from committed index.
+
+- **Watch overload on hot keys**
+  - **What happens:** release triggers a notification storm, starving commits and increasing tail latency.
+  - **Detect:** watch queue depth, per-key watcher counts, notification lag.
+  - **Recover:** enforce per-key watcher limits, add backpressure (drop/compact watch events to “latest state”), and encourage FIFO locking (watch predecessor, not the lock).
+
+## What I'd Do Differently At...
+
+- **10x scale:** shard by key prefix into multiple Raft groups (each with its own leader) and keep leases local to a shard; clients map lock key → shard deterministically.
+- **100x scale:** redesign watches as a separate, horizontally-scaled notification plane fed by committed indices, and split “lease/lock writes” from “read-heavy metadata” (different consistency tiers).
+
+## Operational Notes
+
+- **Lease safety rule:** if a client can’t renew and confirm within `TTL/2`, it must assume it no longer owns the lock and self-fence.
+- **Time handling:** base lease expiry on the leader’s monotonic clock; never trust wall-clock time for correctness.
+- **Snapshots/compaction:** required to cap log growth; watchers must anchor to a committed index and recover via snapshot + subsequent log.
+- **SLO dashboards:** commit p99, election rate, pending proposals, expired leases, watch lag, and per-key contention are the five graphs that predict incidents.
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+You correctly separate **safety** from **liveness** by making “ownership” a linearizable fact *and* requiring **fencing tokens** so downstream systems can reject zombie owners even when clients are alive-but-unsafe.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Raft (single leader) | The simplest way to get linearizable acquire/release/renew semantics without hand-wavy race conditions. |
+| Lease-bound ownership | Converts ambiguous client failure into a server-authoritative rule: no renew → eventually not owner. |
+| Fencing tokens | The only robust safety mechanism against pauses/partitions where a client keeps acting. |
+| Snapshot/compaction | Required for long-lived clusters; also the only sane way to make watch recovery practical. |
+| Backpressured watch delivery | Without it, “release” becomes an unbounded amplification vector and kills tail latency. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom Raft-based lock service | Use **etcd** (leases + concurrency/lock + watch) or **Consul sessions** | Less custom control, but dramatically lower correctness/ops risk for a small team. |
+| Custom watch fanout subsystem | Reuse proven **watch-by-revision** model (etcd-style): clients track a revision and resume | Requires careful API design, but avoids bespoke per-key fanout complexity. |
+| Per-lock watcher storms | Use **queueing semantics**: only notify “next waiter” (predecessor watch / FIFO) | More state per lock (wait nodes), but turns O(N) wakeups into O(1). |
+| Leader-only renew + monotonic clock TTL | Store lease “deadline” as replicated data using **wall clock + NTP** *or* accept **conservative expiry on leader change** | Wall clock adds ops dependency; conservative expiry preserves safety but may hurt liveness after failover. |
+| “Retry on unknown” described informally | Add explicit **idempotency keys** for acquire/renew/release | Slightly more API surface, much easier client correctness and incident handling. |
+| One Raft group for everything | Split **metadata reads** (eventually consistent) from **lock writes** (linearizable) | More moving parts, but keeps the “interesting” lock path clean under load. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Quorum loss for 5 minutes (2/3 down or partitioned)**
+   - Design’s answer: partially addressed (“some availability during quorum loss”)
+   - Recommendation: **Strengthen** — be explicit: *writes stop*, leases stop renewing, clients must self-fence; clarify whether reads/watches are served (and with what guarantees).
+
+2. **Leader change while many leases near expiry**
+   - Design’s answer: not addressed (time/TTL semantics across leadership change are hand-waved)
+   - Recommendation: **Must strengthen** — specify the lease-timer model on failover (e.g., conservative extension on new leader, or replicated deadlines with bounded clock skew) and how that impacts correctness/liveness.
+
+3. **Slow component: watch delivery lags but Raft commits are healthy**
+   - Design’s answer: addressed (watch backlog + compaction + “drop/compact to latest”)
+   - Recommendation: **Strengthen** — define watch semantics under backpressure (at-least-once? coalesced state-only? per-key ordering?) so clients don’t accidentally build correctness on “every event”.
+
+4. **Bad config deploy (TTL too low, watcher limits too strict, keepalive interval mismatch)**
+   - Design’s answer: not addressed
+   - Recommendation: **Strengthen** — add config validation + safe defaults + staged rollout guidance; this is a very real 3am failure mode.
+
+5. **Traffic 10x unexpectedly (renew storms + hot key contention)**
+   - Design’s answer: partially addressed (“10x scale → shard”, “hot lock → optimize watch”)
+   - Recommendation: **Acceptable but clarify** — quantify ceilings (max renew QPS per leader, max watchers per key/node), and define overload behavior (reject fast vs queue).
+
+## Recommendations
+
+### Must Fix
+- **Lease time semantics on leader change**: define exactly how expiry is computed and ensure it can’t create “two owners” unless downstream fencing is mandatory (and then state that loudly).
+- **API idempotency + conditional operations**: require `request_id` and make `release/renew` conditional on `(lease_id, token)` to make retries safe and operator tooling reliable.
+- **Overload behavior**: specify what happens when watcher/renew limits are hit (errors, shedding, coalescing), and how clients should back off.
+
+### Should Consider
+- **Adopt etcd/Consul unless “build vs buy” is explicitly justified**: your design is basically “etcd leases + lock + fencing discipline”; if the goal is elegance for a small team, standing on a mature coordination system is often the most elegant move.
+- **Make fencing non-optional in the story**: call out that leases alone are insufficient; if a protected resource can’t validate tokens, this service can’t provide safety for that resource.
+- **Clarify watch contract**: recommend “state-based notifications” (current owner/token at revision R) rather than “event stream”, which reduces client foot-guns.
+
+### Nice to Have
+- **Fairness policy** (FIFO vs best-effort) per lock key, and how it interacts with hot keys and watcher limits.
+- **Operational runbooks**: “quorum loss”, “leader churn”, “watch lag”, “compaction caught up” with concrete thresholds.
+- **Multi-tenant controls**: authn/z, per-tenant quotas, and blast-radius limits (especially for watchers).
+
+## What's Working Well
+- The design is honest about the real problem: **zombie owners**, not just “dead clients”.
+- The core model is clean: *single linearizable write path* for ownership transitions and monotonic fencing for safety.
+- You already anticipate the real scalability trap: **watch amplification**, not just Raft throughput.
+- The “unknown result → retry” guidance is directionally correct; with idempotency keys it becomes production-grade.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+
+thinking
+**Addressing markdown simplification**
+
+The user has asked me to rewrite a markdown document with specific simplification rules: I need to remove or merge components without adding new sections and should incorporate feedback while addressing failure scenarios. The title, difficulty, and tags must stay the same, but content within existing sections can change. I'm noticing a bit of tension with the required output sections since I can't add new ones. So, I might have to cleverly repurpose what’s already there.
+thinking
+**Navigating markdown section rules**
+
+I need to organize the markdown document while following the user's request to keep the title, difficulty, and tags unchanged. They want specific content, like minimal architecture and justifications, to fit under existing sections. However, adding new subsections might be tricky since the rules say not to add sections at all. It seems I could consolidate "What We Removed" into the Key Design Decisions or Architecture lists. I think I can interpret the instructions to allow for renaming existing headings as a way to include that info.
+thinking
+**Deciding on section modification**
+
+I'm considering if renaming a section counts as modifying it, since the rules didn’t explicitly forbid changing headings, aside from the title, difficulty, and tags. The output format requests a "What We Removed" section, and I'm wondering if it's best to replace something like "What I'd Do Differently." However, I think it might be safer to keep all original headings while adding "What We Removed" as a bold subheading within an existing section. This way, it stays explicit without technically adding new sections.
+thinking
+**Refining architecture and components**
+
+I can place minimal architecture under the Architecture section and provide justifications for each component in the Components list. The user wants me to incorporate simplifications like adopting etcd or Consul instead of a custom raft service, which would help reduce complexity. I'm wondering if etcd counts as a component since it serves as a coordination store. In a minimal architecture, I could outline an etcd cluster, clients, and a protected resource, suggesting that we simplify by having clients communicate with etcd directly using its API.
+thinking
+**Finalizing the lock service design**
+
+To keep the document as a "Distributed Lock Service," I’ll state that the system is built on etcd, effectively removing elements like custom raft and state machines. I need to preserve fencing tokens and clarify how etcd's Mutex can provide this. I can use etcd's key revision as a fencing token and structure the lock service simply. It's important to include failure scenarios and optimizations for TTLs and client behaviors. I should maintain minimal observability and decouple some components, ensuring the document stays streamlined and accurate while following the user's requirements.
+thinking
+**Streamlining leader changes and overload behavior**
+
+The design also accounts for leader changes and overload behavior where etcd may return errors like `RESOURCE_EXHAUSTED`, so clients need to back off. I want to clarify that clients shouldn’t rely on every event from watchers and can use the revision to resume. Since we’re using etcd, we don’t need a custom raft group. We should simplify scale targets to realistic numbers for etcd, which can handle a significant number of watchers with the right strategy. I'll ensure to specify what components were removed in a bullet list to maintain clarity while avoiding section additions.
+Plan update
+  → Locate original markdown file
+  • Rewrite with minimal architecture
+  • Sanity-check formatting and links
+exec
+/bin/zsh -lc ls in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 72ms:
+challenges
+drafts
+drafts-v2
+frontend
+grades
+logs
+problems.yaml
+prompts
+reviewed
+scripts
+solutions
+solutions-v2
+exec
+/bin/zsh -lc "rg -n \"title: \\\"Distributed Lock Service\\\"\" -S ." in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 78ms:
+./prompts/agent-frontend.md:11:title: "Distributed Lock Service"
+./logs/resimplify-lock.log:82:title: "Distributed Lock Service"
+./logs/resimplify-lock.log:830:title: "Distributed Lock Service"
+./logs/resimplify-lock.log:1088:title: "Distributed Lock Service"
+./solutions/01-foundational-infrastructure/distributed-lock-service.md:2:title: "Distributed Lock Service"
+./problems.yaml:27:    title: "Distributed Lock Service"
+./logs/distributed-lock-service.log:201:title: "Distributed Lock Service"
+./logs/distributed-lock-service.log:604:title: "Distributed Lock Service"
+./logs/distributed-lock-service.log:1088:title: "Distributed Lock Service"
+./logs/distributed-lock-service.log:1514:title: "Distributed Lock Service"
+./logs/distributed-lock-service.log:2213:title: "Distributed Lock Service"
+./logs/distributed-lock-service.log:2987:title: "Distributed Lock Service"
+./logs/v2/distributed-lock-service.log:171:title: "Distributed Lock Service"
+./logs/v2/distributed-lock-service.log:307:title: "Distributed Lock Service"
+./logs/v2/distributed-lock-service.log:564:title: "Distributed Lock Service"
+./logs/v2/distributed-lock-service.log:970:title: "Distributed Lock Service"
+./reviewed/distributed-lock-service.md:2:title: "Distributed Lock Service"
+./drafts/distributed-lock-service.md:2:title: "Distributed Lock Service"
+./drafts-v2/distributed-lock-service.md:3:title: "Distributed Lock Service"
+./grades/distributed-lock-service.log:52:title: "Distributed Lock Service"
+exec
+/bin/zsh -lc 'ls solutions-v2 | head' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 79ms:
+01-foundational-infrastructure
+02-storage-data-platforms
+03-observability-reliability
+04-realtime-media
+05-social-discovery
+06-commerce-fintech
+07-ai-ml-infrastructure
+08-security-access-control
+09-iot-edge
+10-strategic-problems
+exec
+/bin/zsh -lc "sed -n '1,220p' solutions/01-foundational-infrastructure/distributed-lock-service.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 44ms:
+---
+title: "Distributed Lock Service"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["coordination", "distributed-systems", "consensus"]
+---
+
+## Overview
+
+This distributed lock service provides **mutual exclusion** with **linearizable semantics** across unreliable clients. It is built on a small **etcd** cluster (3–5 nodes) and a **client library** that implements lock operations using etcd’s proven primitives:
+
+- **Consensus-backed linearizable writes** (transactions)
+- **Leases** for liveness and automatic cleanup
+- **Watches** to wait efficiently without polling
+- **Fencing tokens** derived from committed revisions to protect downstream resources
+
+The service is “safe” when downstream systems enforce the fencing token (or an equivalent monotonic guard).
+
+---
+
+exec
+/bin/zsh -lc "sed -n '1,80p' drafts-v2/distributed-lock-service.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 44ms:
+```markdown
+---
+title: "Distributed Lock Service"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["coordination", "distributed-systems", "raft", "leases", "fencing-tokens"]
+---
+
+## Overview
+
+This system is a small, strongly-consistent coordination service for distributed locks and lightweight metadata—purpose-built around **leases**, **fencing tokens**, and **client failure detection**. The key idea is to treat “lock ownership” as nothing more than “a replicated fact attached to a lease”, and to make every externally-visible ownership change (acquire/release/expire) a **single linearizable write** through a consensus leader.
+
+The elegance comes from keeping the surface area narrow: one consensus group, one keyspace, one correctness model (linearizability for lock state), and one way to recover from ambiguity (lease expiry + fencing). Leases answer “who still has the lock?”, fencing answers “who gets to act?”, and failure detection becomes “who can keep renewing through quorum?”.
+
+## What Makes This Hard
+
+Naive lock services confuse **liveness** with **safety**. They detect dead clients via heartbeats, but miss the real problem: in partitions or slow networks, *two clients can both believe they own the lock*. If the protected system accepts requests from both, you get split-brain writes, corrupted state, and bugs that only appear under partial failure.
+
+The trap is thinking that “the lock service says I own it” is enough. It isn’t. You need a **monotonic fencing token** that downstream systems can validate, so that even if a former owner is still running (or resumes after a pause), its actions are rejected.
+
+exec
+/bin/zsh -lc "sed -n '1,220p' reviewed/distributed-lock-service.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 45ms:
+---
+title: "Distributed Lock Service"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["coordination", "distributed-systems", "consensus"]
+---
+
+## Overview
+
+A distributed lock service is a coordination primitive that provides **mutual exclusion** for shared resources across many unreliable clients. The hard part is not tracking “who holds the lock,” but doing so **safely** under network partitions, process crashes, long GC pauses, clock drift, and retry storms—while still offering **low-latency, linearizable** semantics that other systems can trust.
+
+This design follows the proven pattern of **Chubby / ZooKeeper / etcd**: a small replicated control-plane cluster that provides:
+
+- **Linearizable writes** (acquire/release, session/lease state)
+- **Linearizable reads** (optional but supported) and cheaper **serializable reads** (optional)
+- **Leases/sessions** for liveness and automatic cleanup of ephemeral state
+- **Watches** for efficient notification (to avoid polling)
+- **Fencing tokens** to prevent stale clients from corrupting downstream systems
+
+The key separation is:
+exec
+/bin/zsh -lc 'rg -n "Distributed Lock Service" solutions-v2 -S' in /Users/dominikdabrowski/pr/system-design-atlas exited 1 in 75ms:
+
+
+
+thinking
+**Clarifying output requirements**
+
+I need to consider if the solutions-v2 uses a different scheme, perhaps `solutions/...`. The user is looking for a v2 simplifier and wants an output as a response, not just an update file. In the coding repo, it seems likely they want to update `drafts-v2`. 
+
+I should explore the rest of the solutions file to confirm it has the necessary sections. It appears to have more sections, such as "Data Model" and "API Design," compared to the original. However, since the instruction is to cut or condense without adding sections, we'll retain the original headings like Overview and Requirements for the final document.
+thinking
+**Simplifying document revisions**
+
+I plan to simplify the sections while keeping the original headings intact. I think I need to edit the `reviewed/distributed-lock-service.md` or possibly `drafts/distributed-lock-service.md` to align with these goals. 
+
+I should inspect `drafts/distributed-lock-service.md` to see if it contains the original content. It might be helpful to check the first 40 lines to get a better understanding of what needs to be simplified. That way, I can ensure I’m working with the correct information.
+exec
+/bin/zsh -lc "sed -n '1,60p' drafts/distributed-lock-service.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 44ms:
+---
+title: "Distributed Lock Service"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["coordination", "distributed-systems", "consensus"]
+---
+
+## Overview
+
+A distributed lock service is a coordination primitive used to ensure mutually exclusive access to shared resources across a fleet of unreliable clients and servers. The hard part is not “who holds the lock,” but doing so safely under network partitions, process crashes, GC pauses, clock drift, and retry storms—while still providing low-latency, linearizable semantics that higher-level systems can trust.
+
+The key insight is to separate **liveness** (leases + failure detection) from **safety** (consensus + fencing tokens). Leases with heartbeats determine when a client is considered alive and when its locks should be revoked; consensus ensures there is a single authoritative history of lock ownership; fencing tokens ensure that even if an old client continues running after losing its lease, it cannot corrupt downstream systems.
+
+This design is essentially a focused “Chubby/ZooKeeper/etcd-like” service: a small replicated control-plane cluster providing linearizable metadata operations (lock acquire/release, session/lease management) plus watch notifications for scalable coordination patterns.
+
+## Requirements
+
+### Functional Requirements
+- Create and manage **client sessions** with server-assigned leases (TTL-based).
+- Support **acquire** and **release** of named locks with **linearizable** semantics.
+
+thinking
+**Updating file tags**
+
+I’m noticing that the drafts are already expanded with various sections and multiple versions exist. The user provided an original design with specific tags like raft, leases, and fencing-tokens that we should keep in our simplified document. It seems like the target is the reviewed file or the drafts-v2 original. The instructions indicate that the title difficulty tags shouldn't be changed, so we need to ensure we update the file while preserving the original design's tags. Let's inspect the full content further.
+exec
+/bin/zsh -lc "sed -n '1,220p' drafts-v2/distributed-lock-service.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 56ms:
+```markdown
+---
+title: "Distributed Lock Service"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["coordination", "distributed-systems", "raft", "leases", "fencing-tokens"]
+---
+
+## Overview
+
+This system is a small, strongly-consistent coordination service for distributed locks and lightweight metadata—purpose-built around **leases**, **fencing tokens**, and **client failure detection**. The key idea is to treat “lock ownership” as nothing more than “a replicated fact attached to a lease”, and to make every externally-visible ownership change (acquire/release/expire) a **single linearizable write** through a consensus leader.
+
+The elegance comes from keeping the surface area narrow: one consensus group, one keyspace, one correctness model (linearizability for lock state), and one way to recover from ambiguity (lease expiry + fencing). Leases answer “who still has the lock?”, fencing answers “who gets to act?”, and failure detection becomes “who can keep renewing through quorum?”.
+
+## What Makes This Hard
+
+Naive lock services confuse **liveness** with **safety**. They detect dead clients via heartbeats, but miss the real problem: in partitions or slow networks, *two clients can both believe they own the lock*. If the protected system accepts requests from both, you get split-brain writes, corrupted state, and bugs that only appear under partial failure.
+
+The trap is thinking that “the lock service says I own it” is enough. It isn’t. You need a **monotonic fencing token** that downstream systems can validate, so that even if a former owner is still running (or resumes after a pause), its actions are rejected.
+
+
+
+thinking
+**Evaluating solution file updates**
+
+It seems the file is just the original design inside a code fence, and the user wants a final document instead. I’m considering whether to create a new solution file or update the existing one. The repository includes a solution file for etcd-based content but uses different tags, which might not align with the user’s constraints. The user specifically requested not to modify the title, difficulty, or tags, so I think I need to keep the original tags.
+thinking
+**Aligning with user requests**
+
+As a coding assistant, it’s crucial that my changes align with what the user requested: to produce a final markdown document with the specified tags. I’m considering whether to create a new file in `solutions-v2/01-foundational-infrastructure/distributed-lock-service.md` or update an existing one in `solutions/01...` to match the desired tags. I wonder if `solutions-v2` has the necessary category directories, though they might be empty. Let me check what's listed in `solutions-v2/01-foundational-infrastructure`.
+exec
+/bin/zsh -lc 'ls solutions-v2/01-foundational-infrastructure | head -n 50' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 44ms:
+global-rate-limiter.md
+service-discovery.md
+task-scheduler-batch.md
+url-shortener.md
+
+thinking
+**Considering documentation needs**
+
+I see there's no distributed lock service in solutions-v2, and maybe we should add it. That's a file write, and it's important to preserve existing solutions. The user didn't specifically ask to modify the repo; they requested a document output. However, in this coding environment, it's likely expected to create a file with a simplified document. I'll need to check the `solutions-v2` docs to follow the appropriate style.
+exec
+/bin/zsh -lc "sed -n '1,120p' solutions-v2/01-foundational-infrastructure/global-rate-limiter.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 45ms:
+```markdown
+---
+title: "Global Rate Limiter"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: [rate-limiting, edge, distributed-systems, quota-leasing, reliability]
+---
+
+## Overview
+
+Enforce global per-identity limits without putting a global round-trip on every request.
+
+The gateway makes the allow/deny decision locally using short-lived tokens. A single global allocator occasionally grants **time-bounded quota leases** from a strongly consistent store. This keeps the request path fast while making global overshoot explicitly bounded.
+
+## What Makes This Hard
+
+- Global correctness and low latency fight each other; per-request global counters don’t scale.
+- Failure retries can silently turn “bounded overshoot” into unbounded overshoot if leases aren’t idempotent.
+- Hot identities must be boring: one abused key shouldn’t melt shared state.
+
+
+thinking
+**Addressing failure scenarios**
+
+I need to address the failure scenarios mentioned in the critique, including quorum loss, leader changes, watch lag, bad configuration deployment, and significant traffic increases. I’ll include these in the Failure Modes section as bullet points. It’s also essential to incorporate idempotency by using attempt_id in key names or storing request_id in transactions. For lock acquisition, I’ll use queue semantics and create a wait key with attempt_id, which makes unknown results resolvable. We can simplify watch storms too!
+exec
+/bin/zsh -lc 'find .. -maxdepth 3 -name AGENTS.md -print' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 65ms:
+../semper/AGENTS.md
+../24h_modal/AGENTS.md
+../betterdocs/AGENTS.md
+../tmp/opencode/AGENTS.md
+../kafkette/AGENTS.md
+Plan update
+  ✓ Locate original markdown file
+  → Rewrite with minimal architecture
+  • Sanity-check formatting and links
+
+
+
+thinking
+**Evaluating key management**
+
+I'm thinking about using a deterministic key naming scheme for managing locks, focusing on `/locks/K/queue/<client_id>/<request_id>`. It allows me to retry the same Put while checking if the version is zero. For releasing or renewing, I should compare on the lease ID. The renew function uses keepalive, and etcd manages that well. If a watch compaction occurs, I can just re-list the prefix to find the current predecessor. I'm also considering TTL settings and ensuring validation in the client library.
+thinking
+**Considering simplification strategies**
+
+I see some simplification opportunities in the critique, especially regarding using etcd or Consul — we’ll stick with etcd, focusing on watch-by-revision and predecessor watches. For overload behavior, if there are too many waiters or keepalives, etcd gives an overload response. The client library handles this with jittered backoff and returns a `BUSY` message. 
+
+When discussing future scaling, I can suggest running multiple etcd clusters partitioned by namespace or tenant without adding new components. I'll ensure the document remains concise while retaining the original front matter, title, and tags.
+thinking
+**Refining presentation approach**
+
+I need to focus on presenting the design as the definitive version without any argumentative language. Avoiding phrases like "instead of" will help maintain neutrality. In the "What We Removed" section, it’s important to list out the removed components as facts, so I can mention them clearly as "Removed: ...". 
+
+I’ll aim to keep the tone objective and factual throughout. Next, I’ll move on to implement the file addition as planned.
+file update
+A /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/01-foundational-infrastructure/distributed-lock-service.md
+```markdown
+---
+title: "Distributed Lock Service"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["coordination", "distributed-systems", "raft", "leases", "fencing-tokens"]
+---
+
+## Overview
+
+Provide safe distributed locks by using an existing strongly-consistent store with **leases**, **transactions**, and **watches**. Lock ownership is an ephemeral key attached to a lease; every acquire is a single linearizable write. Safety comes from **fencing tokens** that downstream systems validate.
+
+## What Makes This Hard
+
+Under partitions and pauses, clients can keep running after they become unsafe. Leases answer “who is still connected enough to renew?”, but they don’t stop a zombie client from acting. A lock is only safe when every protected write carries a **monotonic fencing token** that the protected system rejects when stale.
+
+## Requirements
+
+### Functional Requirements
+- **Linearizable acquire/release** for each lock key.
+- **Leases**: ownership is bound to a lease; expiry deletes ownership automatically.
+- **Fencing tokens**: each successful acquire yields a strictly increasing token per lock key; clients include it with downstream writes.
+- **Client failure detection**: loss of lease renewals forces client self-fencing.
+- **Watch/notify** to wait without polling.
+
+### Scale Targets
+- **Cluster size**: 3 nodes (Raft), tolerate 1 failure; 5 nodes for maintenance windows.
+- **Clients**: 10k concurrent clients, 50k active leases.
+- **Locks**: 1–5 million lock keys (sparse).
+- **Write QPS**: dominated by lease keepalives and acquire/release; keep p99 commit latency < 50ms intra-region.
+- **Watchers**: high cardinality supported by avoiding per-lock fanout (FIFO queue with predecessor watches).
+
+## Key Design Decisions
+
+- **What we chose:** use an existing Raft-backed KV (etcd-style) that already provides linearizable transactions, leases, and watch-by-revision.
+  - **Why:** the lock service becomes a client recipe, not a new consensus system.
+
+- **What we chose:** represent a lock as an ephemeral “queue node” key under `/locks/<K>/q/<attempt_id>` attached to the caller’s lease.
+  - **Why:** ownership and cleanup are automatic (lease expiry deletes the key).
+
+- **What we chose:** FIFO waiting with **predecessor watches**.
+  - **Why:** release wakes O(1) waiters instead of a per-key notification storm.
+
+- **What we chose:** fencing token = the queue node’s committed **create revision** (monotonic).
+  - **Why:** it is issued by the consensus log and is safe under retries and leader changes.
+
+- **What we chose:** idempotent acquire via a stable `attempt_id` (request id) embedded in the queue key name.
+  - **Why:** “unknown result → retry” becomes “retry the same attempt and then check position”.
+
+- **What We Removed:** custom gRPC front-end, custom Raft implementation, bespoke state machine, bespoke watch fanout, and custom metrics pipeline (use the store’s metrics + standard dashboards).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Clients + lock library] --> S[(Strong KV with leases/watches\n3–5 nodes, Raft)]
+  C --> P[Protected resource\nrejects stale fencing tokens]
+```
+
+### Components
+
+- **Strong KV with leases/watches**: the single serialization point for acquire/release and the source of truth for lease expiry and revisions.
+- **Client library**: implements acquire/release/wait, keepalive, backoff, and self-fencing.
+- **Protected resource token check**: stores `MaxToken[K]` and rejects `token < MaxToken[K]`.
+
+## Deep Dive: Fencing Tokens (The Hardest Part)
+
+**Token model**
+- On acquire, the client creates `/locks/<K>/q/<attempt_id>` with its lease.
+- The key’s **create revision** is the fencing token.
+- The client holds the lock when its queue key is the smallest by create revision under `/locks/<K>/q/`.
+
+**Waiting (FIFO, O(1) wakeups)**
+1. Create queue key (idempotent: same `attempt_id`).
+2. List `/locks/<K>/q/` sorted by create revision and find your predecessor.
+3. If none, you own the lock.
+4. Otherwise, watch the predecessor key for deletion; on delete (or watch reset), repeat step 2.
+
+**Downstream enforcement**
+- Every protected write includes `(K, token)`.
+- The protected resource stores `MaxToken[K]` and rejects any request with `token < MaxToken[K]`.
+- On accept, it updates `MaxToken[K] = token` (atomically).
+
+**Edge cases**
+- **Leader change / timeout during acquire**: retry using the same `attempt_id`, then re-check queue position.
+- **Client pause / partition**: if keepalive isn’t acknowledged within `TTL/2`, the client self-fences and stops acting; if its lease expires, its queue key is deleted automatically.
+- **Compaction / watch lag**: if a predecessor watch is compacted or reset, the client re-lists the queue prefix and resumes from current state.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Strong correctness (linearizable ownership + fencing) | Cross-region latency for writes |
+| Minimal custom code (client recipe on proven KV) | Feature set limited to what the KV provides |
+| O(1) wakeups per release (predecessor watches) | Requires a queue key per waiting client |
+| Operational predictability | Writes stop on quorum loss |
+
+## Failure Modes
+
+- **Quorum loss for minutes (2/3 down or partitioned)**
+  - **What happens:** all linearizable ops stop (acquire/release/keepalive); leases stop renewing; clients must assume locks are lost.
+  - **Detect:** keepalive acks stop; store returns `UNAVAILABLE`/timeouts; lease-expiry counters rise after recovery.
+  - **Recover:** clients self-fence, recreate session, rejoin queue; downstream rejects stale-token writes.
+
+- **Leader change while many leases are near expiry**
+  - **What happens:** brief keepalive disruption; some leases expire; some clients see unknown results on acquire.
+  - **Detect:** leader election events; keepalive retry spike.
+  - **Recover:** self-fence on missed keepalive within `TTL/2`; retry acquire with the same `attempt_id`; token enforcement prevents zombie writes.
+
+- **Slow watch delivery (commits healthy, notifications lag)**
+  - **What happens:** waiters take longer to observe predecessor deletion; throughput drops, correctness unchanged.
+  - **Detect:** watch lag metrics, reconnect rates.
+  - **Recover:** clients treat watches as hints and re-list on reconnect/timeout; do not build correctness on “every event”.
+
+- **Bad config deploy (TTL too low, keepalive mismatch, waiter limits too strict)**
+  - **What happens:** self-inflicted lease churn, retry storms, artificial contention.
+  - **Detect:** keepalive QPS spikes, increased lease expiries, rising acquire timeouts.
+  - **Recover:** enforce safe defaults in the client library (TTL floor, keepalive <= TTL/3, jitter), and fail fast with clear errors when limits are exceeded.
+
+- **Traffic 10x unexpectedly (renew storms + hot keys)**
+  - **What happens:** keepalive dominates write budget; hot locks serialize waiters; tail latency rises.
+  - **Detect:** sustained write saturation, fsync latency, growing client backoff.
+  - **Recover:** raise TTL (reduces keepalive QPS), add jitter, cap per-tenant sessions, and return fast “busy” errors when the store is saturated.
+
+## What I'd Do Differently At...
+
+- **10x scale:** run multiple independent clusters partitioned by namespace/tenant; keep the same client recipe.
+- **100x scale:** move coordination needs that don’t require linearizability out of the lock path; keep locks and fencing on the strong store.
+
+## Operational Notes
+
+- **Lease safety rule:** if a client can’t renew and confirm within `TTL/2`, it self-fences immediately.
+- **Time handling:** treat TTL as a monotonic countdown on the server; never trust client wall-clock.
+- **Compaction:** clients must handle “compacted” watch errors by re-listing current queue state and resuming.
+- **Overload behavior:** on `UNAVAILABLE`/timeouts, clients back off with jitter; on explicit limits (watchers, sessions), fail fast with actionable errors.
+```
+apply_patch(auto_approved=true) exited 0 in 50ms:
+Success. Updated the following files:
+A solutions-v2/01-foundational-infrastructure/distributed-lock-service.md
+file update:
+diff --git a/solutions-v2/01-foundational-infrastructure/distributed-lock-service.md b/solutions-v2/01-foundational-infrastructure/distributed-lock-service.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..f2983c2aac80754690635cbe0e773143c13e33d9
+--- /dev/null
++++ b/solutions-v2/01-foundational-infrastructure/distributed-lock-service.md
+@@ -0,0 +1,136 @@
++```markdown
++---
++title: "Distributed Lock Service"
++category: "Foundational Infrastructure"
++difficulty: "Hard"
++tags: ["coordination", "distributed-systems", "raft", "leases", "fencing-tokens"]
++---
++
++## Overview
++
++Provide safe distributed locks by using an existing strongly-consistent store with **leases**, **transactions**, and **watches**. Lock ownership is an ephemeral key attached to a lease; every acquire is a single linearizable write. Safety comes from **fencing tokens** that downstream systems validate.
++
++## What Makes This Hard
++
++Under partitions and pauses, clients can keep running after they become unsafe. Leases answer “who is still connected enough to renew?”, but they don’t stop a zombie client from acting. A lock is only safe when every protected write carries a **monotonic fencing token** that the protected system rejects when stale.
++
++## Requirements
++
++### Functional Requirements
++- **Linearizable acquire/release** for each lock key.
++- **Leases**: ownership is bound to a lease; expiry deletes ownership automatically.
++- **Fencing tokens**: each successful acquire yields a strictly increasing token per lock key; clients include it with downstream writes.
++- **Client failure detection**: loss of lease renewals forces client self-fencing.
++- **Watch/notify** to wait without polling.
++
++### Scale Targets
++- **Cluster size**: 3 nodes (Raft), tolerate 1 failure; 5 nodes for maintenance windows.
++- **Clients**: 10k concurrent clients, 50k active leases.
++- **Locks**: 1–5 million lock keys (sparse).
++- **Write QPS**: dominated by lease keepalives and acquire/release; keep p99 commit latency < 50ms intra-region.
++- **Watchers**: high cardinality supported by avoiding per-lock fanout (FIFO queue with predecessor watches).
++
++## Key Design Decisions
++
++- **What we chose:** use an existing Raft-backed KV (etcd-style) that already provides linearizable transactions, leases, and watch-by-revision.
++  - **Why:** the lock service becomes a client recipe, not a new consensus system.
++
++- **What we chose:** represent a lock as an ephemeral “queue node” key under `/locks/<K>/q/<attempt_id>` attached to the caller’s lease.
++  - **Why:** ownership and cleanup are automatic (lease expiry deletes the key).
++
++- **What we chose:** FIFO waiting with **predecessor watches**.
++  - **Why:** release wakes O(1) waiters instead of a per-key notification storm.
++
++- **What we chose:** fencing token = the queue node’s committed **create revision** (monotonic).
++  - **Why:** it is issued by the consensus log and is safe under retries and leader changes.
++
++- **What we chose:** idempotent acquire via a stable `attempt_id` (request id) embedded in the queue key name.
++  - **Why:** “unknown result → retry” becomes “retry the same attempt and then check position”.
++
++- **What We Removed:** custom gRPC front-end, custom Raft implementation, bespoke state machine, bespoke watch fanout, and custom metrics pipeline (use the store’s metrics + standard dashboards).
++
++## Architecture
++
++```mermaid
++flowchart LR
++  C[Clients + lock library] --> S[(Strong KV with leases/watches\n3–5 nodes, Raft)]
++  C --> P[Protected resource\nrejects stale fencing tokens]
++```
++
++### Components
++
++- **Strong KV with leases/watches**: the single serialization point for acquire/release and the source of truth for lease expiry and revisions.
++- **Client library**: implements acquire/release/wait, keepalive, backoff, and self-fencing.
++- **Protected resource token check**: stores `MaxToken[K]` and rejects `token < MaxToken[K]`.
++
++## Deep Dive: Fencing Tokens (The Hardest Part)
++
++**Token model**
++- On acquire, the client creates `/locks/<K>/q/<attempt_id>` with its lease.
++- The key’s **create revision** is the fencing token.
++- The client holds the lock when its queue key is the smallest by create revision under `/locks/<K>/q/`.
++
++**Waiting (FIFO, O(1) wakeups)**
++1. Create queue key (idempotent: same `attempt_id`).
++2. List `/locks/<K>/q/` sorted by create revision and find your predecessor.
++3. If none, you own the lock.
++4. Otherwise, watch the predecessor key for deletion; on delete (or watch reset), repeat step 2.
++
++**Downstream enforcement**
++- Every protected write includes `(K, token)`.
++- The protected resource stores `MaxToken[K]` and rejects any request with `token < MaxToken[K]`.
++- On accept, it updates `MaxToken[K] = token` (atomically).
++
++**Edge cases**
++- **Leader change / timeout during acquire**: retry using the same `attempt_id`, then re-check queue position.
++- **Client pause / partition**: if keepalive isn’t acknowledged within `TTL/2`, the client self-fences and stops acting; if its lease expires, its queue key is deleted automatically.
++- **Compaction / watch lag**: if a predecessor watch is compacted or reset, the client re-lists the queue prefix and resumes from current state.
++
++## Trade-offs
++
++| Optimized For | Sacrificed |
++|--------------|------------|
++| Strong correctness (linearizable ownership + fencing) | Cross-region latency for writes |
++| Minimal custom code (client recipe on proven KV) | Feature set limited to what the KV provides |
++| O(1) wakeups per release (predecessor watches) | Requires a queue key per waiting client |
++| Operational predictability | Writes stop on quorum loss |
++
++## Failure Modes
++
++- **Quorum loss for minutes (2/3 down or partitioned)**
++  - **What happens:** all linearizable ops stop (acquire/release/keepalive); leases stop renewing; clients must assume locks are lost.
++  - **Detect:** keepalive acks stop; store returns `UNAVAILABLE`/timeouts; lease-expiry counters rise after recovery.
++  - **Recover:** clients self-fence, recreate session, rejoin queue; downstream rejects stale-token writes.
++
++- **Leader change while many leases are near expiry**
++  - **What happens:** brief keepalive disruption; some leases expire; some clients see unknown results on acquire.
++  - **Detect:** leader election events; keepalive retry spike.
++  - **Recover:** self-fence on missed keepalive within `TTL/2`; retry acquire with the same `attempt_id`; token enforcement prevents zombie writes.
++
++- **Slow watch delivery (commits healthy, notifications lag)**
++  - **What happens:** waiters take longer to observe predecessor deletion; throughput drops, correctness unchanged.
++  - **Detect:** watch lag metrics, reconnect rates.
++  - **Recover:** clients treat watches as hints and re-list on reconnect/timeout; do not build correctness on “every event”.
++
++- **Bad config deploy (TTL too low, keepalive mismatch, waiter limits too strict)**
++  - **What happens:** self-inflicted lease churn, retry storms, artificial contention.
++  - **Detect:** keepalive QPS spikes, increased lease expiries, rising acquire timeouts.
++  - **Recover:** enforce safe defaults in the client library (TTL floor, keepalive <= TTL/3, jitter), and fail fast with clear errors when limits are exceeded.
++
++- **Traffic 10x unexpectedly (renew storms + hot keys)**
++  - **What happens:** keepalive dominates write budget; hot locks serialize waiters; tail latency rises.
++  - **Detect:** sustained write saturation, fsync latency, growing client backoff.
++  - **Recover:** raise TTL (reduces keepalive QPS), add jitter, cap per-tenant sessions, and return fast “busy” errors when the store is saturated.
++
++## What I'd Do Differently At...
++
++- **10x scale:** run multiple independent clusters partitioned by namespace/tenant; keep the same client recipe.
++- **100x scale:** move coordination needs that don’t require linearizability out of the lock path; keep locks and fencing on the strong store.
++
++## Operational Notes
++
++- **Lease safety rule:** if a client can’t renew and confirm within `TTL/2`, it self-fences immediately.
++- **Time handling:** treat TTL as a monotonic countdown on the server; never trust client wall-clock.
++- **Compaction:** clients must handle “compacted” watch errors by re-listing current queue state and resuming.
++- **Overload behavior:** on `UNAVAILABLE`/timeouts, clients back off with jitter; on explicit limits (watchers, sessions), fail fast with actionable errors.
++```
+
+file update:
+diff --git a/solutions-v2/01-foundational-infrastructure/distributed-lock-service.md b/solutions-v2/01-foundational-infrastructure/distributed-lock-service.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..f2983c2aac80754690635cbe0e773143c13e33d9
+--- /dev/null
++++ b/solutions-v2/01-foundational-infrastructure/distributed-lock-service.md
+@@ -0,0 +1,136 @@
++```markdown
++---
++title: "Distributed Lock Service"
++category: "Foundational Infrastructure"
++difficulty: "Hard"
++tags: ["coordination", "distributed-systems", "raft", "leases", "fencing-tokens"]
++---
++
++## Overview
++
++Provide safe distributed locks by using an existing strongly-consistent store with **leases**, **transactions**, and **watches**. Lock ownership is an ephemeral key attached to a lease; every acquire is a single linearizable write. Safety comes from **fencing tokens** that downstream systems validate.
++
++## What Makes This Hard
++
++Under partitions and pauses, clients can keep running after they become unsafe. Leases answer “who is still connected enough to renew?”, but they don’t stop a zombie client from acting. A lock is only safe when every protected write carries a **monotonic fencing token** that the protected system rejects when stale.
++
++## Requirements
++
++### Functional Requirements
++- **Linearizable acquire/release** for each lock key.
++- **Leases**: ownership is bound to a lease; expiry deletes ownership automatically.
++- **Fencing tokens**: each successful acquire yields a strictly increasing token per lock key; clients include it with downstream writes.
++- **Client failure detection**: loss of lease renewals forces client self-fencing.
++- **Watch/notify** to wait without polling.
++
++### Scale Targets
++- **Cluster size**: 3 nodes (Raft), tolerate 1 failure; 5 nodes for maintenance windows.
++- **Clients**: 10k concurrent clients, 50k active leases.
++- **Locks**: 1–5 million lock keys (sparse).
++- **Write QPS**: dominated by lease keepalives and acquire/release; keep p99 commit latency < 50ms intra-region.
++- **Watchers**: high cardinality supported by avoiding per-lock fanout (FIFO queue with predecessor watches).
++
++## Key Design Decisions
++
++- **What we chose:** use an existing Raft-backed KV (etcd-style) that already provides linearizable transactions, leases, and watch-by-revision.
++  - **Why:** the lock service becomes a client recipe, not a new consensus system.
++
++- **What we chose:** represent a lock as an ephemeral “queue node” key under `/locks/<K>/q/<attempt_id>` attached to the caller’s lease.
++  - **Why:** ownership and cleanup are automatic (lease expiry deletes the key).
++
++- **What we chose:** FIFO waiting with **predecessor watches**.
++  - **Why:** release wakes O(1) waiters instead of a per-key notification storm.
++
++- **What we chose:** fencing token = the queue node’s committed **create revision** (monotonic).
++  - **Why:** it is issued by the consensus log and is safe under retries and leader changes.
++
++- **What we chose:** idempotent acquire via a stable `attempt_id` (request id) embedded in the queue key name.
++  - **Why:** “unknown result → retry” becomes “retry the same attempt and then check position”.
++
++- **What We Removed:** custom gRPC front-end, custom Raft implementation, bespoke state machine, bespoke watch fanout, and custom metrics pipeline (use the store’s metrics + standard dashboards).
++
++## Architecture
++
++```mermaid
++flowchart LR
++  C[Clients + lock library] --> S[(Strong KV with leases/watches\n3–5 nodes, Raft)]
++  C --> P[Protected resource\nrejects stale fencing tokens]
++```
++
++### Components
++
++- **Strong KV with leases/watches**: the single serialization point for acquire/release and the source of truth for lease expiry and revisions.
++- **Client library**: implements acquire/release/wait, keepalive, backoff, and self-fencing.
++- **Protected resource token check**: stores `MaxToken[K]` and rejects `token < MaxToken[K]`.
++
++## Deep Dive: Fencing Tokens (The Hardest Part)
++
++**Token model**
++- On acquire, the client creates `/locks/<K>/q/<attempt_id>` with its lease.
++- The key’s **create revision** is the fencing token.
++- The client holds the lock when its queue key is the smallest by create revision under `/locks/<K>/q/`.
++
++**Waiting (FIFO, O(1) wakeups)**
++1. Create queue key (idempotent: same `attempt_id`).
++2. List `/locks/<K>/q/` sorted by create revision and find your predecessor.
++3. If none, you own the lock.
++4. Otherwise, watch the predecessor key for deletion; on delete (or watch reset), repeat step 2.
++
++**Downstream enforcement**
++- Every protected write includes `(K, token)`.
++- The protected resource stores `MaxToken[K]` and rejects any request with `token < MaxToken[K]`.
++- On accept, it updates `MaxToken[K] = token` (atomically).
++
++**Edge cases**
++- **Leader change / timeout during acquire**: retry using the same `attempt_id`, then re-check queue position.
++- **Client pause / partition**: if keepalive isn’t acknowledged within `TTL/2`, the client self-fences and stops acting; if its lease expires, its queue key is deleted automatically.
++- **Compaction / watch lag**: if a predecessor watch is compacted or reset, the client re-lists the queue prefix and resumes from current state.
++
++## Trade-offs
++
++| Optimized For | Sacrificed |
++|--------------|------------|
++| Strong correctness (linearizable ownership + fencing) | Cross-region latency for writes |
++| Minimal custom code (client recipe on proven KV) | Feature set limited to what the KV provides |
++| O(1) wakeups per release (predecessor watches) | Requires a queue key per waiting client |
++| Operational predictability | Writes stop on quorum loss |
++
++## Failure Modes
++
++- **Quorum loss for minutes (2/3 down or partitioned)**
++  - **What happens:** all linearizable ops stop (acquire/release/keepalive); leases stop renewing; clients must assume locks are lost.
++  - **Detect:** keepalive acks stop; store returns `UNAVAILABLE`/timeouts; lease-expiry counters rise after recovery.
++  - **Recover:** clients self-fence, recreate session, rejoin queue; downstream rejects stale-token writes.
++
++- **Leader change while many leases are near expiry**
++  - **What happens:** brief keepalive disruption; some leases expire; some clients see unknown results on acquire.
++  - **Detect:** leader election events; keepalive retry spike.
++  - **Recover:** self-fence on missed keepalive within `TTL/2`; retry acquire with the same `attempt_id`; token enforcement prevents zombie writes.
++
++- **Slow watch delivery (commits healthy, notifications lag)**
++  - **What happens:** waiters take longer to observe predecessor deletion; throughput drops, correctness unchanged.
++  - **Detect:** watch lag metrics, reconnect rates.
++  - **Recover:** clients treat watches as hints and re-list on reconnect/timeout; do not build correctness on “every event”.
++
++- **Bad config deploy (TTL too low, keepalive mismatch, waiter limits too strict)**
++  - **What happens:** self-inflicted lease churn, retry storms, artificial contention.
++  - **Detect:** keepalive QPS spikes, increased lease expiries, rising acquire timeouts.
++  - **Recover:** enforce safe defaults in the client library (TTL floor, keepalive <= TTL/3, jitter), and fail fast with clear errors when limits are exceeded.
++
++- **Traffic 10x unexpectedly (renew storms + hot keys)**
++  - **What happens:** keepalive dominates write budget; hot locks serialize waiters; tail latency rises.
++  - **Detect:** sustained write saturation, fsync latency, growing client backoff.
++  - **Recover:** raise TTL (reduces keepalive QPS), add jitter, cap per-tenant sessions, and return fast “busy” errors when the store is saturated.
++
++## What I'd Do Differently At...
++
++- **10x scale:** run multiple independent clusters partitioned by namespace/tenant; keep the same client recipe.
++- **100x scale:** move coordination needs that don’t require linearizability out of the lock path; keep locks and fencing on the strong store.
++
++## Operational Notes
++
++- **Lease safety rule:** if a client can’t renew and confirm within `TTL/2`, it self-fences immediately.
++- **Time handling:** treat TTL as a monotonic countdown on the server; never trust client wall-clock.
++- **Compaction:** clients must handle “compacted” watch errors by re-listing current queue state and resuming.
++- **Overload behavior:** on `UNAVAILABLE`/timeouts, clients back off with jitter; on explicit limits (watchers, sessions), fail fast with actionable errors.
++```
+
+exec
+/bin/zsh -lc "sed -n '1,80p' solutions-v2/01-foundational-infrastructure/distributed-lock-service.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 45ms:
+```markdown
+---
+title: "Distributed Lock Service"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["coordination", "distributed-systems", "raft", "leases", "fencing-tokens"]
+---
+
+## Overview
+
+Provide safe distributed locks by using an existing strongly-consistent store with **leases**, **transactions**, and **watches**. Lock ownership is an ephemeral key attached to a lease; every acquire is a single linearizable write. Safety comes from **fencing tokens** that downstream systems validate.
+
+## What Makes This Hard
+
+Under partitions and pauses, clients can keep running after they become unsafe. Leases answer “who is still connected enough to renew?”, but they don’t stop a zombie client from acting. A lock is only safe when every protected write carries a **monotonic fencing token** that the protected system rejects when stale.
+
+## Requirements
+
+### Functional Requirements
+- **Linearizable acquire/release** for each lock key.
+
+thinking
+I think everything looks good so far. However, I need to confirm that the file ends with a closing code fence and maybe even a newline for good measure. It's always better to have that checked, just to avoid issues later on. Let's take a moment to view the end of the file and make sure everything is in order. It's those little details that can really matter!
+file update:
+diff --git a/solutions-v2/01-foundational-infrastructure/distributed-lock-service.md b/solutions-v2/01-foundational-infrastructure/distributed-lock-service.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..f2983c2aac80754690635cbe0e773143c13e33d9
+--- /dev/null
++++ b/solutions-v2/01-foundational-infrastructure/distributed-lock-service.md
+@@ -0,0 +1,136 @@
++```markdown
++---
++title: "Distributed Lock Service"
++category: "Foundational Infrastructure"
++difficulty: "Hard"
++tags: ["coordination", "distributed-systems", "raft", "leases", "fencing-tokens"]
++---
++
++## Overview
++
++Provide safe distributed locks by using an existing strongly-consistent store with **leases**, **transactions**, and **watches**. Lock ownership is an ephemeral key attached to a lease; every acquire is a single linearizable write. Safety comes from **fencing tokens** that downstream systems validate.
++
++## What Makes This Hard
++
++Under partitions and pauses, clients can keep running after they become unsafe. Leases answer “who is still connected enough to renew?”, but they don’t stop a zombie client from acting. A lock is only safe when every protected write carries a **monotonic fencing token** that the protected system rejects when stale.
++
++## Requirements
++
++### Functional Requirements
++- **Linearizable acquire/release** for each lock key.
++- **Leases**: ownership is bound to a lease; expiry deletes ownership automatically.
++- **Fencing tokens**: each successful acquire yields a strictly increasing token per lock key; clients include it with downstream writes.
++- **Client failure detection**: loss of lease renewals forces client self-fencing.
++- **Watch/notify** to wait without polling.
++
++### Scale Targets
++- **Cluster size**: 3 nodes (Raft), tolerate 1 failure; 5 nodes for maintenance windows.
++- **Clients**: 10k concurrent clients, 50k active leases.
++- **Locks**: 1–5 million lock keys (sparse).
++- **Write QPS**: dominated by lease keepalives and acquire/release; keep p99 commit latency < 50ms intra-region.
++- **Watchers**: high cardinality supported by avoiding per-lock fanout (FIFO queue with predecessor watches).
++
++## Key Design Decisions
++
++- **What we chose:** use an existing Raft-backed KV (etcd-style) that already provides linearizable transactions, leases, and watch-by-revision.
++  - **Why:** the lock service becomes a client recipe, not a new consensus system.
++
++- **What we chose:** represent a lock as an ephemeral “queue node” key under `/locks/<K>/q/<attempt_id>` attached to the caller’s lease.
++  - **Why:** ownership and cleanup are automatic (lease expiry deletes the key).
++
++- **What we chose:** FIFO waiting with **predecessor watches**.
++  - **Why:** release wakes O(1) waiters instead of a per-key notification storm.
++
++- **What we chose:** fencing token = the queue node’s committed **create revision** (monotonic).
++  - **Why:** it is issued by the consensus log and is safe under retries and leader changes.
++
++- **What we chose:** idempotent acquire via a stable `attempt_id` (request id) embedded in the queue key name.
++  - **Why:** “unknown result → retry” becomes “retry the same attempt and then check position”.
++
++- **What We Removed:** custom gRPC front-end, custom Raft implementation, bespoke state machine, bespoke watch fanout, and custom metrics pipeline (use the store’s metrics + standard dashboards).
++
++## Architecture
++
++```mermaid
++flowchart LR
++  C[Clients + lock library] --> S[(Strong KV with leases/watches\n3–5 nodes, Raft)]
++  C --> P[Protected resource\nrejects stale fencing tokens]
++```
++
++### Components
++
++- **Strong KV with leases/watches**: the single serialization point for acquire/release and the source of truth for lease expiry and revisions.
++- **Client library**: implements acquire/release/wait, keepalive, backoff, and self-fencing.
++- **Protected resource token check**: stores `MaxToken[K]` and rejects `token < MaxToken[K]`.
++
++## Deep Dive: Fencing Tokens (The Hardest Part)
++
++**Token model**
++- On acquire, the client creates `/locks/<K>/q/<attempt_id>` with its lease.
++- The key’s **create revision** is the fencing token.
++- The client holds the lock when its queue key is the smallest by create revision under `/locks/<K>/q/`.
++
++**Waiting (FIFO, O(1) wakeups)**
++1. Create queue key (idempotent: same `attempt_id`).
++2. List `/locks/<K>/q/` sorted by create revision and find your predecessor.
++3. If none, you own the lock.
++4. Otherwise, watch the predecessor key for deletion; on delete (or watch reset), repeat step 2.
++
++**Downstream enforcement**
++- Every protected write includes `(K, token)`.
++- The protected resource stores `MaxToken[K]` and rejects any request with `token < MaxToken[K]`.
++- On accept, it updates `MaxToken[K] = token` (atomically).
++
++**Edge cases**
++- **Leader change / timeout during acquire**: retry using the same `attempt_id`, then re-check queue position.
++- **Client pause / partition**: if keepalive isn’t acknowledged within `TTL/2`, the client self-fences and stops acting; if its lease expires, its queue key is deleted automatically.
++- **Compaction / watch lag**: if a predecessor watch is compacted or reset, the client re-lists the queue prefix and resumes from current state.
++
++## Trade-offs
++
++| Optimized For | Sacrificed |
++|--------------|------------|
++| Strong correctness (linearizable ownership + fencing) | Cross-region latency for writes |
++| Minimal custom code (client recipe on proven KV) | Feature set limited to what the KV provides |
++| O(1) wakeups per release (predecessor watches) | Requires a queue key per waiting client |
++| Operational predictability | Writes stop on quorum loss |
++
++## Failure Modes
++
++- **Quorum loss for minutes (2/3 down or partitioned)**
++  - **What happens:** all linearizable ops stop (acquire/release/keepalive); leases stop renewing; clients must assume locks are lost.
++  - **Detect:** keepalive acks stop; store returns `UNAVAILABLE`/timeouts; lease-expiry counters rise after recovery.
++  - **Recover:** clients self-fence, recreate session, rejoin queue; downstream rejects stale-token writes.
++
++- **Leader change while many leases are near expiry**
++  - **What happens:** brief keepalive disruption; some leases expire; some clients see unknown results on acquire.
++  - **Detect:** leader election events; keepalive retry spike.
++  - **Recover:** self-fence on missed keepalive within `TTL/2`; retry acquire with the same `attempt_id`; token enforcement prevents zombie writes.
++
++- **Slow watch delivery (commits healthy, notifications lag)**
++  - **What happens:** waiters take longer to observe predecessor deletion; throughput drops, correctness unchanged.
++  - **Detect:** watch lag metrics, reconnect rates.
++  - **Recover:** clients treat watches as hints and re-list on reconnect/timeout; do not build correctness on “every event”.
++
++- **Bad config deploy (TTL too low, keepalive mismatch, waiter limits too strict)**
++  - **What happens:** self-inflicted lease churn, retry storms, artificial contention.
++  - **Detect:** keepalive QPS spikes, increased lease expiries, rising acquire timeouts.
++  - **Recover:** enforce safe defaults in the client library (TTL floor, keepalive <= TTL/3, jitter), and fail fast with clear errors when limits are exceeded.
++
++- **Traffic 10x unexpectedly (renew storms + hot keys)**
++  - **What happens:** keepalive dominates write budget; hot locks serialize waiters; tail latency rises.
++  - **Detect:** sustained write saturation, fsync latency, growing client backoff.
++  - **Recover:** raise TTL (reduces keepalive QPS), add jitter, cap per-tenant sessions, and return fast “busy” errors when the store is saturated.
++
++## What I'd Do Differently At...
++
++- **10x scale:** run multiple independent clusters partitioned by namespace/tenant; keep the same client recipe.
++- **100x scale:** move coordination needs that don’t require linearizability out of the lock path; keep locks and fencing on the strong store.
++
++## Operational Notes
++
++- **Lease safety rule:** if a client can’t renew and confirm within `TTL/2`, it self-fences immediately.
++- **Time handling:** treat TTL as a monotonic countdown on the server; never trust client wall-clock.
++- **Compaction:** clients must handle “compacted” watch errors by re-listing current queue state and resuming.
++- **Overload behavior:** on `UNAVAILABLE`/timeouts, clients back off with jitter; on explicit limits (watchers, sessions), fail fast with actionable errors.
++```
+
+exec
+/bin/zsh -lc 'tail -n 30 solutions-v2/01-foundational-infrastructure/distributed-lock-service.md' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 45ms:
+  - **Detect:** leader election events; keepalive retry spike.
+  - **Recover:** self-fence on missed keepalive within `TTL/2`; retry acquire with the same `attempt_id`; token enforcement prevents zombie writes.
+
+- **Slow watch delivery (commits healthy, notifications lag)**
+  - **What happens:** waiters take longer to observe predecessor deletion; throughput drops, correctness unchanged.
+  - **Detect:** watch lag metrics, reconnect rates.
+  - **Recover:** clients treat watches as hints and re-list on reconnect/timeout; do not build correctness on “every event”.
+
+- **Bad config deploy (TTL too low, keepalive mismatch, waiter limits too strict)**
+  - **What happens:** self-inflicted lease churn, retry storms, artificial contention.
+  - **Detect:** keepalive QPS spikes, increased lease expiries, rising acquire timeouts.
+  - **Recover:** enforce safe defaults in the client library (TTL floor, keepalive <= TTL/3, jitter), and fail fast with clear errors when limits are exceeded.
+
+- **Traffic 10x unexpectedly (renew storms + hot keys)**
+  - **What happens:** keepalive dominates write budget; hot locks serialize waiters; tail latency rises.
+  - **Detect:** sustained write saturation, fsync latency, growing client backoff.
+  - **Recover:** raise TTL (reduces keepalive QPS), add jitter, cap per-tenant sessions, and return fast “busy” errors when the store is saturated.
+
+## What I'd Do Differently At...
+
+
+thinking
+**Updating the plan status**
+
+I think it's time to update our plan, specifically step 3. I need to decide if it should be marked as "in progress" or "completed." Whatever the choice, we are getting closer to finishing things up! It’s so satisfying to tick off those steps and see progress. I'll make sure to clearly mark this status change so it reflects accurately where we're at. It feels good to finalize everything.
+file update:
+diff --git a/solutions-v2/01-foundational-infrastructure/distributed-lock-service.md b/solutions-v2/01-foundational-infrastructure/distributed-lock-service.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..f2983c2aac80754690635cbe0e773143c13e33d9
+--- /dev/null
++++ b/solutions-v2/01-foundational-infrastructure/distributed-lock-service.md
+@@ -0,0 +1,136 @@
++```markdown
++---
++title: "Distributed Lock Service"
++category: "Foundational Infrastructure"
++difficulty: "Hard"
++tags: ["coordination", "distributed-systems", "raft", "leases", "fencing-tokens"]
++---
++
++## Overview
++
++Provide safe distributed locks by using an existing strongly-consistent store with **leases**, **transactions**, and **watches**. Lock ownership is an ephemeral key attached to a lease; every acquire is a single linearizable write. Safety comes from **fencing tokens** that downstream systems validate.
++
++## What Makes This Hard
++
++Under partitions and pauses, clients can keep running after they become unsafe. Leases answer “who is still connected enough to renew?”, but they don’t stop a zombie client from acting. A lock is only safe when every protected write carries a **monotonic fencing token** that the protected system rejects when stale.
++
++## Requirements
++
++### Functional Requirements
++- **Linearizable acquire/release** for each lock key.
++- **Leases**: ownership is bound to a lease; expiry deletes ownership automatically.
++- **Fencing tokens**: each successful acquire yields a strictly increasing token per lock key; clients include it with downstream writes.
++- **Client failure detection**: loss of lease renewals forces client self-fencing.
++- **Watch/notify** to wait without polling.
++
++### Scale Targets
++- **Cluster size**: 3 nodes (Raft), tolerate 1 failure; 5 nodes for maintenance windows.
++- **Clients**: 10k concurrent clients, 50k active leases.
++- **Locks**: 1–5 million lock keys (sparse).
++- **Write QPS**: dominated by lease keepalives and acquire/release; keep p99 commit latency < 50ms intra-region.
++- **Watchers**: high cardinality supported by avoiding per-lock fanout (FIFO queue with predecessor watches).
++
++## Key Design Decisions
++
++- **What we chose:** use an existing Raft-backed KV (etcd-style) that already provides linearizable transactions, leases, and watch-by-revision.
++  - **Why:** the lock service becomes a client recipe, not a new consensus system.
++
++- **What we chose:** represent a lock as an ephemeral “queue node” key under `/locks/<K>/q/<attempt_id>` attached to the caller’s lease.
++  - **Why:** ownership and cleanup are automatic (lease expiry deletes the key).
++
++- **What we chose:** FIFO waiting with **predecessor watches**.
++  - **Why:** release wakes O(1) waiters instead of a per-key notification storm.
++
++- **What we chose:** fencing token = the queue node’s committed **create revision** (monotonic).
++  - **Why:** it is issued by the consensus log and is safe under retries and leader changes.
++
++- **What we chose:** idempotent acquire via a stable `attempt_id` (request id) embedded in the queue key name.
++  - **Why:** “unknown result → retry” becomes “retry the same attempt and then check position”.
++
++- **What We Removed:** custom gRPC front-end, custom Raft implementation, bespoke state machine, bespoke watch fanout, and custom metrics pipeline (use the store’s metrics + standard dashboards).
++
++## Architecture
++
++```mermaid
++flowchart LR
++  C[Clients + lock library] --> S[(Strong KV with leases/watches\n3–5 nodes, Raft)]
++  C --> P[Protected resource\nrejects stale fencing tokens]
++```
++
++### Components
++
++- **Strong KV with leases/watches**: the single serialization point for acquire/release and the source of truth for lease expiry and revisions.
++- **Client library**: implements acquire/release/wait, keepalive, backoff, and self-fencing.
++- **Protected resource token check**: stores `MaxToken[K]` and rejects `token < MaxToken[K]`.
++
++## Deep Dive: Fencing Tokens (The Hardest Part)
++
++**Token model**
++- On acquire, the client creates `/locks/<K>/q/<attempt_id>` with its lease.
++- The key’s **create revision** is the fencing token.
++- The client holds the lock when its queue key is the smallest by create revision under `/locks/<K>/q/`.
++
++**Waiting (FIFO, O(1) wakeups)**
++1. Create queue key (idempotent: same `attempt_id`).
++2. List `/locks/<K>/q/` sorted by create revision and find your predecessor.
++3. If none, you own the lock.
++4. Otherwise, watch the predecessor key for deletion; on delete (or watch reset), repeat step 2.
++
++**Downstream enforcement**
++- Every protected write includes `(K, token)`.
++- The protected resource stores `MaxToken[K]` and rejects any request with `token < MaxToken[K]`.
++- On accept, it updates `MaxToken[K] = token` (atomically).
++
++**Edge cases**
++- **Leader change / timeout during acquire**: retry using the same `attempt_id`, then re-check queue position.
++- **Client pause / partition**: if keepalive isn’t acknowledged within `TTL/2`, the client self-fences and stops acting; if its lease expires, its queue key is deleted automatically.
++- **Compaction / watch lag**: if a predecessor watch is compacted or reset, the client re-lists the queue prefix and resumes from current state.
++
++## Trade-offs
++
++| Optimized For | Sacrificed |
++|--------------|------------|
++| Strong correctness (linearizable ownership + fencing) | Cross-region latency for writes |
++| Minimal custom code (client recipe on proven KV) | Feature set limited to what the KV provides |
++| O(1) wakeups per release (predecessor watches) | Requires a queue key per waiting client |
++| Operational predictability | Writes stop on quorum loss |
++
++## Failure Modes
++
++- **Quorum loss for minutes (2/3 down or partitioned)**
++  - **What happens:** all linearizable ops stop (acquire/release/keepalive); leases stop renewing; clients must assume locks are lost.
++  - **Detect:** keepalive acks stop; store returns `UNAVAILABLE`/timeouts; lease-expiry counters rise after recovery.
++  - **Recover:** clients self-fence, recreate session, rejoin queue; downstream rejects stale-token writes.
++
++- **Leader change while many leases are near expiry**
++  - **What happens:** brief keepalive disruption; some leases expire; some clients see unknown results on acquire.
++  - **Detect:** leader election events; keepalive retry spike.
++  - **Recover:** self-fence on missed keepalive within `TTL/2`; retry acquire with the same `attempt_id`; token enforcement prevents zombie writes.
++
++- **Slow watch delivery (commits healthy, notifications lag)**
++  - **What happens:** waiters take longer to observe predecessor deletion; throughput drops, correctness unchanged.
++  - **Detect:** watch lag metrics, reconnect rates.
++  - **Recover:** clients treat watches as hints and re-list on reconnect/timeout; do not build correctness on “every event”.
++
++- **Bad config deploy (TTL too low, keepalive mismatch, waiter limits too strict)**
++  - **What happens:** self-inflicted lease churn, retry storms, artificial contention.
++  - **Detect:** keepalive QPS spikes, increased lease expiries, rising acquire timeouts.
++  - **Recover:** enforce safe defaults in the client library (TTL floor, keepalive <= TTL/3, jitter), and fail fast with clear errors when limits are exceeded.
++
++- **Traffic 10x unexpectedly (renew storms + hot keys)**
++  - **What happens:** keepalive dominates write budget; hot locks serialize waiters; tail latency rises.
++  - **Detect:** sustained write saturation, fsync latency, growing client backoff.
++  - **Recover:** raise TTL (reduces keepalive QPS), add jitter, cap per-tenant sessions, and return fast “busy” errors when the store is saturated.
++
++## What I'd Do Differently At...
++
++- **10x scale:** run multiple independent clusters partitioned by namespace/tenant; keep the same client recipe.
++- **100x scale:** move coordination needs that don’t require linearizability out of the lock path; keep locks and fencing on the strong store.
++
++## Operational Notes
++
++- **Lease safety rule:** if a client can’t renew and confirm within `TTL/2`, it self-fences immediately.
++- **Time handling:** treat TTL as a monotonic countdown on the server; never trust client wall-clock.
++- **Compaction:** clients must handle “compacted” watch errors by re-listing current queue state and resuming.
++- **Overload behavior:** on `UNAVAILABLE`/timeouts, clients back off with jitter; on explicit limits (watchers, sessions), fail fast with actionable errors.
++```
+
+Plan update
+  ✓ Locate original markdown file
+  ✓ Rewrite with minimal architecture
+  → Sanity-check formatting and links
+
+
+
+
+
+thinking
+**Verifying document output**
+
+I need to sanity-check the file path and front matter to ensure everything matches. I want to make sure there are no extra sections added, and that we kept the original ones like Overview. The inclusion of the "What We Removed" bullet is good, but I should aim to provide the complete, final markdown document as the user requested. Even though we created the file, it seems like the user wants both the updated file and its content. I should keep in mind the instructions about avoiding huge code blocks, but this might be an exception.
+thinking
+**Finalizing document output**
+
+The system instructions suggest being concise and avoiding huge blocks in the final answer, but the user is asking for the complete document, so I should provide that. Even though it feels large, I can manage it. The user's context indicates they shared the "Original Design" and want the markdown document output, not just repo changes. While we created the file, my response could also mention that the file contains the document and paste it for them.
+thinking
+**Preparing markdown document output**
+
+Given the instructions, it seems best to provide the complete markdown document in response while mentioning the file path that has been added. I can output the document exactly as requested without any extra commentary and ensure I don't modify the title, difficulty, or tags. The user's previous examples show the use of code fences, so I should wrap the document in a markdown code block for clarity, even though they'll likely want the raw markdown as well. It’s important to keep formatting intact while respecting their requests!
+thinking
+**Verifying document details**
+
+I need to ensure the front matter is exact. I should incorporate the "Just use X" test, and while we've referenced "existing Raft-backed KV (etcd-style)" without naming etcd, that's okay. Now, I have to verify that the failure scenario regarding "reads/watches served with what guarantees" covers quorum loss, which means linearizable operations stop. I should mention that reads may be stale if there's no quorum, treating them as advisory. This adds more info but remains relevant to the same bullet point. Should I update the file? I might need to, especially for watch semantics under backpressure and to clarify contract specifics.
+thinking
+**Finalizing key release specifications**
+
+I think it’s important to clarify that releasing a lease involves deleting the key from its own queue. If the lease expires, that key gets deleted. For safety, I should include a comparison on the lease ID since the key is tied to that lease. There’s a concern about a zombie process potentially deleting another's key, but the client library should only know its own key name (attempt_id). We need to avoid accidental releases. It looks like we've introduced a new component called "Client library," but it seems fine since that's part of the clients. Now, I just need to confirm my plan is complete by running a quick check for triple backticks!
+file update:
+diff --git a/solutions-v2/01-foundational-infrastructure/distributed-lock-service.md b/solutions-v2/01-foundational-infrastructure/distributed-lock-service.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..f2983c2aac80754690635cbe0e773143c13e33d9
+--- /dev/null
++++ b/solutions-v2/01-foundational-infrastructure/distributed-lock-service.md
+@@ -0,0 +1,136 @@
++```markdown
++---
++title: "Distributed Lock Service"
++category: "Foundational Infrastructure"
++difficulty: "Hard"
++tags: ["coordination", "distributed-systems", "raft", "leases", "fencing-tokens"]
++---
++
++## Overview
++
++Provide safe distributed locks by using an existing strongly-consistent store with **leases**, **transactions**, and **watches**. Lock ownership is an ephemeral key attached to a lease; every acquire is a single linearizable write. Safety comes from **fencing tokens** that downstream systems validate.
++
++## What Makes This Hard
++
++Under partitions and pauses, clients can keep running after they become unsafe. Leases answer “who is still connected enough to renew?”, but they don’t stop a zombie client from acting. A lock is only safe when every protected write carries a **monotonic fencing token** that the protected system rejects when stale.
++
++## Requirements
++
++### Functional Requirements
++- **Linearizable acquire/release** for each lock key.
++- **Leases**: ownership is bound to a lease; expiry deletes ownership automatically.
++- **Fencing tokens**: each successful acquire yields a strictly increasing token per lock key; clients include it with downstream writes.
++- **Client failure detection**: loss of lease renewals forces client self-fencing.
++- **Watch/notify** to wait without polling.
++
++### Scale Targets
++- **Cluster size**: 3 nodes (Raft), tolerate 1 failure; 5 nodes for maintenance windows.
++- **Clients**: 10k concurrent clients, 50k active leases.
++- **Locks**: 1–5 million lock keys (sparse).
++- **Write QPS**: dominated by lease keepalives and acquire/release; keep p99 commit latency < 50ms intra-region.
++- **Watchers**: high cardinality supported by avoiding per-lock fanout (FIFO queue with predecessor watches).
++
++## Key Design Decisions
++
++- **What we chose:** use an existing Raft-backed KV (etcd-style) that already provides linearizable transactions, leases, and watch-by-revision.
++  - **Why:** the lock service becomes a client recipe, not a new consensus system.
++
++- **What we chose:** represent a lock as an ephemeral “queue node” key under `/locks/<K>/q/<attempt_id>` attached to the caller’s lease.
++  - **Why:** ownership and cleanup are automatic (lease expiry deletes the key).
++
++- **What we chose:** FIFO waiting with **predecessor watches**.
++  - **Why:** release wakes O(1) waiters instead of a per-key notification storm.
++
++- **What we chose:** fencing token = the queue node’s committed **create revision** (monotonic).
++  - **Why:** it is issued by the consensus log and is safe under retries and leader changes.
++
++- **What we chose:** idempotent acquire via a stable `attempt_id` (request id) embedded in the queue key name.
++  - **Why:** “unknown result → retry” becomes “retry the same attempt and then check position”.
++
++- **What We Removed:** custom gRPC front-end, custom Raft implementation, bespoke state machine, bespoke watch fanout, and custom metrics pipeline (use the store’s metrics + standard dashboards).
++
++## Architecture
++
++```mermaid
++flowchart LR
++  C[Clients + lock library] --> S[(Strong KV with leases/watches\n3–5 nodes, Raft)]
++  C --> P[Protected resource\nrejects stale fencing tokens]
++```
++
++### Components
++
++- **Strong KV with leases/watches**: the single serialization point for acquire/release and the source of truth for lease expiry and revisions.
++- **Client library**: implements acquire/release/wait, keepalive, backoff, and self-fencing.
++- **Protected resource token check**: stores `MaxToken[K]` and rejects `token < MaxToken[K]`.
++
++## Deep Dive: Fencing Tokens (The Hardest Part)
++
++**Token model**
++- On acquire, the client creates `/locks/<K>/q/<attempt_id>` with its lease.
++- The key’s **create revision** is the fencing token.
++- The client holds the lock when its queue key is the smallest by create revision under `/locks/<K>/q/`.
++
++**Waiting (FIFO, O(1) wakeups)**
++1. Create queue key (idempotent: same `attempt_id`).
++2. List `/locks/<K>/q/` sorted by create revision and find your predecessor.
++3. If none, you own the lock.
++4. Otherwise, watch the predecessor key for deletion; on delete (or watch reset), repeat step 2.
++
++**Downstream enforcement**
++- Every protected write includes `(K, token)`.
++- The protected resource stores `MaxToken[K]` and rejects any request with `token < MaxToken[K]`.
++- On accept, it updates `MaxToken[K] = token` (atomically).
++
++**Edge cases**
++- **Leader change / timeout during acquire**: retry using the same `attempt_id`, then re-check queue position.
++- **Client pause / partition**: if keepalive isn’t acknowledged within `TTL/2`, the client self-fences and stops acting; if its lease expires, its queue key is deleted automatically.
++- **Compaction / watch lag**: if a predecessor watch is compacted or reset, the client re-lists the queue prefix and resumes from current state.
++
++## Trade-offs
++
++| Optimized For | Sacrificed |
++|--------------|------------|
++| Strong correctness (linearizable ownership + fencing) | Cross-region latency for writes |
++| Minimal custom code (client recipe on proven KV) | Feature set limited to what the KV provides |
++| O(1) wakeups per release (predecessor watches) | Requires a queue key per waiting client |
++| Operational predictability | Writes stop on quorum loss |
++
++## Failure Modes
++
++- **Quorum loss for minutes (2/3 down or partitioned)**
++  - **What happens:** all linearizable ops stop (acquire/release/keepalive); leases stop renewing; clients must assume locks are lost.
++  - **Detect:** keepalive acks stop; store returns `UNAVAILABLE`/timeouts; lease-expiry counters rise after recovery.
++  - **Recover:** clients self-fence, recreate session, rejoin queue; downstream rejects stale-token writes.
++
++- **Leader change while many leases are near expiry**
++  - **What happens:** brief keepalive disruption; some leases expire; some clients see unknown results on acquire.
++  - **Detect:** leader election events; keepalive retry spike.
++  - **Recover:** self-fence on missed keepalive within `TTL/2`; retry acquire with the same `attempt_id`; token enforcement prevents zombie writes.
++
++- **Slow watch delivery (commits healthy, notifications lag)**
++  - **What happens:** waiters take longer to observe predecessor deletion; throughput drops, correctness unchanged.
++  - **Detect:** watch lag metrics, reconnect rates.
++  - **Recover:** clients treat watches as hints and re-list on reconnect/timeout; do not build correctness on “every event”.
++
++- **Bad config deploy (TTL too low, keepalive mismatch, waiter limits too strict)**
++  - **What happens:** self-inflicted lease churn, retry storms, artificial contention.
++  - **Detect:** keepalive QPS spikes, increased lease expiries, rising acquire timeouts.
++  - **Recover:** enforce safe defaults in the client library (TTL floor, keepalive <= TTL/3, jitter), and fail fast with clear errors when limits are exceeded.
++
++- **Traffic 10x unexpectedly (renew storms + hot keys)**
++  - **What happens:** keepalive dominates write budget; hot locks serialize waiters; tail latency rises.
++  - **Detect:** sustained write saturation, fsync latency, growing client backoff.
++  - **Recover:** raise TTL (reduces keepalive QPS), add jitter, cap per-tenant sessions, and return fast “busy” errors when the store is saturated.
++
++## What I'd Do Differently At...
++
++- **10x scale:** run multiple independent clusters partitioned by namespace/tenant; keep the same client recipe.
++- **100x scale:** move coordination needs that don’t require linearizability out of the lock path; keep locks and fencing on the strong store.
++
++## Operational Notes
++
++- **Lease safety rule:** if a client can’t renew and confirm within `TTL/2`, it self-fences immediately.
++- **Time handling:** treat TTL as a monotonic countdown on the server; never trust client wall-clock.
++- **Compaction:** clients must handle “compacted” watch errors by re-listing current queue state and resuming.
++- **Overload behavior:** on `UNAVAILABLE`/timeouts, clients back off with jitter; on explicit limits (watchers, sessions), fail fast with actionable errors.
++```
+
+Plan update
+  ✓ Locate original markdown file
+  ✓ Rewrite with minimal architecture
+  ✓ Sanity-check formatting and links
+codex
+Added `solutions-v2/01-foundational-infrastructure/distributed-lock-service.md`:
+
+```markdown
+---
+title: "Distributed Lock Service"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["coordination", "distributed-systems", "raft", "leases", "fencing-tokens"]
+---
+
+## Overview
+
+Provide safe distributed locks by using an existing strongly-consistent store with **leases**, **transactions**, and **watches**. Lock ownership is an ephemeral key attached to a lease; every acquire is a single linearizable write. Safety comes from **fencing tokens** that downstream systems validate.
+
+## What Makes This Hard
+
+Under partitions and pauses, clients can keep running after they become unsafe. Leases answer “who is still connected enough to renew?”, but they don’t stop a zombie client from acting. A lock is only safe when every protected write carries a **monotonic fencing token** that the protected system rejects when stale.
+
+## Requirements
+
+### Functional Requirements
+- **Linearizable acquire/release** for each lock key.
+- **Leases**: ownership is bound to a lease; expiry deletes ownership automatically.
+- **Fencing tokens**: each successful acquire yields a strictly increasing token per lock key; clients include it with downstream writes.
+- **Client failure detection**: loss of lease renewals forces client self-fencing.
+- **Watch/notify** to wait without polling.
+
+### Scale Targets
+- **Cluster size**: 3 nodes (Raft), tolerate 1 failure; 5 nodes for maintenance windows.
+- **Clients**: 10k concurrent clients, 50k active leases.
+- **Locks**: 1–5 million lock keys (sparse).
+- **Write QPS**: dominated by lease keepalives and acquire/release; keep p99 commit latency < 50ms intra-region.
+- **Watchers**: high cardinality supported by avoiding per-lock fanout (FIFO queue with predecessor watches).
+
+## Key Design Decisions
+
+- **What we chose:** use an existing Raft-backed KV (etcd-style) that already provides linearizable transactions, leases, and watch-by-revision.
+  - **Why:** the lock service becomes a client recipe, not a new consensus system.
+
+- **What we chose:** represent a lock as an ephemeral “queue node” key under `/locks/<K>/q/<attempt_id>` attached to the caller’s lease.
+  - **Why:** ownership and cleanup are automatic (lease expiry deletes the key).
+
+- **What we chose:** FIFO waiting with **predecessor watches**.
+  - **Why:** release wakes O(1) waiters instead of a per-key notification storm.
+
+- **What we chose:** fencing token = the queue node’s committed **create revision** (monotonic).
+  - **Why:** it is issued by the consensus log and is safe under retries and leader changes.
+
+- **What we chose:** idempotent acquire via a stable `attempt_id` (request id) embedded in the queue key name.
+  - **Why:** “unknown result → retry” becomes “retry the same attempt and then check position”.
+
+- **What We Removed:** custom gRPC front-end, custom Raft implementation, bespoke state machine, bespoke watch fanout, and custom metrics pipeline (use the store’s metrics + standard dashboards).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Clients + lock library] --> S[(Strong KV with leases/watches\n3–5 nodes, Raft)]
+  C --> P[Protected resource\nrejects stale fencing tokens]
+```
+
+### Components
+
+- **Strong KV with leases/watches**: the single serialization point for acquire/release and the source of truth for lease expiry and revisions.
+- **Client library**: implements acquire/release/wait, keepalive, backoff, and self-fencing.
+- **Protected resource token check**: stores `MaxToken[K]` and rejects `token < MaxToken[K]`.
+
+## Deep Dive: Fencing Tokens (The Hardest Part)
+
+**Token model**
+- On acquire, the client creates `/locks/<K>/q/<attempt_id>` with its lease.
+- The key’s **create revision** is the fencing token.
+- The client holds the lock when its queue key is the smallest by create revision under `/locks/<K>/q/`.
+
+**Waiting (FIFO, O(1) wakeups)**
+1. Create queue key (idempotent: same `attempt_id`).
+2. List `/locks/<K>/q/` sorted by create revision and find your predecessor.
+3. If none, you own the lock.
+4. Otherwise, watch the predecessor key for deletion; on delete (or watch reset), repeat step 2.
+
+**Downstream enforcement**
+- Every protected write includes `(K, token)`.
+- The protected resource stores `MaxToken[K]` and rejects any request with `token < MaxToken[K]`.
+- On accept, it updates `MaxToken[K] = token` (atomically).
+
+**Edge cases**
+- **Leader change / timeout during acquire**: retry using the same `attempt_id`, then re-check queue position.
+- **Client pause / partition**: if keepalive isn’t acknowledged within `TTL/2`, the client self-fences and stops acting; if its lease expires, its queue key is deleted automatically.
+- **Compaction / watch lag**: if a predecessor watch is compacted or reset, the client re-lists the queue prefix and resumes from current state.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Strong correctness (linearizable ownership + fencing) | Cross-region latency for writes |
+| Minimal custom code (client recipe on proven KV) | Feature set limited to what the KV provides |
+| O(1) wakeups per release (predecessor watches) | Requires a queue key per waiting client |
+| Operational predictability | Writes stop on quorum loss |
+
+## Failure Modes
+
+- **Quorum loss for minutes (2/3 down or partitioned)**
+  - **What happens:** all linearizable ops stop (acquire/release/keepalive); leases stop renewing; clients must assume locks are lost.
+  - **Detect:** keepalive acks stop; store returns `UNAVAILABLE`/timeouts; lease-expiry counters rise after recovery.
+  - **Recover:** clients self-fence, recreate session, rejoin queue; downstream rejects stale-token writes.
+
+- **Leader change while many leases are near expiry**
+  - **What happens:** brief keepalive disruption; some leases expire; some clients see unknown results on acquire.
+  - **Detect:** leader election events; keepalive retry spike.
+  - **Recover:** self-fence on missed keepalive within `TTL/2`; retry acquire with the same `attempt_id`; token enforcement prevents zombie writes.
+
+- **Slow watch delivery (commits healthy, notifications lag)**
+  - **What happens:** waiters take longer to observe predecessor deletion; throughput drops, correctness unchanged.
+  - **Detect:** watch lag metrics, reconnect rates.
+  - **Recover:** clients treat watches as hints and re-list on reconnect/timeout; do not build correctness on “every event”.
+
+- **Bad config deploy (TTL too low, keepalive mismatch, waiter limits too strict)**
+  - **What happens:** self-inflicted lease churn, retry storms, artificial contention.
+  - **Detect:** keepalive QPS spikes, increased lease expiries, rising acquire timeouts.
+  - **Recover:** enforce safe defaults in the client library (TTL floor, keepalive <= TTL/3, jitter), and fail fast with clear errors when limits are exceeded.
+
+- **Traffic 10x unexpectedly (renew storms + hot keys)**
+  - **What happens:** keepalive dominates write budget; hot locks serialize waiters; tail latency rises.
+  - **Detect:** sustained write saturation, fsync latency, growing client backoff.
+  - **Recover:** raise TTL (reduces keepalive QPS), add jitter, cap per-tenant sessions, and return fast “busy” errors when the store is saturated.
+
+## What I'd Do Differently At...
+
+- **10x scale:** run multiple independent clusters partitioned by namespace/tenant; keep the same client recipe.
+- **100x scale:** move coordination needs that don’t require linearizability out of the lock path; keep locks and fencing on the strong store.
+
+## Operational Notes
+
+- **Lease safety rule:** if a client can’t renew and confirm within `TTL/2`, it self-fences immediately.
+- **Time handling:** treat TTL as a monotonic countdown on the server; never trust client wall-clock.
+- **Compaction:** clients must handle “compacted” watch errors by re-listing current queue state and resuming.
+- **Overload behavior:** on `UNAVAILABLE`/timeouts, clients back off with jitter; on explicit limits (watchers, sessions), fail fast with actionable errors.
+```
+file update:
+diff --git a/solutions-v2/01-foundational-infrastructure/distributed-lock-service.md b/solutions-v2/01-foundational-infrastructure/distributed-lock-service.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..f2983c2aac80754690635cbe0e773143c13e33d9
+--- /dev/null
++++ b/solutions-v2/01-foundational-infrastructure/distributed-lock-service.md
+@@ -0,0 +1,136 @@
++```markdown
++---
++title: "Distributed Lock Service"
++category: "Foundational Infrastructure"
++difficulty: "Hard"
++tags: ["coordination", "distributed-systems", "raft", "leases", "fencing-tokens"]
++---
++
++## Overview
++
++Provide safe distributed locks by using an existing strongly-consistent store with **leases**, **transactions**, and **watches**. Lock ownership is an ephemeral key attached to a lease; every acquire is a single linearizable write. Safety comes from **fencing tokens** that downstream systems validate.
++
++## What Makes This Hard
++
++Under partitions and pauses, clients can keep running after they become unsafe. Leases answer “who is still connected enough to renew?”, but they don’t stop a zombie client from acting. A lock is only safe when every protected write carries a **monotonic fencing token** that the protected system rejects when stale.
++
++## Requirements
++
++### Functional Requirements
++- **Linearizable acquire/release** for each lock key.
++- **Leases**: ownership is bound to a lease; expiry deletes ownership automatically.
++- **Fencing tokens**: each successful acquire yields a strictly increasing token per lock key; clients include it with downstream writes.
++- **Client failure detection**: loss of lease renewals forces client self-fencing.
++- **Watch/notify** to wait without polling.
++
++### Scale Targets
++- **Cluster size**: 3 nodes (Raft), tolerate 1 failure; 5 nodes for maintenance windows.
++- **Clients**: 10k concurrent clients, 50k active leases.
++- **Locks**: 1–5 million lock keys (sparse).
++- **Write QPS**: dominated by lease keepalives and acquire/release; keep p99 commit latency < 50ms intra-region.
++- **Watchers**: high cardinality supported by avoiding per-lock fanout (FIFO queue with predecessor watches).
++
++## Key Design Decisions
++
++- **What we chose:** use an existing Raft-backed KV (etcd-style) that already provides linearizable transactions, leases, and watch-by-revision.
++  - **Why:** the lock service becomes a client recipe, not a new consensus system.
++
++- **What we chose:** represent a lock as an ephemeral “queue node” key under `/locks/<K>/q/<attempt_id>` attached to the caller’s lease.
++  - **Why:** ownership and cleanup are automatic (lease expiry deletes the key).
++
++- **What we chose:** FIFO waiting with **predecessor watches**.
++  - **Why:** release wakes O(1) waiters instead of a per-key notification storm.
++
++- **What we chose:** fencing token = the queue node’s committed **create revision** (monotonic).
++  - **Why:** it is issued by the consensus log and is safe under retries and leader changes.
++
++- **What we chose:** idempotent acquire via a stable `attempt_id` (request id) embedded in the queue key name.
++  - **Why:** “unknown result → retry” becomes “retry the same attempt and then check position”.
++
++- **What We Removed:** custom gRPC front-end, custom Raft implementation, bespoke state machine, bespoke watch fanout, and custom metrics pipeline (use the store’s metrics + standard dashboards).
++
++## Architecture
++
++```mermaid
++flowchart LR
++  C[Clients + lock library] --> S[(Strong KV with leases/watches\n3–5 nodes, Raft)]
++  C --> P[Protected resource\nrejects stale fencing tokens]
++```
++
++### Components
++
++- **Strong KV with leases/watches**: the single serialization point for acquire/release and the source of truth for lease expiry and revisions.
++- **Client library**: implements acquire/release/wait, keepalive, backoff, and self-fencing.
++- **Protected resource token check**: stores `MaxToken[K]` and rejects `token < MaxToken[K]`.
++
++## Deep Dive: Fencing Tokens (The Hardest Part)
++
++**Token model**
++- On acquire, the client creates `/locks/<K>/q/<attempt_id>` with its lease.
++- The key’s **create revision** is the fencing token.
++- The client holds the lock when its queue key is the smallest by create revision under `/locks/<K>/q/`.
++
++**Waiting (FIFO, O(1) wakeups)**
++1. Create queue key (idempotent: same `attempt_id`).
++2. List `/locks/<K>/q/` sorted by create revision and find your predecessor.
++3. If none, you own the lock.
++4. Otherwise, watch the predecessor key for deletion; on delete (or watch reset), repeat step 2.
++
++**Downstream enforcement**
++- Every protected write includes `(K, token)`.
++- The protected resource stores `MaxToken[K]` and rejects any request with `token < MaxToken[K]`.
++- On accept, it updates `MaxToken[K] = token` (atomically).
++
++**Edge cases**
++- **Leader change / timeout during acquire**: retry using the same `attempt_id`, then re-check queue position.
++- **Client pause / partition**: if keepalive isn’t acknowledged within `TTL/2`, the client self-fences and stops acting; if its lease expires, its queue key is deleted automatically.
++- **Compaction / watch lag**: if a predecessor watch is compacted or reset, the client re-lists the queue prefix and resumes from current state.
++
++## Trade-offs
++
++| Optimized For | Sacrificed |
++|--------------|------------|
++| Strong correctness (linearizable ownership + fencing) | Cross-region latency for writes |
++| Minimal custom code (client recipe on proven KV) | Feature set limited to what the KV provides |
++| O(1) wakeups per release (predecessor watches) | Requires a queue key per waiting client |
++| Operational predictability | Writes stop on quorum loss |
++
++## Failure Modes
++
++- **Quorum loss for minutes (2/3 down or partitioned)**
++  - **What happens:** all linearizable ops stop (acquire/release/keepalive); leases stop renewing; clients must assume locks are lost.
++  - **Detect:** keepalive acks stop; store returns `UNAVAILABLE`/timeouts; lease-expiry counters rise after recovery.
++  - **Recover:** clients self-fence, recreate session, rejoin queue; downstream rejects stale-token writes.
++
++- **Leader change while many leases are near expiry**
++  - **What happens:** brief keepalive disruption; some leases expire; some clients see unknown results on acquire.
++  - **Detect:** leader election events; keepalive retry spike.
++  - **Recover:** self-fence on missed keepalive within `TTL/2`; retry acquire with the same `attempt_id`; token enforcement prevents zombie writes.
++
++- **Slow watch delivery (commits healthy, notifications lag)**
++  - **What happens:** waiters take longer to observe predecessor deletion; throughput drops, correctness unchanged.
++  - **Detect:** watch lag metrics, reconnect rates.
++  - **Recover:** clients treat watches as hints and re-list on reconnect/timeout; do not build correctness on “every event”.
++
++- **Bad config deploy (TTL too low, keepalive mismatch, waiter limits too strict)**
++  - **What happens:** self-inflicted lease churn, retry storms, artificial contention.
++  - **Detect:** keepalive QPS spikes, increased lease expiries, rising acquire timeouts.
++  - **Recover:** enforce safe defaults in the client library (TTL floor, keepalive <= TTL/3, jitter), and fail fast with clear errors when limits are exceeded.
++
++- **Traffic 10x unexpectedly (renew storms + hot keys)**
++  - **What happens:** keepalive dominates write budget; hot locks serialize waiters; tail latency rises.
++  - **Detect:** sustained write saturation, fsync latency, growing client backoff.
++  - **Recover:** raise TTL (reduces keepalive QPS), add jitter, cap per-tenant sessions, and return fast “busy” errors when the store is saturated.
++
++## What I'd Do Differently At...
++
++- **10x scale:** run multiple independent clusters partitioned by namespace/tenant; keep the same client recipe.
++- **100x scale:** move coordination needs that don’t require linearizability out of the lock path; keep locks and fencing on the strong store.
++
++## Operational Notes
++
++- **Lease safety rule:** if a client can’t renew and confirm within `TTL/2`, it self-fences immediately.
++- **Time handling:** treat TTL as a monotonic countdown on the server; never trust client wall-clock.
++- **Compaction:** clients must handle “compacted” watch errors by re-listing current queue state and resuming.
++- **Overload behavior:** on `UNAVAILABLE`/timeouts, clients back off with jitter; on explicit limits (watchers, sessions), fail fast with actionable errors.
++```
+
+tokens used
+34,469
+Added `solutions-v2/01-foundational-infrastructure/distributed-lock-service.md`:
+
+```markdown
+---
+title: "Distributed Lock Service"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["coordination", "distributed-systems", "raft", "leases", "fencing-tokens"]
+---
+
+## Overview
+
+Provide safe distributed locks by using an existing strongly-consistent store with **leases**, **transactions**, and **watches**. Lock ownership is an ephemeral key attached to a lease; every acquire is a single linearizable write. Safety comes from **fencing tokens** that downstream systems validate.
+
+## What Makes This Hard
+
+Under partitions and pauses, clients can keep running after they become unsafe. Leases answer “who is still connected enough to renew?”, but they don’t stop a zombie client from acting. A lock is only safe when every protected write carries a **monotonic fencing token** that the protected system rejects when stale.
+
+## Requirements
+
+### Functional Requirements
+- **Linearizable acquire/release** for each lock key.
+- **Leases**: ownership is bound to a lease; expiry deletes ownership automatically.
+- **Fencing tokens**: each successful acquire yields a strictly increasing token per lock key; clients include it with downstream writes.
+- **Client failure detection**: loss of lease renewals forces client self-fencing.
+- **Watch/notify** to wait without polling.
+
+### Scale Targets
+- **Cluster size**: 3 nodes (Raft), tolerate 1 failure; 5 nodes for maintenance windows.
+- **Clients**: 10k concurrent clients, 50k active leases.
+- **Locks**: 1–5 million lock keys (sparse).
+- **Write QPS**: dominated by lease keepalives and acquire/release; keep p99 commit latency < 50ms intra-region.
+- **Watchers**: high cardinality supported by avoiding per-lock fanout (FIFO queue with predecessor watches).
+
+## Key Design Decisions
+
+- **What we chose:** use an existing Raft-backed KV (etcd-style) that already provides linearizable transactions, leases, and watch-by-revision.
+  - **Why:** the lock service becomes a client recipe, not a new consensus system.
+
+- **What we chose:** represent a lock as an ephemeral “queue node” key under `/locks/<K>/q/<attempt_id>` attached to the caller’s lease.
+  - **Why:** ownership and cleanup are automatic (lease expiry deletes the key).
+
+- **What we chose:** FIFO waiting with **predecessor watches**.
+  - **Why:** release wakes O(1) waiters instead of a per-key notification storm.
+
+- **What we chose:** fencing token = the queue node’s committed **create revision** (monotonic).
+  - **Why:** it is issued by the consensus log and is safe under retries and leader changes.
+
+- **What we chose:** idempotent acquire via a stable `attempt_id` (request id) embedded in the queue key name.
+  - **Why:** “unknown result → retry” becomes “retry the same attempt and then check position”.
+
+- **What We Removed:** custom gRPC front-end, custom Raft implementation, bespoke state machine, bespoke watch fanout, and custom metrics pipeline (use the store’s metrics + standard dashboards).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Clients + lock library] --> S[(Strong KV with leases/watches\n3–5 nodes, Raft)]
+  C --> P[Protected resource\nrejects stale fencing tokens]
+```
+
+### Components
+
+- **Strong KV with leases/watches**: the single serialization point for acquire/release and the source of truth for lease expiry and revisions.
+- **Client library**: implements acquire/release/wait, keepalive, backoff, and self-fencing.
+- **Protected resource token check**: stores `MaxToken[K]` and rejects `token < MaxToken[K]`.
+
+## Deep Dive: Fencing Tokens (The Hardest Part)
+
+**Token model**
+- On acquire, the client creates `/locks/<K>/q/<attempt_id>` with its lease.
+- The key’s **create revision** is the fencing token.
+- The client holds the lock when its queue key is the smallest by create revision under `/locks/<K>/q/`.
+
+**Waiting (FIFO, O(1) wakeups)**
+1. Create queue key (idempotent: same `attempt_id`).
+2. List `/locks/<K>/q/` sorted by create revision and find your predecessor.
+3. If none, you own the lock.
+4. Otherwise, watch the predecessor key for deletion; on delete (or watch reset), repeat step 2.
+
+**Downstream enforcement**
+- Every protected write includes `(K, token)`.
+- The protected resource stores `MaxToken[K]` and rejects any request with `token < MaxToken[K]`.
+- On accept, it updates `MaxToken[K] = token` (atomically).
+
+**Edge cases**
+- **Leader change / timeout during acquire**: retry using the same `attempt_id`, then re-check queue position.
+- **Client pause / partition**: if keepalive isn’t acknowledged within `TTL/2`, the client self-fences and stops acting; if its lease expires, its queue key is deleted automatically.
+- **Compaction / watch lag**: if a predecessor watch is compacted or reset, the client re-lists the queue prefix and resumes from current state.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Strong correctness (linearizable ownership + fencing) | Cross-region latency for writes |
+| Minimal custom code (client recipe on proven KV) | Feature set limited to what the KV provides |
+| O(1) wakeups per release (predecessor watches) | Requires a queue key per waiting client |
+| Operational predictability | Writes stop on quorum loss |
+
+## Failure Modes
+
+- **Quorum loss for minutes (2/3 down or partitioned)**
+  - **What happens:** all linearizable ops stop (acquire/release/keepalive); leases stop renewing; clients must assume locks are lost.
+  - **Detect:** keepalive acks stop; store returns `UNAVAILABLE`/timeouts; lease-expiry counters rise after recovery.
+  - **Recover:** clients self-fence, recreate session, rejoin queue; downstream rejects stale-token writes.
+
+- **Leader change while many leases are near expiry**
+  - **What happens:** brief keepalive disruption; some leases expire; some clients see unknown results on acquire.
+  - **Detect:** leader election events; keepalive retry spike.
+  - **Recover:** self-fence on missed keepalive within `TTL/2`; retry acquire with the same `attempt_id`; token enforcement prevents zombie writes.
+
+- **Slow watch delivery (commits healthy, notifications lag)**
+  - **What happens:** waiters take longer to observe predecessor deletion; throughput drops, correctness unchanged.
+  - **Detect:** watch lag metrics, reconnect rates.
+  - **Recover:** clients treat watches as hints and re-list on reconnect/timeout; do not build correctness on “every event”.
+
+- **Bad config deploy (TTL too low, keepalive mismatch, waiter limits too strict)**
+  - **What happens:** self-inflicted lease churn, retry storms, artificial contention.
+  - **Detect:** keepalive QPS spikes, increased lease expiries, rising acquire timeouts.
+  - **Recover:** enforce safe defaults in the client library (TTL floor, keepalive <= TTL/3, jitter), and fail fast with clear errors when limits are exceeded.
+
+- **Traffic 10x unexpectedly (renew storms + hot keys)**
+  - **What happens:** keepalive dominates write budget; hot locks serialize waiters; tail latency rises.
+  - **Detect:** sustained write saturation, fsync latency, growing client backoff.
+  - **Recover:** raise TTL (reduces keepalive QPS), add jitter, cap per-tenant sessions, and return fast “busy” errors when the store is saturated.
+
+## What I'd Do Differently At...
+
+- **10x scale:** run multiple independent clusters partitioned by namespace/tenant; keep the same client recipe.
+- **100x scale:** move coordination needs that don’t require linearizability out of the lock path; keep locks and fencing on the strong store.
+
+## Operational Notes
+
+- **Lease safety rule:** if a client can’t renew and confirm within `TTL/2`, it self-fences immediately.
+- **Time handling:** treat TTL as a monotonic countdown on the server; never trust client wall-clock.
+- **Compaction:** clients must handle “compacted” watch errors by re-listing current queue state and resuming.
+- **Overload behavior:** on `UNAVAILABLE`/timeouts, clients back off with jitter; on explicit limits (watchers, sessions), fail fast with actionable errors.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/01-foundational-infrastructure/distributed-lock-service.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Distributed Lock Service
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/distributed-lock-service.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/distributed-lock-service.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/01-foundational-infrastructure/distributed-lock-service.md

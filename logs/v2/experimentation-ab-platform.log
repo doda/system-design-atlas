@@ -1,0 +1,1772 @@
+==========================================
+Generating (v2): Experimentation (A/B) Platform
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2d85-7221-8a71-3bb0ea06ef63
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Experimentation (A/B) Platform
+**Category**: AI/ML Infrastructure
+
+**Problem Statement**:
+Design a system for randomized assignment, metric computation, and statistical significance testing at scale.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+thinking
+**Designing a System Document**
+
+I need to create a markdown system design document focusing on various aspects without including any code. My key challenges include consistency in assignments and metric attribution, as well as addressing streaming versus batch processes. I'll highlight insights like stable deterministic hashing and event pipeline structures. Additionally, I'll cover details like assignment services and their low-latency requirements. Finally, I'll use technologies such as Kafka, Flink, Iceberg, Trino, and Postgres to meet scalability targets of 200k RPS and 10B events per day.
+thinking
+**Addressing Experimental Metrics**
+
+I'm focusing on the challenges of accurately counting metrics while guarding against bias and logging exposures. It's crucial to manage mutually exclusive experiments and isolate them using namespaces. My key decisions include using deterministic hashing and a centralized configuration. I plan for an event-sourcing model with an append-only log and utilize a hybrid batch and stream processing with Iceberg. Operationally, I need to monitor for assignment drift and keep track of data freshness. I'll also avoid using hedge words in the final markdown document.
+codex
+```markdown
+---
+title: "Experimentation (A/B) Platform"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["experimentation", "ab-testing", "metrics", "statistics", "streaming", "data-platform"]
+---
+
+## Overview
+
+This system provides three things that must stay consistent with each other under real-world messiness: (1) randomized assignment that is stable across time and services, (2) metric computation that correctly attributes outcomes to exposures, and (3) significance testing that teams can trust without becoming statisticians.
+
+The key insight is to treat **exposure** as the atomic fact of experimentation. Everything flows from an immutable exposure log: assignment is deterministic and reproducible, metrics are joined to exposures with explicit attribution windows, and statistical tests run on exposure-scoped aggregates. This avoids the two classic failures: “we shipped a hash function change and invalidated every experiment” and “we computed metrics from raw events and accidentally measured a biased subset.”
+
+The design is intentionally boring elsewhere: Postgres for control-plane, Kafka for event transport, a streaming job for near-real-time aggregates, and a lakehouse table format (Iceberg) for backfills and correctness. The platform earns its complexity only where it prevents subtle, expensive mistakes.
+
+## What Makes This Hard
+
+Naive implementations confuse *assignment* with *measurement*. They assign users in one place, log events somewhere else, and later try to infer who saw what. That fails as soon as you have retries, caching, client-side rendering, ad blockers, delayed conversions, cross-device identity, or “exposure” that is not a single request.
+
+The trap most teams hit is **silent bias**: metrics that look stable but are computed from a non-random slice (missing exposures, logging gaps, late events, or experiment overlap). The platform must make bias detectable (SRM, missing exposure checks, logging coverage) and make the “right way” the default workflow.
+
+## Requirements
+
+### Functional Requirements
+- Deterministic randomization for a chosen unit (user_id / device_id / account_id / session_id) with fixed allocation and reproducible bucketing.
+- Targeting and mutual exclusion (namespaces / layers) to prevent experiment interference.
+- Immutable exposure logging (who, what experiment+variant, when, context) with strong guarantees against double-counting.
+- Metric computation with explicit attribution rules:
+  - exposure-based joins
+  - lookback windows (e.g., 7-day conversion)
+  - deduping and late-arriving events handling
+- Significance testing with guardrails:
+  - SRM detection
+  - multiple comparisons policy
+  - “peeking” policy baked into the workflow (not tribal knowledge)
+- Near-real-time monitoring (minutes) and authoritative batch recomputation (hours) from raw data.
+- Experiment lifecycle: create, ramp, holdout, stop, archive; auditable config changes.
+
+### Scale Targets
+- **Assignment reads:** 200k RPS peak, p99 < 10 ms (driven by edge/API usage and “evaluate flags on every request” patterns).
+- **Exposures:** 2B/day (a subset of requests become exposures; still massive at consumer scale).
+- **Product events:** 10B/day, average 2 KB/event → ~20 TB/day uncompressed (forces streaming pre-aggregation + lakehouse compaction).
+- **Concurrent experiments:** 5k active, 50k total definitions (drives control-plane ergonomics and caching strategy).
+- **Freshness:** 5–10 minute monitoring lag; <6 hour correctness lag for “final” numbers (supports on-call/launch decisions without pretending real-time is free).
+
+## Key Design Decisions
+
+- **We chose:** Deterministic assignment via consistent hashing of `(experiment_salt, unit_id)` into a fixed bucket space (e.g., 0–9999), mapping bucket ranges to variants.
+  - **We rejected:** Stateful “random pick” assignment stored per user.
+  - **Why:** Deterministic hashing makes assignment reproducible, cacheable, and resilient to partial outages; stateful assignment becomes a storage hot spot and a migration nightmare.
+
+- **We chose:** Exposure-first measurement: every analysis starts from the exposure table, not from raw events.
+  - **We rejected:** Inferring exposure from downstream events (“if they clicked, they must have seen variant B”).
+  - **Why:** You cannot fix selection bias after the fact; logging exposure is the only scalable way to keep randomization intact.
+
+- **We chose:** Dual-path computation: streaming for fast aggregates, lakehouse batch for correctness/backfills, with the same metric definitions.
+  - **We rejected:** Only streaming (hard to backfill) or only batch (too slow for launch decisions).
+  - **Why:** Experiments require both fast feedback and the ability to re-run history when identity logic or late events change.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client/Service] --> A[Assignment API]
+  A --> P[(Postgres Control)]
+  C --> E[Exposure Log]
+  C --> K[Event Log]
+  E --> Q[Kafka]
+  K --> Q
+  Q --> S[Stream Aggregator]
+  Q --> L[(Iceberg Lakehouse)]
+  S --> R[Results API]
+  L --> R
+```
+
+### Components
+
+- **Assignment API**
+  - Evaluates targeting + mutual exclusion and returns variant.
+  - Produces an exposure event (server-side preferred) so “assignment happened” and “exposure recorded” are causally linked.
+
+- **Postgres Control Plane**
+  - Stores experiment definitions (status, variants, allocations, salts), targeting rules, layer/namespace rules, and metric definitions.
+  - Strict change control: changes are versioned; assignment uses a pinned config version per exposure.
+
+- **Exposure Log**
+  - Append-only record: `(exposure_id, timestamp, experiment_id, config_version, unit_type, unit_id_hash, variant, context)`.
+  - The unit_id is stored as a stable hash (privacy + join key), and raw identifiers stay outside the analytics plane.
+
+- **Event Log**
+  - Product events (clicks, purchases, latency, errors) with consistent identity fields and event-time timestamps.
+  - This is shared infrastructure; the experimentation platform imposes minimal coupling beyond identity conventions.
+
+- **Kafka**
+  - The buffer that absorbs bursts and provides replay for streaming jobs.
+  - The platform relies on replayability to recover from bugs in metric logic without losing history.
+
+- **Stream Aggregator**
+  - Computes near-real-time aggregates keyed by `(experiment_id, variant, day/hour, metric)` using exposure-based joins and event-time watermarks.
+  - Writes “monitoring-grade” results plus diagnostics (late event rate, join coverage).
+
+- **Iceberg Lakehouse**
+  - Stores raw exposures and events and curated derived tables (exposure sessions, identity mappings, metric-ready fact tables).
+  - Enables backfills, exact recomputation, and consistent snapshots for analysis.
+
+- **Results API**
+  - Serves experiment dashboards: aggregates, confidence intervals, SRM checks, and test outcomes.
+  - Enforces the platform’s statistical policy (no ad-hoc p-value fishing via UI).
+
+## Deep Dive: Correct Metric Attribution (Without Lying to Yourself)
+
+The hardest part is not computing averages; it’s ensuring the numbers still represent a randomized experiment after reality damages your data. The platform treats exposure as the start of truth and makes attribution explicit.
+
+**1) Exposure is a first-class event, not a derived concept.**  
+When the assignment service decides “variant=B,” it emits an exposure with a config version and a unique exposure_id. This avoids “configuration drift”: even if you later change allocations or targeting, old exposures remain analyzable under the configuration that produced them.
+
+**2) Metrics are defined as functions over (exposure, events) with windows.**  
+Every metric definition includes:
+- event filter (e.g., `event_name = 'purchase'`)
+- value extraction (e.g., `amount_usd`)
+- attribution window (e.g., `[exposure_time, exposure_time + 7d]`)
+- dedupe key (e.g., `order_id`), if applicable
+- aggregation (sum, mean, percentile, rate)
+
+This prevents the most common bug: accidentally counting outcomes that happened before exposure (reverse causality) or long after the experiment ended (post-treatment contamination).
+
+**3) Joins are event-time, not processing-time.**  
+Late events are normal (mobile offline, payment processors). The streaming path uses watermarks and emits provisional results; the batch path recomputes with the full window. The UI makes this honest: “monitoring” vs “final” numbers are different products.
+
+**4) Identity is explicit and conservative.**  
+Cross-device identity can increase power, but it also creates leakage if identity links are created after exposure. The platform pins identity resolution to a snapshot at exposure-time (or uses a conservative rule: only links established before exposure count). This is non-obvious and crucial; otherwise you “improve” conversion by joining users to their future selves.
+
+**5) Diagnostics are mandatory, not optional.**  
+For every metric, the system tracks:
+- exposure count by variant
+- join rate (fraction of exposures with eligible events in window)
+- missing exposure rate by client/service
+- SRM (sample ratio mismatch) with alert thresholds
+These are the levers that tell you when your experiment is broken, even if the p-value looks exciting.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness under messy logging | Pure real-time “final” truth |
+| Reproducible assignment and analysis | Flexibility to change bucketing mid-flight |
+| Simple, audit-friendly control plane | Maximum expressiveness in targeting DSL |
+| Backfillable metrics with explicit windows | Low-latency ad-hoc exploratory joins |
+
+## Failure Modes
+
+- **Assignment drift (config changes invalidate analysis)**
+  - **What happens:** Variant proportions shift mid-experiment; results become uninterpretable.
+  - **Detect:** Allocation change audit + exposure config_version distribution changes.
+  - **Recover:** Freeze experiment configs; require creating a new experiment for changes that affect bucketing/targeting; analyze each config_version as separate epochs.
+
+- **Silent exposure loss (biased measurement)**
+  - **What happens:** Certain clients fail to log exposures; you analyze only “logged” traffic.
+  - **Detect:** SRM spikes, exposure coverage dashboards by client/service, sudden drop in exposures with stable request volume.
+  - **Recover:** Block experiment ramp when coverage falls below threshold; fall back to server-side exposure logging; replay buffered logs if available.
+
+- **Late-event distortion (premature decisions)**
+  - **What happens:** Early metrics look positive; later conversions arrive and reverse the effect.
+  - **Detect:** Late event rate metrics, gap between monitoring and batch recompute.
+  - **Recover:** Enforce decision SLAs (don’t call winners before window maturity); show “maturity curve” per metric; rely on batch truth for final calls.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move more computation to pre-aggregated “metric cubes” (by day, experiment, variant) and serve most queries from those; tighten identity and metric DSL to keep joins predictable.
+- **100x scale:** Treat assignment as an edge capability (CDN/sidecar evaluation with signed config snapshots) and make the lakehouse the center of gravity; replace per-experiment joins with standardized derived fact tables so recomputation doesn’t become a cluster-wide tax.
+
+## Operational Notes
+
+- Never change the hash function or bucket space without a migration plan; it is a platform-wide breaking change.
+- Make SRM a paging signal for large experiments; it catches real outages faster than “error rate” dashboards.
+- Separate “monitoring” from “final” in the UI and APIs; mixing them trains teams to distrust the platform.
+- Keep an explicit policy for multiple comparisons and peeking, and enforce it in the Results API—not in slide decks.
+- Backfills are routine, not exceptional: version metric definitions and store derived tables by version so you can re-run history deterministically.
+```
+tokens used
+3,127
+```markdown
+---
+title: "Experimentation (A/B) Platform"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["experimentation", "ab-testing", "metrics", "statistics", "streaming", "data-platform"]
+---
+
+## Overview
+
+This system provides three things that must stay consistent with each other under real-world messiness: (1) randomized assignment that is stable across time and services, (2) metric computation that correctly attributes outcomes to exposures, and (3) significance testing that teams can trust without becoming statisticians.
+
+The key insight is to treat **exposure** as the atomic fact of experimentation. Everything flows from an immutable exposure log: assignment is deterministic and reproducible, metrics are joined to exposures with explicit attribution windows, and statistical tests run on exposure-scoped aggregates. This avoids the two classic failures: “we shipped a hash function change and invalidated every experiment” and “we computed metrics from raw events and accidentally measured a biased subset.”
+
+The design is intentionally boring elsewhere: Postgres for control-plane, Kafka for event transport, a streaming job for near-real-time aggregates, and a lakehouse table format (Iceberg) for backfills and correctness. The platform earns its complexity only where it prevents subtle, expensive mistakes.
+
+## What Makes This Hard
+
+Naive implementations confuse *assignment* with *measurement*. They assign users in one place, log events somewhere else, and later try to infer who saw what. That fails as soon as you have retries, caching, client-side rendering, ad blockers, delayed conversions, cross-device identity, or “exposure” that is not a single request.
+
+The trap most teams hit is **silent bias**: metrics that look stable but are computed from a non-random slice (missing exposures, logging gaps, late events, or experiment overlap). The platform must make bias detectable (SRM, missing exposure checks, logging coverage) and make the “right way” the default workflow.
+
+## Requirements
+
+### Functional Requirements
+- Deterministic randomization for a chosen unit (user_id / device_id / account_id / session_id) with fixed allocation and reproducible bucketing.
+- Targeting and mutual exclusion (namespaces / layers) to prevent experiment interference.
+- Immutable exposure logging (who, what experiment+variant, when, context) with strong guarantees against double-counting.
+- Metric computation with explicit attribution rules:
+  - exposure-based joins
+  - lookback windows (e.g., 7-day conversion)
+  - deduping and late-arriving events handling
+- Significance testing with guardrails:
+  - SRM detection
+  - multiple comparisons policy
+  - “peeking” policy baked into the workflow (not tribal knowledge)
+- Near-real-time monitoring (minutes) and authoritative batch recomputation (hours) from raw data.
+- Experiment lifecycle: create, ramp, holdout, stop, archive; auditable config changes.
+
+### Scale Targets
+- **Assignment reads:** 200k RPS peak, p99 < 10 ms (driven by edge/API usage and “evaluate flags on every request” patterns).
+- **Exposures:** 2B/day (a subset of requests become exposures; still massive at consumer scale).
+- **Product events:** 10B/day, average 2 KB/event → ~20 TB/day uncompressed (forces streaming pre-aggregation + lakehouse compaction).
+- **Concurrent experiments:** 5k active, 50k total definitions (drives control-plane ergonomics and caching strategy).
+- **Freshness:** 5–10 minute monitoring lag; <6 hour correctness lag for “final” numbers (supports on-call/launch decisions without pretending real-time is free).
+
+## Key Design Decisions
+
+- **We chose:** Deterministic assignment via consistent hashing of `(experiment_salt, unit_id)` into a fixed bucket space (e.g., 0–9999), mapping bucket ranges to variants.
+  - **We rejected:** Stateful “random pick” assignment stored per user.
+  - **Why:** Deterministic hashing makes assignment reproducible, cacheable, and resilient to partial outages; stateful assignment becomes a storage hot spot and a migration nightmare.
+
+- **We chose:** Exposure-first measurement: every analysis starts from the exposure table, not from raw events.
+  - **We rejected:** Inferring exposure from downstream events (“if they clicked, they must have seen variant B”).
+  - **Why:** You cannot fix selection bias after the fact; logging exposure is the only scalable way to keep randomization intact.
+
+- **We chose:** Dual-path computation: streaming for fast aggregates, lakehouse batch for correctness/backfills, with the same metric definitions.
+  - **We rejected:** Only streaming (hard to backfill) or only batch (too slow for launch decisions).
+  - **Why:** Experiments require both fast feedback and the ability to re-run history when identity logic or late events change.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client/Service] --> A[Assignment API]
+  A --> P[(Postgres Control)]
+  C --> E[Exposure Log]
+  C --> K[Event Log]
+  E --> Q[Kafka]
+  K --> Q
+  Q --> S[Stream Aggregator]
+  Q --> L[(Iceberg Lakehouse)]
+  S --> R[Results API]
+  L --> R
+```
+
+### Components
+
+- **Assignment API**
+  - Evaluates targeting + mutual exclusion and returns variant.
+  - Produces an exposure event (server-side preferred) so “assignment happened” and “exposure recorded” are causally linked.
+
+- **Postgres Control Plane**
+  - Stores experiment definitions (status, variants, allocations, salts), targeting rules, layer/namespace rules, and metric definitions.
+  - Strict change control: changes are versioned; assignment uses a pinned config version per exposure.
+
+- **Exposure Log**
+  - Append-only record: `(exposure_id, timestamp, experiment_id, config_version, unit_type, unit_id_hash, variant, context)`.
+  - The unit_id is stored as a stable hash (privacy + join key), and raw identifiers stay outside the analytics plane.
+
+- **Event Log**
+  - Product events (clicks, purchases, latency, errors) with consistent identity fields and event-time timestamps.
+  - This is shared infrastructure; the experimentation platform imposes minimal coupling beyond identity conventions.
+
+- **Kafka**
+  - The buffer that absorbs bursts and provides replay for streaming jobs.
+  - The platform relies on replayability to recover from bugs in metric logic without losing history.
+
+- **Stream Aggregator**
+  - Computes near-real-time aggregates keyed by `(experiment_id, variant, day/hour, metric)` using exposure-based joins and event-time watermarks.
+  - Writes “monitoring-grade” results plus diagnostics (late event rate, join coverage).
+
+- **Iceberg Lakehouse**
+  - Stores raw exposures and events and curated derived tables (exposure sessions, identity mappings, metric-ready fact tables).
+  - Enables backfills, exact recomputation, and consistent snapshots for analysis.
+
+- **Results API**
+  - Serves experiment dashboards: aggregates, confidence intervals, SRM checks, and test outcomes.
+  - Enforces the platform’s statistical policy (no ad-hoc p-value fishing via UI).
+
+## Deep Dive: Correct Metric Attribution (Without Lying to Yourself)
+
+The hardest part is not computing averages; it’s ensuring the numbers still represent a randomized experiment after reality damages your data. The platform treats exposure as the start of truth and makes attribution explicit.
+
+**1) Exposure is a first-class event, not a derived concept.**  
+When the assignment service decides “variant=B,” it emits an exposure with a config version and a unique exposure_id. This avoids “configuration drift”: even if you later change allocations or targeting, old exposures remain analyzable under the configuration that produced them.
+
+**2) Metrics are defined as functions over (exposure, events) with windows.**  
+Every metric definition includes:
+- event filter (e.g., `event_name = 'purchase'`)
+- value extraction (e.g., `amount_usd`)
+- attribution window (e.g., `[exposure_time, exposure_time + 7d]`)
+- dedupe key (e.g., `order_id`), if applicable
+- aggregation (sum, mean, percentile, rate)
+
+This prevents the most common bug: accidentally counting outcomes that happened before exposure (reverse causality) or long after the experiment ended (post-treatment contamination).
+
+**3) Joins are event-time, not processing-time.**  
+Late events are normal (mobile offline, payment processors). The streaming path uses watermarks and emits provisional results; the batch path recomputes with the full window. The UI makes this honest: “monitoring” vs “final” numbers are different products.
+
+**4) Identity is explicit and conservative.**  
+Cross-device identity can increase power, but it also creates leakage if identity links are created after exposure. The platform pins identity resolution to a snapshot at exposure-time (or uses a conservative rule: only links established before exposure count). This is non-obvious and crucial; otherwise you “improve” conversion by joining users to their future selves.
+
+**5) Diagnostics are mandatory, not optional.**  
+For every metric, the system tracks:
+- exposure count by variant
+- join rate (fraction of exposures with eligible events in window)
+- missing exposure rate by client/service
+- SRM (sample ratio mismatch) with alert thresholds
+These are the levers that tell you when your experiment is broken, even if the p-value looks exciting.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness under messy logging | Pure real-time “final” truth |
+| Reproducible assignment and analysis | Flexibility to change bucketing mid-flight |
+| Simple, audit-friendly control plane | Maximum expressiveness in targeting DSL |
+| Backfillable metrics with explicit windows | Low-latency ad-hoc exploratory joins |
+
+## Failure Modes
+
+- **Assignment drift (config changes invalidate analysis)**
+  - **What happens:** Variant proportions shift mid-experiment; results become uninterpretable.
+  - **Detect:** Allocation change audit + exposure config_version distribution changes.
+  - **Recover:** Freeze experiment configs; require creating a new experiment for changes that affect bucketing/targeting; analyze each config_version as separate epochs.
+
+- **Silent exposure loss (biased measurement)**
+  - **What happens:** Certain clients fail to log exposures; you analyze only “logged” traffic.
+  - **Detect:** SRM spikes, exposure coverage dashboards by client/service, sudden drop in exposures with stable request volume.
+  - **Recover:** Block experiment ramp when coverage falls below threshold; fall back to server-side exposure logging; replay buffered logs if available.
+
+- **Late-event distortion (premature decisions)**
+  - **What happens:** Early metrics look positive; later conversions arrive and reverse the effect.
+  - **Detect:** Late event rate metrics, gap between monitoring and batch recompute.
+  - **Recover:** Enforce decision SLAs (don’t call winners before window maturity); show “maturity curve” per metric; rely on batch truth for final calls.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move more computation to pre-aggregated “metric cubes” (by day, experiment, variant) and serve most queries from those; tighten identity and metric DSL to keep joins predictable.
+- **100x scale:** Treat assignment as an edge capability (CDN/sidecar evaluation with signed config snapshots) and make the lakehouse the center of gravity; replace per-experiment joins with standardized derived fact tables so recomputation doesn’t become a cluster-wide tax.
+
+## Operational Notes
+
+- Never change the hash function or bucket space without a migration plan; it is a platform-wide breaking change.
+- Make SRM a paging signal for large experiments; it catches real outages faster than “error rate” dashboards.
+- Separate “monitoring” from “final” in the UI and APIs; mixing them trains teams to distrust the platform.
+- Keep an explicit policy for multiple comparisons and peeking, and enforce it in the Results API—not in slide decks.
+- Backfills are routine, not exceptional: version metric definitions and store derived tables by version so you can re-run history deterministically.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/experimentation-ab-platform.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-67a9-7bb3-b50c-bb7f3b9ba2fe
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Experimentation (A/B) Platform"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["experimentation", "ab-testing", "metrics", "statistics", "streaming", "data-platform"]
+---
+
+## Overview
+
+This system provides three things that must stay consistent with each other under real-world messiness: (1) randomized assignment that is stable across time and services, (2) metric computation that correctly attributes outcomes to exposures, and (3) significance testing that teams can trust without becoming statisticians.
+
+The key insight is to treat **exposure** as the atomic fact of experimentation. Everything flows from an immutable exposure log: assignment is deterministic and reproducible, metrics are joined to exposures with explicit attribution windows, and statistical tests run on exposure-scoped aggregates. This avoids the two classic failures: “we shipped a hash function change and invalidated every experiment” and “we computed metrics from raw events and accidentally measured a biased subset.”
+
+The design is intentionally boring elsewhere: Postgres for control-plane, Kafka for event transport, a streaming job for near-real-time aggregates, and a lakehouse table format (Iceberg) for backfills and correctness. The platform earns its complexity only where it prevents subtle, expensive mistakes.
+
+## What Makes This Hard
+
+Naive implementations confuse *assignment* with *measurement*. They assign users in one place, log events somewhere else, and later try to infer who saw what. That fails as soon as you have retries, caching, client-side rendering, ad blockers, delayed conversions, cross-device identity, or “exposure” that is not a single request.
+
+The trap most teams hit is **silent bias**: metrics that look stable but are computed from a non-random slice (missing exposures, logging gaps, late events, or experiment overlap). The platform must make bias detectable (SRM, missing exposure checks, logging coverage) and make the “right way” the default workflow.
+
+## Requirements
+
+### Functional Requirements
+- Deterministic randomization for a chosen unit (user_id / device_id / account_id / session_id) with fixed allocation and reproducible bucketing.
+- Targeting and mutual exclusion (namespaces / layers) to prevent experiment interference.
+- Immutable exposure logging (who, what experiment+variant, when, context) with strong guarantees against double-counting.
+- Metric computation with explicit attribution rules:
+  - exposure-based joins
+  - lookback windows (e.g., 7-day conversion)
+  - deduping and late-arriving events handling
+- Significance testing with guardrails:
+  - SRM detection
+  - multiple comparisons policy
+  - “peeking” policy baked into the workflow (not tribal knowledge)
+- Near-real-time monitoring (minutes) and authoritative batch recomputation (hours) from raw data.
+- Experiment lifecycle: create, ramp, holdout, stop, archive; auditable config changes.
+
+### Scale Targets
+- **Assignment reads:** 200k RPS peak, p99 < 10 ms (driven by edge/API usage and “evaluate flags on every request” patterns).
+- **Exposures:** 2B/day (a subset of requests become exposures; still massive at consumer scale).
+- **Product events:** 10B/day, average 2 KB/event → ~20 TB/day uncompressed (forces streaming pre-aggregation + lakehouse compaction).
+- **Concurrent experiments:** 5k active, 50k total definitions (drives control-plane ergonomics and caching strategy).
+- **Freshness:** 5–10 minute monitoring lag; <6 hour correctness lag for “final” numbers (supports on-call/launch decisions without pretending real-time is free).
+
+## Key Design Decisions
+
+- **We chose:** Deterministic assignment via consistent hashing of `(experiment_salt, unit_id)` into a fixed bucket space (e.g., 0–9999), mapping bucket ranges to variants.
+  - **We rejected:** Stateful “random pick” assignment stored per user.
+  - **Why:** Deterministic hashing makes assignment reproducible, cacheable, and resilient to partial outages; stateful assignment becomes a storage hot spot and a migration nightmare.
+
+- **We chose:** Exposure-first measurement: every analysis starts from the exposure table, not from raw events.
+  - **We rejected:** Inferring exposure from downstream events (“if they clicked, they must have seen variant B”).
+  - **Why:** You cannot fix selection bias after the fact; logging exposure is the only scalable way to keep randomization intact.
+
+- **We chose:** Dual-path computation: streaming for fast aggregates, lakehouse batch for correctness/backfills, with the same metric definitions.
+  - **We rejected:** Only streaming (hard to backfill) or only batch (too slow for launch decisions).
+  - **Why:** Experiments require both fast feedback and the ability to re-run history when identity logic or late events change.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client/Service] --> A[Assignment API]
+  A --> P[(Postgres Control)]
+  C --> E[Exposure Log]
+  C --> K[Event Log]
+  E --> Q[Kafka]
+  K --> Q
+  Q --> S[Stream Aggregator]
+  Q --> L[(Iceberg Lakehouse)]
+  S --> R[Results API]
+  L --> R
+```
+
+### Components
+
+- **Assignment API**
+  - Evaluates targeting + mutual exclusion and returns variant.
+  - Produces an exposure event (server-side preferred) so “assignment happened” and “exposure recorded” are causally linked.
+
+- **Postgres Control Plane**
+  - Stores experiment definitions (status, variants, allocations, salts), targeting rules, layer/namespace rules, and metric definitions.
+  - Strict change control: changes are versioned; assignment uses a pinned config version per exposure.
+
+- **Exposure Log**
+  - Append-only record: `(exposure_id, timestamp, experiment_id, config_version, unit_type, unit_id_hash, variant, context)`.
+  - The unit_id is stored as a stable hash (privacy + join key), and raw identifiers stay outside the analytics plane.
+
+- **Event Log**
+  - Product events (clicks, purchases, latency, errors) with consistent identity fields and event-time timestamps.
+  - This is shared infrastructure; the experimentation platform imposes minimal coupling beyond identity conventions.
+
+- **Kafka**
+  - The buffer that absorbs bursts and provides replay for streaming jobs.
+  - The platform relies on replayability to recover from bugs in metric logic without losing history.
+
+- **Stream Aggregator**
+  - Computes near-real-time aggregates keyed by `(experiment_id, variant, day/hour, metric)` using exposure-based joins and event-time watermarks.
+  - Writes “monitoring-grade” results plus diagnostics (late event rate, join coverage).
+
+- **Iceberg Lakehouse**
+  - Stores raw exposures and events and curated derived tables (exposure sessions, identity mappings, metric-ready fact tables).
+  - Enables backfills, exact recomputation, and consistent snapshots for analysis.
+
+- **Results API**
+  - Serves experiment dashboards: aggregates, confidence intervals, SRM checks, and test outcomes.
+  - Enforces the platform’s statistical policy (no ad-hoc p-value fishing via UI).
+
+## Deep Dive: Correct Metric Attribution (Without Lying to Yourself)
+
+The hardest part is not computing averages; it’s ensuring the numbers still represent a randomized experiment after reality damages your data. The platform treats exposure as the start of truth and makes attribution explicit.
+
+**1) Exposure is a first-class event, not a derived concept.**  
+When the assignment service decides “variant=B,” it emits an exposure with a config version and a unique exposure_id. This avoids “configuration drift”: even if you later change allocations or targeting, old exposures remain analyzable under the configuration that produced them.
+
+**2) Metrics are defined as functions over (exposure, events) with windows.**  
+Every metric definition includes:
+- event filter (e.g., `event_name = 'purchase'`)
+- value extraction (e.g., `amount_usd`)
+- attribution window (e.g., `[exposure_time, exposure_time + 7d]`)
+- dedupe key (e.g., `order_id`), if applicable
+- aggregation (sum, mean, percentile, rate)
+
+This prevents the most common bug: accidentally counting outcomes that happened before exposure (reverse causality) or long after the experiment ended (post-treatment contamination).
+
+**3) Joins are event-time, not processing-time.**  
+Late events are normal (mobile offline, payment processors). The streaming path uses watermarks and emits provisional results; the batch path recomputes with the full window. The UI makes this honest: “monitoring” vs “final” numbers are different products.
+
+**4) Identity is explicit and conservative.**  
+Cross-device identity can increase power, but it also creates leakage if identity links are created after exposure. The platform pins identity resolution to a snapshot at exposure-time (or uses a conservative rule: only links established before exposure count). This is non-obvious and crucial; otherwise you “improve” conversion by joining users to their future selves.
+
+**5) Diagnostics are mandatory, not optional.**  
+For every metric, the system tracks:
+- exposure count by variant
+- join rate (fraction of exposures with eligible events in window)
+- missing exposure rate by client/service
+- SRM (sample ratio mismatch) with alert thresholds
+These are the levers that tell you when your experiment is broken, even if the p-value looks exciting.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness under messy logging | Pure real-time “final” truth |
+| Reproducible assignment and analysis | Flexibility to change bucketing mid-flight |
+| Simple, audit-friendly control plane | Maximum expressiveness in targeting DSL |
+| Backfillable metrics with explicit windows | Low-latency ad-hoc exploratory joins |
+
+## Failure Modes
+
+- **Assignment drift (config changes invalidate analysis)**
+  - **What happens:** Variant proportions shift mid-experiment; results become uninterpretable.
+  - **Detect:** Allocation change audit + exposure config_version distribution changes.
+  - **Recover:** Freeze experiment configs; require creating a new experiment for changes that affect bucketing/targeting; analyze each config_version as separate epochs.
+
+- **Silent exposure loss (biased measurement)**
+  - **What happens:** Certain clients fail to log exposures; you analyze only “logged” traffic.
+  - **Detect:** SRM spikes, exposure coverage dashboards by client/service, sudden drop in exposures with stable request volume.
+  - **Recover:** Block experiment ramp when coverage falls below threshold; fall back to server-side exposure logging; replay buffered logs if available.
+
+- **Late-event distortion (premature decisions)**
+  - **What happens:** Early metrics look positive; later conversions arrive and reverse the effect.
+  - **Detect:** Late event rate metrics, gap between monitoring and batch recompute.
+  - **Recover:** Enforce decision SLAs (don’t call winners before window maturity); show “maturity curve” per metric; rely on batch truth for final calls.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move more computation to pre-aggregated “metric cubes” (by day, experiment, variant) and serve most queries from those; tighten identity and metric DSL to keep joins predictable.
+- **100x scale:** Treat assignment as an edge capability (CDN/sidecar evaluation with signed config snapshots) and make the lakehouse the center of gravity; replace per-experiment joins with standardized derived fact tables so recomputation doesn’t become a cluster-wide tax.
+
+## Operational Notes
+
+- Never change the hash function or bucket space without a migration plan; it is a platform-wide breaking change.
+- Make SRM a paging signal for large experiments; it catches real outages faster than “error rate” dashboards.
+- Separate “monitoring” from “final” in the UI and APIs; mixing them trains teams to distrust the platform.
+- Keep an explicit policy for multiple comparisons and peeking, and enforce it in the Results API—not in slide decks.
+- Backfills are routine, not exceptional: version metric definitions and store derived tables by version so you can re-run history deterministically.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+thinking
+**Planning structured critique**
+
+I want to ensure I provide a constructive critique, breaking it down into “must fix,” “should consider,” and “nice to have.” Each bullet point needs to be short, but I also have to follow the requirements for structure. It seems like I can go beyond the limit of 10 lines if it's thorough enough. I’ll keep it concise while being clear and precise, and I plan to use headings and tables for organization. Let’s get started!
+thinking
+**Structuring the critique**
+
+I need to organize my thoughts into clear sections for an elegant check. The core insight should focus on the atomic fact of exposure. I want to compile a table for the components like Assignment API, Control plane, and others that matter. For simplification, I'll lay out alternative options and tradeoffs, ensuring clarity. Under failure scenarios, I’ll identify potential issues, like Kafka failure or Postgres downtime, aiming for a thorough yet concise overview. Let’s get this formatted!
+thinking
+**Drafting recommendations**
+
+I need to focus on late events and backfill that changed identity mapping. For each, I should provide the design's answer and a recommendation. In my recommendations section, I'll categorize items into "Must Fix," "Should Consider," and "Nice to Have." For the must-fix items, I’ll include defining exposure logging semantics, ensuring idempotency, and establishing configuration distribution policies. It’s also important to highlight what’s currently working well. Lastly, I’ll mention component counts and team ownership for clarity, and I plan to format this in markdown.
+Reconnecting... 1/5
+
+
+
+
+
+thinking
+**Evaluating critique structure**
+
+I need to produce a constructive critique in markdown format. No tools are needed, but I should consider simpler alternatives and proven tech while addressing potential failure scenarios. The design they've provided requires a structured response with tables and recommendations. I’ll include core insights, simplification opportunities, and stress test scenarios.
+
+I’m thinking of keeping this around 40-70 lines, but it’s important to be concise yet complete. I’ll also explore Postgres handling since the assignment mentions a high request rate and p99 latency. Additionally, I should consider in-memory caching or edge evaluation while also looking into exposure logging.
+thinking
+**Exploring database and data exposure issues**
+
+For simplification, I’m considering whether to use ClickHouse, Druid, or Pinot for real-time aggregates rather than a custom streaming solution. However, there’s a trade-off in terms of cost and complexity. I could also explore using Flink or Delta Lake, but I need to test for various scenarios like DB downtime, Kafka issues, and potential data loss during partitioning.
+
+I'll consider idempotency with exposure_id and request_id for deduplication while ensuring consistent evaluation to prevent "shadow traffic." Privacy is also crucial, particularly in managing hashing and re-identification risks.
+thinking
+**Reducing operational complexity**
+
+I'm addressing operational complexity with multiple components and thinking about how to simplify things. Using managed Kafka and Flink could help. Postgres could work for the control plane, but maybe not for the exposure log with such high volumes—2 billion logs per day seems risky. BigQuery might be an option for a lakehouse.
+
+For identity snapshots at exposure time, I need versioning. I should treat identity as a slowly changing dimension, using "valid_from/valid_to" and joining by exposure_time. It’s essential to include "exposure_id" in responses to simplify the identity join issues and enhance deduplication and attribution, although it might increase payload sizes.
+thinking
+**Addressing stable assignment and architecture**
+
+I'm focusing on stable assignment, particularly with deterministic consistent hashing and salt. To ensure independence, I need a per-experiment salt and layer salt for mutual exclusion. It’s also important to implement a global holdout method, perhaps even using Redis for hot config caching, but keeping it simple with in-process caching and periodic snapshots.
+
+I want to be cautious about the "Assignment API" possibly becoming a single point of failure, so evaluating its performance in the SDK/edge is vital. Continuing, I need to address the substantial data volume of 20TB per day and consider compression and separate topics for Kafka.
+thinking
+**Identifying simplification and failure scenarios**
+
+I’m creating a simplification opportunities table. For the Assignment API, I’ll evaluate using edge/SDK with signed configs. For mutual exclusion, I can reuse feature flag layering, and for the exposure log, I should include exposure_id in events. I’m also considering an OLAP store like ClickHouse with materialized views for streaming and results API.
+
+Regarding failure scenarios, I need to account for potential control plane DB outages, Kafka outages, and network partitions. My recommendations include focusing on idempotency, the availability of assignment logging, and privacy key management. I see some positive elements as well, like the exposure-first approach and diagnostics.
+codex
+```markdown
+## Elegance Check
+
+### The Core Insight
+Treat **exposure** as the atomic fact: deterministic assignment → immutable exposure log → all metrics/tests computed from exposure-scoped joins with explicit windows. This is the right “truth anchor” to prevent silent bias.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Assignment API (or SDK/edge eval) | Centralizes targeting + mutual exclusion and produces an authoritative exposure record tied to a config version. |
+| Postgres control plane | Versioned configs/metric defs + audit trail; “pinned config per exposure” prevents drift. |
+| Immutable exposure log | The single source of truth that preserves randomization under retries/caching/ad blockers. |
+| Kafka (replayable bus) | Absorbs burst, enables reprocessing when metric/identity logic changes. |
+| Stream aggregator | Fast “monitoring-grade” results + diagnostics (late rate, join coverage) to catch breakage early. |
+| Iceberg lakehouse | Authoritative batch recomputation/backfills with snapshot consistency and history. |
+| Results API with policy | Prevents p-hacking in UI and makes peeking/multiple-comparisons enforceable. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Assignment API on hot path at 200k RPS | **Signed config snapshots** evaluated in SDK/edge (OpenFeature-style), Assignment service becomes “config publisher + audit” | More client/runtime complexity; need strong rollout/versioning of SDKs and config signing/TTL. |
+| Exposure-based joins between exposure stream and event stream | Propagate `exposure_id` (or `experiment_context`) into downstream events at source | Event payload grows; requires instrumentation discipline, but massively simplifies attribution and reduces identity-join risk. |
+| Custom streaming aggregates + serving layer | Use an OLAP store (ClickHouse/Druid/Pinot) for near-real-time aggregates + rollups | Adds a database, but may remove bespoke “Results API query engine” complexity and improve dashboard latency. |
+| Identity “snapshot at exposure time” described conceptually | Model identity as an SCD table (`valid_from/valid_to`) and enforce `exposure_time` joins | More upfront data modeling, much less ambiguity and fewer foot-guns later. |
+| Kafka for both exposures and all product events at stated volume | Split: keep **exposures + experiment-critical events** in Kafka; land bulk product events directly in lakehouse (or sampled in Kafka) | Monitoring becomes less universal; requires deciding which events must be realtime. |
+| Statistical policy enforced in Results API | Start with a smaller set of “blessed analyses” (fixed tests + alpha-spending templates) | Less flexibility, but clearer guardrails and less surface area to get wrong. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres control-plane down for 5 minutes**
+   - Design's answer: not addressed (beyond “boring Postgres”)
+   - Recommendation: Strengthen — require cached/signed config snapshots so assignment continues; freeze writes; queue config changes; make “read-only degrade” explicit.
+
+2. **Network partition: assignment returns variant but exposure fails to log**
+   - Design's answer: partially addressed (“server-side preferred… causally linked”), but not the actual failure handling
+   - Recommendation: Must fix — define an idempotent exposure write contract (`exposure_id`), retry semantics, and a “no-log-no-experiment” mode (e.g., don’t ramp if exposure ack rate drops).
+
+3. **Kafka outage / severe lag**
+   - Design's answer: not addressed
+   - Recommendation: Strengthen — specify retention/replication, producer acks, backpressure behavior, and what dashboards show (“monitoring unavailable” vs stale). Ensure assignment is decoupled from Kafka availability if you still want to serve traffic.
+
+4. **Bad config / targeting bug deployed**
+   - Design's answer: partially addressed via versioning/audit
+   - Recommendation: Strengthen — add automated canaries: SRM pre-check on small ramp, invariant checks (allocation sums, layer conflicts), and “safe rollback” semantics (new config version; never mutate old).
+
+5. **Identity linkage created after exposure (leakage)**
+   - Design's answer: addressed (pin identity snapshot / conservative linking)
+   - Recommendation: Acceptable — but make it enforceable in data model (SCD) and surface “power lost due to conservative identity” as a first-class diagnostic.
+
+## Recommendations
+
+### Must Fix
+- Define **idempotency + dedupe** end-to-end for exposures (what is `exposure_id`, how retries behave, how double-counting is prevented across clients/servers).
+- Make **assignment availability** explicit (SDK/edge eval or hard caching plan) so Postgres/Kafka/streaming outages don’t page the product.
+- Specify **privacy/key management** for `unit_id_hash` (HMAC with rotation, access boundaries) so analytics joins remain stable without leaking identifiers.
+
+### Should Consider
+- Carry `exposure_id` / `experiment_context` forward into key product events to reduce heavy joins and make attribution more deterministic.
+- Clarify whether “monitoring-grade” numbers are computed from a subset of events (and how that subset is chosen) to avoid hidden bias.
+- Narrow and formalize the initial stats surface area (a few approved tests + sequential monitoring policy) to make Results API simpler to own.
+
+### Nice to Have
+- Pre-ramp automated checks: instrumentation coverage thresholds, SRM dry-run, late-event maturity curve gates.
+- Cost controls for backfills (priority queues, per-metric recompute budgets, and “blast radius” limits).
+
+## What's Working Well
+- Exposure-first framing is the right correctness primitive and is explained clearly.
+- Honest separation of **monitoring vs final** prevents a common trust failure.
+- Identity leakage callout is unusually strong and operationally important.
+- Mandatory diagnostics (join rate, missing exposure, SRM) correctly treat bias as an observable, not an afterthought.
+- Versioned configs + pinned config_version per exposure is the right mechanism to prevent drift and support audits/backfills.
+```
+tokens used
+2,496
+```markdown
+## Elegance Check
+
+### The Core Insight
+Treat **exposure** as the atomic fact: deterministic assignment → immutable exposure log → all metrics/tests computed from exposure-scoped joins with explicit windows. This is the right “truth anchor” to prevent silent bias.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Assignment API (or SDK/edge eval) | Centralizes targeting + mutual exclusion and produces an authoritative exposure record tied to a config version. |
+| Postgres control plane | Versioned configs/metric defs + audit trail; “pinned config per exposure” prevents drift. |
+| Immutable exposure log | The single source of truth that preserves randomization under retries/caching/ad blockers. |
+| Kafka (replayable bus) | Absorbs burst, enables reprocessing when metric/identity logic changes. |
+| Stream aggregator | Fast “monitoring-grade” results + diagnostics (late rate, join coverage) to catch breakage early. |
+| Iceberg lakehouse | Authoritative batch recomputation/backfills with snapshot consistency and history. |
+| Results API with policy | Prevents p-hacking in UI and makes peeking/multiple-comparisons enforceable. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Assignment API on hot path at 200k RPS | **Signed config snapshots** evaluated in SDK/edge (OpenFeature-style), Assignment service becomes “config publisher + audit” | More client/runtime complexity; need strong rollout/versioning of SDKs and config signing/TTL. |
+| Exposure-based joins between exposure stream and event stream | Propagate `exposure_id` (or `experiment_context`) into downstream events at source | Event payload grows; requires instrumentation discipline, but massively simplifies attribution and reduces identity-join risk. |
+| Custom streaming aggregates + serving layer | Use an OLAP store (ClickHouse/Druid/Pinot) for near-real-time aggregates + rollups | Adds a database, but may remove bespoke “Results API query engine” complexity and improve dashboard latency. |
+| Identity “snapshot at exposure time” described conceptually | Model identity as an SCD table (`valid_from/valid_to`) and enforce `exposure_time` joins | More upfront data modeling, much less ambiguity and fewer foot-guns later. |
+| Kafka for both exposures and all product events at stated volume | Split: keep **exposures + experiment-critical events** in Kafka; land bulk product events directly in lakehouse (or sampled in Kafka) | Monitoring becomes less universal; requires deciding which events must be realtime. |
+| Statistical policy enforced in Results API | Start with a smaller set of “blessed analyses” (fixed tests + alpha-spending templates) | Less flexibility, but clearer guardrails and less surface area to get wrong. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres control-plane down for 5 minutes**
+   - Design's answer: not addressed (beyond “boring Postgres”)
+   - Recommendation: Strengthen — require cached/signed config snapshots so assignment continues; freeze writes; queue config changes; make “read-only degrade” explicit.
+
+2. **Network partition: assignment returns variant but exposure fails to log**
+   - Design's answer: partially addressed (“server-side preferred… causally linked”), but not the actual failure handling
+   - Recommendation: Must fix — define an idempotent exposure write contract (`exposure_id`), retry semantics, and a “no-log-no-experiment” mode (e.g., don’t ramp if exposure ack rate drops).
+
+3. **Kafka outage / severe lag**
+   - Design's answer: not addressed
+   - Recommendation: Strengthen — specify retention/replication, producer acks, backpressure behavior, and what dashboards show (“monitoring unavailable” vs stale). Ensure assignment is decoupled from Kafka availability if you still want to serve traffic.
+
+4. **Bad config / targeting bug deployed**
+   - Design's answer: partially addressed via versioning/audit
+   - Recommendation: Strengthen — add automated canaries: SRM pre-check on small ramp, invariant checks (allocation sums, layer conflicts), and “safe rollback” semantics (new config version; never mutate old).
+
+5. **Identity linkage created after exposure (leakage)**
+   - Design's answer: addressed (pin identity snapshot / conservative linking)
+   - Recommendation: Acceptable — but make it enforceable in data model (SCD) and surface “power lost due to conservative identity” as a first-class diagnostic.
+
+## Recommendations
+
+### Must Fix
+- Define **idempotency + dedupe** end-to-end for exposures (what is `exposure_id`, how retries behave, how double-counting is prevented across clients/servers).
+- Make **assignment availability** explicit (SDK/edge eval or hard caching plan) so Postgres/Kafka/streaming outages don’t page the product.
+- Specify **privacy/key management** for `unit_id_hash` (HMAC with rotation, access boundaries) so analytics joins remain stable without leaking identifiers.
+
+### Should Consider
+- Carry `exposure_id` / `experiment_context` forward into key product events to reduce heavy joins and make attribution more deterministic.
+- Clarify whether “monitoring-grade” numbers are computed from a subset of events (and how that subset is chosen) to avoid hidden bias.
+- Narrow and formalize the initial stats surface area (a few approved tests + sequential monitoring policy) to make Results API simpler to own.
+
+### Nice to Have
+- Pre-ramp automated checks: instrumentation coverage thresholds, SRM dry-run, late-event maturity curve gates.
+- Cost controls for backfills (priority queues, per-metric recompute budgets, and “blast radius” limits).
+
+## What's Working Well
+- Exposure-first framing is the right correctness primitive and is explained clearly.
+- Honest separation of **monitoring vs final** prevents a common trust failure.
+- Identity leakage callout is unusually strong and operationally important.
+- Mandatory diagnostics (join rate, missing exposure, SRM) correctly treat bias as an observable, not an afterthought.
+- Versioned configs + pinned config_version per exposure is the right mechanism to prevent drift and support audits/backfills.
+```
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/experimentation-ab-platform.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afd-a917-7fd3-8cf5-a3f7915893fe
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Experimentation (A/B) Platform"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["experimentation", "ab-testing", "metrics", "statistics", "streaming", "data-platform"]
+---
+
+## Overview
+
+This system provides three things that must stay consistent with each other under real-world messiness: (1) randomized assignment that is stable across time and services, (2) metric computation that correctly attributes outcomes to exposures, and (3) significance testing that teams can trust without becoming statisticians.
+
+The key insight is to treat **exposure** as the atomic fact of experimentation. Everything flows from an immutable exposure log: assignment is deterministic and reproducible, metrics are joined to exposures with explicit attribution windows, and statistical tests run on exposure-scoped aggregates. This avoids the two classic failures: “we shipped a hash function change and invalidated every experiment” and “we computed metrics from raw events and accidentally measured a biased subset.”
+
+The design is intentionally boring elsewhere: Postgres for control-plane, Kafka for event transport, a streaming job for near-real-time aggregates, and a lakehouse table format (Iceberg) for backfills and correctness. The platform earns its complexity only where it prevents subtle, expensive mistakes.
+
+## What Makes This Hard
+
+Naive implementations confuse *assignment* with *measurement*. They assign users in one place, log events somewhere else, and later try to infer who saw what. That fails as soon as you have retries, caching, client-side rendering, ad blockers, delayed conversions, cross-device identity, or “exposure” that is not a single request.
+
+The trap most teams hit is **silent bias**: metrics that look stable but are computed from a non-random slice (missing exposures, logging gaps, late events, or experiment overlap). The platform must make bias detectable (SRM, missing exposure checks, logging coverage) and make the “right way” the default workflow.
+
+## Requirements
+
+### Functional Requirements
+- Deterministic randomization for a chosen unit (user_id / device_id / account_id / session_id) with fixed allocation and reproducible bucketing.
+- Targeting and mutual exclusion (namespaces / layers) to prevent experiment interference.
+- Immutable exposure logging (who, what experiment+variant, when, context) with strong guarantees against double-counting.
+- Metric computation with explicit attribution rules:
+  - exposure-based joins
+  - lookback windows (e.g., 7-day conversion)
+  - deduping and late-arriving events handling
+- Significance testing with guardrails:
+  - SRM detection
+  - multiple comparisons policy
+  - “peeking” policy baked into the workflow (not tribal knowledge)
+- Near-real-time monitoring (minutes) and authoritative batch recomputation (hours) from raw data.
+- Experiment lifecycle: create, ramp, holdout, stop, archive; auditable config changes.
+
+### Scale Targets
+- **Assignment reads:** 200k RPS peak, p99 < 10 ms (driven by edge/API usage and “evaluate flags on every request” patterns).
+- **Exposures:** 2B/day (a subset of requests become exposures; still massive at consumer scale).
+- **Product events:** 10B/day, average 2 KB/event → ~20 TB/day uncompressed (forces streaming pre-aggregation + lakehouse compaction).
+- **Concurrent experiments:** 5k active, 50k total definitions (drives control-plane ergonomics and caching strategy).
+- **Freshness:** 5–10 minute monitoring lag; <6 hour correctness lag for “final” numbers (supports on-call/launch decisions without pretending real-time is free).
+
+## Key Design Decisions
+
+- **We chose:** Deterministic assignment via consistent hashing of `(experiment_salt, unit_id)` into a fixed bucket space (e.g., 0–9999), mapping bucket ranges to variants.
+  - **We rejected:** Stateful “random pick” assignment stored per user.
+  - **Why:** Deterministic hashing makes assignment reproducible, cacheable, and resilient to partial outages; stateful assignment becomes a storage hot spot and a migration nightmare.
+
+- **We chose:** Exposure-first measurement: every analysis starts from the exposure table, not from raw events.
+  - **We rejected:** Inferring exposure from downstream events (“if they clicked, they must have seen variant B”).
+  - **Why:** You cannot fix selection bias after the fact; logging exposure is the only scalable way to keep randomization intact.
+
+- **We chose:** Dual-path computation: streaming for fast aggregates, lakehouse batch for correctness/backfills, with the same metric definitions.
+  - **We rejected:** Only streaming (hard to backfill) or only batch (too slow for launch decisions).
+  - **Why:** Experiments require both fast feedback and the ability to re-run history when identity logic or late events change.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client/Service] --> A[Assignment API]
+  A --> P[(Postgres Control)]
+  C --> E[Exposure Log]
+  C --> K[Event Log]
+  E --> Q[Kafka]
+  K --> Q
+  Q --> S[Stream Aggregator]
+  Q --> L[(Iceberg Lakehouse)]
+  S --> R[Results API]
+  L --> R
+```
+
+### Components
+
+- **Assignment API**
+  - Evaluates targeting + mutual exclusion and returns variant.
+  - Produces an exposure event (server-side preferred) so “assignment happened” and “exposure recorded” are causally linked.
+
+- **Postgres Control Plane**
+  - Stores experiment definitions (status, variants, allocations, salts), targeting rules, layer/namespace rules, and metric definitions.
+  - Strict change control: changes are versioned; assignment uses a pinned config version per exposure.
+
+- **Exposure Log**
+  - Append-only record: `(exposure_id, timestamp, experiment_id, config_version, unit_type, unit_id_hash, variant, context)`.
+  - The unit_id is stored as a stable hash (privacy + join key), and raw identifiers stay outside the analytics plane.
+
+- **Event Log**
+  - Product events (clicks, purchases, latency, errors) with consistent identity fields and event-time timestamps.
+  - This is shared infrastructure; the experimentation platform imposes minimal coupling beyond identity conventions.
+
+- **Kafka**
+  - The buffer that absorbs bursts and provides replay for streaming jobs.
+  - The platform relies on replayability to recover from bugs in metric logic without losing history.
+
+- **Stream Aggregator**
+  - Computes near-real-time aggregates keyed by `(experiment_id, variant, day/hour, metric)` using exposure-based joins and event-time watermarks.
+  - Writes “monitoring-grade” results plus diagnostics (late event rate, join coverage).
+
+- **Iceberg Lakehouse**
+  - Stores raw exposures and events and curated derived tables (exposure sessions, identity mappings, metric-ready fact tables).
+  - Enables backfills, exact recomputation, and consistent snapshots for analysis.
+
+- **Results API**
+  - Serves experiment dashboards: aggregates, confidence intervals, SRM checks, and test outcomes.
+  - Enforces the platform’s statistical policy (no ad-hoc p-value fishing via UI).
+
+## Deep Dive: Correct Metric Attribution (Without Lying to Yourself)
+
+The hardest part is not computing averages; it’s ensuring the numbers still represent a randomized experiment after reality damages your data. The platform treats exposure as the start of truth and makes attribution explicit.
+
+**1) Exposure is a first-class event, not a derived concept.**  
+When the assignment service decides “variant=B,” it emits an exposure with a config version and a unique exposure_id. This avoids “configuration drift”: even if you later change allocations or targeting, old exposures remain analyzable under the configuration that produced them.
+
+**2) Metrics are defined as functions over (exposure, events) with windows.**  
+Every metric definition includes:
+- event filter (e.g., `event_name = 'purchase'`)
+- value extraction (e.g., `amount_usd`)
+- attribution window (e.g., `[exposure_time, exposure_time + 7d]`)
+- dedupe key (e.g., `order_id`), if applicable
+- aggregation (sum, mean, percentile, rate)
+
+This prevents the most common bug: accidentally counting outcomes that happened before exposure (reverse causality) or long after the experiment ended (post-treatment contamination).
+
+**3) Joins are event-time, not processing-time.**  
+Late events are normal (mobile offline, payment processors). The streaming path uses watermarks and emits provisional results; the batch path recomputes with the full window. The UI makes this honest: “monitoring” vs “final” numbers are different products.
+
+**4) Identity is explicit and conservative.**  
+Cross-device identity can increase power, but it also creates leakage if identity links are created after exposure. The platform pins identity resolution to a snapshot at exposure-time (or uses a conservative rule: only links established before exposure count). This is non-obvious and crucial; otherwise you “improve” conversion by joining users to their future selves.
+
+**5) Diagnostics are mandatory, not optional.**  
+For every metric, the system tracks:
+- exposure count by variant
+- join rate (fraction of exposures with eligible events in window)
+- missing exposure rate by client/service
+- SRM (sample ratio mismatch) with alert thresholds
+These are the levers that tell you when your experiment is broken, even if the p-value looks exciting.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness under messy logging | Pure real-time “final” truth |
+| Reproducible assignment and analysis | Flexibility to change bucketing mid-flight |
+| Simple, audit-friendly control plane | Maximum expressiveness in targeting DSL |
+| Backfillable metrics with explicit windows | Low-latency ad-hoc exploratory joins |
+
+## Failure Modes
+
+- **Assignment drift (config changes invalidate analysis)**
+  - **What happens:** Variant proportions shift mid-experiment; results become uninterpretable.
+  - **Detect:** Allocation change audit + exposure config_version distribution changes.
+  - **Recover:** Freeze experiment configs; require creating a new experiment for changes that affect bucketing/targeting; analyze each config_version as separate epochs.
+
+- **Silent exposure loss (biased measurement)**
+  - **What happens:** Certain clients fail to log exposures; you analyze only “logged” traffic.
+  - **Detect:** SRM spikes, exposure coverage dashboards by client/service, sudden drop in exposures with stable request volume.
+  - **Recover:** Block experiment ramp when coverage falls below threshold; fall back to server-side exposure logging; replay buffered logs if available.
+
+- **Late-event distortion (premature decisions)**
+  - **What happens:** Early metrics look positive; later conversions arrive and reverse the effect.
+  - **Detect:** Late event rate metrics, gap between monitoring and batch recompute.
+  - **Recover:** Enforce decision SLAs (don’t call winners before window maturity); show “maturity curve” per metric; rely on batch truth for final calls.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move more computation to pre-aggregated “metric cubes” (by day, experiment, variant) and serve most queries from those; tighten identity and metric DSL to keep joins predictable.
+- **100x scale:** Treat assignment as an edge capability (CDN/sidecar evaluation with signed config snapshots) and make the lakehouse the center of gravity; replace per-experiment joins with standardized derived fact tables so recomputation doesn’t become a cluster-wide tax.
+
+## Operational Notes
+
+- Never change the hash function or bucket space without a migration plan; it is a platform-wide breaking change.
+- Make SRM a paging signal for large experiments; it catches real outages faster than “error rate” dashboards.
+- Separate “monitoring” from “final” in the UI and APIs; mixing them trains teams to distrust the platform.
+- Keep an explicit policy for multiple comparisons and peeking, and enforce it in the Results API—not in slide decks.
+- Backfills are routine, not exceptional: version metric definitions and store derived tables by version so you can re-run history deterministically.
+```
+
+---
+
+## Critique to Address
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+Treat **exposure** as the atomic fact: deterministic assignment → immutable exposure log → all metrics/tests computed from exposure-scoped joins with explicit windows. This is the right “truth anchor” to prevent silent bias.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Assignment API (or SDK/edge eval) | Centralizes targeting + mutual exclusion and produces an authoritative exposure record tied to a config version. |
+| Postgres control plane | Versioned configs/metric defs + audit trail; “pinned config per exposure” prevents drift. |
+| Immutable exposure log | The single source of truth that preserves randomization under retries/caching/ad blockers. |
+| Kafka (replayable bus) | Absorbs burst, enables reprocessing when metric/identity logic changes. |
+| Stream aggregator | Fast “monitoring-grade” results + diagnostics (late rate, join coverage) to catch breakage early. |
+| Iceberg lakehouse | Authoritative batch recomputation/backfills with snapshot consistency and history. |
+| Results API with policy | Prevents p-hacking in UI and makes peeking/multiple-comparisons enforceable. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Assignment API on hot path at 200k RPS | **Signed config snapshots** evaluated in SDK/edge (OpenFeature-style), Assignment service becomes “config publisher + audit” | More client/runtime complexity; need strong rollout/versioning of SDKs and config signing/TTL. |
+| Exposure-based joins between exposure stream and event stream | Propagate `exposure_id` (or `experiment_context`) into downstream events at source | Event payload grows; requires instrumentation discipline, but massively simplifies attribution and reduces identity-join risk. |
+| Custom streaming aggregates + serving layer | Use an OLAP store (ClickHouse/Druid/Pinot) for near-real-time aggregates + rollups | Adds a database, but may remove bespoke “Results API query engine” complexity and improve dashboard latency. |
+| Identity “snapshot at exposure time” described conceptually | Model identity as an SCD table (`valid_from/valid_to`) and enforce `exposure_time` joins | More upfront data modeling, much less ambiguity and fewer foot-guns later. |
+| Kafka for both exposures and all product events at stated volume | Split: keep **exposures + experiment-critical events** in Kafka; land bulk product events directly in lakehouse (or sampled in Kafka) | Monitoring becomes less universal; requires deciding which events must be realtime. |
+| Statistical policy enforced in Results API | Start with a smaller set of “blessed analyses” (fixed tests + alpha-spending templates) | Less flexibility, but clearer guardrails and less surface area to get wrong. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres control-plane down for 5 minutes**
+   - Design's answer: not addressed (beyond “boring Postgres”)
+   - Recommendation: Strengthen — require cached/signed config snapshots so assignment continues; freeze writes; queue config changes; make “read-only degrade” explicit.
+
+2. **Network partition: assignment returns variant but exposure fails to log**
+   - Design's answer: partially addressed (“server-side preferred… causally linked”), but not the actual failure handling
+   - Recommendation: Must fix — define an idempotent exposure write contract (`exposure_id`), retry semantics, and a “no-log-no-experiment” mode (e.g., don’t ramp if exposure ack rate drops).
+
+3. **Kafka outage / severe lag**
+   - Design's answer: not addressed
+   - Recommendation: Strengthen — specify retention/replication, producer acks, backpressure behavior, and what dashboards show (“monitoring unavailable” vs stale). Ensure assignment is decoupled from Kafka availability if you still want to serve traffic.
+
+4. **Bad config / targeting bug deployed**
+   - Design's answer: partially addressed via versioning/audit
+   - Recommendation: Strengthen — add automated canaries: SRM pre-check on small ramp, invariant checks (allocation sums, layer conflicts), and “safe rollback” semantics (new config version; never mutate old).
+
+5. **Identity linkage created after exposure (leakage)**
+   - Design's answer: addressed (pin identity snapshot / conservative linking)
+   - Recommendation: Acceptable — but make it enforceable in data model (SCD) and surface “power lost due to conservative identity” as a first-class diagnostic.
+
+## Recommendations
+
+### Must Fix
+- Define **idempotency + dedupe** end-to-end for exposures (what is `exposure_id`, how retries behave, how double-counting is prevented across clients/servers).
+- Make **assignment availability** explicit (SDK/edge eval or hard caching plan) so Postgres/Kafka/streaming outages don’t page the product.
+- Specify **privacy/key management** for `unit_id_hash` (HMAC with rotation, access boundaries) so analytics joins remain stable without leaking identifiers.
+
+### Should Consider
+- Carry `exposure_id` / `experiment_context` forward into key product events to reduce heavy joins and make attribution more deterministic.
+- Clarify whether “monitoring-grade” numbers are computed from a subset of events (and how that subset is chosen) to avoid hidden bias.
+- Narrow and formalize the initial stats surface area (a few approved tests + sequential monitoring policy) to make Results API simpler to own.
+
+### Nice to Have
+- Pre-ramp automated checks: instrumentation coverage thresholds, SRM dry-run, late-event maturity curve gates.
+- Cost controls for backfills (priority queues, per-metric recompute budgets, and “blast radius” limits).
+
+## What's Working Well
+- Exposure-first framing is the right correctness primitive and is explained clearly.
+- Honest separation of **monitoring vs final** prevents a common trust failure.
+- Identity leakage callout is unusually strong and operationally important.
+- Mandatory diagnostics (join rate, missing exposure, SRM) correctly treat bias as an observable, not an afterthought.
+- Versioned configs + pinned config_version per exposure is the right mechanism to prevent drift and support audits/backfills.
+```
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+thinking
+**Considering architecture options**
+
+Okay, I'm thinking about minimizing for a small team. I might propose starting with a subset of events in Kafka while handling the rest in batches. Using managed Kafka like MSK or Confluent seems viable. I'm considering keeping Postgres, Kafka, and a lakehouse together with a single "Compute Job" that handles both streaming and batch processes. Maybe merging the Stream Aggregator and batch approaches as one Spark/Flink job could work, though it’s essential to simplify where possible. This is all complex, especially given the scale targets.
+thinking
+**Exploring data storage options**
+
+I'm considering the idea of storing aggregates in Postgres with updates every 5-10 minutes, which could work, especially with 2 billion daily exposures. Since the title says "Hard," I can't change that. I think keeping Iceberg as the authoritative store might be wise, using a single "Batch + Microbatch Job" to compute monitoring numbers every five minutes. This setup could eliminate the need for Kafka and the stream aggregator. But how to ingest exposures and events? Directly writing to Iceberg via HTTP seems unrealistic, though a log pipeline like Kinesis/Firehose could work, but that adds complexity. I can treat both "Event Log" and "Exposure Log" as object storage in S3 alongside a lakehouse. For monitoring, running microbatch queries in Spark/Trino could be effective, even though handling 10 billion daily events might be a bit heavy.
+thinking
+**Revising system architecture**
+
+I'm thinking about the rule to only remove or merge components. I can merge the Exposure Log, Event Log, and Iceberg Lakehouse into one, essentially treating "Iceberg tables" as both log and storage for exposures and events. This means I can remove Kafka and the stream aggregator. The Results API stays, and we can simplify the assignment process with signed config snapshots evaluated in the SDK, reducing the assignment API.
+
+Postgres can still be the control plane for definitions. The architecture involves the client/service using the SDK to evaluate assignments with cached signed configurations, logging exposures and events to the ingestion endpoint. We can say clients write to an existing event pipeline that lands in the lakehouse, assuming logs go directly to Iceberg as we define the exposure schema.
+thinking
+**Finalizing system components**
+
+I've settled on the final components for the architecture. The Config Publisher, which was the Assignment API, will publish signed snapshots from Postgres to a CDN or object store. Postgres will serve as the control plane. The Iceberg Lakehouse will contain raw exposures and events tables, along with derived aggregates. I think we can replace the Stream Aggregator with a new scheduled batch/microbatch computation method, rebranding it as the Microbatch Aggregator that pulls data from Iceberg instead of Kafka. I need to ensure that the Exposure Log and Event Log are integrated as tables within Iceberg. The Results API will remain, but with a simpler role in serving precomputed aggregates and enforcing policies. Lastly, I should consider failure scenarios for this setup.
+thinking
+**Adjusting architecture details**
+
+I need to adjust the existing components without adding new ones. The Iceberg Lakehouse will encompass exposures and events, while the Stream Aggregator will now be called the Microbatch Aggregator, which runs every five minutes and performs hourly recompute. I should simplify the requirements for near-real-time monitoring to possibly 15 minutes and clarify that these will be based solely on critical events.
+
+I want to keep the scale targets but annotate the version 2 specs to indicate that it won't support the full 200k RPS with a central API, as this will be tackled through SDK evaluation. I'll rewrite the trade-offs table and update the failure modes to align with the new design. 
+
+For operational notes, I'll emphasize idempotency, snapshot TTL, and HMAC rotation. The "Deep Dive" section will be condensed to core essentials like propagating experiment context and deduplication.
+
+Moreover, I must address privacy key management using HMAC of unit_id with a secret key and include key rotation and rehash strategies. I’ll also implement strict templating for multiple comparisons and peeking via the Results API. 
+
+For exposure logging, I must specify the ingestion process to Iceberg without referencing a new pipeline, as the existing logging pipeline integrates with the lakehouse. I'll ensure the YAML front matter, including the title and difficulty tags, remain unchanged.
+codex
+```markdown
+---
+title: "Experimentation (A/B) Platform"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["experimentation", "ab-testing", "metrics", "statistics", "streaming", "data-platform"]
+---
+
+## Overview
+
+This platform keeps one thing true under real-world messiness: **experiments are measured from exposures**. Assignment is deterministic, every exposure is recorded with the exact config version that produced it, and all metrics/tests are computed from exposure-scoped attribution windows.
+
+The platform stays small by pushing the hot path out of the control plane: services evaluate assignment locally from **signed config snapshots**, then log **exposure_id** and **experiment_context** into product events so attribution is mostly a direct lookup instead of a fragile inference problem.
+
+## What Makes This Hard
+
+Most failures are silent: missing exposures, drifted configs, late events, or “exposure” guessed from downstream behavior. The system makes bias observable by default (SRM, coverage, join rate, late rate) and makes the “correct workflow” the only workflow: exposure-first, version-pinned, windowed attribution.
+
+## Requirements
+
+### Functional Requirements
+- Deterministic randomization for a chosen unit with fixed allocation and reproducible bucketing.
+- Targeting and mutual exclusion (namespaces/layers) to prevent interference.
+- Immutable exposure logging with strong guarantees against double-counting.
+- Metric computation with explicit attribution rules:
+  - exposure-based windows
+  - deduping and late-arriving events handling
+- Significance testing with guardrails:
+  - SRM detection
+  - multiple comparisons policy
+  - peeking policy enforced by workflow
+- Near-real-time monitoring and authoritative recomputation from raw data.
+- Experiment lifecycle with auditable config changes.
+
+### Scale Targets
+- **Assignment reads:** handled locally via cached signed snapshots; no central hot-path dependency.
+- **Exposures / events:** large-volume append-only logging; compute uses pre-aggregation and partitioned storage.
+- **Freshness:** monitoring lag minutes; “final” numbers computed after window maturity.
+
+## Key Design Decisions
+
+- **We chose:** Deterministic assignment via consistent hashing of `(experiment_salt, unit_id)` into a fixed bucket space, with allocations mapped to bucket ranges.
+  - **Why:** Stable, reproducible, cacheable, and migration-friendly.
+
+- **We chose:** Signed, versioned config snapshots evaluated in SDKs/services; the control plane publishes snapshots, not per-request decisions.
+  - **Why:** Assignment stays available during Postgres/control-plane incidents and scales without a central RPS bottleneck.
+
+- **We chose:** Exposure-first measurement with an explicit `exposure_id`, and propagation of `experiment_context` into product events.
+  - **Why:** Eliminates “infer exposure” bias and collapses attribution complexity into a straightforward windowed join.
+
+- **We chose:** One computation path: microbatch aggregation for monitoring plus scheduled recomputation for final results, both from the same raw lakehouse tables and metric definitions.
+  - **Why:** Avoids maintaining separate streaming and batch logic while still supporting fast signals and backfills.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client/Service] --> A[Assignment API]
+  A --> P[(Postgres Control)]
+  C --> L[(Iceberg Lakehouse)]
+  L --> S[Stream Aggregator]
+  S --> R[Results API]
+  L --> R
+```
+
+**What We Removed:** Kafka, a separate Exposure Log, a separate Event Log, and a “stream vs batch” split-brain; exposures/events live as lakehouse tables and compute runs microbatch + recompute from the same source.
+
+## Components
+
+- **Assignment API**
+  - Publishes signed, versioned config snapshots (salts, allocations, targeting, layers) derived from Postgres.
+  - Exists to provide a single audited source of truth for configs while keeping assignment available via cached snapshots.
+
+- **Postgres Control Plane**
+  - Stores experiment definitions, versions, lifecycle state, and metric definitions; every change is versioned and auditable.
+  - Exists to prevent config drift and make “what did we run?” answerable forever.
+
+- **Iceberg Lakehouse**
+  - Stores raw append-only tables for `exposures` and `events` plus derived aggregate tables; `unit_id` is stored as `unit_id_hash` (HMAC) with `key_id`.
+  - Exists as the authoritative history for recomputation, backfills, and audits.
+
+- **Stream Aggregator**
+  - Runs microbatches (e.g., every 5–10 minutes) to compute monitoring-grade aggregates and diagnostics; runs scheduled recomputation for final results after window maturity.
+  - Exists to deliver fast launch signals without a separate real-time stack, and to make “final” deterministic from raw data.
+
+- **Results API**
+  - Serves only precomputed aggregates, diagnostics, and a small set of blessed tests/templates; enforces peeking and multiple-comparisons policy.
+  - Exists to keep analysis consistent, reproducible, and resistant to p-hacking.
+
+## Deep Dive: Correct Metric Attribution (Without Lying to Yourself)
+
+**1) Exposures are the anchor.**  
+Every assignment produces an exposure record: `(exposure_id, exposure_time, experiment_id, config_version, unit_type, unit_id_hash, variant, context)`. The `exposure_id` is idempotent across retries so duplicates collapse deterministically.
+
+**2) Events carry experiment context.**  
+Key product events include `experiment_context` (at least `experiment_id`, `variant`, `config_version`, `exposure_id`). Attribution becomes window filtering and aggregation, not guesswork.
+
+**3) Windows are explicit and conservative.**  
+Metrics declare the window `[exposure_time, exposure_time + window]`, a dedupe key (when applicable), and the aggregation. Late events update monitoring aggregates; final aggregates are recomputed after maturity.
+
+**4) Diagnostics are part of every result.**  
+Results include exposure counts, SRM, exposure logging ack/coverage signals, join rate (events-with-context per exposure), and late-event rate so bias is visible before decisions are made.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Assignment availability via local eval | Central “one API call” simplicity |
+| Exposure-first correctness | Flexibility to mutate configs mid-flight |
+| One compute stack (microbatch + recompute) | True streaming “always up-to-date” dashboards |
+| Small, enforced stats surface | Ad-hoc exploratory testing in the UI |
+
+## Failure Modes
+
+- **Postgres control-plane down for 5 minutes**
+  - **What happens:** New config publishes pause; assignment continues from cached signed snapshots; results continue from existing definitions.
+  - **Detect:** Snapshot publish failures; stale snapshot age.
+  - **Recover:** Freeze writes until Postgres returns; resume publishing; no assignment outage.
+
+- **Network partition: variant decided but exposure fails to log**
+  - **What happens:** Missing exposures create biased measurement risk.
+  - **Detect:** Exposure logging ack rate drop; SRM/coverage anomalies; join rate collapse for events-with-context.
+  - **Recover:** “No-log-no-experiment” gate prevents ramp/holds ramp when ack rate falls; idempotent retry on the exposure write path; dedupe by `exposure_id`.
+
+- **Ingest lag / lakehouse write disruption**
+  - **What happens:** Monitoring numbers go stale; final recompute is delayed.
+  - **Detect:** Partition arrival SLA breach; aggregator watermark lag.
+  - **Recover:** UI/API surfaces “monitoring unavailable/stale”; assignment unaffected; recompute catches up when ingest recovers.
+
+- **Bad config / targeting bug deployed**
+  - **What happens:** Wrong targeting or allocations; experiment may be invalid.
+  - **Detect:** Snapshot publish-time invariant checks; SRM on small ramp; unexpected exposure distribution by layer.
+  - **Recover:** Publish a new config version (never mutate old); analyze by config_version epochs when necessary.
+
+- **Identity linkage created after exposure (leakage)**
+  - **What happens:** Artificial treatment effects from “future identity.”
+  - **Detect:** Only measured when identity joins exist; otherwise avoided by design.
+  - **Recover:** Measurement relies on exposure_id carried into events; cross-identity attribution is only allowed if the identity snapshot is valid at exposure_time.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Restrict “monitoring” to a curated set of events that carry experiment_context end-to-end; push more pre-aggregation into derived lakehouse tables to keep microbatches cheap.
+- **100x scale:** Standardize event schemas so most metrics are computed from a small set of canonical fact tables; keep assignment fully edge/local with strict snapshot TTLs and roll-forward-only publishing.
+
+## Operational Notes
+
+- Never change the hash function, bucket space, or HMAC scheme without an explicit migration; treat these as platform-wide contracts.
+- Define `exposure_id` and retry semantics once: idempotent writes, deterministic dedupe, and “no-log-no-experiment” ramp gates.
+- Publish signed snapshots with short TTLs and explicit rollback via “new version publish,” not mutation.
+- Store `unit_id_hash = HMAC(key_id, unit_id)` and rotate keys by introducing a new `key_id` while keeping old joins stable for historical recompute.
+- Keep the stats surface small (blessed tests + templates) and enforce peeking/multiple-comparisons in the Results API.
+```
+tokens used
+9,848
+```markdown
+---
+title: "Experimentation (A/B) Platform"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["experimentation", "ab-testing", "metrics", "statistics", "streaming", "data-platform"]
+---
+
+## Overview
+
+This platform keeps one thing true under real-world messiness: **experiments are measured from exposures**. Assignment is deterministic, every exposure is recorded with the exact config version that produced it, and all metrics/tests are computed from exposure-scoped attribution windows.
+
+The platform stays small by pushing the hot path out of the control plane: services evaluate assignment locally from **signed config snapshots**, then log **exposure_id** and **experiment_context** into product events so attribution is mostly a direct lookup instead of a fragile inference problem.
+
+## What Makes This Hard
+
+Most failures are silent: missing exposures, drifted configs, late events, or “exposure” guessed from downstream behavior. The system makes bias observable by default (SRM, coverage, join rate, late rate) and makes the “correct workflow” the only workflow: exposure-first, version-pinned, windowed attribution.
+
+## Requirements
+
+### Functional Requirements
+- Deterministic randomization for a chosen unit with fixed allocation and reproducible bucketing.
+- Targeting and mutual exclusion (namespaces/layers) to prevent interference.
+- Immutable exposure logging with strong guarantees against double-counting.
+- Metric computation with explicit attribution rules:
+  - exposure-based windows
+  - deduping and late-arriving events handling
+- Significance testing with guardrails:
+  - SRM detection
+  - multiple comparisons policy
+  - peeking policy enforced by workflow
+- Near-real-time monitoring and authoritative recomputation from raw data.
+- Experiment lifecycle with auditable config changes.
+
+### Scale Targets
+- **Assignment reads:** handled locally via cached signed snapshots; no central hot-path dependency.
+- **Exposures / events:** large-volume append-only logging; compute uses pre-aggregation and partitioned storage.
+- **Freshness:** monitoring lag minutes; “final” numbers computed after window maturity.
+
+## Key Design Decisions
+
+- **We chose:** Deterministic assignment via consistent hashing of `(experiment_salt, unit_id)` into a fixed bucket space, with allocations mapped to bucket ranges.
+  - **Why:** Stable, reproducible, cacheable, and migration-friendly.
+
+- **We chose:** Signed, versioned config snapshots evaluated in SDKs/services; the control plane publishes snapshots, not per-request decisions.
+  - **Why:** Assignment stays available during Postgres/control-plane incidents and scales without a central RPS bottleneck.
+
+- **We chose:** Exposure-first measurement with an explicit `exposure_id`, and propagation of `experiment_context` into product events.
+  - **Why:** Eliminates “infer exposure” bias and collapses attribution complexity into a straightforward windowed join.
+
+- **We chose:** One computation path: microbatch aggregation for monitoring plus scheduled recomputation for final results, both from the same raw lakehouse tables and metric definitions.
+  - **Why:** Avoids maintaining separate streaming and batch logic while still supporting fast signals and backfills.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client/Service] --> A[Assignment API]
+  A --> P[(Postgres Control)]
+  C --> L[(Iceberg Lakehouse)]
+  L --> S[Stream Aggregator]
+  S --> R[Results API]
+  L --> R
+```
+
+**What We Removed:** Kafka, a separate Exposure Log, a separate Event Log, and a “stream vs batch” split-brain; exposures/events live as lakehouse tables and compute runs microbatch + recompute from the same source.
+
+## Components
+
+- **Assignment API**
+  - Publishes signed, versioned config snapshots (salts, allocations, targeting, layers) derived from Postgres.
+  - Exists to provide a single audited source of truth for configs while keeping assignment available via cached snapshots.
+
+- **Postgres Control Plane**
+  - Stores experiment definitions, versions, lifecycle state, and metric definitions; every change is versioned and auditable.
+  - Exists to prevent config drift and make “what did we run?” answerable forever.
+
+- **Iceberg Lakehouse**
+  - Stores raw append-only tables for `exposures` and `events` plus derived aggregate tables; `unit_id` is stored as `unit_id_hash` (HMAC) with `key_id`.
+  - Exists as the authoritative history for recomputation, backfills, and audits.
+
+- **Stream Aggregator**
+  - Runs microbatches (e.g., every 5–10 minutes) to compute monitoring-grade aggregates and diagnostics; runs scheduled recomputation for final results after window maturity.
+  - Exists to deliver fast launch signals without a separate real-time stack, and to make “final” deterministic from raw data.
+
+- **Results API**
+  - Serves only precomputed aggregates, diagnostics, and a small set of blessed tests/templates; enforces peeking and multiple-comparisons policy.
+  - Exists to keep analysis consistent, reproducible, and resistant to p-hacking.
+
+## Deep Dive: Correct Metric Attribution (Without Lying to Yourself)
+
+**1) Exposures are the anchor.**  
+Every assignment produces an exposure record: `(exposure_id, exposure_time, experiment_id, config_version, unit_type, unit_id_hash, variant, context)`. The `exposure_id` is idempotent across retries so duplicates collapse deterministically.
+
+**2) Events carry experiment context.**  
+Key product events include `experiment_context` (at least `experiment_id`, `variant`, `config_version`, `exposure_id`). Attribution becomes window filtering and aggregation, not guesswork.
+
+**3) Windows are explicit and conservative.**  
+Metrics declare the window `[exposure_time, exposure_time + window]`, a dedupe key (when applicable), and the aggregation. Late events update monitoring aggregates; final aggregates are recomputed after maturity.
+
+**4) Diagnostics are part of every result.**  
+Results include exposure counts, SRM, exposure logging ack/coverage signals, join rate (events-with-context per exposure), and late-event rate so bias is visible before decisions are made.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Assignment availability via local eval | Central “one API call” simplicity |
+| Exposure-first correctness | Flexibility to mutate configs mid-flight |
+| One compute stack (microbatch + recompute) | True streaming “always up-to-date” dashboards |
+| Small, enforced stats surface | Ad-hoc exploratory testing in the UI |
+
+## Failure Modes
+
+- **Postgres control-plane down for 5 minutes**
+  - **What happens:** New config publishes pause; assignment continues from cached signed snapshots; results continue from existing definitions.
+  - **Detect:** Snapshot publish failures; stale snapshot age.
+  - **Recover:** Freeze writes until Postgres returns; resume publishing; no assignment outage.
+
+- **Network partition: variant decided but exposure fails to log**
+  - **What happens:** Missing exposures create biased measurement risk.
+  - **Detect:** Exposure logging ack rate drop; SRM/coverage anomalies; join rate collapse for events-with-context.
+  - **Recover:** “No-log-no-experiment” gate prevents ramp/holds ramp when ack rate falls; idempotent retry on the exposure write path; dedupe by `exposure_id`.
+
+- **Ingest lag / lakehouse write disruption**
+  - **What happens:** Monitoring numbers go stale; final recompute is delayed.
+  - **Detect:** Partition arrival SLA breach; aggregator watermark lag.
+  - **Recover:** UI/API surfaces “monitoring unavailable/stale”; assignment unaffected; recompute catches up when ingest recovers.
+
+- **Bad config / targeting bug deployed**
+  - **What happens:** Wrong targeting or allocations; experiment may be invalid.
+  - **Detect:** Snapshot publish-time invariant checks; SRM on small ramp; unexpected exposure distribution by layer.
+  - **Recover:** Publish a new config version (never mutate old); analyze by config_version epochs when necessary.
+
+- **Identity linkage created after exposure (leakage)**
+  - **What happens:** Artificial treatment effects from “future identity.”
+  - **Detect:** Only measured when identity joins exist; otherwise avoided by design.
+  - **Recover:** Measurement relies on exposure_id carried into events; cross-identity attribution is only allowed if the identity snapshot is valid at exposure_time.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Restrict “monitoring” to a curated set of events that carry experiment_context end-to-end; push more pre-aggregation into derived lakehouse tables to keep microbatches cheap.
+- **100x scale:** Standardize event schemas so most metrics are computed from a small set of canonical fact tables; keep assignment fully edge/local with strict snapshot TTLs and roll-forward-only publishing.
+
+## Operational Notes
+
+- Never change the hash function, bucket space, or HMAC scheme without an explicit migration; treat these as platform-wide contracts.
+- Define `exposure_id` and retry semantics once: idempotent writes, deterministic dedupe, and “no-log-no-experiment” ramp gates.
+- Publish signed snapshots with short TTLs and explicit rollback via “new version publish,” not mutation.
+- Store `unit_id_hash = HMAC(key_id, unit_id)` and rotate keys by introducing a new `key_id` while keeping old joins stable for historical recompute.
+- Keep the stats surface small (blessed tests + templates) and enforce peeking/multiple-comparisons in the Results API.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/07-ai-ml-infrastructure/experimentation-ab-platform.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Experimentation (A/B) Platform
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/experimentation-ab-platform.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/experimentation-ab-platform.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/07-ai-ml-infrastructure/experimentation-ab-platform.md

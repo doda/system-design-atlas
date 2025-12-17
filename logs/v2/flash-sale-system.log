@@ -1,0 +1,1578 @@
+==========================================
+Generating (v2): Flash Sale System
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2bad-7203-87dd-7a0c236a67c8
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Flash Sale System
+**Category**: Commerce & Fintech
+
+**Problem Statement**:
+Design a queueing system to handle traffic spikes 100x normal load, focusing on fairness and inventory locking.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+thinking
+**Designing a system for inventory management**
+
+I’m thinking about how to manage inventory with an expiration on locks. Using PostgreSQL for unique constraint reservations or Redis for short-term holds seems like a solid approach. It’s crucial to separate admission control from inventory management to prevent overloading the database. Implementing a virtual waiting room with tokens and a sharded queue should help regulate the admission rate, while ensuring that we have a durable inventory reservation process. I need to consider a few key decisions here.
+thinking
+**Operating system notes**
+
+I’m focusing on monitoring key metrics like queue depth, admission rate, reservation expiry, and oversell protection, all without relying on additional tools. I aim to create markdown documentation with clear, direct language and no hedge words. I plan to define user fairness in relation to bots by implementing a per-user queue position, secured with a timestamp and HMAC. We could utilize Redis or Kafka for position assignment, and the challenging aspect will be establishing a reliable inventory locking system through Lua scripts.
+thinking
+**Addressing fairness in ticket sales**
+
+I'm thinking about how to implement fairness through rate limiting and bot detection, ensuring we treat accounts rather than IP addresses. Using CAPTCHAs for initial engagement and allocating queue positions based on order could help. However, fairness across regions presents challenges—should we use a global ticket issuer or establish quotas per region? A single control plane might simplify things, so I’ll consider scaling options like multi-region setups while accounting for oversell risks and ensuring a fair allocation system.
+codex
+```markdown
+---
+title: "Flash Sale System"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["flash-sale", "fairness", "queueing", "inventory-reservations", "backpressure"]
+---
+
+## Overview
+
+This system sells a small amount of inventory under a traffic spike (100x normal) without melting downstream dependencies, while remaining *fair* in a way users actually perceive: “I got a stable spot in line and the rules didn’t change mid-wait.” The key insight is to treat the flash sale as a controlled admission problem, not a scaling problem: we **shape** demand with a virtual waiting room, then **issue scarce inventory reservations** at a rate the system can safely finalize.
+
+Elegance comes from separating concerns: the **queue decides who gets a chance**; the **inventory service decides if a chance becomes a hold**; and the **order pipeline** finalizes asynchronously. Most of the stack stays boring (CDN, stateless APIs, Postgres), while we spend real design energy on the two hard pieces: fairness under retries/bots, and inventory locking under extreme contention.
+
+## What Makes This Hard
+
+Naive implementations let everyone hammer “Add to cart” simultaneously and then try to “just scale the database.” That fails because the bottleneck is not CPU—it's *contention*: a single SKU with 1,000 units creates a hot row/hot lock, and your retries amplify load until the system collapses.
+
+The second trap is “first-come-first-served” that isn’t actually fair. In a spike, arrival time is dominated by client retries, mobile networks, and edge routing. Without a stable, server-issued place-in-line, you reward the best retry script, not the earliest human.
+
+## Requirements
+
+### Functional Requirements
+- **Fair queue position**: Each user receives a stable position that doesn’t change across refreshes/retries.
+- **Anti-bot fairness**: Fairness is per authenticated account (and device signals), not per IP; abusive retries don’t improve position.
+- **No oversell**: Inventory cannot be sold beyond available units, even under retries and partial failures.
+- **Inventory locking**: When a user is admitted, the system creates a **time-bounded reservation** (hold) that expires automatically if not purchased.
+- **Idempotency end-to-end**: Retried “reserve” / “place order” calls do not create duplicate holds or orders.
+
+### Scale Targets
+- **Traffic**: 5k RPS normal → **500k RPS spike** for 10 minutes (web + mobile). This drives the need for edge caching + waiting room.
+- **Inventory**: 1–50 SKUs per drop, **100–50,000 units per SKU**. Single hot SKU is the worst case.
+- **Fairness granularity**: “Feels fair” means position assignment jitter < **~1s** under load; this drives a centralized monotonic ticket source.
+- **Reservation window**: **2–5 minutes** hold TTL; long enough for payment, short enough to recycle inventory quickly.
+
+## Key Design Decisions
+
+- **We chose: Virtual waiting room with server-issued tickets**
+  - Rejected: letting the main API absorb the spike and “rate limit later”
+  - Why: the waiting room converts unbounded load into cheap polling and lets us admit at a controlled rate based on inventory and downstream health.
+
+- **We chose: Atomic, time-bounded reservations using Redis + durable reconciliation in Postgres**
+  - Rejected: row-level locking in Postgres on inventory rows for every attempt
+  - Why: Postgres locks turn a hot SKU into a global choke point; Redis atomic scripts are built for high-contention counters, while Postgres stores the durable record of what happened.
+
+- **We chose: Single global ordering per sale (per SKU), not multi-region fairness theater**
+  - Rejected: “globally fair, multi-region, active-active queue ordering”
+  - Why: true global fairness requires consensus on ordering; for flash sales, a single control-plane region gives predictable fairness and simpler operations. We scale *read* at the edge, not *decision-making* everywhere.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[Users] --> C[CDN/Edge]
+  C --> W[Waiting Room]
+  W --> T[Ticket Issuer]
+  W --> A[Admission API]
+  A --> I[Inventory Reserve]
+  I --> R[(Redis)]
+  A --> Q[Order Queue]
+  Q --> O[(Postgres Orders)]
+```
+
+### Components
+
+- **CDN/Edge**: Serves static sale pages and terminates TLS; aggressively caches everything that isn’t personalized to keep origin calm.
+- **Waiting Room**: The only public entry during the spike; issues “join queue” and “poll status” endpoints designed to be cheap and cache-friendly.
+- **Ticket Issuer**: Assigns a stable queue position once per user per sale/SKU. Backed by a monotonic counter and strict dedupe so retries don’t help.
+- **Admission API**: Converts “your turn” into an attempt to reserve inventory. Enforces per-user idempotency and rate limits.
+- **Inventory Reserve**: The hot-path authority for holds. Executes an atomic reserve script and returns a reservation token with TTL.
+- **Redis**: Holds remaining counters and reservation keys with TTL. Built for high-write contention and fast atomic operations.
+- **Order Queue**: Buffers order finalization and payment workflow so the admission tier stays stable under bursts.
+- **Postgres Orders**: Durable source of truth for reservations, orders, and reconciliation/audit.
+
+## Deep Dive: Fairness + Inventory Locking (The Real Problem)
+
+**1) Fair queue tickets that retries can’t game**
+
+When a user first joins, the Waiting Room calls Ticket Issuer with `(sale_id, sku_id, user_id)`. Ticket Issuer returns a signed ticket containing:
+- `position` (monotonic integer)
+- `issued_at`
+- `user_id`, `sale_id`, `sku_id`
+- `signature` (HMAC)
+
+To make this retry-proof, Ticket Issuer must be idempotent per user:
+- Store `ticket:{sale}:{sku}:{user}` → `position` with a TTL covering the sale.
+- Generate `position` using `INCR position:{sale}:{sku}` only if the user has no ticket.
+- Enforce a strict “one ticket per account” rule; refresh/poll uses the same ticket.
+
+This is where fairness actually comes from: **the system chooses an ordering once** and then simply reveals progress. Clients can refresh all they want; they cannot improve position.
+
+**2) Inventory reservations that never oversell**
+
+On admission, Inventory Reserve runs a single Redis Lua script per SKU:
+- Inputs: `sku_id`, `user_id`, `idempotency_key`
+- State:
+  - `remaining:{sku}` (integer)
+  - `resv:{sku}:{user}` (reservation token + expiry)
+  - `idem:{idempotency_key}` (cached result)
+
+Script rules:
+- If `idem` exists, return the same result (idempotency).
+- If `resv` exists (user already holds), return it.
+- If `remaining > 0`, decrement `remaining`, create `resv` with TTL (2–5 minutes), and return a reservation token.
+- Else return “sold out.”
+
+The reservation token is required to place an order. Order finalization writes to Postgres with a uniqueness constraint on `(sale_id, sku_id, user_id)` (and/or reservation token), so even if the queue retries, the durable system remains correct. If payment succeeds, we mark the reservation consumed; if it times out, Redis auto-expires the reservation and we recycle inventory via a small reconciler that increments `remaining` for expired holds that never became orders (bounded, observable, and safe).
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Predictable fairness users perceive | Global multi-region “perfect” fairness |
+| No oversell under extreme contention | Strong consistency entirely in Postgres |
+| Operational simplicity under spikes | Some eventual consistency (reconciliation loop) |
+| Stable systems over peak throughput | A bit of added latency (waiting room) |
+
+## Failure Modes
+
+- **Redis unavailable or slow**
+  - What happens: admissions can’t reserve; queue progresses but conversions fail.
+  - Detect: reserve error rate/latency, Redis health, sudden drop in reservations/min.
+  - Recover: stop admissions (set admission rate to zero), keep waiting room alive, fail closed on reserve, and resume gradually after Redis recovers.
+
+- **Ticket Issuer overload**
+  - What happens: users can’t join; fairness collapses if we mint tickets inconsistently.
+  - Detect: join latency, error rate, counter lag.
+  - Recover: cache “queue open” pages at edge, autoscale Ticket Issuer, and prioritize *idempotent reads* (existing tickets) over new joins.
+
+- **Reservation/order mismatch (reconciliation drift)**
+  - What happens: remaining count diverges from true sellable units; risk of “phantom sold out” or stuck inventory.
+  - Detect: compare Postgres confirmed orders + active reservations vs starting inventory; alert on drift.
+  - Recover: run a bounded reconciler to recompute `remaining` from Postgres truth and reset Redis counters for the SKU.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Partition by SKU and run multiple Ticket Issuer shards (consistent hash by `sku_id`) to spread hot counters; move polling to edge KV for cheaper “position updates.”
+- **100x scale:** Make the sale control-plane a dedicated “flash sale platform”: per-SKU isolated Redis clusters, multi-region read-only waiting room with a single-region ordering authority, and strict bot gating before ticket issuance (device attestation + risk scoring) to protect fairness.
+
+## Operational Notes
+
+- Track **admission rate** as a first-class control knob; tie it to `remaining` and downstream health (payment latency, order queue depth).
+- Watch **queue abandonment** vs **reservation conversion**; tuning TTL and admission burst size usually matters more than raw capacity.
+- Protect fairness by enforcing **one ticket per account** and throttling “join” harder than “poll.”
+- Run “sold out” as a state machine: sold out means **no remaining and no reclaimable expired holds**, not “DB looks busy.”
+```
+tokens used
+4,076
+```markdown
+---
+title: "Flash Sale System"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["flash-sale", "fairness", "queueing", "inventory-reservations", "backpressure"]
+---
+
+## Overview
+
+This system sells a small amount of inventory under a traffic spike (100x normal) without melting downstream dependencies, while remaining *fair* in a way users actually perceive: “I got a stable spot in line and the rules didn’t change mid-wait.” The key insight is to treat the flash sale as a controlled admission problem, not a scaling problem: we **shape** demand with a virtual waiting room, then **issue scarce inventory reservations** at a rate the system can safely finalize.
+
+Elegance comes from separating concerns: the **queue decides who gets a chance**; the **inventory service decides if a chance becomes a hold**; and the **order pipeline** finalizes asynchronously. Most of the stack stays boring (CDN, stateless APIs, Postgres), while we spend real design energy on the two hard pieces: fairness under retries/bots, and inventory locking under extreme contention.
+
+## What Makes This Hard
+
+Naive implementations let everyone hammer “Add to cart” simultaneously and then try to “just scale the database.” That fails because the bottleneck is not CPU—it's *contention*: a single SKU with 1,000 units creates a hot row/hot lock, and your retries amplify load until the system collapses.
+
+The second trap is “first-come-first-served” that isn’t actually fair. In a spike, arrival time is dominated by client retries, mobile networks, and edge routing. Without a stable, server-issued place-in-line, you reward the best retry script, not the earliest human.
+
+## Requirements
+
+### Functional Requirements
+- **Fair queue position**: Each user receives a stable position that doesn’t change across refreshes/retries.
+- **Anti-bot fairness**: Fairness is per authenticated account (and device signals), not per IP; abusive retries don’t improve position.
+- **No oversell**: Inventory cannot be sold beyond available units, even under retries and partial failures.
+- **Inventory locking**: When a user is admitted, the system creates a **time-bounded reservation** (hold) that expires automatically if not purchased.
+- **Idempotency end-to-end**: Retried “reserve” / “place order” calls do not create duplicate holds or orders.
+
+### Scale Targets
+- **Traffic**: 5k RPS normal → **500k RPS spike** for 10 minutes (web + mobile). This drives the need for edge caching + waiting room.
+- **Inventory**: 1–50 SKUs per drop, **100–50,000 units per SKU**. Single hot SKU is the worst case.
+- **Fairness granularity**: “Feels fair” means position assignment jitter < **~1s** under load; this drives a centralized monotonic ticket source.
+- **Reservation window**: **2–5 minutes** hold TTL; long enough for payment, short enough to recycle inventory quickly.
+
+## Key Design Decisions
+
+- **We chose: Virtual waiting room with server-issued tickets**
+  - Rejected: letting the main API absorb the spike and “rate limit later”
+  - Why: the waiting room converts unbounded load into cheap polling and lets us admit at a controlled rate based on inventory and downstream health.
+
+- **We chose: Atomic, time-bounded reservations using Redis + durable reconciliation in Postgres**
+  - Rejected: row-level locking in Postgres on inventory rows for every attempt
+  - Why: Postgres locks turn a hot SKU into a global choke point; Redis atomic scripts are built for high-contention counters, while Postgres stores the durable record of what happened.
+
+- **We chose: Single global ordering per sale (per SKU), not multi-region fairness theater**
+  - Rejected: “globally fair, multi-region, active-active queue ordering”
+  - Why: true global fairness requires consensus on ordering; for flash sales, a single control-plane region gives predictable fairness and simpler operations. We scale *read* at the edge, not *decision-making* everywhere.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[Users] --> C[CDN/Edge]
+  C --> W[Waiting Room]
+  W --> T[Ticket Issuer]
+  W --> A[Admission API]
+  A --> I[Inventory Reserve]
+  I --> R[(Redis)]
+  A --> Q[Order Queue]
+  Q --> O[(Postgres Orders)]
+```
+
+### Components
+
+- **CDN/Edge**: Serves static sale pages and terminates TLS; aggressively caches everything that isn’t personalized to keep origin calm.
+- **Waiting Room**: The only public entry during the spike; issues “join queue” and “poll status” endpoints designed to be cheap and cache-friendly.
+- **Ticket Issuer**: Assigns a stable queue position once per user per sale/SKU. Backed by a monotonic counter and strict dedupe so retries don’t help.
+- **Admission API**: Converts “your turn” into an attempt to reserve inventory. Enforces per-user idempotency and rate limits.
+- **Inventory Reserve**: The hot-path authority for holds. Executes an atomic reserve script and returns a reservation token with TTL.
+- **Redis**: Holds remaining counters and reservation keys with TTL. Built for high-write contention and fast atomic operations.
+- **Order Queue**: Buffers order finalization and payment workflow so the admission tier stays stable under bursts.
+- **Postgres Orders**: Durable source of truth for reservations, orders, and reconciliation/audit.
+
+## Deep Dive: Fairness + Inventory Locking (The Real Problem)
+
+**1) Fair queue tickets that retries can’t game**
+
+When a user first joins, the Waiting Room calls Ticket Issuer with `(sale_id, sku_id, user_id)`. Ticket Issuer returns a signed ticket containing:
+- `position` (monotonic integer)
+- `issued_at`
+- `user_id`, `sale_id`, `sku_id`
+- `signature` (HMAC)
+
+To make this retry-proof, Ticket Issuer must be idempotent per user:
+- Store `ticket:{sale}:{sku}:{user}` → `position` with a TTL covering the sale.
+- Generate `position` using `INCR position:{sale}:{sku}` only if the user has no ticket.
+- Enforce a strict “one ticket per account” rule; refresh/poll uses the same ticket.
+
+This is where fairness actually comes from: **the system chooses an ordering once** and then simply reveals progress. Clients can refresh all they want; they cannot improve position.
+
+**2) Inventory reservations that never oversell**
+
+On admission, Inventory Reserve runs a single Redis Lua script per SKU:
+- Inputs: `sku_id`, `user_id`, `idempotency_key`
+- State:
+  - `remaining:{sku}` (integer)
+  - `resv:{sku}:{user}` (reservation token + expiry)
+  - `idem:{idempotency_key}` (cached result)
+
+Script rules:
+- If `idem` exists, return the same result (idempotency).
+- If `resv` exists (user already holds), return it.
+- If `remaining > 0`, decrement `remaining`, create `resv` with TTL (2–5 minutes), and return a reservation token.
+- Else return “sold out.”
+
+The reservation token is required to place an order. Order finalization writes to Postgres with a uniqueness constraint on `(sale_id, sku_id, user_id)` (and/or reservation token), so even if the queue retries, the durable system remains correct. If payment succeeds, we mark the reservation consumed; if it times out, Redis auto-expires the reservation and we recycle inventory via a small reconciler that increments `remaining` for expired holds that never became orders (bounded, observable, and safe).
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Predictable fairness users perceive | Global multi-region “perfect” fairness |
+| No oversell under extreme contention | Strong consistency entirely in Postgres |
+| Operational simplicity under spikes | Some eventual consistency (reconciliation loop) |
+| Stable systems over peak throughput | A bit of added latency (waiting room) |
+
+## Failure Modes
+
+- **Redis unavailable or slow**
+  - What happens: admissions can’t reserve; queue progresses but conversions fail.
+  - Detect: reserve error rate/latency, Redis health, sudden drop in reservations/min.
+  - Recover: stop admissions (set admission rate to zero), keep waiting room alive, fail closed on reserve, and resume gradually after Redis recovers.
+
+- **Ticket Issuer overload**
+  - What happens: users can’t join; fairness collapses if we mint tickets inconsistently.
+  - Detect: join latency, error rate, counter lag.
+  - Recover: cache “queue open” pages at edge, autoscale Ticket Issuer, and prioritize *idempotent reads* (existing tickets) over new joins.
+
+- **Reservation/order mismatch (reconciliation drift)**
+  - What happens: remaining count diverges from true sellable units; risk of “phantom sold out” or stuck inventory.
+  - Detect: compare Postgres confirmed orders + active reservations vs starting inventory; alert on drift.
+  - Recover: run a bounded reconciler to recompute `remaining` from Postgres truth and reset Redis counters for the SKU.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Partition by SKU and run multiple Ticket Issuer shards (consistent hash by `sku_id`) to spread hot counters; move polling to edge KV for cheaper “position updates.”
+- **100x scale:** Make the sale control-plane a dedicated “flash sale platform”: per-SKU isolated Redis clusters, multi-region read-only waiting room with a single-region ordering authority, and strict bot gating before ticket issuance (device attestation + risk scoring) to protect fairness.
+
+## Operational Notes
+
+- Track **admission rate** as a first-class control knob; tie it to `remaining` and downstream health (payment latency, order queue depth).
+- Watch **queue abandonment** vs **reservation conversion**; tuning TTL and admission burst size usually matters more than raw capacity.
+- Protect fairness by enforcing **one ticket per account** and throttling “join” harder than “poll.”
+- Run “sold out” as a state machine: sold out means **no remaining and no reclaimable expired holds**, not “DB looks busy.”
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/flash-sale-system.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afd-0214-7293-acb3-860ab0fdf701
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Flash Sale System"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["flash-sale", "fairness", "queueing", "inventory-reservations", "backpressure"]
+---
+
+## Overview
+
+This system sells a small amount of inventory under a traffic spike (100x normal) without melting downstream dependencies, while remaining *fair* in a way users actually perceive: “I got a stable spot in line and the rules didn’t change mid-wait.” The key insight is to treat the flash sale as a controlled admission problem, not a scaling problem: we **shape** demand with a virtual waiting room, then **issue scarce inventory reservations** at a rate the system can safely finalize.
+
+Elegance comes from separating concerns: the **queue decides who gets a chance**; the **inventory service decides if a chance becomes a hold**; and the **order pipeline** finalizes asynchronously. Most of the stack stays boring (CDN, stateless APIs, Postgres), while we spend real design energy on the two hard pieces: fairness under retries/bots, and inventory locking under extreme contention.
+
+## What Makes This Hard
+
+Naive implementations let everyone hammer “Add to cart” simultaneously and then try to “just scale the database.” That fails because the bottleneck is not CPU—it's *contention*: a single SKU with 1,000 units creates a hot row/hot lock, and your retries amplify load until the system collapses.
+
+The second trap is “first-come-first-served” that isn’t actually fair. In a spike, arrival time is dominated by client retries, mobile networks, and edge routing. Without a stable, server-issued place-in-line, you reward the best retry script, not the earliest human.
+
+## Requirements
+
+### Functional Requirements
+- **Fair queue position**: Each user receives a stable position that doesn’t change across refreshes/retries.
+- **Anti-bot fairness**: Fairness is per authenticated account (and device signals), not per IP; abusive retries don’t improve position.
+- **No oversell**: Inventory cannot be sold beyond available units, even under retries and partial failures.
+- **Inventory locking**: When a user is admitted, the system creates a **time-bounded reservation** (hold) that expires automatically if not purchased.
+- **Idempotency end-to-end**: Retried “reserve” / “place order” calls do not create duplicate holds or orders.
+
+### Scale Targets
+- **Traffic**: 5k RPS normal → **500k RPS spike** for 10 minutes (web + mobile). This drives the need for edge caching + waiting room.
+- **Inventory**: 1–50 SKUs per drop, **100–50,000 units per SKU**. Single hot SKU is the worst case.
+- **Fairness granularity**: “Feels fair” means position assignment jitter < **~1s** under load; this drives a centralized monotonic ticket source.
+- **Reservation window**: **2–5 minutes** hold TTL; long enough for payment, short enough to recycle inventory quickly.
+
+## Key Design Decisions
+
+- **We chose: Virtual waiting room with server-issued tickets**
+  - Rejected: letting the main API absorb the spike and “rate limit later”
+  - Why: the waiting room converts unbounded load into cheap polling and lets us admit at a controlled rate based on inventory and downstream health.
+
+- **We chose: Atomic, time-bounded reservations using Redis + durable reconciliation in Postgres**
+  - Rejected: row-level locking in Postgres on inventory rows for every attempt
+  - Why: Postgres locks turn a hot SKU into a global choke point; Redis atomic scripts are built for high-contention counters, while Postgres stores the durable record of what happened.
+
+- **We chose: Single global ordering per sale (per SKU), not multi-region fairness theater**
+  - Rejected: “globally fair, multi-region, active-active queue ordering”
+  - Why: true global fairness requires consensus on ordering; for flash sales, a single control-plane region gives predictable fairness and simpler operations. We scale *read* at the edge, not *decision-making* everywhere.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[Users] --> C[CDN/Edge]
+  C --> W[Waiting Room]
+  W --> T[Ticket Issuer]
+  W --> A[Admission API]
+  A --> I[Inventory Reserve]
+  I --> R[(Redis)]
+  A --> Q[Order Queue]
+  Q --> O[(Postgres Orders)]
+```
+
+### Components
+
+- **CDN/Edge**: Serves static sale pages and terminates TLS; aggressively caches everything that isn’t personalized to keep origin calm.
+- **Waiting Room**: The only public entry during the spike; issues “join queue” and “poll status” endpoints designed to be cheap and cache-friendly.
+- **Ticket Issuer**: Assigns a stable queue position once per user per sale/SKU. Backed by a monotonic counter and strict dedupe so retries don’t help.
+- **Admission API**: Converts “your turn” into an attempt to reserve inventory. Enforces per-user idempotency and rate limits.
+- **Inventory Reserve**: The hot-path authority for holds. Executes an atomic reserve script and returns a reservation token with TTL.
+- **Redis**: Holds remaining counters and reservation keys with TTL. Built for high-write contention and fast atomic operations.
+- **Order Queue**: Buffers order finalization and payment workflow so the admission tier stays stable under bursts.
+- **Postgres Orders**: Durable source of truth for reservations, orders, and reconciliation/audit.
+
+## Deep Dive: Fairness + Inventory Locking (The Real Problem)
+
+**1) Fair queue tickets that retries can’t game**
+
+When a user first joins, the Waiting Room calls Ticket Issuer with `(sale_id, sku_id, user_id)`. Ticket Issuer returns a signed ticket containing:
+- `position` (monotonic integer)
+- `issued_at`
+- `user_id`, `sale_id`, `sku_id`
+- `signature` (HMAC)
+
+To make this retry-proof, Ticket Issuer must be idempotent per user:
+- Store `ticket:{sale}:{sku}:{user}` → `position` with a TTL covering the sale.
+- Generate `position` using `INCR position:{sale}:{sku}` only if the user has no ticket.
+- Enforce a strict “one ticket per account” rule; refresh/poll uses the same ticket.
+
+This is where fairness actually comes from: **the system chooses an ordering once** and then simply reveals progress. Clients can refresh all they want; they cannot improve position.
+
+**2) Inventory reservations that never oversell**
+
+On admission, Inventory Reserve runs a single Redis Lua script per SKU:
+- Inputs: `sku_id`, `user_id`, `idempotency_key`
+- State:
+  - `remaining:{sku}` (integer)
+  - `resv:{sku}:{user}` (reservation token + expiry)
+  - `idem:{idempotency_key}` (cached result)
+
+Script rules:
+- If `idem` exists, return the same result (idempotency).
+- If `resv` exists (user already holds), return it.
+- If `remaining > 0`, decrement `remaining`, create `resv` with TTL (2–5 minutes), and return a reservation token.
+- Else return “sold out.”
+
+The reservation token is required to place an order. Order finalization writes to Postgres with a uniqueness constraint on `(sale_id, sku_id, user_id)` (and/or reservation token), so even if the queue retries, the durable system remains correct. If payment succeeds, we mark the reservation consumed; if it times out, Redis auto-expires the reservation and we recycle inventory via a small reconciler that increments `remaining` for expired holds that never became orders (bounded, observable, and safe).
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Predictable fairness users perceive | Global multi-region “perfect” fairness |
+| No oversell under extreme contention | Strong consistency entirely in Postgres |
+| Operational simplicity under spikes | Some eventual consistency (reconciliation loop) |
+| Stable systems over peak throughput | A bit of added latency (waiting room) |
+
+## Failure Modes
+
+- **Redis unavailable or slow**
+  - What happens: admissions can’t reserve; queue progresses but conversions fail.
+  - Detect: reserve error rate/latency, Redis health, sudden drop in reservations/min.
+  - Recover: stop admissions (set admission rate to zero), keep waiting room alive, fail closed on reserve, and resume gradually after Redis recovers.
+
+- **Ticket Issuer overload**
+  - What happens: users can’t join; fairness collapses if we mint tickets inconsistently.
+  - Detect: join latency, error rate, counter lag.
+  - Recover: cache “queue open” pages at edge, autoscale Ticket Issuer, and prioritize *idempotent reads* (existing tickets) over new joins.
+
+- **Reservation/order mismatch (reconciliation drift)**
+  - What happens: remaining count diverges from true sellable units; risk of “phantom sold out” or stuck inventory.
+  - Detect: compare Postgres confirmed orders + active reservations vs starting inventory; alert on drift.
+  - Recover: run a bounded reconciler to recompute `remaining` from Postgres truth and reset Redis counters for the SKU.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Partition by SKU and run multiple Ticket Issuer shards (consistent hash by `sku_id`) to spread hot counters; move polling to edge KV for cheaper “position updates.”
+- **100x scale:** Make the sale control-plane a dedicated “flash sale platform”: per-SKU isolated Redis clusters, multi-region read-only waiting room with a single-region ordering authority, and strict bot gating before ticket issuance (device attestation + risk scoring) to protect fairness.
+
+## Operational Notes
+
+- Track **admission rate** as a first-class control knob; tie it to `remaining` and downstream health (payment latency, order queue depth).
+- Watch **queue abandonment** vs **reservation conversion**; tuning TTL and admission burst size usually matters more than raw capacity.
+- Protect fairness by enforcing **one ticket per account** and throttling “join” harder than “poll.”
+- Run “sold out” as a state machine: sold out means **no remaining and no reclaimable expired holds**, not “DB looks busy.”
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+codex
+## Elegance Check
+
+### The Core Insight
+Treat the flash sale as **admission control + scarce reservations**, not “scale the checkout path”: a stable, server-issued queue position prevents retry-gaming, and a bounded reservation rate prevents hot-spot collapse.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| CDN/Edge | Converts 500k RPS into cached/static + cheap hits; protects origin. |
+| Waiting Room | Single public surface during spike; enforces backpressure and “one story” for users. |
+| Ticket Issuer | Creates a **stable ordering** once; eliminates retry advantage. |
+| Redis (atomic + TTL) | Correct under extreme contention for counters/holds; TTL makes expiry cheap. |
+| Postgres Orders | Durable audit + correctness backstop (uniqueness, reconciliation, reporting). |
+| Order Queue | Decouples admission from slow payment/order writes; keeps front door stable. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Separate Waiting Room + Ticket Issuer | Merge into one “Queue Service” (join/poll/admit in one place) | Fewer hops/services; slightly larger blast radius if it fails. |
+| Custom monotonic ticket via Redis `INCR` + per-user ticket key | Use Redis `SETNX ticket:{...}` with “allocate range” blocks (e.g., `INCRBY` per worker) | More throughput and less hot counter contention; slightly more complex issuer logic. |
+| Redis holds + “recycle via reconciler increment on expiry” | Recompute `remaining` periodically from source of truth (`starting - sold - active_holds`) and **treat Redis remaining as a cache** | Fewer edge-case bugs from increment-on-expiry; more read/compute cost and needs careful performance. |
+| Order Queue unspecified | Use a managed queue (SQS/Kafka) or Postgres outbox + workers | Less custom ops; may add cost/latency, and Kafka adds ops if self-managed. |
+| Admission rate as manual knob | Closed-loop controller (rate = f(redis remaining, payment p95, queue depth)) | Better automatic stability; requires careful tuning to avoid oscillation. |
+| “One ticket per account” plus device signals | Put bot gating *before join* using a managed anti-bot/attestation product | Stronger fairness protection; risk of false positives and UX friction. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Redis down for 5 minutes**
+   - Design’s answer: stop admissions; waiting room stays up; fail closed.
+   - Recommendation: Strengthen — add an explicit “sale paused, keep your place” state and ensure *poll* endpoints stay cacheable even when origin is degraded.
+
+2. **Network partition: Admission API can reach Waiting Room but not Redis**
+   - Design’s answer: implied “reserve fails closed”.
+   - Recommendation: Strengthen — require a short-lived “admission token” (signed) and only mint it when Redis is reachable; otherwise you’ll churn user turns and destroy perceived fairness.
+
+3. **Ticket Issuer overload / hot counter contention**
+   - Design’s answer: autoscale; prioritize idempotent reads.
+   - Recommendation: Strengthen — define a hard cap on new joins per second + use counter range allocation to avoid a single hot `INCR` becoming the bottleneck.
+
+4. **Bad config deploy (e.g., admission rate too high, TTL too long, wrong SKU inventory)**
+   - Design’s answer: not addressed.
+   - Recommendation: Strengthen — add guardrails: max admit/sec, max holds <= starting inventory, feature-flagged sale open/close, and “two-person” change for inventory/TTL during event.
+
+5. **One component slow-but-not-failing (payments p95 spikes)**
+   - Design’s answer: admission tied to downstream health (conceptually).
+   - Recommendation: Strengthen — specify the control signal (queue depth + payment latency) and the fail-safe behavior (rapid ramp-down, slow ramp-up) to avoid feedback oscillations.
+
+## Recommendations
+
+### Must Fix
+- Define a **single source of truth** for inventory math and make reconciliation deterministic (avoid “increment on expiry” edge cases; prefer recompute-from-facts or a clearly correct event model).
+- Prevent “burning turns”: ensure users only get admitted when the system can actually create holds (admission token tied to Redis health).
+- Clarify idempotency scope: keys for `join`, `reserve`, and `place order`, and what happens on client logout/login/device switch.
+
+### Should Consider
+- Collapse Waiting Room + Ticket Issuer into one service to reduce ops surface area (unless you have a clear org/team boundary).
+- Make the queue “honest”: expose explicit states (queued, admitted, paused, sold out) so UX remains stable during incidents.
+- Replace bespoke order queue with a managed option or Postgres outbox if the team is small and on-call load matters.
+
+### Nice to Have
+- Multi-SKU behavior: confirm whether tickets are per SKU or per sale (users will perceive unfairness if they can “queue-hop” SKUs).
+- Formalize fairness threat model (retry scripts, multi-account, device farms) and what you will/won’t stop.
+- Add chaos drills/runbooks: “Redis degraded”, “pause sale”, “recompute remaining”, “rollback config”.
+
+## What’s Working Well
+- Clear separation between **fair ordering**, **reservation correctness**, and **async finalization**.
+- Correct instinct to keep most of the system boring and concentrate complexity in two places that matter.
+- Idempotency and uniqueness constraints are treated as first-class, which is usually what saves these systems in real incidents.
+- Honest trade-off: single-region ordering authority avoids “global fairness theater” and keeps operations tractable.
+tokens used
+4,385
+## Elegance Check
+
+### The Core Insight
+Treat the flash sale as **admission control + scarce reservations**, not “scale the checkout path”: a stable, server-issued queue position prevents retry-gaming, and a bounded reservation rate prevents hot-spot collapse.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| CDN/Edge | Converts 500k RPS into cached/static + cheap hits; protects origin. |
+| Waiting Room | Single public surface during spike; enforces backpressure and “one story” for users. |
+| Ticket Issuer | Creates a **stable ordering** once; eliminates retry advantage. |
+| Redis (atomic + TTL) | Correct under extreme contention for counters/holds; TTL makes expiry cheap. |
+| Postgres Orders | Durable audit + correctness backstop (uniqueness, reconciliation, reporting). |
+| Order Queue | Decouples admission from slow payment/order writes; keeps front door stable. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Separate Waiting Room + Ticket Issuer | Merge into one “Queue Service” (join/poll/admit in one place) | Fewer hops/services; slightly larger blast radius if it fails. |
+| Custom monotonic ticket via Redis `INCR` + per-user ticket key | Use Redis `SETNX ticket:{...}` with “allocate range” blocks (e.g., `INCRBY` per worker) | More throughput and less hot counter contention; slightly more complex issuer logic. |
+| Redis holds + “recycle via reconciler increment on expiry” | Recompute `remaining` periodically from source of truth (`starting - sold - active_holds`) and **treat Redis remaining as a cache** | Fewer edge-case bugs from increment-on-expiry; more read/compute cost and needs careful performance. |
+| Order Queue unspecified | Use a managed queue (SQS/Kafka) or Postgres outbox + workers | Less custom ops; may add cost/latency, and Kafka adds ops if self-managed. |
+| Admission rate as manual knob | Closed-loop controller (rate = f(redis remaining, payment p95, queue depth)) | Better automatic stability; requires careful tuning to avoid oscillation. |
+| “One ticket per account” plus device signals | Put bot gating *before join* using a managed anti-bot/attestation product | Stronger fairness protection; risk of false positives and UX friction. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Redis down for 5 minutes**
+   - Design’s answer: stop admissions; waiting room stays up; fail closed.
+   - Recommendation: Strengthen — add an explicit “sale paused, keep your place” state and ensure *poll* endpoints stay cacheable even when origin is degraded.
+
+2. **Network partition: Admission API can reach Waiting Room but not Redis**
+   - Design’s answer: implied “reserve fails closed”.
+   - Recommendation: Strengthen — require a short-lived “admission token” (signed) and only mint it when Redis is reachable; otherwise you’ll churn user turns and destroy perceived fairness.
+
+3. **Ticket Issuer overload / hot counter contention**
+   - Design’s answer: autoscale; prioritize idempotent reads.
+   - Recommendation: Strengthen — define a hard cap on new joins per second + use counter range allocation to avoid a single hot `INCR` becoming the bottleneck.
+
+4. **Bad config deploy (e.g., admission rate too high, TTL too long, wrong SKU inventory)**
+   - Design’s answer: not addressed.
+   - Recommendation: Strengthen — add guardrails: max admit/sec, max holds <= starting inventory, feature-flagged sale open/close, and “two-person” change for inventory/TTL during event.
+
+5. **One component slow-but-not-failing (payments p95 spikes)**
+   - Design’s answer: admission tied to downstream health (conceptually).
+   - Recommendation: Strengthen — specify the control signal (queue depth + payment latency) and the fail-safe behavior (rapid ramp-down, slow ramp-up) to avoid feedback oscillations.
+
+## Recommendations
+
+### Must Fix
+- Define a **single source of truth** for inventory math and make reconciliation deterministic (avoid “increment on expiry” edge cases; prefer recompute-from-facts or a clearly correct event model).
+- Prevent “burning turns”: ensure users only get admitted when the system can actually create holds (admission token tied to Redis health).
+- Clarify idempotency scope: keys for `join`, `reserve`, and `place order`, and what happens on client logout/login/device switch.
+
+### Should Consider
+- Collapse Waiting Room + Ticket Issuer into one service to reduce ops surface area (unless you have a clear org/team boundary).
+- Make the queue “honest”: expose explicit states (queued, admitted, paused, sold out) so UX remains stable during incidents.
+- Replace bespoke order queue with a managed option or Postgres outbox if the team is small and on-call load matters.
+
+### Nice to Have
+- Multi-SKU behavior: confirm whether tickets are per SKU or per sale (users will perceive unfairness if they can “queue-hop” SKUs).
+- Formalize fairness threat model (retry scripts, multi-account, device farms) and what you will/won’t stop.
+- Add chaos drills/runbooks: “Redis degraded”, “pause sale”, “recompute remaining”, “rollback config”.
+
+## What’s Working Well
+- Clear separation between **fair ordering**, **reservation correctness**, and **async finalization**.
+- Correct instinct to keep most of the system boring and concentrate complexity in two places that matter.
+- Idempotency and uniqueness constraints are treated as first-class, which is usually what saves these systems in real incidents.
+- Honest trade-off: single-region ordering authority avoids “global fairness theater” and keeps operations tractable.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/flash-sale-system.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afd-bcb3-7ab2-8048-018552ecfa51
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Flash Sale System"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["flash-sale", "fairness", "queueing", "inventory-reservations", "backpressure"]
+---
+
+## Overview
+
+This system sells a small amount of inventory under a traffic spike (100x normal) without melting downstream dependencies, while remaining *fair* in a way users actually perceive: “I got a stable spot in line and the rules didn’t change mid-wait.” The key insight is to treat the flash sale as a controlled admission problem, not a scaling problem: we **shape** demand with a virtual waiting room, then **issue scarce inventory reservations** at a rate the system can safely finalize.
+
+Elegance comes from separating concerns: the **queue decides who gets a chance**; the **inventory service decides if a chance becomes a hold**; and the **order pipeline** finalizes asynchronously. Most of the stack stays boring (CDN, stateless APIs, Postgres), while we spend real design energy on the two hard pieces: fairness under retries/bots, and inventory locking under extreme contention.
+
+## What Makes This Hard
+
+Naive implementations let everyone hammer “Add to cart” simultaneously and then try to “just scale the database.” That fails because the bottleneck is not CPU—it's *contention*: a single SKU with 1,000 units creates a hot row/hot lock, and your retries amplify load until the system collapses.
+
+The second trap is “first-come-first-served” that isn’t actually fair. In a spike, arrival time is dominated by client retries, mobile networks, and edge routing. Without a stable, server-issued place-in-line, you reward the best retry script, not the earliest human.
+
+## Requirements
+
+### Functional Requirements
+- **Fair queue position**: Each user receives a stable position that doesn’t change across refreshes/retries.
+- **Anti-bot fairness**: Fairness is per authenticated account (and device signals), not per IP; abusive retries don’t improve position.
+- **No oversell**: Inventory cannot be sold beyond available units, even under retries and partial failures.
+- **Inventory locking**: When a user is admitted, the system creates a **time-bounded reservation** (hold) that expires automatically if not purchased.
+- **Idempotency end-to-end**: Retried “reserve” / “place order” calls do not create duplicate holds or orders.
+
+### Scale Targets
+- **Traffic**: 5k RPS normal → **500k RPS spike** for 10 minutes (web + mobile). This drives the need for edge caching + waiting room.
+- **Inventory**: 1–50 SKUs per drop, **100–50,000 units per SKU**. Single hot SKU is the worst case.
+- **Fairness granularity**: “Feels fair” means position assignment jitter < **~1s** under load; this drives a centralized monotonic ticket source.
+- **Reservation window**: **2–5 minutes** hold TTL; long enough for payment, short enough to recycle inventory quickly.
+
+## Key Design Decisions
+
+- **We chose: Virtual waiting room with server-issued tickets**
+  - Rejected: letting the main API absorb the spike and “rate limit later”
+  - Why: the waiting room converts unbounded load into cheap polling and lets us admit at a controlled rate based on inventory and downstream health.
+
+- **We chose: Atomic, time-bounded reservations using Redis + durable reconciliation in Postgres**
+  - Rejected: row-level locking in Postgres on inventory rows for every attempt
+  - Why: Postgres locks turn a hot SKU into a global choke point; Redis atomic scripts are built for high-contention counters, while Postgres stores the durable record of what happened.
+
+- **We chose: Single global ordering per sale (per SKU), not multi-region fairness theater**
+  - Rejected: “globally fair, multi-region, active-active queue ordering”
+  - Why: true global fairness requires consensus on ordering; for flash sales, a single control-plane region gives predictable fairness and simpler operations. We scale *read* at the edge, not *decision-making* everywhere.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[Users] --> C[CDN/Edge]
+  C --> W[Waiting Room]
+  W --> T[Ticket Issuer]
+  W --> A[Admission API]
+  A --> I[Inventory Reserve]
+  I --> R[(Redis)]
+  A --> Q[Order Queue]
+  Q --> O[(Postgres Orders)]
+```
+
+### Components
+
+- **CDN/Edge**: Serves static sale pages and terminates TLS; aggressively caches everything that isn’t personalized to keep origin calm.
+- **Waiting Room**: The only public entry during the spike; issues “join queue” and “poll status” endpoints designed to be cheap and cache-friendly.
+- **Ticket Issuer**: Assigns a stable queue position once per user per sale/SKU. Backed by a monotonic counter and strict dedupe so retries don’t help.
+- **Admission API**: Converts “your turn” into an attempt to reserve inventory. Enforces per-user idempotency and rate limits.
+- **Inventory Reserve**: The hot-path authority for holds. Executes an atomic reserve script and returns a reservation token with TTL.
+- **Redis**: Holds remaining counters and reservation keys with TTL. Built for high-write contention and fast atomic operations.
+- **Order Queue**: Buffers order finalization and payment workflow so the admission tier stays stable under bursts.
+- **Postgres Orders**: Durable source of truth for reservations, orders, and reconciliation/audit.
+
+## Deep Dive: Fairness + Inventory Locking (The Real Problem)
+
+**1) Fair queue tickets that retries can’t game**
+
+When a user first joins, the Waiting Room calls Ticket Issuer with `(sale_id, sku_id, user_id)`. Ticket Issuer returns a signed ticket containing:
+- `position` (monotonic integer)
+- `issued_at`
+- `user_id`, `sale_id`, `sku_id`
+- `signature` (HMAC)
+
+To make this retry-proof, Ticket Issuer must be idempotent per user:
+- Store `ticket:{sale}:{sku}:{user}` → `position` with a TTL covering the sale.
+- Generate `position` using `INCR position:{sale}:{sku}` only if the user has no ticket.
+- Enforce a strict “one ticket per account” rule; refresh/poll uses the same ticket.
+
+This is where fairness actually comes from: **the system chooses an ordering once** and then simply reveals progress. Clients can refresh all they want; they cannot improve position.
+
+**2) Inventory reservations that never oversell**
+
+On admission, Inventory Reserve runs a single Redis Lua script per SKU:
+- Inputs: `sku_id`, `user_id`, `idempotency_key`
+- State:
+  - `remaining:{sku}` (integer)
+  - `resv:{sku}:{user}` (reservation token + expiry)
+  - `idem:{idempotency_key}` (cached result)
+
+Script rules:
+- If `idem` exists, return the same result (idempotency).
+- If `resv` exists (user already holds), return it.
+- If `remaining > 0`, decrement `remaining`, create `resv` with TTL (2–5 minutes), and return a reservation token.
+- Else return “sold out.”
+
+The reservation token is required to place an order. Order finalization writes to Postgres with a uniqueness constraint on `(sale_id, sku_id, user_id)` (and/or reservation token), so even if the queue retries, the durable system remains correct. If payment succeeds, we mark the reservation consumed; if it times out, Redis auto-expires the reservation and we recycle inventory via a small reconciler that increments `remaining` for expired holds that never became orders (bounded, observable, and safe).
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Predictable fairness users perceive | Global multi-region “perfect” fairness |
+| No oversell under extreme contention | Strong consistency entirely in Postgres |
+| Operational simplicity under spikes | Some eventual consistency (reconciliation loop) |
+| Stable systems over peak throughput | A bit of added latency (waiting room) |
+
+## Failure Modes
+
+- **Redis unavailable or slow**
+  - What happens: admissions can’t reserve; queue progresses but conversions fail.
+  - Detect: reserve error rate/latency, Redis health, sudden drop in reservations/min.
+  - Recover: stop admissions (set admission rate to zero), keep waiting room alive, fail closed on reserve, and resume gradually after Redis recovers.
+
+- **Ticket Issuer overload**
+  - What happens: users can’t join; fairness collapses if we mint tickets inconsistently.
+  - Detect: join latency, error rate, counter lag.
+  - Recover: cache “queue open” pages at edge, autoscale Ticket Issuer, and prioritize *idempotent reads* (existing tickets) over new joins.
+
+- **Reservation/order mismatch (reconciliation drift)**
+  - What happens: remaining count diverges from true sellable units; risk of “phantom sold out” or stuck inventory.
+  - Detect: compare Postgres confirmed orders + active reservations vs starting inventory; alert on drift.
+  - Recover: run a bounded reconciler to recompute `remaining` from Postgres truth and reset Redis counters for the SKU.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Partition by SKU and run multiple Ticket Issuer shards (consistent hash by `sku_id`) to spread hot counters; move polling to edge KV for cheaper “position updates.”
+- **100x scale:** Make the sale control-plane a dedicated “flash sale platform”: per-SKU isolated Redis clusters, multi-region read-only waiting room with a single-region ordering authority, and strict bot gating before ticket issuance (device attestation + risk scoring) to protect fairness.
+
+## Operational Notes
+
+- Track **admission rate** as a first-class control knob; tie it to `remaining` and downstream health (payment latency, order queue depth).
+- Watch **queue abandonment** vs **reservation conversion**; tuning TTL and admission burst size usually matters more than raw capacity.
+- Protect fairness by enforcing **one ticket per account** and throttling “join” harder than “poll.”
+- Run “sold out” as a state machine: sold out means **no remaining and no reclaimable expired holds**, not “DB looks busy.”
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Treat the flash sale as **admission control + scarce reservations**, not “scale the checkout path”: a stable, server-issued queue position prevents retry-gaming, and a bounded reservation rate prevents hot-spot collapse.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| CDN/Edge | Converts 500k RPS into cached/static + cheap hits; protects origin. |
+| Waiting Room | Single public surface during spike; enforces backpressure and “one story” for users. |
+| Ticket Issuer | Creates a **stable ordering** once; eliminates retry advantage. |
+| Redis (atomic + TTL) | Correct under extreme contention for counters/holds; TTL makes expiry cheap. |
+| Postgres Orders | Durable audit + correctness backstop (uniqueness, reconciliation, reporting). |
+| Order Queue | Decouples admission from slow payment/order writes; keeps front door stable. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Separate Waiting Room + Ticket Issuer | Merge into one “Queue Service” (join/poll/admit in one place) | Fewer hops/services; slightly larger blast radius if it fails. |
+| Custom monotonic ticket via Redis `INCR` + per-user ticket key | Use Redis `SETNX ticket:{...}` with “allocate range” blocks (e.g., `INCRBY` per worker) | More throughput and less hot counter contention; slightly more complex issuer logic. |
+| Redis holds + “recycle via reconciler increment on expiry” | Recompute `remaining` periodically from source of truth (`starting - sold - active_holds`) and **treat Redis remaining as a cache** | Fewer edge-case bugs from increment-on-expiry; more read/compute cost and needs careful performance. |
+| Order Queue unspecified | Use a managed queue (SQS/Kafka) or Postgres outbox + workers | Less custom ops; may add cost/latency, and Kafka adds ops if self-managed. |
+| Admission rate as manual knob | Closed-loop controller (rate = f(redis remaining, payment p95, queue depth)) | Better automatic stability; requires careful tuning to avoid oscillation. |
+| “One ticket per account” plus device signals | Put bot gating *before join* using a managed anti-bot/attestation product | Stronger fairness protection; risk of false positives and UX friction. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Redis down for 5 minutes**
+   - Design’s answer: stop admissions; waiting room stays up; fail closed.
+   - Recommendation: Strengthen — add an explicit “sale paused, keep your place” state and ensure *poll* endpoints stay cacheable even when origin is degraded.
+
+2. **Network partition: Admission API can reach Waiting Room but not Redis**
+   - Design’s answer: implied “reserve fails closed”.
+   - Recommendation: Strengthen — require a short-lived “admission token” (signed) and only mint it when Redis is reachable; otherwise you’ll churn user turns and destroy perceived fairness.
+
+3. **Ticket Issuer overload / hot counter contention**
+   - Design’s answer: autoscale; prioritize idempotent reads.
+   - Recommendation: Strengthen — define a hard cap on new joins per second + use counter range allocation to avoid a single hot `INCR` becoming the bottleneck.
+
+4. **Bad config deploy (e.g., admission rate too high, TTL too long, wrong SKU inventory)**
+   - Design’s answer: not addressed.
+   - Recommendation: Strengthen — add guardrails: max admit/sec, max holds <= starting inventory, feature-flagged sale open/close, and “two-person” change for inventory/TTL during event.
+
+5. **One component slow-but-not-failing (payments p95 spikes)**
+   - Design’s answer: admission tied to downstream health (conceptually).
+   - Recommendation: Strengthen — specify the control signal (queue depth + payment latency) and the fail-safe behavior (rapid ramp-down, slow ramp-up) to avoid feedback oscillations.
+
+## Recommendations
+
+### Must Fix
+- Define a **single source of truth** for inventory math and make reconciliation deterministic (avoid “increment on expiry” edge cases; prefer recompute-from-facts or a clearly correct event model).
+- Prevent “burning turns”: ensure users only get admitted when the system can actually create holds (admission token tied to Redis health).
+- Clarify idempotency scope: keys for `join`, `reserve`, and `place order`, and what happens on client logout/login/device switch.
+
+### Should Consider
+- Collapse Waiting Room + Ticket Issuer into one service to reduce ops surface area (unless you have a clear org/team boundary).
+- Make the queue “honest”: expose explicit states (queued, admitted, paused, sold out) so UX remains stable during incidents.
+- Replace bespoke order queue with a managed option or Postgres outbox if the team is small and on-call load matters.
+
+### Nice to Have
+- Multi-SKU behavior: confirm whether tickets are per SKU or per sale (users will perceive unfairness if they can “queue-hop” SKUs).
+- Formalize fairness threat model (retry scripts, multi-account, device farms) and what you will/won’t stop.
+- Add chaos drills/runbooks: “Redis degraded”, “pause sale”, “recompute remaining”, “rollback config”.
+
+## What’s Working Well
+- Clear separation between **fair ordering**, **reservation correctness**, and **async finalization**.
+- Correct instinct to keep most of the system boring and concentrate complexity in two places that matter.
+- Idempotency and uniqueness constraints are treated as first-class, which is usually what saves these systems in real incidents.
+- Honest trade-off: single-region ordering authority avoids “global fairness theater” and keeps operations tractable.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+
+
+
+thinking
+**Refining document guidelines**
+
+I need to rewrite the document with a focus on minimal architecture. I can't modify title difficulty tags or add sections — I can only cut or condense. The user wants to simplify and address failure scenarios without adding new components. So, I can merge services and consider replacing the order queue with a Postgres outbox while keeping in mind that I can't introduce managed services. This involves eliminating the order queue by directly writing to Postgres instead.
+thinking
+**Optimizing inventory calculations**
+
+For deterministic inventory management, I want to steer clear of "increment on expiry" by recomputing remaining stock based on facts. I’m considering keeping Redis as a cache for active holds and ticket counters. I might treat the Redis remaining counter as derived and scan holds, but scanning many keys could be costly. So, I could ditch the remaining counter and instead use `INCR` for reservations. I still need to ensure there's no overselling, potentially utilizing atomic counts and considering Postgres as a source of truth for holds and orders. This involves some trade-offs, especially at scale.
+thinking
+**Consolidating service architecture**
+
+I’m considering simplifying the architecture by merging the Waiting Room, Ticket Issuer, Admission API, and Inventory Reserve into one service. The inventory reserve might remain a module, but I can create a "Queue & Reservation API" behind a CDN, with endpoints for joining, polling, reserving, and placing orders. Using Redis for tickets and holds, along with Postgres for orders, could streamline things. I'll need to address failure scenarios, such as Redis downtime or payment spikes, while ensuring safe behavior through configuration guardrails. A closed-loop system might help with these challenges.
+thinking
+**Navigating document constraints**
+
+I'm considering including a cron job in the service without adding a new component. To minimize complexity, I might implement both a manual control option and an automatic failsafe to pause admissions if error rates increase. I have to stick with existing headings like Overview, Key Design Decisions, and Failure Modes, which means I can't create new sections—but I can condense and modify content within those. My challenge is how to incorporate a required "What We Removed" section without technically adding a new one, as that conflicts with the format rules.
+thinking
+**Resolving section inconsistencies**
+
+I can address the requirement for a "What We Removed" section by embedding it within an existing section, like "Key Design Decisions" or "Architecture." Since I can't add sections, renaming an existing heading might be a solution, but I need to ensure it aligns with the rules about modifying titles and tags. I'll also need to combine existing sections, potentially condensing "What I'd Do Differently At..." to fit the requirement while keeping all necessary components. Balancing user requests and architectural simplicity is key!
+thinking
+**Implementing admission control**
+
+I need a solid admission control mechanism. I can use an edge waiting room approach where users receive a signed "admission token" for a reserve attempt when they're eligible. To control token issuance, I can use an atomic increment for `admissions_issued` and set an `admit_limit` based on time. Although this might create high eligibility, it should be manageable. 
+
+For inventory reservations, I’ll use Redis to track active holds but need to avoid complexities with increment-on-expiry. Instead, I could treat Redis as the truth source for holds, compensating for expiration with a periodic job actively cleaning up expired holds, ensuring this process remains deterministic.
+thinking
+**Finalizing the design document**
+
+I'll maintain a derived counter in the script while keeping things simple. Using a `remaining` counter along with `holds_zset` that has expiry makes sense. The reclaim job will increment `remaining` as it removes expired holds, but it needs to ensure that holds consumed by orders are accounted for properly. 
+
+I'll ensure Redis acts as the runtime truth for remaining counts and holds while Postgres will just record orders. To keep it simple, I'll implement periodic reconciliation. I need to prepare a final markdown design document, keeping it minimal but incorporating all simplifications and addressing failure scenarios. Additionally, I'll rename sections to meet the requirements without adding any new ones.
+thinking
+**Drafting the design document**
+
+The output format specifies that I need to include sections like "Minimal architecture," "Justification for each component," "What We Removed," and "Honest trade-offs." I can integrate the minimal architecture and justifications into the "Architecture" and "Components" sections, while trade-offs can stay in their own area.
+
+I'll simplify things by removing the signed ticket and HMAC, focusing on server-side checks for user positions, especially for authenticated users. My goal is to keep this manageable, so I'll highlight that a small team of three engineers could build this with components like CDN, Redis, and Postgres, along with implementing key states like `queued`, `admitted`, `paused`, and `sold_out`.
+codex
+```markdown
+---
+title: "Flash Sale System"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["flash-sale", "fairness", "queueing", "inventory-reservations", "backpressure"]
+---
+
+## Overview
+
+This system sells a small amount of inventory under a short, extreme traffic spike by turning the event into two controlled steps:
+
+1) Assign a stable place in line per authenticated user.
+2) Convert that turn into a time-bounded inventory hold at a safe, bounded rate.
+
+Everything else stays boring: a CDN absorbs the spike, a single API owns queue + reservation logic, Redis handles atomic counters/TTLs, and Postgres records durable orders and provides a correctness backstop.
+
+## What Makes This Hard
+
+The bottleneck is contention on a hot SKU, not CPU. If everyone can attempt “reserve” at once, retries amplify load until the system collapses.
+
+“First come, first served” is not fair under real networks. Without a stable, server-issued place in line, you reward the best retry script.
+
+## Requirements
+
+### Functional Requirements
+- **Fair queue position**: Stable per authenticated user per sale/SKU across refreshes/retries.
+- **Anti-bot fairness**: Retries don’t improve position; one ticket per account.
+- **No oversell**: Never sell beyond starting units, even under retries and partial failures.
+- **Inventory locking**: Admitted users receive a time-bounded hold that expires automatically.
+- **Idempotency end-to-end**: Retried join/reserve/place-order calls do not duplicate holds or orders.
+
+### Scale Targets
+- **Traffic**: 5k RPS normal → **500k RPS spike** for 10 minutes.
+- **Inventory**: 1–50 SKUs per drop, **100–50,000 units per SKU**.
+- **Fairness granularity**: Position assignment jitter < **~1s** under load.
+- **Reservation window**: **2–5 minutes** hold TTL.
+
+## Key Design Decisions
+
+- **We chose: One “Queue + Reservation” service**
+  - Join, poll, admission, reserve, and order placement live in one API to minimize hops and operational surface area.
+
+- **We chose: Admission tokens to prevent “burning turns”**
+  - The service only issues a short-lived admission token when Redis is reachable and the system is allowing new holds.
+  - Users keep their place in line through pauses; admission simply stops issuing tokens.
+
+- **We chose: Redis for contention, Postgres for durability**
+  - Redis does the hot-path atomic work (ticket ordering, holds with TTL).
+  - Postgres records orders with uniqueness constraints and drives deterministic reconciliation.
+
+- **We chose: Single-region ordering authority**
+  - One region assigns ordering and holds; the CDN scales reads globally.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[Users] --> C[CDN/Edge]
+  C --> S[Queue + Reservation API]
+  S --> R[(Redis)]
+  S --> P[(Postgres)]
+```
+
+### Components
+
+- **CDN/Edge**: Keeps origin alive by caching static sale pages and serving a consistent “queued/paused/sold out” experience under load.
+- **Queue + Reservation API**: The only origin entry; owns queue position, admission pacing, holds, idempotency, and order writes.
+- **Redis**: Atomic counters and hold state with TTL for the hot SKU path.
+- **Postgres**: Durable orders (and reconciliation inputs), with uniqueness constraints to prevent duplicates.
+
+## Deep Dive: Fairness + Inventory Locking (The Real Problem)
+
+**1) Fair queue tickets that retries can’t game**
+
+On `join(sale_id, sku_id)` the API does:
+- `SETNX ticket:{sale}:{sku}:{user} = position` with a TTL covering the sale.
+- If new: allocate `position` from `INCR position:{sale}:{sku}` and store it.
+- If existing: return the stored `position`.
+
+On `poll(sale_id, sku_id)` the API returns a state machine:
+- `queued` (position assigned, waiting)
+- `admitted` (an admission token is available)
+- `paused` (sale is paused, keep position)
+- `sold_out` (no remaining and no reclaimable holds)
+
+**2) Inventory reservations that never oversell**
+
+Holds are created only with a valid, short-lived admission token. The reserve script is atomic and idempotent:
+- If `idem:{reserve_key}` exists, return it.
+- If `hold:{sale}:{sku}:{user}` exists, return it.
+- If `remaining:{sale}:{sku} > 0`, decrement remaining, create `hold` with TTL (2–5 minutes), and return a hold token.
+- Else return `sold_out`.
+
+Placing an order requires the hold token and is idempotent in Postgres:
+- Insert/update order with a uniqueness constraint on `(sale_id, sku_id, user_id)` (or hold token).
+- On success, mark hold as consumed (delete hold key / prevent reuse).
+
+Inventory math is kept deterministic by periodic recompute:
+- `remaining = starting_inventory - confirmed_orders - active_holds`
+- Redis `remaining` is treated as derived state and is reset from those facts (after cleaning expired holds).
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Simple, stable perceived fairness | Global multi-region “perfect” ordering |
+| No oversell under extreme contention | Pure-Postgres strong consistency on the hot path |
+| Small-team operability | Some derived-state reconciliation work |
+| Stable systems under spikes | Waiting room latency and “paused” states |
+
+## Failure Modes
+
+- **Redis unavailable or slow**
+  - What happens: join/poll can stay up; admissions stop; holds cannot be created.
+  - Recover: enter `paused`, stop issuing admission tokens, resume gradually when Redis is healthy.
+
+- **Network partition: API can’t reach Redis**
+  - What happens: admissions stop before users are told to reserve.
+  - Recover: same as Redis-down; no “turns” are burned because admission tokens are only minted with Redis reachability.
+
+- **Ticket hot counter contention**
+  - What happens: join latency rises.
+  - Recover: cap new joins/sec, prioritize returning existing tickets, and allocate positions in blocks (`INCRBY`) per worker.
+
+- **Bad config deploy (admit rate, TTL, wrong starting inventory)**
+  - What happens: oversubscription risk or inventory stuck.
+  - Recover: hard guardrails (max admit/sec, max TTL, holds <= starting inventory), feature-flagged open/close/pause, and fast “reset remaining from facts” reconciliation.
+
+- **Payments slow-but-not-failing**
+  - What happens: holds convert slowly; users time out.
+  - Recover: rapid ramp-down on elevated reserve/order latency or error rate; slow ramp-up after recovery.
+
+## What We Removed
+
+- Separate **Waiting Room**, **Ticket Issuer**, **Admission API**, and **Inventory Reserve** services (merged into one API).
+- The separate **Order Queue** (orders are written idempotently to Postgres; background work is driven from the same system).
+- Increment-on-expiry as the inventory truth (remaining is reset from facts; drift is corrected by recompute).
+
+## Operational Notes
+
+- Keep **admission rate** as the primary knob, with a fail-safe: fast pause on rising reserve/order failures; slow resume.
+- Make join expensive and poll cheap: strict throttles on `join`, lightweight `poll` responses, and predictable user states (`queued/admitted/paused/sold_out`).
+- Track three numbers per SKU: **starting inventory**, **confirmed orders (Postgres)**, **active holds (Redis)**; derive everything else.
+```
+tokens used
+10,289
+```markdown
+---
+title: "Flash Sale System"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["flash-sale", "fairness", "queueing", "inventory-reservations", "backpressure"]
+---
+
+## Overview
+
+This system sells a small amount of inventory under a short, extreme traffic spike by turning the event into two controlled steps:
+
+1) Assign a stable place in line per authenticated user.
+2) Convert that turn into a time-bounded inventory hold at a safe, bounded rate.
+
+Everything else stays boring: a CDN absorbs the spike, a single API owns queue + reservation logic, Redis handles atomic counters/TTLs, and Postgres records durable orders and provides a correctness backstop.
+
+## What Makes This Hard
+
+The bottleneck is contention on a hot SKU, not CPU. If everyone can attempt “reserve” at once, retries amplify load until the system collapses.
+
+“First come, first served” is not fair under real networks. Without a stable, server-issued place in line, you reward the best retry script.
+
+## Requirements
+
+### Functional Requirements
+- **Fair queue position**: Stable per authenticated user per sale/SKU across refreshes/retries.
+- **Anti-bot fairness**: Retries don’t improve position; one ticket per account.
+- **No oversell**: Never sell beyond starting units, even under retries and partial failures.
+- **Inventory locking**: Admitted users receive a time-bounded hold that expires automatically.
+- **Idempotency end-to-end**: Retried join/reserve/place-order calls do not duplicate holds or orders.
+
+### Scale Targets
+- **Traffic**: 5k RPS normal → **500k RPS spike** for 10 minutes.
+- **Inventory**: 1–50 SKUs per drop, **100–50,000 units per SKU**.
+- **Fairness granularity**: Position assignment jitter < **~1s** under load.
+- **Reservation window**: **2–5 minutes** hold TTL.
+
+## Key Design Decisions
+
+- **We chose: One “Queue + Reservation” service**
+  - Join, poll, admission, reserve, and order placement live in one API to minimize hops and operational surface area.
+
+- **We chose: Admission tokens to prevent “burning turns”**
+  - The service only issues a short-lived admission token when Redis is reachable and the system is allowing new holds.
+  - Users keep their place in line through pauses; admission simply stops issuing tokens.
+
+- **We chose: Redis for contention, Postgres for durability**
+  - Redis does the hot-path atomic work (ticket ordering, holds with TTL).
+  - Postgres records orders with uniqueness constraints and drives deterministic reconciliation.
+
+- **We chose: Single-region ordering authority**
+  - One region assigns ordering and holds; the CDN scales reads globally.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[Users] --> C[CDN/Edge]
+  C --> S[Queue + Reservation API]
+  S --> R[(Redis)]
+  S --> P[(Postgres)]
+```
+
+### Components
+
+- **CDN/Edge**: Keeps origin alive by caching static sale pages and serving a consistent “queued/paused/sold out” experience under load.
+- **Queue + Reservation API**: The only origin entry; owns queue position, admission pacing, holds, idempotency, and order writes.
+- **Redis**: Atomic counters and hold state with TTL for the hot SKU path.
+- **Postgres**: Durable orders (and reconciliation inputs), with uniqueness constraints to prevent duplicates.
+
+## Deep Dive: Fairness + Inventory Locking (The Real Problem)
+
+**1) Fair queue tickets that retries can’t game**
+
+On `join(sale_id, sku_id)` the API does:
+- `SETNX ticket:{sale}:{sku}:{user} = position` with a TTL covering the sale.
+- If new: allocate `position` from `INCR position:{sale}:{sku}` and store it.
+- If existing: return the stored `position`.
+
+On `poll(sale_id, sku_id)` the API returns a state machine:
+- `queued` (position assigned, waiting)
+- `admitted` (an admission token is available)
+- `paused` (sale is paused, keep position)
+- `sold_out` (no remaining and no reclaimable holds)
+
+**2) Inventory reservations that never oversell**
+
+Holds are created only with a valid, short-lived admission token. The reserve script is atomic and idempotent:
+- If `idem:{reserve_key}` exists, return it.
+- If `hold:{sale}:{sku}:{user}` exists, return it.
+- If `remaining:{sale}:{sku} > 0`, decrement remaining, create `hold` with TTL (2–5 minutes), and return a hold token.
+- Else return `sold_out`.
+
+Placing an order requires the hold token and is idempotent in Postgres:
+- Insert/update order with a uniqueness constraint on `(sale_id, sku_id, user_id)` (or hold token).
+- On success, mark hold as consumed (delete hold key / prevent reuse).
+
+Inventory math is kept deterministic by periodic recompute:
+- `remaining = starting_inventory - confirmed_orders - active_holds`
+- Redis `remaining` is treated as derived state and is reset from those facts (after cleaning expired holds).
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Simple, stable perceived fairness | Global multi-region “perfect” ordering |
+| No oversell under extreme contention | Pure-Postgres strong consistency on the hot path |
+| Small-team operability | Some derived-state reconciliation work |
+| Stable systems under spikes | Waiting room latency and “paused” states |
+
+## Failure Modes
+
+- **Redis unavailable or slow**
+  - What happens: join/poll can stay up; admissions stop; holds cannot be created.
+  - Recover: enter `paused`, stop issuing admission tokens, resume gradually when Redis is healthy.
+
+- **Network partition: API can’t reach Redis**
+  - What happens: admissions stop before users are told to reserve.
+  - Recover: same as Redis-down; no “turns” are burned because admission tokens are only minted with Redis reachability.
+
+- **Ticket hot counter contention**
+  - What happens: join latency rises.
+  - Recover: cap new joins/sec, prioritize returning existing tickets, and allocate positions in blocks (`INCRBY`) per worker.
+
+- **Bad config deploy (admit rate, TTL, wrong starting inventory)**
+  - What happens: oversubscription risk or inventory stuck.
+  - Recover: hard guardrails (max admit/sec, max TTL, holds <= starting inventory), feature-flagged open/close/pause, and fast “reset remaining from facts” reconciliation.
+
+- **Payments slow-but-not-failing**
+  - What happens: holds convert slowly; users time out.
+  - Recover: rapid ramp-down on elevated reserve/order latency or error rate; slow ramp-up after recovery.
+
+## What We Removed
+
+- Separate **Waiting Room**, **Ticket Issuer**, **Admission API**, and **Inventory Reserve** services (merged into one API).
+- The separate **Order Queue** (orders are written idempotently to Postgres; background work is driven from the same system).
+- Increment-on-expiry as the inventory truth (remaining is reset from facts; drift is corrected by recompute).
+
+## Operational Notes
+
+- Keep **admission rate** as the primary knob, with a fail-safe: fast pause on rising reserve/order failures; slow resume.
+- Make join expensive and poll cheap: strict throttles on `join`, lightweight `poll` responses, and predictable user states (`queued/admitted/paused/sold_out`).
+- Track three numbers per SKU: **starting inventory**, **confirmed orders (Postgres)**, **active holds (Redis)**; derive everything else.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/06-commerce-fintech/flash-sale-system.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Flash Sale System
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/flash-sale-system.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/flash-sale-system.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/06-commerce-fintech/flash-sale-system.md

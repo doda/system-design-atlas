@@ -1,0 +1,1371 @@
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2a08-bb03-7690-bbf7-ef7bdfd8446f
+--------
+user
+# System Design Simplifier
+
+You are a pragmatic Staff Engineer who believes the best systems are the simplest ones that meet the requirements. Your job is to produce a clean, minimal design.
+
+## Your Task
+
+Take the input design and produce a **polished, standalone solution document** with a simpler architecture. The output should read as a complete, confident solution - not as a critique or comparison to something more complex.
+
+**Important**:
+- Do NOT modify the title, difficulty, or tags unless the simplification fundamentally changes the problem scope.
+- Do NOT use argumentative language like "We don't need X" or "Instead of X, use Y".
+- DO present the simplified design as THE design, written fresh. The reader has never seen the complex version.
+
+For every component, service, database, cache, queue, or dependency in the input, ask yourself:
+
+1. **Do we actually need this?** What breaks if we remove it?
+2. **Can we merge this with something else?** Two services doing related things → one service
+3. **Can we use a simpler alternative?** Kafka → Redis streams? Cassandra → Postgres? Microservice → library?
+4. **Are we over-engineering for scale we don't have?** Start simple, scale later
+5. **Is this dependency worth the operational cost?** Every new technology = on-call burden
+
+## Simplification Principles
+
+### Remove Before You Add
+- Question every cache layer - do we need it at this scale?
+- Question every queue - can we use synchronous calls?
+- Question every separate service - can it be a library or module?
+- Question every "scalable" database - would Postgres work?
+
+### Merge When Possible
+- Combine services that always deploy together
+- Use one database instead of three specialized ones
+- Use existing infrastructure before adding new
+
+### Challenge Complexity
+- "Eventually consistent" → Can we just use strong consistency?
+- "Sharded across regions" → Do we need multi-region yet?
+- "Event-driven architecture" → Would request/response be simpler?
+- "Microservices" → Would a modular monolith work?
+
+### Keep What's Essential
+- Don't remove things that are genuinely needed for correctness
+- Keep redundancy that's required for the stated availability target
+- Keep components that handle genuinely different scaling dimensions
+
+## Output Format
+
+Return the **complete, simplified document** with:
+
+1. **Simplified architecture** - Fewer boxes in the diagram
+2. **Merged components** - Combine where possible
+3. **Removed dependencies** - Cut unnecessary tech
+4. **Justified complexity** - What remains should have clear reasons
+
+For each major simplification, briefly note what was removed/merged and why it's acceptable.
+
+Add a "## Simplification Notes" section at the end listing:
+- What was removed and why
+- What was merged and why
+- What complexity remains and why it's necessary
+
+Do NOT add other commentary - just output the simplified document.
+
+---
+
+## Document to Simplify
+
+```markdown
+---
+title: "Global Rate Limiter"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["rate-limiting", "distributed-systems", "edge", "token-bucket", "gcra", "multi-region"]
+---
+
+## Overview
+
+A **global rate limiter** enforces per-principal quotas (API key / user ID / IP / CIDR) across many geographic regions while keeping request-path latency low at the edge. The central tension is:
+
+- **Correctness**: don’t exceed contractual or safety limits
+- **Performance/availability**: don’t add cross-region RTTs to every request
+- **Operability**: handle hot keys, uneven traffic, partial failures, and fast-changing policies
+
+A production-grade approach treats “global rate limiting” as **bounded-consistency enforcement**: decisions are made locally using **regional token leases** issued by a global authority. This avoids per-request cross-region calls while bounding overshoot during partitions and degraded modes.
+
+---
+
+## Requirements
+
+### Functional Requirements
+- Enforce limits by principal:
+  - `API_KEY`, `USER_ID`, `IP`, `CIDR` (with configurable precedence, e.g., `API_KEY` first, then `IP`)
+- Support policy types:
+  - **Throughput**: requests/second, requests/minute (token bucket or GCRA)
+  - **Burst**: allow short bursts up to a configured cap
+  - **Concurrency**: max in-flight requests (semaphore-style)
+- Support multi-dimensional rules (a “descriptor set”), e.g.:
+  - endpoint/method, customer tier, product, region overrides, and emergency blocks
+- Deterministic outcomes per evaluation:
+  - `ALLOW` or `DENY`, `retry_after_ms`, and standard rate limit response headers
+- Administrative APIs:
+  - CRUD policies, principal overrides, disable/enable keys, emergency blocklists
+  - staged rollout modes: `SHADOW` → `ENFORCE` with canaries and rollback
+- Observability:
+  - allow/deny counts, top offenders, hot keys, rule history, and debugging traces
+- Batch evaluation:
+  - evaluate multiple descriptors per request (gateway integration)
+
+### Non-Functional Requirements
+
+#### Scale (Targets)
+- Footprint: **30+ regions**, **300+ edge POPs**
+- Global peak decision volume: **5M decisions/sec** (steady 1–2M/sec)
+- Principals: **up to 100M** (long tail + hot keys)
+- Active policies: **~1M**, updates **~10K/day** (bursty during incidents)
+
+Reality check (why feasible):
+- If **95–99%** of decisions are served from **edge L1**, regional systems see a small fraction of global QPS.
+- Hot keys are the dominating factor; the design must explicitly optimize for them.
+
+#### Latency (Request Path)
+- Edge L1 decision: **P50 0.2 ms**, **P99 ≤ 1 ms**
+- Edge → regional (same region) refill: **P99 5–10 ms** (rare)
+- Cross-region coordination: **never on critical path**; lease maintenance is out-of-band with **P99 150–300 ms** acceptable
+
+#### Availability / Isolation
+- Request-path decisioning: **99.99%** per region (regional isolation)
+- Control plane (policy CRUD/publish): **99.9%**
+- Blast radius principle: a single region failure should not cause global outage
+
+#### Consistency Model
+- **Strong** for policy publication/versioning (no split-brain rules)
+- **Bounded eventual** for global quotas:
+  - small overshoot is acceptable and explicitly bounded by outstanding leases
+  - during partitions, enforcement degrades in a controlled way
+
+#### Durability
+- Policy data: **RPO ≤ 1 minute**, **RTO ≤ 15 minutes**
+- Buckets/counters: **ephemeral is acceptable**, but restarts must not cause widespread false-deny
+
+### Constraints & Assumptions
+- Deployed behind an API gateway / edge proxy (e.g., Envoy/Nginx/Cloud LB)
+- Inter-region networking has high latency and occasional partitions
+- Prefer stateless edge components + regional data stores
+- Minimize PII; IPs may be truncated/hashed; configurable retention for analytics (e.g., 7–30 days)
+- Small platform team: operational simplicity is a first-class goal
+
+---
+
+## Architecture
+
+### Key Concepts (Terminology)
+- **Principal**: the identity being limited (API key, user ID, IP, CIDR)
+- **Descriptor set**: the dimensions for a decision (e.g., `endpoint=/v1/payments`, `method=POST`, `tier=premium`)
+- **Policy snapshot**: an immutable, versioned policy bundle consumed by data-plane components
+- **Lease**: a time-bounded grant of tokens to a region for `(policy_id, principal, descriptor_hash)` (or a coarser key if desired)
+
+### High-Level Component Diagram
+
+```mermaid
+graph TB
+  subgraph CL[Client Layer]
+    C[Clients / SDKs]
+  end
+
+  subgraph EL[Edge Layer (per POP)]
+    GW[API Gateway / Edge Proxy]
+    RL[Rate Limiter Filter / Library]
+    L1[(L1 In-Memory Buckets)]
+  end
+
+  subgraph RLAYER[Regional Layer (per Region)]
+    RLS[Regional Rate Limit Service]
+    RKV[(Regional KV: Redis/KeyDB Cluster)]
+    SUB[Policy Subscriber + Snapshot Cache]
+  end
+
+  subgraph CP[Global Control Plane]
+    PS[Policy Service]
+    PDB[(Policy DB: Postgres/Spanner)]
+    BUS[Pub/Sub or Kafka]
+    TC[Token Lease Coordinator]
+    LDB[(Lease State DB: Spanner/FDB/DynamoDB+CAS)]
+  end
+
+  subgraph OBS[Observability]
+    MET[Metrics/Tracing]
+    LOG[Decision Logs Stream]
+    ANA[(Analytics Store)]
+  end
+
+  C --> GW --> RL --> L1
+  RL -->|cold start / lease depleted| RLS --> RKV
+  PS --> PDB
+  PS --> BUS
+  BUS --> RL
+  BUS --> SUB
+  SUB --> RLS
+  RLS -->|out-of-band lease reserve| TC --> LDB
+  RL --> MET
+  RLS --> MET
+  RL --> LOG --> ANA
+```
+
+### Request/Data Flow (Critical Path)
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Client
+  participant Edge as Edge RL
+  participant RLS as Regional RLS
+  participant Redis as Regional Redis
+
+  Client->>Edge: HTTP request (principal + descriptors)
+  Edge->>Edge: policy match + L1 bucket check
+  alt L1 has tokens
+    Edge-->>Client: ALLOW (200/2xx) + rate headers
+  else L1 miss / lease depleted
+    Edge->>RLS: CheckAndConsume(principal, descriptors, policy_version)
+    RLS->>Redis: Atomic consume/refill (script)
+    Redis-->>RLS: ALLOW/DENY + retry_after_ms + remaining
+    RLS-->>Edge: decision
+    Edge-->>Client: ALLOW or DENY (429/403) + rate headers
+  end
+```
+
+### Lease Maintenance Flow (Not on Request Path)
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant RLS as Regional RLS
+  participant TC as Token Coordinator
+  participant LDB as Lease DB
+
+  RLS->>RLS: Detect low regional lease watermark (async)
+  RLS->>TC: Reserve(policy, principal, region, desired_tokens)
+  TC->>LDB: CAS update lease row(s)
+  LDB-->>TC: success + granted_tokens + expiry
+  TC-->>RLS: granted lease
+  RLS->>RLS: Update regional budget (Redis metadata)
+```
+
+---
+
+## Components
+
+### Edge Rate Limiter (Gateway Filter / Library)
+**Responsibilities**
+- Match policy(ies) for the request descriptor set
+- Make fast ALLOW/DENY decisions from L1 buckets when possible
+- Attach:
+  - `retry_after_ms`
+  - `RateLimit-*` response headers (RFC 9333) for client friendliness
+- Emit minimal telemetry; avoid per-request logging overhead
+
+**Key Decisions**
+- **Token bucket or GCRA** over fixed windows:
+  - reduces boundary spikes and is easier to reason about
+- **Two-tier state**:
+  - L1 (per-process) for ultra-low latency
+  - regional shared state for refill and convergence
+
+**Hot-key protections (edge)**
+- **Single-flight** refill per key (collapse many misses into one regional call)
+- **Local burst cushion** (small per-key buffer) to absorb microbursts without hammering Redis/RLS
+- **Backpressure** for abusive keys (limit refill concurrency per key)
+
+---
+
+### Regional Rate Limit Service (RLS)
+**Responsibilities**
+- Provide regional decisioning when edge L1 is missing/empty
+- Perform atomic consume/refill in regional KV
+- Maintain (async) regional budgets/leases for “global” policies
+- Implement idempotency/deduplication for gateway retries
+
+**Why a service instead of direct Redis from edge**
+- centralizes scripts, policies, and safety controls
+- reduces client complexity across many gateway types
+- provides a place for adaptive lease sizing and hot-key shaping
+
+**Regional KV choice**
+- Redis/KeyDB cluster with replication and failover
+- atomic consume via script/function to avoid race conditions
+
+---
+
+### Token Lease Coordinator (Global)
+**Responsibilities**
+- Allocate global quotas into **regional leases** so regions can decide locally
+- Enforce invariants for global limits (bounded overshoot)
+- Rebalance when traffic shifts (regions become hot/cold)
+
+**Lease model (practical defaults)**
+- Lease TTL: **10–60s**
+- Desired lease size:
+  - hot keys: larger leases (e.g., 1–5 seconds worth) to reduce coordinator churn
+  - cold keys: small leases (e.g., 10–100 tokens) to reduce overshoot and wasted grants
+- Hard safety cap: maximum outstanding tokens per principal/policy across all regions
+
+**Bounded overshoot intuition**
+- If the coordinator ensures `sum(outstanding_leases) ≤ global_limit_per_window + buffer`,
+  then worst-case overshoot is bounded by outstanding leases plus in-flight requests during partitions.
+
+---
+
+### Policy Service (Control Plane)
+**Responsibilities**
+- CRUD policies and principal overrides
+- Validate configs (syntax + semantic validation + safety limits)
+- Publish immutable, versioned snapshots
+- Rollout management: shadow/canary/full, fast rollback
+
+**Distribution**
+- **Push** via pub/sub for speed
+- **Pull** periodic snapshot fetch for resilience to missed events
+- Data-plane caches are always usable with last-known-good snapshot
+
+---
+
+### Telemetry & Analytics
+**Goals**
+- Debugging and forensics (why was this request denied?)
+- Capacity planning and abuse detection
+- Confidence during rollout (shadow vs enforce)
+
+**Practical logging approach**
+- Always record denial samples at high rate (often 100%)
+- Sample allow decisions aggressively (e.g., 0.01–1%) and aggregate at edge/region
+- Separate “security signals” pipeline (blocklists, anomalies) from general analytics
+
+---
+
+## Algorithms & Semantics
+
+### Token Bucket (Throughput + Burst)
+- Parameters: `rate` (tokens/sec), `burst` (max tokens)
+- Each request consumes `cost` tokens (usually 1; can vary by endpoint)
+- `retry_after_ms` is computed from deficit:
+  - `retry_after = ceil((cost - available_tokens) / rate)`
+
+**Pros**: intuitive burst control  
+**Cons**: requires storing tokens + last_refill time
+
+### GCRA (Smoother Rate)
+- Models a “theoretical arrival time” (TAT)
+- Often yields smoother pacing and simple arithmetic
+
+**Pros**: stable pacing; good for per-second limits  
+**Cons**: less intuitive burst tuning than token bucket (but supported)
+
+### Concurrency Limits
+- Use a semaphore per principal/dimension:
+  - increment on request start, decrement on completion
+- Requires reliable completion signals; gateways should emit completion even on errors/timeouts
+
+**Common choice**: enforce concurrency regionally (not globally) unless absolutely required.
+
+---
+
+## Data Model
+
+### Policy Storage (Strong Consistency)
+
+**Tables (logical)**
+- `policies`
+  - `policy_id` (UUID, PK)
+  - `name`
+  - `scope_type` (`API_KEY|USER|IP|CIDR|CUSTOM`)
+  - `matchers` (structured rules for descriptors; avoid regex-only systems)
+  - `algorithm` (`TOKEN_BUCKET|GCRA|CONCURRENCY`)
+  - `rate` (tokens/sec) and/or `period_ms` + `limit`
+  - `burst`
+  - `cost_rules` (optional: cost by endpoint/method)
+  - `mode` (`ENFORCE|SHADOW|DISABLED`)
+  - `priority` (tie-breaker)
+  - `created_at`, `updated_at`
+
+- `policy_versions`
+  - `policy_id` + `version` (PK)
+  - `snapshot_blob` (protobuf/JSON)
+  - `published_at`, `published_by`
+  - `checksum` (integrity, cache validation)
+
+- `principal_overrides`
+  - `principal_id` (hashed)
+  - `policy_id`
+  - `override_fields` (rate/burst/mode/expiry)
+  - `expires_at`
+
+**Snapshot rule**
+- Data plane consumes snapshots only; no request-path DB reads.
+
+### Lease State (Global Authority)
+
+- `token_leases`
+  - `lease_key` (PK: hash(policy_id + principal_id + region + descriptor_hash))
+  - `policy_id`, `principal_id`, `region`, `descriptor_hash`
+  - `granted_tokens_total`
+  - `consumed_tokens_total`
+  - `lease_expires_at_ms`
+  - `version` (CAS)
+
+**Invariant**
+- Coordinator uses CAS to prevent double-grant and to maintain outstanding token bounds.
+
+### Regional KV (Ephemeral)
+
+**Bucket key**
+- `bucket:{policy_id}:{principal_hash}:{descriptor_hash}`
+
+**Value**
+- `tokens` (float/int)
+- `last_refill_ms` (int64; use monotonic clock source where possible)
+- `policy_version` (int)
+- `idempotency_cache` (separate keys; see below)
+
+### Idempotency / Deduplication (Regional)
+To avoid double-consumption on gateway retries:
+- Key: `dedupe:{request_id}:{policy_id}:{principal_hash}:{descriptor_hash}`
+- Value: decision + token delta
+- TTL: **5–30 seconds** (must exceed typical retry window)
+
+---
+
+## API Design
+
+### Decision API (gRPC Recommended)
+
+**Service**
+- `RateLimitService.Check`
+
+**Request fields**
+- `request_id` (required; UUID)
+- `principal` (oneof: api_key_hash/user_id_hash/ip_hash/cidr_hash)
+- `region` (string)
+- `descriptors` (repeated key/value; canonicalized ordering)
+- `policy_snapshot_version` (optional; helps detect stale data plane)
+
+**Response fields**
+- `decision` (`ALLOW|DENY`)
+- `retry_after_ms` (0 if allow)
+- `policy_id_applied`
+- `policy_version`
+- `headers` (map)
+
+**Standard HTTP headers (recommended)**
+- `Retry-After` (seconds; for 429 compatibility)
+- `RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset` (RFC 9333)
+- Optional: `RateLimit-Policy` (human-readable policy summary)
+
+### Policy APIs (REST, Control Plane)
+- `POST /v1/policies`
+- `PUT /v1/policies/{policy_id}` (creates new draft version)
+- `POST /v1/policies/{policy_id}:publish?version=...`
+- `POST /v1/policies/{policy_id}:rollback?version=...`
+- `GET /v1/snapshots/{snapshot_id}` (immutable)
+- `POST /v1/overrides` (principal override with expiry)
+- `POST /v1/emergency:block` (fast blocklist path with audit)
+
+### Internal Lease API (Coordinator)
+- `TokenCoordinator.Reserve(policy_id, principal_id, region, descriptor_hash, desired_tokens, min_tokens, now_ms)`
+- Coordinator returns `(granted_tokens, lease_expires_at_ms, version)`
+
+---
+
+## Scaling & Performance
+
+### Capacity Planning (Back-of-the-Envelope)
+- Global peak: **5M decisions/sec**
+- Assume **98%** edge L1 hit rate:
+  - Regional path: **100K decisions/sec** total
+  - Per region (30 regions) average: **~3.3K/sec** (peaks much higher)
+- A single hot principal can be **100K–1M QPS** globally:
+  - must be handled with:
+    - larger leases
+    - per-key single-flight
+    - per-key concurrency limits on refills
+
+### Bottlenecks & Mitigations
+- **Hot principals → Redis hot shards**
+  - adaptive lease sizing (bigger leases for hot keys)
+  - use hash tags / stable hashing to keep per-key locality predictable
+  - consider per-hot-key “microsharding” only if necessary (complexity trade-off)
+- **Coordinator churn during restarts**
+  - jitter lease renewals
+  - warm-start: keep small pre-grants per region for common tiers
+  - exponential backoff + request coalescing for lease reserves
+- **Policy update storms**
+  - snapshots are immutable and cached
+  - pub/sub only delivers pointers; bulk snapshot download is CDN-backed
+
+### Caching Strategy
+- **Policy cache**
+  - edge + RLS keep latest snapshot in memory
+  - pub/sub invalidation + periodic pull (e.g., every 60s)
+- **Bucket cache (L1)**
+  - TTL: 5–30s; size cap (e.g., 100K–1M entries per instance depending on memory)
+  - store only hot keys; long tail falls back to RLS
+- **Negative caching**
+  - cache “no policy matched” briefly (e.g., 1–5s) to reduce repeated matcher work
+
+### Consistency and Overshoot Controls
+- Lease TTL small (10–60s)
+- Cap outstanding tokens per principal/policy (global safety belt)
+- Conservative defaults for cold keys; expand leases only when sustained demand is observed
+- Post-incident reconciliation is analytic (not request-path): quantify overshoot per tenant and tune caps
+
+---
+
+## Trade-offs & Alternatives
+
+### Key Trade-offs
+1. **Token leasing for global limits**
+   - Gain: no per-request cross-region calls; low latency; regional isolation
+   - Cost: bounded overshoot during partitions; more complex coordinator logic
+2. **Redis/KeyDB ephemeral state**
+   - Gain: high throughput, low latency, atomic scripts
+   - Cost: counters are not durable; requires careful fail-open/closed choices
+3. **Snapshot-based policy distribution**
+   - Gain: no request-path DB dependency; easy rollback; consistent policy bundles
+   - Cost: extra machinery (pub/sub + snapshot store + cache invalidation)
+
+### Alternatives (When to Use)
+- **Single global strongly-consistent counter**
+  - Use when limits must be exact and QPS is low, or clients are single-region
+  - Expect higher latency and lower availability under regional failures
+- **CRDT-based counters**
+  - Use when you accept larger overshoot and want to avoid a central coordinator
+  - Added complexity and convergence behavior can be difficult to explain/operate
+- **Edge-only local limits**
+  - Use for “best-effort fairness” but not contractual global quotas
+  - Tenants can exceed limits by spreading traffic across regions
+
+---
+
+## Failure Modes & Mitigations
+
+### Failure Scenarios (Examples)
+1. **Regional Redis degradation or shard failure**
+   - Impact: increased regional denies/timeouts; elevated tail latency
+   - Mitigation: replicas + failover, circuit breakers, degrade to L1-only for a short window, protect hot keys with local cushion
+
+2. **Token Coordinator unavailable**
+   - Impact: leases can’t be renewed; global policies eventually become stricter (deny more) or looser (if fail-open)
+   - Mitigation: use existing leases until expiry; configurable emergency regional budget (bounded); aggressive alerting and autoscaling
+
+3. **Cross-region partition / isolated region**
+   - Impact: isolated region keeps spending its remaining leases; global overshoot risk increases but is bounded
+   - Mitigation: short lease TTLs, conservative outstanding caps, prioritize renewals when connectivity returns
+
+4. **Bad policy publish (misconfiguration)**
+   - Impact: widespread throttling or unthrottled abuse
+   - Mitigation: validation, shadow mode, canary rollout, one-click rollback to prior snapshot, guardrails (max deny % per tenant during rollout)
+
+5. **Clock skew (subtle but common)**
+   - Impact: incorrect refill timing → false-deny or false-allow
+   - Mitigation: use monotonic clocks for interval math; treat wall clock only as metadata; enforce NTP; detect skew via metrics
+
+### Disaster Recovery
+- Control plane:
+  - RTO **≤ 15 minutes**, RPO **≤ 1 minute** (replication + PITR backups)
+- Data plane:
+  - continues regionally using last-known policies and remaining leases
+- Backups:
+  - Policy DB: continuous WAL + daily snapshots + PITR
+  - Lease DB: PITR if supported; otherwise leases are reconstructible (ephemeral) but bounded by caps
+
+---
+
+## Operations
+
+### SLOs (Suggested)
+- Edge decision latency: P99 **≤ 1 ms**
+- Regional refill latency (when used): P99 **≤ 10 ms**
+- Decision availability (per region): **99.99%**
+- Policy publish propagation:
+  - P99 **≤ 30s** to all regions (push + pull)
+
+### Monitoring & Alerting
+Key metrics:
+- `rl_decisions_total{region,policy_id,decision}`
+- `rl_latency_ms_bucket{component=edge|rls}`
+- `rl_l1_hit_ratio{region}`
+- `redis_script_latency_ms`, `redis_errors_total`, `redis_evictions_total`
+- `lease_reserve_latency_ms`, `lease_reserve_failures_total`
+- `policy_snapshot_staleness_seconds{region}`
+
+Alerts (examples):
+- Edge P99 > 2 ms for 5 minutes (page if sustained)
+- Deny rate spike > 3× baseline per tenant/policy
+- Redis error rate > 1% or failover events
+- Lease reserve failures > 0.5% for 5 minutes
+- Policy snapshot staleness > 120s in any region
+
+### Deployment & Rollouts
+- Data plane (edge/RLS): rolling deploy with canaries per region
+- Lua/scripts: versioned; RLS supports N and N-1 script versions during rollout
+- Policy changes:
+  - `SHADOW` first (log would-deny), then canary tenants, then full rollout
+  - rollback by switching “latest snapshot pointer”
+
+### Fail-open vs Fail-closed (Per Policy)
+- Default **fail-open** for general user traffic to preserve availability
+- Default **fail-closed** for:
+  - authentication endpoints
+  - abuse-prone operations (e.g., signup, password reset, card testing vectors)
+- Enforce explicit policy ownership and review for fail-closed rules (blast radius risk)
+
+---
+
+## References & Further Reading
+- Envoy Global Rate Limiting: https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/other_features/global_rate_limiting
+- RateLimit response headers (RFC 9333): https://www.rfc-editor.org/rfc/rfc9333
+- Token Bucket: https://en.wikipedia.org/wiki/Token_bucket
+- GCRA: https://en.wikipedia.org/wiki/Generic_cell_rate_algorithm
+- Redis rate limiting patterns: https://redis.io/docs/latest/develop/use/patterns/rate-limiting/
+- Google SRE Workbook (overload control): https://sre.google/workbook/
+- Cloudflare Rate Limiting (real-world edge constraints): https://developers.cloudflare.com/waf/rate-limiting/
+```
+
+---
+
+Output the complete, simplified document now.
+mcp startup: no servers
+codex
+```markdown
+---
+title: "Global Rate Limiter"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["rate-limiting", "distributed-systems", "edge", "token-bucket", "gcra", "multi-region"]
+---
+
+## Overview
+
+A **global rate limiter** enforces per-principal quotas (API key / user ID / IP / CIDR) across many geographic regions with low edge latency and regional fault isolation. The design makes decisions locally at the edge using a small, time-bounded **regional budget** for each key and refills those budgets asynchronously. This keeps cross-region coordination off the request path while bounding overshoot during partitions.
+
+---
+
+## Requirements
+
+### Functional Requirements
+- Enforce limits by principal:
+  - `API_KEY`, `USER_ID`, `IP`, `CIDR` (with configurable precedence, e.g., `API_KEY` then `IP`)
+- Support policy types:
+  - **Throughput**: requests/second, requests/minute (token bucket or GCRA)
+  - **Burst**: short bursts up to a configured cap
+  - **Concurrency**: max in-flight requests (semaphore-style)
+- Support multi-dimensional rules (descriptor sets), e.g.:
+  - endpoint/method, customer tier, product, region overrides, emergency blocks
+- Deterministic outcomes per evaluation:
+  - `ALLOW` or `DENY`, `retry_after_ms`, and standard rate limit response headers
+- Administrative APIs:
+  - CRUD policies, principal overrides, disable/enable keys, emergency blocklists
+  - staged rollout: `SHADOW` → `ENFORCE` with canaries and rollback
+- Observability:
+  - allow/deny counts, hot keys, rule history, and debugging traces
+- Batch evaluation:
+  - evaluate multiple descriptors per request (gateway integration)
+
+### Non-Functional Requirements
+
+#### Scale (Targets)
+- Footprint: **30+ regions**, **300+ edge POPs**
+- Global peak decision volume: **5M decisions/sec** (steady 1–2M/sec)
+- Principals: **up to 100M**
+- Active policies: **~1M**, updates **~10K/day**
+
+#### Latency (Request Path)
+- Edge decision: **P50 0.2 ms**, **P99 ≤ 1 ms**
+- Edge → regional refill: **P99 5–10 ms** (rare)
+- Cross-region coordination: **never on critical path**; async maintenance **P99 150–300 ms** acceptable
+
+#### Availability / Isolation
+- Request-path decisioning: **99.99%** per region
+- Control plane (policy CRUD/publish): **99.9%**
+- A single region failure should not cause global outage
+
+#### Consistency Model
+- **Strong** for policy publication/versioning
+- **Bounded eventual** for global quotas (overshoot bounded by regional budgets)
+
+#### Durability
+- Policy data: **RPO ≤ 1 minute**, **RTO ≤ 15 minutes**
+- Buckets/counters: **ephemeral acceptable**, restarts must avoid widespread false-deny
+
+### Constraints & Assumptions
+- Deployed behind an API gateway / edge proxy (e.g., Envoy/Nginx/Cloud LB)
+- Inter-region networking has high latency and occasional partitions
+- Prefer stateless edge components + regional data stores
+- Minimize PII; IPs may be truncated/hashed; configurable retention for analytics (e.g., 7–30 days)
+- Small platform team: operational simplicity is a first-class goal
+
+---
+
+## Simplified Architecture
+
+This system uses:
+- An **edge rate limiter** (library/filter) with an in-process L1 cache for microsecond decisions.
+- A **regional rate limit service** that owns atomic counter updates and regional budget management.
+- A **single Postgres-backed control plane** that stores policies, publishes immutable snapshots, and coordinates regional budgets for global limits.
+- Standard metrics/tracing plus sampled decision logs for debugging and abuse analysis.
+
+### High-Level Component Diagram
+
+```mermaid
+graph TB
+  subgraph EL[Edge Layer (per POP)]
+    GW[API Gateway / Edge Proxy]
+    RL[Rate Limiter Filter / Library]
+    L1[(L1 In-Memory Buckets)]
+  end
+
+  subgraph RLAYER[Regional Layer (per Region)]
+    RLS[Regional Rate Limit Service]
+    RKV[(Regional KV: Redis/KeyDB)]
+    SC[Snapshot Cache (in RLS)]
+  end
+
+  subgraph CP[Global Control Plane]
+    CPS[Control Plane Service (Policies + Budget Coordinator)]
+    PDB[(Postgres: policies + snapshots + budget state)]
+  end
+
+  subgraph OBS[Observability]
+    MET[Metrics/Tracing]
+    LOG[Sampled Decision Logs]
+    ANA[(Analytics Store)]
+  end
+
+  GW --> RL --> L1
+  RL -->|L1 miss / budget low| RLS --> RKV
+  CPS --> PDB
+  CPS -->|publish snapshots| RLS
+  RL --> MET
+  RLS --> MET
+  RL --> LOG --> ANA
+  RLS --> LOG --> ANA
+```
+
+---
+
+## Request and Maintenance Flows
+
+### Request Path (Critical)
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Client
+  participant Edge as Edge RL
+  participant RLS as Regional RLS
+  participant Redis as Regional Redis
+
+  Client->>Edge: HTTP request (principal + descriptors)
+  Edge->>Edge: policy match + L1 bucket check
+  alt L1 has tokens
+    Edge-->>Client: ALLOW + headers
+  else L1 miss / low budget
+    Edge->>RLS: CheckAndConsume(principal, descriptors, snapshot_version)
+    RLS->>Redis: Atomic consume/refill (script)
+    Redis-->>RLS: ALLOW/DENY + retry_after_ms + remaining
+    RLS-->>Edge: decision
+    Edge-->>Client: ALLOW or DENY + headers
+  end
+```
+
+### Background (Out of Band)
+
+- **Policy distribution**: control plane publishes versioned snapshots; regions poll as a backstop.
+- **Regional budget refresh**: RLS periodically requests budget top-ups for hot keys; control plane grants budgets with TTL and caps to bound overshoot.
+
+---
+
+## Components
+
+### Edge Rate Limiter (Gateway Filter / Library)
+**Responsibilities**
+- Match policy(ies) for the request descriptor set using the latest snapshot
+- Fast ALLOW/DENY from L1 buckets when possible
+- Attach:
+  - `retry_after_ms`
+  - RFC 9333 `RateLimit-*` headers (+ `Retry-After` for 429 compatibility)
+- Emit lightweight telemetry
+
+**Hot-key protections**
+- Single-flight regional refill per key (collapse concurrent misses)
+- Per-key refill concurrency limits to prevent stampedes
+- Small local burst cushion for microbursts (kept conservative to limit overshoot)
+
+---
+
+### Regional Rate Limit Service (RLS)
+**Responsibilities**
+- Serve edge misses with low latency
+- Perform atomic consume/refill in regional Redis (token bucket / GCRA / concurrency)
+- Maintain a per-key **regional budget** for global policies (spent locally, refreshed asynchronously)
+- Provide idempotency/deduplication for gateway retries
+- Cache and serve policy snapshots locally (last-known-good)
+
+**Regional data store**
+- Redis/KeyDB cluster with replication and failover
+- Atomic operations via Lua/script/functions to avoid race conditions
+
+---
+
+### Control Plane Service (Policies + Budget Coordinator)
+**Responsibilities**
+- CRUD policies, overrides, emergency blocks
+- Validate configs and enforce safety guardrails
+- Publish immutable, versioned policy snapshots
+- Coordinate **regional budgets** for global limits:
+  - grant time-bounded budgets per `(policy, principal, descriptor_hash, region)`
+  - enforce caps on total outstanding budgets to bound overshoot
+  - adapt budget sizing for hot keys vs cold keys
+- Support rollout management: `SHADOW` → canary → `ENFORCE`, plus rollback to prior snapshot
+
+**Storage**
+- Postgres as the single durable store for:
+  - policies + versions + snapshots
+  - budget state (leases/budgets with TTL and CAS/versioning)
+
+This keeps the system to one primary database technology while still supporting strong consistency for policy publication and controlled global enforcement.
+
+---
+
+### Telemetry & Analytics
+**Goals**
+- Debugging (why was a request denied?)
+- Abuse detection and capacity planning
+- Rollout confidence (shadow vs enforce)
+
+**Logging approach**
+- High-rate denial logging (often 100%)
+- Aggressive sampling for allows with aggregation
+- Separate retention policy for security signals vs general analytics
+
+---
+
+## Algorithms & Semantics
+
+### Throughput + Burst (Token Bucket)
+- Parameters: `rate` (tokens/sec), `burst` (max tokens)
+- Each request consumes `cost` tokens (default 1)
+- `retry_after_ms` from deficit:
+  - `retry_after = ceil((cost - available_tokens) / rate)`
+
+### Smoother Pacing (GCRA)
+- Tracks theoretical arrival time (TAT)
+- Good for tight per-second pacing and low state overhead
+
+### Concurrency Limits
+- Semaphore per principal/dimension:
+  - increment on start, decrement on completion
+- Enforced regionally by default; global concurrency is only applied when explicitly required and supported by the same budget mechanism.
+
+---
+
+## Data Model
+
+### Postgres (Control Plane)
+
+**Core tables (logical)**
+- `policies`:
+  - `policy_id` (UUID, PK), `name`, `scope_type`, `matchers`, `algorithm`, `rate/period/limit`, `burst`, `cost_rules`, `mode`, `priority`, timestamps
+- `policy_versions`:
+  - `(policy_id, version)` (PK), `snapshot_blob`, `published_at`, `checksum`
+- `principal_overrides`:
+  - `principal_id` (hashed), `policy_id`, `override_fields`, `expires_at`
+- `regional_budgets` (global limits):
+  - key: `(policy_id, principal_id, descriptor_hash, region)`
+  - `granted_tokens_total`, `consumed_tokens_total`, `expires_at`, `version` (CAS)
+  - invariant: sum of unexpired outstanding budgets per `(policy_id, principal_id, descriptor_hash)` is capped
+
+**Snapshot rule**
+- Data plane consumes snapshots only; no request-path Postgres reads.
+
+### Redis (Regional, Ephemeral)
+- `bucket:{policy_id}:{principal_hash}:{descriptor_hash}`
+  - `tokens`, `last_refill_ms`, `policy_version`
+- `dedupe:{request_id}:{policy_id}:{principal_hash}:{descriptor_hash}`
+  - decision + token delta, TTL 5–30s
+
+---
+
+## API Design
+
+### Decision API (gRPC/HTTP)
+- `Check(request_id, principal, region, descriptors, snapshot_version)` → `ALLOW|DENY`, `retry_after_ms`, `policy_id_applied`, `policy_version`, response headers
+
+### Policy APIs (REST)
+- `POST /v1/policies`
+- `PUT /v1/policies/{policy_id}`
+- `POST /v1/policies/{policy_id}:publish?version=...`
+- `POST /v1/policies/{policy_id}:rollback?version=...`
+- `GET /v1/snapshots/{snapshot_id}`
+- `POST /v1/overrides`
+- `POST /v1/emergency:block`
+
+### Budget API (Internal)
+- `ReserveBudget(policy_id, principal_id, region, descriptor_hash, desired_tokens, now_ms)` → `(granted_tokens, expires_at, version)`
+
+---
+
+## Scaling & Performance
+
+### Back-of-the-Envelope
+- Global peak: **5M decisions/sec**
+- With **98%** L1 hit rate:
+  - Regional path: **~100K/sec** total
+  - Average per region (30): **~3.3K/sec** (with higher peaks)
+
+### Hot-Key Handling
+- Larger, shorter-lived budgets for hot keys to reduce coordinator churn
+- Single-flight refills at edge + RLS batching
+- Stable hashing/hashtags in Redis keys to keep locality predictable
+
+### Caching
+- Policy snapshot in memory at edge and RLS, with periodic refresh
+- L1 bucket TTL 5–30s with size caps
+- Brief negative caching for “no policy match” (1–5s)
+
+### Overshoot Controls
+- Budgets have short TTLs (10–60s)
+- Cap total outstanding budgets per key
+- Conservative defaults for cold keys; expand budgets only on sustained demand
+
+---
+
+## Failure Modes & Mitigations
+
+1. **Regional Redis degradation**
+   - Circuit breakers and fallback behavior per policy (fail-open vs fail-closed)
+   - Preserve availability with L1-only for a short window, with bounded local cushion
+
+2. **Control plane unavailable**
+   - Regions continue using last-known snapshots and remaining budgets until expiry
+   - RLS refresh uses backoff; alerting on staleness and budget exhaustion
+
+3. **Cross-region partition**
+   - Regions spend remaining budgets; overshoot bounded by outstanding caps and TTLs
+   - Recovery is automatic once connectivity returns
+
+4. **Bad policy publish**
+   - Validation + shadow mode + canary rollout
+   - Rollback by switching snapshot pointer to a prior version
+
+5. **Clock skew**
+   - Use monotonic time for refill math; wall clock only for metadata
+   - Detect via metrics; require NTP
+
+---
+
+## Operations
+
+### SLOs (Suggested)
+- Edge decision latency: P99 **≤ 1 ms**
+- Regional decision latency: P99 **≤ 10 ms**
+- Decision availability (per region): **99.99%**
+- Policy propagation: P99 **≤ 30s**
+
+### Monitoring & Alerting
+- `rl_decisions_total{region,policy_id,decision}`
+- `rl_latency_ms_bucket{component=edge|rls}`
+- `rl_l1_hit_ratio{region}`
+- `redis_script_latency_ms`, `redis_errors_total`, `redis_evictions_total`
+- `budget_reserve_latency_ms`, `budget_reserve_failures_total`
+- `policy_snapshot_staleness_seconds{region}`
+
+### Deployment & Rollouts
+- Rolling deploy with canaries per region
+- Versioned Redis scripts; support N and N-1 during rollout
+- Policy rollouts: `SHADOW` → canary → full; rollback by snapshot pointer
+
+### Fail-open vs Fail-closed (Per Policy)
+- Default **fail-open** for general traffic
+- Default **fail-closed** for abuse-prone endpoints (auth, signup, password reset, payment attempts)
+- Enforce explicit ownership and review for fail-closed policies
+
+---
+
+## Simplification Notes
+
+- Removed `Pub/Sub or Kafka` and replaced with control-plane snapshot publish + periodic polling, reducing moving parts while keeping fast propagation and resilience.
+- Removed a separate `Token Lease Coordinator` service and `Lease State DB`; merged budget coordination into the existing control plane service, stored in Postgres with CAS/versioning.
+- Removed a separate `Policy Subscriber + Snapshot Cache` component; snapshot caching is handled inside RLS (and edge), reducing deployment units.
+- Kept Redis regionally for atomic, low-latency bucket updates and idempotency keys; this remains the simplest reliable approach at the stated QPS.
+- Kept bounded-budget (lease-like) global enforcement because global quotas across 30+ regions require coordination that stays off the request path while bounding overshoot.
+```
+tokens used
+9,248
+```markdown
+---
+title: "Global Rate Limiter"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["rate-limiting", "distributed-systems", "edge", "token-bucket", "gcra", "multi-region"]
+---
+
+## Overview
+
+A **global rate limiter** enforces per-principal quotas (API key / user ID / IP / CIDR) across many geographic regions with low edge latency and regional fault isolation. The design makes decisions locally at the edge using a small, time-bounded **regional budget** for each key and refills those budgets asynchronously. This keeps cross-region coordination off the request path while bounding overshoot during partitions.
+
+---
+
+## Requirements
+
+### Functional Requirements
+- Enforce limits by principal:
+  - `API_KEY`, `USER_ID`, `IP`, `CIDR` (with configurable precedence, e.g., `API_KEY` then `IP`)
+- Support policy types:
+  - **Throughput**: requests/second, requests/minute (token bucket or GCRA)
+  - **Burst**: short bursts up to a configured cap
+  - **Concurrency**: max in-flight requests (semaphore-style)
+- Support multi-dimensional rules (descriptor sets), e.g.:
+  - endpoint/method, customer tier, product, region overrides, emergency blocks
+- Deterministic outcomes per evaluation:
+  - `ALLOW` or `DENY`, `retry_after_ms`, and standard rate limit response headers
+- Administrative APIs:
+  - CRUD policies, principal overrides, disable/enable keys, emergency blocklists
+  - staged rollout: `SHADOW` → `ENFORCE` with canaries and rollback
+- Observability:
+  - allow/deny counts, hot keys, rule history, and debugging traces
+- Batch evaluation:
+  - evaluate multiple descriptors per request (gateway integration)
+
+### Non-Functional Requirements
+
+#### Scale (Targets)
+- Footprint: **30+ regions**, **300+ edge POPs**
+- Global peak decision volume: **5M decisions/sec** (steady 1–2M/sec)
+- Principals: **up to 100M**
+- Active policies: **~1M**, updates **~10K/day**
+
+#### Latency (Request Path)
+- Edge decision: **P50 0.2 ms**, **P99 ≤ 1 ms**
+- Edge → regional refill: **P99 5–10 ms** (rare)
+- Cross-region coordination: **never on critical path**; async maintenance **P99 150–300 ms** acceptable
+
+#### Availability / Isolation
+- Request-path decisioning: **99.99%** per region
+- Control plane (policy CRUD/publish): **99.9%**
+- A single region failure should not cause global outage
+
+#### Consistency Model
+- **Strong** for policy publication/versioning
+- **Bounded eventual** for global quotas (overshoot bounded by regional budgets)
+
+#### Durability
+- Policy data: **RPO ≤ 1 minute**, **RTO ≤ 15 minutes**
+- Buckets/counters: **ephemeral acceptable**, restarts must avoid widespread false-deny
+
+### Constraints & Assumptions
+- Deployed behind an API gateway / edge proxy (e.g., Envoy/Nginx/Cloud LB)
+- Inter-region networking has high latency and occasional partitions
+- Prefer stateless edge components + regional data stores
+- Minimize PII; IPs may be truncated/hashed; configurable retention for analytics (e.g., 7–30 days)
+- Small platform team: operational simplicity is a first-class goal
+
+---
+
+## Simplified Architecture
+
+This system uses:
+- An **edge rate limiter** (library/filter) with an in-process L1 cache for microsecond decisions.
+- A **regional rate limit service** that owns atomic counter updates and regional budget management.
+- A **single Postgres-backed control plane** that stores policies, publishes immutable snapshots, and coordinates regional budgets for global limits.
+- Standard metrics/tracing plus sampled decision logs for debugging and abuse analysis.
+
+### High-Level Component Diagram
+
+```mermaid
+graph TB
+  subgraph EL[Edge Layer (per POP)]
+    GW[API Gateway / Edge Proxy]
+    RL[Rate Limiter Filter / Library]
+    L1[(L1 In-Memory Buckets)]
+  end
+
+  subgraph RLAYER[Regional Layer (per Region)]
+    RLS[Regional Rate Limit Service]
+    RKV[(Regional KV: Redis/KeyDB)]
+    SC[Snapshot Cache (in RLS)]
+  end
+
+  subgraph CP[Global Control Plane]
+    CPS[Control Plane Service (Policies + Budget Coordinator)]
+    PDB[(Postgres: policies + snapshots + budget state)]
+  end
+
+  subgraph OBS[Observability]
+    MET[Metrics/Tracing]
+    LOG[Sampled Decision Logs]
+    ANA[(Analytics Store)]
+  end
+
+  GW --> RL --> L1
+  RL -->|L1 miss / budget low| RLS --> RKV
+  CPS --> PDB
+  CPS -->|publish snapshots| RLS
+  RL --> MET
+  RLS --> MET
+  RL --> LOG --> ANA
+  RLS --> LOG --> ANA
+```
+
+---
+
+## Request and Maintenance Flows
+
+### Request Path (Critical)
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Client
+  participant Edge as Edge RL
+  participant RLS as Regional RLS
+  participant Redis as Regional Redis
+
+  Client->>Edge: HTTP request (principal + descriptors)
+  Edge->>Edge: policy match + L1 bucket check
+  alt L1 has tokens
+    Edge-->>Client: ALLOW + headers
+  else L1 miss / low budget
+    Edge->>RLS: CheckAndConsume(principal, descriptors, snapshot_version)
+    RLS->>Redis: Atomic consume/refill (script)
+    Redis-->>RLS: ALLOW/DENY + retry_after_ms + remaining
+    RLS-->>Edge: decision
+    Edge-->>Client: ALLOW or DENY + headers
+  end
+```
+
+### Background (Out of Band)
+
+- **Policy distribution**: control plane publishes versioned snapshots; regions poll as a backstop.
+- **Regional budget refresh**: RLS periodically requests budget top-ups for hot keys; control plane grants budgets with TTL and caps to bound overshoot.
+
+---
+
+## Components
+
+### Edge Rate Limiter (Gateway Filter / Library)
+**Responsibilities**
+- Match policy(ies) for the request descriptor set using the latest snapshot
+- Fast ALLOW/DENY from L1 buckets when possible
+- Attach:
+  - `retry_after_ms`
+  - RFC 9333 `RateLimit-*` headers (+ `Retry-After` for 429 compatibility)
+- Emit lightweight telemetry
+
+**Hot-key protections**
+- Single-flight regional refill per key (collapse concurrent misses)
+- Per-key refill concurrency limits to prevent stampedes
+- Small local burst cushion for microbursts (kept conservative to limit overshoot)
+
+---
+
+### Regional Rate Limit Service (RLS)
+**Responsibilities**
+- Serve edge misses with low latency
+- Perform atomic consume/refill in regional Redis (token bucket / GCRA / concurrency)
+- Maintain a per-key **regional budget** for global policies (spent locally, refreshed asynchronously)
+- Provide idempotency/deduplication for gateway retries
+- Cache and serve policy snapshots locally (last-known-good)
+
+**Regional data store**
+- Redis/KeyDB cluster with replication and failover
+- Atomic operations via Lua/script/functions to avoid race conditions
+
+---
+
+### Control Plane Service (Policies + Budget Coordinator)
+**Responsibilities**
+- CRUD policies, overrides, emergency blocks
+- Validate configs and enforce safety guardrails
+- Publish immutable, versioned policy snapshots
+- Coordinate **regional budgets** for global limits:
+  - grant time-bounded budgets per `(policy, principal, descriptor_hash, region)`
+  - enforce caps on total outstanding budgets to bound overshoot
+  - adapt budget sizing for hot keys vs cold keys
+- Support rollout management: `SHADOW` → canary → `ENFORCE`, plus rollback to prior snapshot
+
+**Storage**
+- Postgres as the single durable store for:
+  - policies + versions + snapshots
+  - budget state (leases/budgets with TTL and CAS/versioning)
+
+This keeps the system to one primary database technology while still supporting strong consistency for policy publication and controlled global enforcement.
+
+---
+
+### Telemetry & Analytics
+**Goals**
+- Debugging (why was a request denied?)
+- Abuse detection and capacity planning
+- Rollout confidence (shadow vs enforce)
+
+**Logging approach**
+- High-rate denial logging (often 100%)
+- Aggressive sampling for allows with aggregation
+- Separate retention policy for security signals vs general analytics
+
+---
+
+## Algorithms & Semantics
+
+### Throughput + Burst (Token Bucket)
+- Parameters: `rate` (tokens/sec), `burst` (max tokens)
+- Each request consumes `cost` tokens (default 1)
+- `retry_after_ms` from deficit:
+  - `retry_after = ceil((cost - available_tokens) / rate)`
+
+### Smoother Pacing (GCRA)
+- Tracks theoretical arrival time (TAT)
+- Good for tight per-second pacing and low state overhead
+
+### Concurrency Limits
+- Semaphore per principal/dimension:
+  - increment on start, decrement on completion
+- Enforced regionally by default; global concurrency is only applied when explicitly required and supported by the same budget mechanism.
+
+---
+
+## Data Model
+
+### Postgres (Control Plane)
+
+**Core tables (logical)**
+- `policies`:
+  - `policy_id` (UUID, PK), `name`, `scope_type`, `matchers`, `algorithm`, `rate/period/limit`, `burst`, `cost_rules`, `mode`, `priority`, timestamps
+- `policy_versions`:
+  - `(policy_id, version)` (PK), `snapshot_blob`, `published_at`, `checksum`
+- `principal_overrides`:
+  - `principal_id` (hashed), `policy_id`, `override_fields`, `expires_at`
+- `regional_budgets` (global limits):
+  - key: `(policy_id, principal_id, descriptor_hash, region)`
+  - `granted_tokens_total`, `consumed_tokens_total`, `expires_at`, `version` (CAS)
+  - invariant: sum of unexpired outstanding budgets per `(policy_id, principal_id, descriptor_hash)` is capped
+
+**Snapshot rule**
+- Data plane consumes snapshots only; no request-path Postgres reads.
+
+### Redis (Regional, Ephemeral)
+- `bucket:{policy_id}:{principal_hash}:{descriptor_hash}`
+  - `tokens`, `last_refill_ms`, `policy_version`
+- `dedupe:{request_id}:{policy_id}:{principal_hash}:{descriptor_hash}`
+  - decision + token delta, TTL 5–30s
+
+---
+
+## API Design
+
+### Decision API (gRPC/HTTP)
+- `Check(request_id, principal, region, descriptors, snapshot_version)` → `ALLOW|DENY`, `retry_after_ms`, `policy_id_applied`, `policy_version`, response headers
+
+### Policy APIs (REST)
+- `POST /v1/policies`
+- `PUT /v1/policies/{policy_id}`
+- `POST /v1/policies/{policy_id}:publish?version=...`
+- `POST /v1/policies/{policy_id}:rollback?version=...`
+- `GET /v1/snapshots/{snapshot_id}`
+- `POST /v1/overrides`
+- `POST /v1/emergency:block`
+
+### Budget API (Internal)
+- `ReserveBudget(policy_id, principal_id, region, descriptor_hash, desired_tokens, now_ms)` → `(granted_tokens, expires_at, version)`
+
+---
+
+## Scaling & Performance
+
+### Back-of-the-Envelope
+- Global peak: **5M decisions/sec**
+- With **98%** L1 hit rate:
+  - Regional path: **~100K/sec** total
+  - Average per region (30): **~3.3K/sec** (with higher peaks)
+
+### Hot-Key Handling
+- Larger, shorter-lived budgets for hot keys to reduce coordinator churn
+- Single-flight refills at edge + RLS batching
+- Stable hashing/hashtags in Redis keys to keep locality predictable
+
+### Caching
+- Policy snapshot in memory at edge and RLS, with periodic refresh
+- L1 bucket TTL 5–30s with size caps
+- Brief negative caching for “no policy match” (1–5s)
+
+### Overshoot Controls
+- Budgets have short TTLs (10–60s)
+- Cap total outstanding budgets per key
+- Conservative defaults for cold keys; expand budgets only on sustained demand
+
+---
+
+## Failure Modes & Mitigations
+
+1. **Regional Redis degradation**
+   - Circuit breakers and fallback behavior per policy (fail-open vs fail-closed)
+   - Preserve availability with L1-only for a short window, with bounded local cushion
+
+2. **Control plane unavailable**
+   - Regions continue using last-known snapshots and remaining budgets until expiry
+   - RLS refresh uses backoff; alerting on staleness and budget exhaustion
+
+3. **Cross-region partition**
+   - Regions spend remaining budgets; overshoot bounded by outstanding caps and TTLs
+   - Recovery is automatic once connectivity returns
+
+4. **Bad policy publish**
+   - Validation + shadow mode + canary rollout
+   - Rollback by switching snapshot pointer to a prior version
+
+5. **Clock skew**
+   - Use monotonic time for refill math; wall clock only for metadata
+   - Detect via metrics; require NTP
+
+---
+
+## Operations
+
+### SLOs (Suggested)
+- Edge decision latency: P99 **≤ 1 ms**
+- Regional decision latency: P99 **≤ 10 ms**
+- Decision availability (per region): **99.99%**
+- Policy propagation: P99 **≤ 30s**
+
+### Monitoring & Alerting
+- `rl_decisions_total{region,policy_id,decision}`
+- `rl_latency_ms_bucket{component=edge|rls}`
+- `rl_l1_hit_ratio{region}`
+- `redis_script_latency_ms`, `redis_errors_total`, `redis_evictions_total`
+- `budget_reserve_latency_ms`, `budget_reserve_failures_total`
+- `policy_snapshot_staleness_seconds{region}`
+
+### Deployment & Rollouts
+- Rolling deploy with canaries per region
+- Versioned Redis scripts; support N and N-1 during rollout
+- Policy rollouts: `SHADOW` → canary → full; rollback by snapshot pointer
+
+### Fail-open vs Fail-closed (Per Policy)
+- Default **fail-open** for general traffic
+- Default **fail-closed** for abuse-prone endpoints (auth, signup, password reset, payment attempts)
+- Enforce explicit ownership and review for fail-closed policies
+
+---
+
+## Simplification Notes
+
+- Removed `Pub/Sub or Kafka` and replaced with control-plane snapshot publish + periodic polling, reducing moving parts while keeping fast propagation and resilience.
+- Removed a separate `Token Lease Coordinator` service and `Lease State DB`; merged budget coordination into the existing control plane service, stored in Postgres with CAS/versioning.
+- Removed a separate `Policy Subscriber + Snapshot Cache` component; snapshot caching is handled inside RLS (and edge), reducing deployment units.
+- Kept Redis regionally for atomic, low-latency bucket updates and idempotency keys; this remains the simplest reliable approach at the stated QPS.
+- Kept bounded-budget (lease-like) global enforcement because global quotas across 30+ regions require coordination that stays off the request path while bounding overshoot.
+```
+Done: global-rate-limiter

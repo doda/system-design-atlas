@@ -1,0 +1,429 @@
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2a95-ab78-7493-b969-7d2a268eec66
+--------
+user
+You are a senior systems architect reviewing a system design document.
+
+Grade this solution on three dimensions (1-10 scale):
+
+1. **Strength** (1-10): How technically sound, complete, and production-ready is the design?
+   - Does it address scalability, reliability, and failure modes?
+   - Are the trade-offs well-reasoned?
+   - Would this actually work at scale?
+
+2. **Interestingness** (1-10): How engaging and educational is the content?
+   - Does it teach useful concepts?
+   - Are there insights that aren't obvious?
+   - Would an engineer learn something valuable?
+
+3. **Novelty** (1-10): How unique or creative is the approach?
+   - Does it go beyond textbook solutions?
+   - Are there clever simplifications or unconventional choices?
+   - Does it challenge common assumptions?
+
+Also note any major issues or particularly strong aspects.
+
+Output ONLY valid JSON in this exact format:
+{
+  "slug": "attribution-measurement-system",
+  "strength": <1-10>,
+  "interestingness": <1-10>,
+  "novelty": <1-10>,
+  "overall": <average of three scores, 1 decimal>,
+  "summary": "<2-3 sentence summary of the design>",
+  "strengths": ["<strength 1>", "<strength 2>"],
+  "weaknesses": ["<weakness 1>", "<weakness 2>"],
+  "verdict": "<one of: exceptional, strong, adequate, weak>"
+}
+
+---
+
+## Solution to Grade
+
+---
+title: "Attribution Measurement System"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags:
+  [
+    "attribution",
+    "privacy",
+    "skan",
+    "streaming-analytics",
+    "olap",
+    "fraud",
+    "data-quality",
+    "slo",
+  ]
+---
+
+## Overview
+
+Attribution measurement answers: “Which ads caused which conversions?” Modern ecosystems add strict privacy constraints (e.g., SKAdNetwork (SKAN), PCM, Android Privacy Sandbox), where user-level identifiers are unavailable or restricted, reporting is delayed, and only coarse or aggregated signals are permitted.
+
+This system is built around three ideas:
+
+1. **Immutable ingestion**: every accepted payload is written to an append-only raw log for audit, reconciliation, and reprocessing.
+2. **Micro-batch aggregation with finalization**: a single compute path produces both fast “directional” metrics and later “finalized” metrics after attribution windows close.
+3. **Query-time privacy enforcement**: all reporting responses are policy-checked (k-thresholds, bucketing, allowlisted dimensions, and query auditing) before any data leaves the system.
+
+The system correlates at **campaign/cohort level** (not per user) and produces **versioned aggregates** so logic and policy changes can be rolled out safely and reproduced from the raw log.
+
+---
+
+## Requirements
+
+### Functional Requirements
+
+- Ingest privacy-constrained signals:
+  - **SKAN postbacks** (signed, delayed, coarse/fine conversion values, multi-postback sequences).
+  - Optional: **PCM-style** web signals and **privacy-safe server-to-server events** (strict allowlist, no stable user IDs).
+- Authenticate partners/tenants; enforce tenant isolation.
+- Verify authenticity/integrity:
+  - SKAN signature verification using platform public keys.
+  - Partner events via mTLS and/or HMAC/JWS with key rotation.
+- Replay protection and idempotent deduplication across retries.
+- Produce marketing reports:
+  - installs, conversions, revenue, ROAS
+  - breakdowns by day/week, campaign/adgroup/creative, country/region (coarse), and source (skan/sdk/partner) subject to policy
+- Backfills and reprocessing:
+  - versioned aggregates by `logic_version` and `privacy_policy_version`
+  - reproducible from immutable raw log
+- Fraud mitigation:
+  - anomaly detection and partner quality scoring
+  - filtered vs unfiltered views (with strict governance)
+
+### Non-Functional Requirements (Targets)
+
+- **Ingest**: 10K sustained QPS, burst to 80K QPS.
+- **Reporting**: 5K–20K queries/min peak (≈ 80–330 QPS).
+- **Latency**
+  - Ingest acknowledgement: **P99 < 200ms**
+  - Directional aggregates: **P50 ~ 5 min, P99 < 30 min**
+  - Finalized aggregates: **2–6 hours** after expected window close
+  - Reporting API: **P50 < 300ms, P99 < 2s** for common breakdowns
+- **Availability**
+  - Ingest APIs: **99.95%**
+  - Reporting APIs: **99.9%**
+- **Durability**
+  - Accepted events: **RPO ≈ 0** (raw log)
+  - Derived aggregates: rebuildable
+
+### Constraints
+
+- No stable user identifiers on the primary SKAN path.
+- Outputs must prevent small-cohort inference:
+  - default **k-anonymity threshold** (e.g., `k >= 50`)
+  - enforced **minimum time bucket** (e.g., day/week) for sensitive cuts
+- Prefer managed components to reduce operational burden.
+
+---
+
+## Simplified Architecture
+
+```mermaid
+flowchart TB
+  subgraph Producers["External Producers"]
+    SKAN["SKAN Postbacks"]
+    Partner["Partner Events"]
+  end
+
+  CDN["CDN / Edge Cache"]
+  API["Attribution API\nIngest + Reports"]
+  Raw["Raw Log\nObject Store"]
+  Jobs["Micro-batch Jobs\nVerify + Dedupe + Aggregate"]
+  WH["Analytics Warehouse\nEvents + Aggregates"]
+  Policy["Policy DB\n(Postgres)"]
+
+  SKAN --> API
+  Partner --> API
+  CDN --> API
+  API --> Raw
+  Raw --> Jobs
+  Jobs --> WH
+  API --> WH
+  API --> Policy
+```
+
+---
+
+## Components
+
+### 1) Attribution API (Ingest + Reporting)
+
+A single service (modular monolith) that exposes ingest and reporting endpoints and centralizes policy enforcement.
+
+**Ingest responsibilities**
+- Authenticate tenant/partner; enforce quotas and rate limits.
+- Validate schema and required fields; assign `tenant_id`, `source`, and `received_at`.
+- Compute deterministic `event_id` for idempotency:
+  - SKAN: platform-provided unique identifiers when available (e.g., transaction id + sequence index), otherwise hash of the signed payload.
+  - Partner: required `Idempotency-Key` (plus tenant + endpoint scope).
+- Write an immutable record to the raw log and return `202 Accepted`.
+
+**Reporting responsibilities**
+- Validate query shape (time range, group-bys, filters).
+- Load tenant privacy policy and enforce:
+  - allowlisted dimensions
+  - minimum time bucket
+  - k-threshold suppression
+  - query auditing and rate limits
+- Query pre-aggregated tables only and return labeled results (`directional` or `finalized`).
+
+**Why it’s kept**
+- One deployable surface for auth, tenancy, and privacy guarantees reduces the risk of bypass paths.
+
+---
+
+### 2) Raw Log (Immutable)
+
+**Responsibilities**
+- Append-only storage of accepted payloads and basic metadata.
+- Primary source of truth for audits, dispute handling, and reprocessing.
+
+**Implementation**
+- Object store (S3/GCS) with partitioning by `day/tenant/source`.
+- Store compact “envelope” records:
+  - canonical metadata columns + encrypted payload blob (or sealed JSON).
+
+**Why it’s kept**
+- Reprocessing and verifiability are required under delayed reporting, retries, and changing SKAN semantics.
+
+---
+
+### 3) Micro-batch Jobs (Verify + Dedupe + Aggregate + Finalize)
+
+A single compute pipeline run frequently (e.g., every 5 minutes) that produces both directional and finalized aggregates.
+
+**Responsibilities**
+- Read new raw-log partitions.
+- Verify signatures and integrity:
+  - SKAN signature check using current key sets.
+  - Partner mTLS/HMAC/JWS verification and replay checks.
+- Normalize into a canonical event schema.
+- Deduplicate by `(tenant_id, source, event_id)` during load into the warehouse.
+- Build aggregates:
+  - frequent refresh for directional views (recent days)
+  - scheduled finalization once attribution windows close
+- Publish aggregate versions per `(tenant_id, day/window, logic_version, privacy_policy_version)`.
+
+**Finalization model**
+- Directional tables are refreshed on a rolling basis (e.g., last 3–14 days).
+- Finalized tables are written once the window closes, with controlled re-finalization if late arrivals exceed tolerance.
+
+**Why it’s kept**
+- The freshness target is met without maintaining a separate always-on streaming stack.
+
+---
+
+### 4) Analytics Warehouse (Events + Aggregates)
+
+**Responsibilities**
+- Store deduped canonical events (optional but useful for audits and recomputation).
+- Store pre-aggregated cubes optimized for reporting QPS.
+- Support partitioning/clustering for tenant isolation and cost control.
+
+**Implementation**
+- A managed analytics warehouse (e.g., BigQuery/Snowflake/Redshift) with:
+  - partitioned tables by day
+  - clustered keys including `tenant_id`, `campaign_id`, `source`
+  - materialized views or scheduled aggregate tables for common breakdowns
+
+**Why it’s kept**
+- Interactive reporting needs fast group-bys over pre-aggregated data; managed warehouses reduce operational burden.
+
+---
+
+### 5) Policy DB (Postgres)
+
+**Responsibilities**
+- Store strongly consistent tenant configuration:
+  - k-threshold, minimum bucketing, allowlisted dimensions, query limits
+- Store attribution metadata:
+  - campaign/adgroup/creative mappings and ownership
+- Provide auditable policy changes.
+
+**Why it’s kept**
+- Policy enforcement is correctness-critical and benefits from transactional guarantees.
+
+---
+
+### 6) CDN / Edge Cache
+
+**Responsibilities**
+- Cache common dashboard queries and exports.
+- Shield the reporting API from spikes.
+
+**Implementation**
+- CDN in front of reporting endpoints with cache keys including:
+  - `(tenant_id, query, policy_version, logic_version, aggregate_version, finalized_only)`
+
+**Why it’s kept**
+- Reporting QPS is predictable and cache-friendly, reducing warehouse load and cost.
+
+---
+
+## Data Model
+
+### Canonical Event (Warehouse)
+
+- `tenant_id` (string)
+- `source` (enum: `skan`, `partner`, `sdk`, `pcm`)
+- `received_at` (timestamp)
+- `event_time` (timestamp; nullable)
+- `event_type` (enum: `postback`, `conversion`, `click` (if allowed))
+- `event_id` (string; dedupe key)
+- `verify_status` (enum: `valid`, `invalid_sig`, `invalid_schema`, `unauthorized`, `replay_suspected`)
+- Extracted fields for aggregation (nullable based on privacy constraints):
+  - `campaign_id`, `country`, `postback_sequence_index`, `coarse_cv`, `fine_cv`, `revenue_micros`
+
+### Aggregates (Warehouse)
+
+Example “daily campaign cube” grain:
+- Dimensions:
+  - `tenant_id`, `day`, `source`, `campaign_id`, `country` (optional), `cv_bucket` (optional)
+- Metrics:
+  - `installs`, `conversions`, `revenue_micros`, `postbacks`
+- Versioning:
+  - `logic_version` (int)
+  - `privacy_policy_version` (int)
+  - `aggregate_version` (string)
+  - `finalized` (bool)
+  - `finalized_at` (timestamp)
+
+### Policy Config (Postgres)
+
+- `tenant_id`
+- `privacy_policy_version`
+- `min_k_installs` (int; e.g., 50)
+- `min_time_bucket` (enum: `day`, `week`)
+- `allowed_dimensions` (json array)
+- `max_group_bys` (int)
+- `noise_mode` (enum: `none`, `laplace`, `gaussian`)
+- `noise_parameters` (json; if enabled)
+- `query_rate_limit` (int; per minute)
+- `updated_at`
+
+---
+
+## API
+
+### Authentication & Authorization
+
+- Tenant-scoped auth via OAuth2/JWT (service accounts) and optional mTLS for partners.
+- Every request includes `X-Tenant-Id`.
+- Partner endpoints require `X-Partner-Id` and signature (HMAC/JWS) or mTLS client cert mapping.
+
+### Ingest APIs
+
+**POST `/v1/ingest/skan/postbacks`**
+- Response: `202 Accepted` `{ "accepted": true, "request_id": "..." }`
+
+**POST `/v1/ingest/conversions`** (privacy-safe S2S)
+- Requirements: no stable user identifiers; strict allowlist of fields.
+- Response: `202 Accepted`
+
+**POST `/v1/ingest/bulk`**
+- Up to N events per request; returns per-item acceptance (redacted).
+
+### Reporting APIs
+
+**GET `/v1/reports/attribution`**
+- Params:
+  - `from`, `to`
+  - `source`
+  - `group_by` (validated against policy)
+  - `finalized_only` (default `true` for exports, `false` for dashboards)
+- Response includes:
+  - `suppressed_cells`
+  - `privacy_policy_version`, `logic_version`
+  - `finalized` flag and a `result_version` token
+
+---
+
+## Privacy Enforcement
+
+All report queries are processed through a single enforcement path inside the Attribution API:
+
+- **Dimension allowlists**: only approved group-bys per tenant.
+- **Minimum bucketing**: day/week enforced for sensitive dimensions.
+- **Small-cell suppression**: suppress rows where the controlling metric (typically installs) is below `min_k_installs`.
+- **Repeated slicing controls**: query auditing + rate limiting to reduce incremental inference.
+- **Fail-closed behavior**: if policy cannot be loaded reliably, return an empty result with a privacy-safe error.
+
+Optional **DP mode** can be enabled per tenant by configuring bounded contributions, calibrated noise, and privacy budgeting; baseline operation relies on suppression + bucketing + auditing.
+
+---
+
+## Fraud & Data Quality
+
+- Jobs compute daily anomaly features per `(tenant, partner, campaign)`:
+  - conversion rate spikes, geo distribution shifts, unusual postback sequences
+- Results are written to a `quality_flags` table and used to:
+  - label suspicious traffic
+  - support filtered reporting views for authorized users
+- Discrepancy checks:
+  - directional vs finalized drift
+  - partner/platform expected ranges
+  - finalized invariants (changes only on controlled re-finalization)
+
+---
+
+## Scaling
+
+- Ingest spikes are absorbed by writing to the object store quickly and processing asynchronously.
+- Micro-batch compute scales horizontally by partitioning work by `(day, tenant_id, source)`.
+- Reporting stays fast via:
+  - pre-aggregated cubes/materialized views
+  - CDN caching for common dashboards
+  - strict query-shape limits (group-by caps, bounded date ranges)
+
+---
+
+## Failure Modes
+
+- **Raw log write issues**: ingestion returns non-acceptance; no partial accept without raw durability.
+- **Verification regressions**: jobs quarantine questionable records and allow reprocessing after key/logic fixes.
+- **Job lag**: directional freshness degrades; reporting continues to serve cached/finalized data.
+- **Warehouse hotspot**: API enforces tighter query limits and relies more on cached common endpoints.
+- **Policy DB outage**: reporting fails closed; ingestion continues.
+
+---
+
+## Operations
+
+### SLOs
+
+- Ingest availability: **99.95%**, ingest P99: **< 200ms**
+- Directional freshness: **P99 < 30 min**
+- Reporting availability: **99.9%**, reporting P99: **< 2s** for common dashboards
+- Finalization: **2–6 hours** after expected window close
+
+### Monitoring
+
+- Ingest: QPS, P99 latency, 4xx/5xx, auth failures, throttles, raw-log write errors
+- Jobs: watermark/lag, verify failure rates, dedupe rates, aggregate publish success, late-arrival rate
+- Reporting: latency percentiles, cache hit rate, suppressed cell rate, blocked-query rate
+- Privacy: policy version mismatches, audit volumes, rate-limit triggers
+- Data quality: drift metrics, invariants on finalized aggregates
+
+---
+
+## Simplification Notes
+
+- Removed: always-on streaming bus and streaming processors; acceptable because 5-minute micro-batch meets freshness targets and finalization already defines correctness boundaries.
+- Removed: separate Privacy Gate service; merged into the Attribution API so all report egress shares one enforcement implementation and audit path.
+- Removed: dedicated Redis cache layer; acceptable because CDN caching covers common dashboards and reduces operational dependencies.
+- Merged: API Gateway, Ingest API, and Reporting API into a single Attribution API service; acceptable because auth, tenancy, and privacy checks benefit from one deployable boundary.
+- Kept complexity: immutable raw log and versioned aggregates; necessary for reproducibility, late arrivals, signature verification fixes, and policy/logic backfills under delayed privacy-constrained signals.
+mcp startup: no servers
+ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Dec 17th, 2025 1:06 AM.
+Warning: no last agent message; wrote empty content to /Users/dominikdabrowski/pr/system-design-atlas/grades/attribution-measurement-system.json

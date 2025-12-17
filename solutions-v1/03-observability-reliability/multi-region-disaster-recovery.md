@@ -1,0 +1,230 @@
+---
+title: "Multi-Region Disaster Recovery"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["disaster-recovery", "multi-region", "failover", "dns", "replication"]
+---
+
+## Overview
+
+Multi-region disaster recovery (DR) for a tier-1 service restores **availability** within a target **RTO** while bounding **data loss** (**RPO**) when an entire region (or critical regional dependencies) becomes unavailable.
+
+This design uses:
+- **Two serving regions (A, B)** with multi-AZ hardening.
+- **Active-passive writes** with a single, explicit **write authority lease** to prevent split-brain.
+- **Asynchronous cross-region replication** for most data, with tiered RPO gates.
+- **DNS/GTM + CDN/WAF** for global routing and progressive traffic shifting.
+- A small **DR control plane** to run an idempotent failover workflow, record an incident timeline, and enforce safety gates.
+
+---
+
+## Requirements
+
+### Functional Requirements
+- Route user traffic to the healthiest eligible region using health-checked global traffic management.
+- Support unplanned regional failover (outage) and planned failover (maintenance/drills) via an explicit workflow.
+- Replicate data across regions; continuously compute and expose replication lag and effective RPO.
+- Perform dependency-aware health evaluation (DB, caches, critical third parties) to avoid failing over into a broken region.
+- Support progressive traffic shifting (0%→10%→50%→100%) and automated rollback based on SLOs.
+- Enforce write fencing so only one region can be primary for each write domain (global or per-tenant).
+- Produce an immutable incident timeline (signals → decisions → actions → verification).
+- Enable regular DR exercises with automated verification and fault injection.
+
+### Non-Functional Requirements (Concrete Targets)
+- Scale: 50k steady QPS; 200k peak; 20M DAU; primary DB ~10 TB; heavy write volume.
+- Latency: within-region P50 30–60 ms, P99 200–350 ms; cross-region replication async for most data.
+- Availability: 99.99% monthly for tier-1 endpoints.
+- Consistency: strong within a region; eventual across regions by default.
+- RTO/RPO:
+  - RTO: ≤ 5 minutes to restore core read/write on unplanned regional outage; ≤ 15 minutes to stabilize.
+  - RPO tiered:
+    - Tier 0: 0–5s preferred, ≤ 30s max acknowledged loss.
+    - Tier 1: ≤ 30s.
+    - Tier 2: ≤ 5–15 minutes.
+
+### Constraints & Assumptions
+- Two primary regions (A and B), each spanning ≥3 AZs.
+- Capacity supports controlled degradation during failover.
+- Some tenants may be data-residency pinned; routing respects eligibility.
+- DNS caching makes cutover timing probabilistic; the system tolerates partial propagation.
+
+---
+
+## Simplified Architecture
+
+### Pattern: Active-Passive Writes with a Lease
+- One region is the **writer** for each write domain (start with a single global domain; extend to per-tenant domains if needed).
+- The other region stays **warm** and continuously applies replication.
+- Global traffic is steered with **health-checked DNS/GTM** and shifted progressively during failover.
+- Write safety is enforced by an explicit **lease + fencing token** stored outside the two serving regions.
+
+### High-Level Diagram
+
+```mermaid
+flowchart TB
+  C[Clients] --> DNS["GTM DNS"]
+  DNS --> EDGE["CDN/WAF"]
+
+  EDGE --> A["Region A App"]
+  EDGE --> B["Region B App"]
+
+  A --> DBA[(Postgres Primary)]
+  B --> DBB[(Postgres Standby)]
+  DBA -. "streaming repl" .-> DBB
+
+  DR["DR Controller"] --> DNS
+  DR --> A
+  DR --> B
+  DR --> CDB[(Control DB)]
+```
+
+---
+
+## Components
+
+### 1) Global Traffic Management (DNS/GTM) + Edge (CDN/WAF)
+**Responsibilities**
+- Route users to the eligible region based on health and policy (including residency constraints).
+- Support weighted traffic shifts and rollback.
+
+**Key behaviors**
+- Low TTL (e.g., 30s) with routing logic designed for minutes of mixed traffic.
+- Health checks combine L7 availability with regional SLO indicators (error rate/latency/saturation).
+
+### 2) Regional Application Stack
+**Responsibilities**
+- Serve requests with predictable behavior during failover and recovery.
+- Enforce write fencing locally.
+
+**Operational modes**
+- Normal: full read/write in the active writer region; standby serves optional read-only endpoints (if product allows) or stays dark.
+- Incident: brownouts (disable non-critical/expensive features), strict rate limiting, and safe read-only fallbacks where appropriate.
+
+**Write fencing**
+- Every write request must present a valid **fencing token** for the domain.
+- Apps refresh the token from the control plane on a short interval and reject writes when the token is missing/stale.
+
+### 3) Data Layer (Postgres + Replication)
+**Primary data store**
+- Postgres in the writer region with strong consistency within-region.
+
+**Cross-region replication**
+- Physical streaming replication to a standby in the other region.
+- Replication metrics tracked as:
+  - `apply_lag_seconds`
+  - `replay_lsn` / `sent_lsn` gap (bytes)
+  - “effective RPO” derived from last safely applied commit on standby.
+
+**Tiered RPO handling**
+- Tier 1/2: governed by async replication gates.
+- Tier 0: handled via stricter gates (and optional synchronous/“remote flush” semantics only for Tier 0 endpoints if business requirements justify the latency trade-off).
+
+### 4) DR Control Plane (DR Controller + Control DB)
+**Responsibilities**
+- Run a guarded failover workflow as an idempotent state machine.
+- Own the write-authority lease and fencing token.
+- Store an immutable incident timeline (actions and results).
+
+**Control DB**
+- A small, highly available database in a separate failure domain from Regions A/B (can be a dedicated control region).
+- Holds:
+  - DR configuration (policy, allowed regions per tenant group, thresholds)
+  - Current lease holder + fencing token
+  - Failover runs and audit events
+
+---
+
+## Failover Workflow
+
+### Safety gates (minimum)
+- Target region is healthy (app + DB standby + critical dependencies).
+- Replication meets the RPO policy for the domains being promoted.
+- Control plane is reachable and can acquire/advance the domain lease.
+- Capacity headroom is sufficient or brownout policies are enabled.
+
+### Workflow (unplanned failover)
+1. Detect sustained regional failure via synthetics + SLO signals.
+2. Acquire domain lease in the control DB and advance fencing token.
+3. Promote standby DB in the target region.
+4. Enable writer mode in the target region (token required).
+5. Shift traffic via DNS weights (e.g., 0→10→50→100) with automated rollback on SLO regression.
+6. Verify correctness (synthetics, write/read checks, key business KPIs).
+7. Continue running with the new primary; replicate in the reverse direction when the old region returns.
+
+---
+
+## Minimal Control-Plane Data Model
+
+**`dr_config`**
+- `service_id` (pk)
+- `domains` (jsonb: `global`, optional per-tenant groups)
+- `eligible_regions` (jsonb: domain → allowed regions)
+- `rpo_policy` (jsonb: tier thresholds)
+- `dns_policy` (jsonb: ttl, max shift step, rollback rules)
+- `mode` (enum: `guarded_auto`, `manual`, `break_glass_allowed`)
+
+**`domain_lease`**
+- `domain` (pk)
+- `holder_region`
+- `fencing_token` (bigint)
+- `expires_at` (timestamptz)
+
+**`failover_run`**
+- `run_id` (pk)
+- `service_id`
+- `domain_scope` (jsonb)
+- `from_region` / `to_region`
+- `state`
+- `started_at` / `ended_at`
+
+**`audit_event`**
+- `event_id` (pk)
+- `run_id`
+- `timestamp`
+- `actor`
+- `action`
+- `outcome` (jsonb)
+
+---
+
+## API Design (Control Plane)
+
+- `POST /v1/failover`
+  - Starts a failover run (planned/unplanned), with optional `domainScope` and `allowDataLossSeconds` (break-glass gated).
+- `POST /v1/traffic`
+  - Applies DNS weights (policy-validated) and records the change.
+- `GET /v1/status?serviceId=...`
+  - Returns current lease holder, fencing token, DNS weights, replication/RPO gate status, and last run summary.
+
+Authn/z: mTLS + OIDC/JWT, RBAC roles (`viewer`, `operator`, `approver`, `break_glass`), and immutable audit events on all writes.
+
+---
+
+## Operations
+
+### Monitoring (inputs to DR decisions)
+- Multi-POP synthetics (user journeys).
+- Regional SLOs: availability, error rate, p99 latency, saturation.
+- Replication health: apply lag, backlog bytes, effective RPO per tier/domain.
+- Control plane health: control DB reachability and lease operations.
+
+### Runbooks (minimum)
+- Unplanned failover (guarded automation + manual override).
+- Planned failover and return-to-primary (including reconciliation checks).
+- Replication lag incident (traffic controls, brownout enablement, promotion gating).
+- Control-plane degradation (safe-mode: stop promotion, keep serving from current primary).
+
+### DR Drills
+- Monthly planned failover with verification.
+- Quarterly “unplanned” simulation with fault injection (region blackhole, dependency outage, replication lag).
+
+---
+
+## Simplification Notes
+
+- Removed: cross-region event-bus replication; acceptable because core correctness is anchored on the primary database, and background processing can pause and resume after cutover.
+- Removed: separate workflow engine; acceptable because failover is implemented as a small idempotent state machine with durable state in the control DB.
+- Removed: dedicated control-plane health/replication tables as a separate subsystem; acceptable because the DR controller consumes signals from the existing monitoring stack and stores only the minimal state/audit trail.
+- Merged: witness/lease store + audit log into a single `Control DB`; acceptable because the control plane has low throughput needs and benefits from one highly-available persistence layer.
+- Complexity kept: write fencing via a lease + token; necessary to prevent split-brain under partitions and stale DNS behavior.
+- Complexity kept: tiered RPO gates; necessary to make failover decisions safe and auditable across different data criticality levels.

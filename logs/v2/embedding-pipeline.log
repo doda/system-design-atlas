@@ -1,0 +1,1728 @@
+==========================================
+Generating (v2): Embedding Pipeline
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2cc1-7083-8903-c796fcc9874f
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Embedding Pipeline
+**Category**: AI/ML Infrastructure
+
+**Problem Statement**:
+Design a system to backfill and update vector embeddings for millions of documents as models are versioned or drift is detected.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+thinking
+**Evaluating vector databases**
+
+I’m considering how to manage millions of documents, possibly around 100 million vectors. I’m thinking about using a managed vector database like Pinecone, but I might prefer something more conventional like OpenSearch kNN or Postgres with pgvector. Milvus seems general, but “boring,” proven options like OpenSearch or Postgres might be better. I’ll plan for embedding generation as a deterministic transform and think about how to handle updates effectively, possibly with a "shadow index."
+thinking
+**Designing a system architecture**
+
+I’m thinking about creating a Mermaid diagram with 6-8 nodes, including Trigger, Orchestrator, Work Queue, Embedding Workers, Content Store, Metadata DB, Vector Index, and Observability. My scale targets are around 50 million documents, aiming for backfill within 24 hours and an embedding latency of 50 ms for local GPU or about 300 ms for an external API. I need to consider numerous operational aspects like poison pills and failure modes, and ensure decisiveness while crafting the documentation.
+codex
+```markdown
+---
+title: "Embedding Pipeline"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["embeddings", "backfill", "model-versioning", "pipelines", "vector-db", "idempotency"]
+---
+
+## Overview
+
+This system backfills and continuously refreshes vector embeddings for millions of documents as embedding models are versioned or drift is detected. The core idea is to treat “embedding” as a deterministic, versioned *build artifact*—like compiled binaries—so the pipeline is about **reproducible builds + safe cutovers**, not ad-hoc reprocessing.
+
+Elegance comes from separating two concerns that teams often conflate: (1) *producing* embeddings reliably at high throughput, and (2) *activating* a new embedding version safely. We build embeddings into a **shadow namespace** keyed by `(doc_id, model_version, content_hash)`, verify coverage/quality, then flip an **alias** (or “active version” pointer) to cut over atomically.
+
+Everything else is deliberately boring: Postgres for orchestration state, an at-least-once queue for work distribution, object storage for document snapshots, and a vector index that supports versioned collections plus aliasing.
+
+## What Makes This Hard
+
+Naive pipelines try to “just re-embed everything” and overwrite vectors in place. That fails in three ways:
+
+1. **Correctness under retries:** at-least-once delivery + flaky model endpoints produce duplicates, partial writes, and silent corruption unless every step is idempotent and auditable.
+2. **Safe activation:** overwriting in place creates a mixed-index state (old + new vectors) that breaks ranking consistency and makes regressions impossible to roll back cleanly.
+3. **Cost and time control:** backfills are bursty; without quotas, batching, and checkpoints, you either melt the model serving stack or pay peak capacity for hours you don’t need.
+
+The trap: teams focus on worker autoscaling and ignore *lineage* (which input produced which vector) and *cutover semantics* (when a version becomes “real”).
+
+## Requirements
+
+### Functional Requirements
+- Re-embed documents when either the **model_version** changes or the document’s **embedding-relevant content** changes.
+- Support **backfill** (millions of docs) and **continuous updates** (ongoing writes/edits/deletes).
+- Provide **idempotent processing**: retries must not create duplicate/incorrect vectors.
+- Enable **safe cutover** to a new model_version with rollback.
+- Keep **full provenance**: for any vector, record model_version, content_hash, timestamp, and embedding parameters.
+- Handle deletes: remove (or tombstone) vectors for deleted documents consistently.
+
+### Scale Targets
+- Corpus: **10M documents** (order of magnitude “millions”).
+- Average embedding payload: **1536 dims**, stored as float16 → ~3 KB/vector plus index overhead.
+- Backfill SLO: **24 hours** for a full re-embed after a model release.
+  - Requires ~116 embeddings/sec sustained (10,000,000 / 86,400).
+  - Design for **500 embeddings/sec** to absorb retries, skew, and throttling.
+- Continuous updates: **100 doc updates/sec peak**, with p99 time-to-fresh-embedding **< 5 minutes**.
+
+These numbers matter because they force: (a) queue-based smoothing, (b) strict idempotency, and (c) a cutover mechanism that doesn’t require rewriting “active” in place.
+
+## Key Design Decisions
+
+- **Decision 1: Versioned, content-addressed embeddings**
+  - Chose: store embeddings by `(doc_id, model_version, content_hash)` and record lineage in Postgres.
+  - Rejected: overwriting a single “current embedding” row/vector in place.
+  - Why: this makes embedding generation a pure function, enabling safe retries, dedupe, auditing, and rollback.
+
+- **Decision 2: Shadow build + atomic activation**
+  - Chose: write new vectors into a per-version namespace (index/collection) and activate via alias (or “active_model_version” pointer).
+  - Rejected: gradual in-place replacement of vectors in the active index.
+  - Why: avoids mixed-version ranking, enables canary evaluation, and allows instant rollback.
+
+- **Decision 3: Boring orchestration with DB + queue**
+  - Chose: Postgres for job/state/provenance and an at-least-once queue (e.g., SQS/PubSub) for distribution.
+  - Rejected: a bespoke distributed scheduler or exactly-once streaming for the whole pipeline.
+  - Why: the hard part is correctness semantics; Postgres transactions + idempotency keys solve it without complexity theater.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  T["Model/Drift Trigger"] --> O["Orchestrator"]
+  O --> Q["Work Queue"]
+  W["Embedding Workers"] --> V["Vector Index"]
+  W --> M["Metadata DB"]
+  Q --> W
+  S["Content Store"] --> W
+  M --> O
+```
+
+### Components
+
+- `Orchestrator`
+  - Creates backfill runs for `(model_version, corpus_scope)`, computes candidate docs, and enqueues work with strict dedupe keys.
+  - Earns its place by owning *run-level invariants*: coverage, throttling, and cutover readiness.
+
+- `Metadata DB` (Postgres)
+  - Tables for documents (or references), embedding runs, tasks, attempts, and produced artifacts.
+  - The source of truth for “what should exist” and “what exists,” enabling repair and audits.
+
+- `Work Queue`
+  - At-least-once delivery of tasks keyed by `(doc_id, model_version, content_hash)`.
+  - Absorbs spikes and decouples throughput from orchestrator and workers.
+
+- `Content Store`
+  - Immutable-ish snapshots (or stable references) of embedding-relevant text at a specific revision.
+  - Prevents the “document changed mid-run” class of heisenbugs.
+
+- `Embedding Workers`
+  - Stateless, horizontally scalable; fetch content, compute embedding, write artifact + metadata idempotently.
+  - Own batching and rate limiting to protect model serving.
+
+- `Vector Index`
+  - Stores vectors in per-version collections with aliasing (e.g., `embeddings_v2025_01` plus alias `embeddings_active`).
+  - Supports atomic cutover by repointing the alias.
+
+## Deep Dive: Idempotent Backfill + Safe Cutover
+
+The hardest part is guaranteeing that a massive backfill produces a *complete, internally consistent* embedding set for a model_version, despite retries, partial failures, and changing documents—then activating it without serving a mixed state.
+
+### 1) Make the work item a pure function
+Define the embedding job unit as:
+
+`EmbeddingTask = (doc_id, model_version, content_hash, content_ref)`
+
+- `content_hash` is computed from the exact text/features that affect the embedding (post-normalization).
+- If the document changes, it produces a new `content_hash`, and therefore a new task. Old tasks become harmless.
+
+This eliminates ambiguity: workers never ask “what’s the latest text?” during a backfill; they embed *the referenced snapshot*.
+
+### 2) Enforce idempotency at the database boundary
+Workers do two writes:
+1. Upsert provenance into Postgres:
+   - Unique constraint on `(doc_id, model_version, content_hash)`.
+   - Record `status=complete`, `embedding_uri` (optional), `vector_index_ref`, `attempt_count`, timestamps.
+2. Upsert the vector into the versioned vector index:
+   - Use a deterministic vector ID like `"{doc_id}:{content_hash}"` within the `model_version` collection.
+
+Order matters. The safe pattern is:
+- Write vector (idempotent upsert).
+- Then mark the artifact row complete in Postgres in a transaction that also records the vector ID.
+If the worker crashes after writing the vector but before DB commit, the task retries and performs the same upsert—no duplication, and the DB eventually reflects reality.
+
+### 3) Run-level completeness checks and cutover gates
+The orchestrator tracks a backfill run with:
+- `target_set_size`: number of docs in scope at run start (by snapshotting a doc_id list or a stable query + watermark).
+- `completed_count`: count of distinct `(doc_id, model_version, content_hash)` completed.
+- Error budget: allowed permanent failures (e.g., corrupted docs) with explicit exclusions.
+
+Cutover gate:
+- Coverage >= 99.9% (or agreed threshold) and no “systemic” error class above a small rate (e.g., model timeouts).
+- Optional offline eval metrics computed on a canary set (stored alongside the run).
+
+Activation:
+- Flip the vector index alias from `embeddings_active -> embeddings_v_old` to `-> embeddings_v_new`.
+- Update a single `active_model_version` record (used by writers and debuggability).
+
+Rollback is the same operation in reverse: repoint the alias.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness under retries | Some extra storage for multiple versions |
+| Atomic cutover + rollback | More moving parts than in-place overwrite |
+| Auditable provenance | Slightly higher write amplification |
+| Operational simplicity | Not “streaming-pure” end-to-end |
+
+## Failure Modes
+
+- **Model endpoint degradation (timeouts / throttling)**
+  - What happens: queue depth grows; workers spend cycles retrying; backfill misses SLO.
+  - Detect: sustained p95/p99 embedding latency + rising queue age; per-model error rate dashboards.
+  - Recover: orchestrator applies global rate limit; workers switch to larger batches; pause non-critical backfills; resume from checkpoints.
+
+- **Partial truth mismatch (vector written, metadata missing)**
+  - What happens: vectors exist but aren’t counted toward run completeness, blocking cutover.
+  - Detect: reconciliation job compares vector index IDs vs Postgres artifacts for a run.
+  - Recover: repair task replays missing metadata rows by re-upserting idempotently; no need to recompute embeddings.
+
+- **Poison documents (bad encoding / extreme size / malformed content)**
+  - What happens: hot-loop retries waste capacity; run never reaches completion.
+  - Detect: high retry count for the same `(doc_id, content_hash)`; DLQ volume.
+  - Recover: route to DLQ after N attempts; mark as excluded with reason; keep exclusions explicit so coverage math stays honest.
+
+## What I'd Do Differently At...
+
+- **10x scale:** move large backfills to dedicated GPU pools with aggressive batching; shard the vector index by tenant/topic; store embeddings as float16 with PQ/IVF tuning to control index cost.
+- **100x scale:** replace DB-driven orchestration loops with a streaming changelog (Kafka) for continuous updates, keep Postgres for provenance but move task state to a scalable state store; multi-region active-active with region-local embedding and async replication of versioned indices.
+
+## Operational Notes
+
+- Backfills are production events: treat each `model_version` as a release with a runbook, dashboards, and a hard rollback button (alias flip).
+- Keep `content_hash` stable: normalize text deterministically (whitespace, HTML stripping rules, language-specific quirks) or you’ll create artificial churn.
+- Always separate “build” from “activate”: serving mixed versions is the fastest way to ship a ranking regression you can’t explain.
+- Reconciliation is mandatory: a cheap periodic job that repairs DB↔index drift prevents week-long “why is coverage stuck at 99.7%” incidents.
+```
+tokens used
+4,190
+```markdown
+---
+title: "Embedding Pipeline"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["embeddings", "backfill", "model-versioning", "pipelines", "vector-db", "idempotency"]
+---
+
+## Overview
+
+This system backfills and continuously refreshes vector embeddings for millions of documents as embedding models are versioned or drift is detected. The core idea is to treat “embedding” as a deterministic, versioned *build artifact*—like compiled binaries—so the pipeline is about **reproducible builds + safe cutovers**, not ad-hoc reprocessing.
+
+Elegance comes from separating two concerns that teams often conflate: (1) *producing* embeddings reliably at high throughput, and (2) *activating* a new embedding version safely. We build embeddings into a **shadow namespace** keyed by `(doc_id, model_version, content_hash)`, verify coverage/quality, then flip an **alias** (or “active version” pointer) to cut over atomically.
+
+Everything else is deliberately boring: Postgres for orchestration state, an at-least-once queue for work distribution, object storage for document snapshots, and a vector index that supports versioned collections plus aliasing.
+
+## What Makes This Hard
+
+Naive pipelines try to “just re-embed everything” and overwrite vectors in place. That fails in three ways:
+
+1. **Correctness under retries:** at-least-once delivery + flaky model endpoints produce duplicates, partial writes, and silent corruption unless every step is idempotent and auditable.
+2. **Safe activation:** overwriting in place creates a mixed-index state (old + new vectors) that breaks ranking consistency and makes regressions impossible to roll back cleanly.
+3. **Cost and time control:** backfills are bursty; without quotas, batching, and checkpoints, you either melt the model serving stack or pay peak capacity for hours you don’t need.
+
+The trap: teams focus on worker autoscaling and ignore *lineage* (which input produced which vector) and *cutover semantics* (when a version becomes “real”).
+
+## Requirements
+
+### Functional Requirements
+- Re-embed documents when either the **model_version** changes or the document’s **embedding-relevant content** changes.
+- Support **backfill** (millions of docs) and **continuous updates** (ongoing writes/edits/deletes).
+- Provide **idempotent processing**: retries must not create duplicate/incorrect vectors.
+- Enable **safe cutover** to a new model_version with rollback.
+- Keep **full provenance**: for any vector, record model_version, content_hash, timestamp, and embedding parameters.
+- Handle deletes: remove (or tombstone) vectors for deleted documents consistently.
+
+### Scale Targets
+- Corpus: **10M documents** (order of magnitude “millions”).
+- Average embedding payload: **1536 dims**, stored as float16 → ~3 KB/vector plus index overhead.
+- Backfill SLO: **24 hours** for a full re-embed after a model release.
+  - Requires ~116 embeddings/sec sustained (10,000,000 / 86,400).
+  - Design for **500 embeddings/sec** to absorb retries, skew, and throttling.
+- Continuous updates: **100 doc updates/sec peak**, with p99 time-to-fresh-embedding **< 5 minutes**.
+
+These numbers matter because they force: (a) queue-based smoothing, (b) strict idempotency, and (c) a cutover mechanism that doesn’t require rewriting “active” in place.
+
+## Key Design Decisions
+
+- **Decision 1: Versioned, content-addressed embeddings**
+  - Chose: store embeddings by `(doc_id, model_version, content_hash)` and record lineage in Postgres.
+  - Rejected: overwriting a single “current embedding” row/vector in place.
+  - Why: this makes embedding generation a pure function, enabling safe retries, dedupe, auditing, and rollback.
+
+- **Decision 2: Shadow build + atomic activation**
+  - Chose: write new vectors into a per-version namespace (index/collection) and activate via alias (or “active_model_version” pointer).
+  - Rejected: gradual in-place replacement of vectors in the active index.
+  - Why: avoids mixed-version ranking, enables canary evaluation, and allows instant rollback.
+
+- **Decision 3: Boring orchestration with DB + queue**
+  - Chose: Postgres for job/state/provenance and an at-least-once queue (e.g., SQS/PubSub) for distribution.
+  - Rejected: a bespoke distributed scheduler or exactly-once streaming for the whole pipeline.
+  - Why: the hard part is correctness semantics; Postgres transactions + idempotency keys solve it without complexity theater.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  T["Model/Drift Trigger"] --> O["Orchestrator"]
+  O --> Q["Work Queue"]
+  W["Embedding Workers"] --> V["Vector Index"]
+  W --> M["Metadata DB"]
+  Q --> W
+  S["Content Store"] --> W
+  M --> O
+```
+
+### Components
+
+- `Orchestrator`
+  - Creates backfill runs for `(model_version, corpus_scope)`, computes candidate docs, and enqueues work with strict dedupe keys.
+  - Earns its place by owning *run-level invariants*: coverage, throttling, and cutover readiness.
+
+- `Metadata DB` (Postgres)
+  - Tables for documents (or references), embedding runs, tasks, attempts, and produced artifacts.
+  - The source of truth for “what should exist” and “what exists,” enabling repair and audits.
+
+- `Work Queue`
+  - At-least-once delivery of tasks keyed by `(doc_id, model_version, content_hash)`.
+  - Absorbs spikes and decouples throughput from orchestrator and workers.
+
+- `Content Store`
+  - Immutable-ish snapshots (or stable references) of embedding-relevant text at a specific revision.
+  - Prevents the “document changed mid-run” class of heisenbugs.
+
+- `Embedding Workers`
+  - Stateless, horizontally scalable; fetch content, compute embedding, write artifact + metadata idempotently.
+  - Own batching and rate limiting to protect model serving.
+
+- `Vector Index`
+  - Stores vectors in per-version collections with aliasing (e.g., `embeddings_v2025_01` plus alias `embeddings_active`).
+  - Supports atomic cutover by repointing the alias.
+
+## Deep Dive: Idempotent Backfill + Safe Cutover
+
+The hardest part is guaranteeing that a massive backfill produces a *complete, internally consistent* embedding set for a model_version, despite retries, partial failures, and changing documents—then activating it without serving a mixed state.
+
+### 1) Make the work item a pure function
+Define the embedding job unit as:
+
+`EmbeddingTask = (doc_id, model_version, content_hash, content_ref)`
+
+- `content_hash` is computed from the exact text/features that affect the embedding (post-normalization).
+- If the document changes, it produces a new `content_hash`, and therefore a new task. Old tasks become harmless.
+
+This eliminates ambiguity: workers never ask “what’s the latest text?” during a backfill; they embed *the referenced snapshot*.
+
+### 2) Enforce idempotency at the database boundary
+Workers do two writes:
+1. Upsert provenance into Postgres:
+   - Unique constraint on `(doc_id, model_version, content_hash)`.
+   - Record `status=complete`, `embedding_uri` (optional), `vector_index_ref`, `attempt_count`, timestamps.
+2. Upsert the vector into the versioned vector index:
+   - Use a deterministic vector ID like `"{doc_id}:{content_hash}"` within the `model_version` collection.
+
+Order matters. The safe pattern is:
+- Write vector (idempotent upsert).
+- Then mark the artifact row complete in Postgres in a transaction that also records the vector ID.
+If the worker crashes after writing the vector but before DB commit, the task retries and performs the same upsert—no duplication, and the DB eventually reflects reality.
+
+### 3) Run-level completeness checks and cutover gates
+The orchestrator tracks a backfill run with:
+- `target_set_size`: number of docs in scope at run start (by snapshotting a doc_id list or a stable query + watermark).
+- `completed_count`: count of distinct `(doc_id, model_version, content_hash)` completed.
+- Error budget: allowed permanent failures (e.g., corrupted docs) with explicit exclusions.
+
+Cutover gate:
+- Coverage >= 99.9% (or agreed threshold) and no “systemic” error class above a small rate (e.g., model timeouts).
+- Optional offline eval metrics computed on a canary set (stored alongside the run).
+
+Activation:
+- Flip the vector index alias from `embeddings_active -> embeddings_v_old` to `-> embeddings_v_new`.
+- Update a single `active_model_version` record (used by writers and debuggability).
+
+Rollback is the same operation in reverse: repoint the alias.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness under retries | Some extra storage for multiple versions |
+| Atomic cutover + rollback | More moving parts than in-place overwrite |
+| Auditable provenance | Slightly higher write amplification |
+| Operational simplicity | Not “streaming-pure” end-to-end |
+
+## Failure Modes
+
+- **Model endpoint degradation (timeouts / throttling)**
+  - What happens: queue depth grows; workers spend cycles retrying; backfill misses SLO.
+  - Detect: sustained p95/p99 embedding latency + rising queue age; per-model error rate dashboards.
+  - Recover: orchestrator applies global rate limit; workers switch to larger batches; pause non-critical backfills; resume from checkpoints.
+
+- **Partial truth mismatch (vector written, metadata missing)**
+  - What happens: vectors exist but aren’t counted toward run completeness, blocking cutover.
+  - Detect: reconciliation job compares vector index IDs vs Postgres artifacts for a run.
+  - Recover: repair task replays missing metadata rows by re-upserting idempotently; no need to recompute embeddings.
+
+- **Poison documents (bad encoding / extreme size / malformed content)**
+  - What happens: hot-loop retries waste capacity; run never reaches completion.
+  - Detect: high retry count for the same `(doc_id, content_hash)`; DLQ volume.
+  - Recover: route to DLQ after N attempts; mark as excluded with reason; keep exclusions explicit so coverage math stays honest.
+
+## What I'd Do Differently At...
+
+- **10x scale:** move large backfills to dedicated GPU pools with aggressive batching; shard the vector index by tenant/topic; store embeddings as float16 with PQ/IVF tuning to control index cost.
+- **100x scale:** replace DB-driven orchestration loops with a streaming changelog (Kafka) for continuous updates, keep Postgres for provenance but move task state to a scalable state store; multi-region active-active with region-local embedding and async replication of versioned indices.
+
+## Operational Notes
+
+- Backfills are production events: treat each `model_version` as a release with a runbook, dashboards, and a hard rollback button (alias flip).
+- Keep `content_hash` stable: normalize text deterministically (whitespace, HTML stripping rules, language-specific quirks) or you’ll create artificial churn.
+- Always separate “build” from “activate”: serving mixed versions is the fastest way to ship a ranking regression you can’t explain.
+- Reconciliation is mandatory: a cheap periodic job that repairs DB↔index drift prevents week-long “why is coverage stuck at 99.7%” incidents.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/embedding-pipeline.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af9-b327-7fa1-8e2d-097e2fc8f149
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Embedding Pipeline"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["embeddings", "backfill", "model-versioning", "pipelines", "vector-db", "idempotency"]
+---
+
+## Overview
+
+This system backfills and continuously refreshes vector embeddings for millions of documents as embedding models are versioned or drift is detected. The core idea is to treat “embedding” as a deterministic, versioned *build artifact*—like compiled binaries—so the pipeline is about **reproducible builds + safe cutovers**, not ad-hoc reprocessing.
+
+Elegance comes from separating two concerns that teams often conflate: (1) *producing* embeddings reliably at high throughput, and (2) *activating* a new embedding version safely. We build embeddings into a **shadow namespace** keyed by `(doc_id, model_version, content_hash)`, verify coverage/quality, then flip an **alias** (or “active version” pointer) to cut over atomically.
+
+Everything else is deliberately boring: Postgres for orchestration state, an at-least-once queue for work distribution, object storage for document snapshots, and a vector index that supports versioned collections plus aliasing.
+
+## What Makes This Hard
+
+Naive pipelines try to “just re-embed everything” and overwrite vectors in place. That fails in three ways:
+
+1. **Correctness under retries:** at-least-once delivery + flaky model endpoints produce duplicates, partial writes, and silent corruption unless every step is idempotent and auditable.
+2. **Safe activation:** overwriting in place creates a mixed-index state (old + new vectors) that breaks ranking consistency and makes regressions impossible to roll back cleanly.
+3. **Cost and time control:** backfills are bursty; without quotas, batching, and checkpoints, you either melt the model serving stack or pay peak capacity for hours you don’t need.
+
+The trap: teams focus on worker autoscaling and ignore *lineage* (which input produced which vector) and *cutover semantics* (when a version becomes “real”).
+
+## Requirements
+
+### Functional Requirements
+- Re-embed documents when either the **model_version** changes or the document’s **embedding-relevant content** changes.
+- Support **backfill** (millions of docs) and **continuous updates** (ongoing writes/edits/deletes).
+- Provide **idempotent processing**: retries must not create duplicate/incorrect vectors.
+- Enable **safe cutover** to a new model_version with rollback.
+- Keep **full provenance**: for any vector, record model_version, content_hash, timestamp, and embedding parameters.
+- Handle deletes: remove (or tombstone) vectors for deleted documents consistently.
+
+### Scale Targets
+- Corpus: **10M documents** (order of magnitude “millions”).
+- Average embedding payload: **1536 dims**, stored as float16 → ~3 KB/vector plus index overhead.
+- Backfill SLO: **24 hours** for a full re-embed after a model release.
+  - Requires ~116 embeddings/sec sustained (10,000,000 / 86,400).
+  - Design for **500 embeddings/sec** to absorb retries, skew, and throttling.
+- Continuous updates: **100 doc updates/sec peak**, with p99 time-to-fresh-embedding **< 5 minutes**.
+
+These numbers matter because they force: (a) queue-based smoothing, (b) strict idempotency, and (c) a cutover mechanism that doesn’t require rewriting “active” in place.
+
+## Key Design Decisions
+
+- **Decision 1: Versioned, content-addressed embeddings**
+  - Chose: store embeddings by `(doc_id, model_version, content_hash)` and record lineage in Postgres.
+  - Rejected: overwriting a single “current embedding” row/vector in place.
+  - Why: this makes embedding generation a pure function, enabling safe retries, dedupe, auditing, and rollback.
+
+- **Decision 2: Shadow build + atomic activation**
+  - Chose: write new vectors into a per-version namespace (index/collection) and activate via alias (or “active_model_version” pointer).
+  - Rejected: gradual in-place replacement of vectors in the active index.
+  - Why: avoids mixed-version ranking, enables canary evaluation, and allows instant rollback.
+
+- **Decision 3: Boring orchestration with DB + queue**
+  - Chose: Postgres for job/state/provenance and an at-least-once queue (e.g., SQS/PubSub) for distribution.
+  - Rejected: a bespoke distributed scheduler or exactly-once streaming for the whole pipeline.
+  - Why: the hard part is correctness semantics; Postgres transactions + idempotency keys solve it without complexity theater.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  T["Model/Drift Trigger"] --> O["Orchestrator"]
+  O --> Q["Work Queue"]
+  W["Embedding Workers"] --> V["Vector Index"]
+  W --> M["Metadata DB"]
+  Q --> W
+  S["Content Store"] --> W
+  M --> O
+```
+
+### Components
+
+- `Orchestrator`
+  - Creates backfill runs for `(model_version, corpus_scope)`, computes candidate docs, and enqueues work with strict dedupe keys.
+  - Earns its place by owning *run-level invariants*: coverage, throttling, and cutover readiness.
+
+- `Metadata DB` (Postgres)
+  - Tables for documents (or references), embedding runs, tasks, attempts, and produced artifacts.
+  - The source of truth for “what should exist” and “what exists,” enabling repair and audits.
+
+- `Work Queue`
+  - At-least-once delivery of tasks keyed by `(doc_id, model_version, content_hash)`.
+  - Absorbs spikes and decouples throughput from orchestrator and workers.
+
+- `Content Store`
+  - Immutable-ish snapshots (or stable references) of embedding-relevant text at a specific revision.
+  - Prevents the “document changed mid-run” class of heisenbugs.
+
+- `Embedding Workers`
+  - Stateless, horizontally scalable; fetch content, compute embedding, write artifact + metadata idempotently.
+  - Own batching and rate limiting to protect model serving.
+
+- `Vector Index`
+  - Stores vectors in per-version collections with aliasing (e.g., `embeddings_v2025_01` plus alias `embeddings_active`).
+  - Supports atomic cutover by repointing the alias.
+
+## Deep Dive: Idempotent Backfill + Safe Cutover
+
+The hardest part is guaranteeing that a massive backfill produces a *complete, internally consistent* embedding set for a model_version, despite retries, partial failures, and changing documents—then activating it without serving a mixed state.
+
+### 1) Make the work item a pure function
+Define the embedding job unit as:
+
+`EmbeddingTask = (doc_id, model_version, content_hash, content_ref)`
+
+- `content_hash` is computed from the exact text/features that affect the embedding (post-normalization).
+- If the document changes, it produces a new `content_hash`, and therefore a new task. Old tasks become harmless.
+
+This eliminates ambiguity: workers never ask “what’s the latest text?” during a backfill; they embed *the referenced snapshot*.
+
+### 2) Enforce idempotency at the database boundary
+Workers do two writes:
+1. Upsert provenance into Postgres:
+   - Unique constraint on `(doc_id, model_version, content_hash)`.
+   - Record `status=complete`, `embedding_uri` (optional), `vector_index_ref`, `attempt_count`, timestamps.
+2. Upsert the vector into the versioned vector index:
+   - Use a deterministic vector ID like `"{doc_id}:{content_hash}"` within the `model_version` collection.
+
+Order matters. The safe pattern is:
+- Write vector (idempotent upsert).
+- Then mark the artifact row complete in Postgres in a transaction that also records the vector ID.
+If the worker crashes after writing the vector but before DB commit, the task retries and performs the same upsert—no duplication, and the DB eventually reflects reality.
+
+### 3) Run-level completeness checks and cutover gates
+The orchestrator tracks a backfill run with:
+- `target_set_size`: number of docs in scope at run start (by snapshotting a doc_id list or a stable query + watermark).
+- `completed_count`: count of distinct `(doc_id, model_version, content_hash)` completed.
+- Error budget: allowed permanent failures (e.g., corrupted docs) with explicit exclusions.
+
+Cutover gate:
+- Coverage >= 99.9% (or agreed threshold) and no “systemic” error class above a small rate (e.g., model timeouts).
+- Optional offline eval metrics computed on a canary set (stored alongside the run).
+
+Activation:
+- Flip the vector index alias from `embeddings_active -> embeddings_v_old` to `-> embeddings_v_new`.
+- Update a single `active_model_version` record (used by writers and debuggability).
+
+Rollback is the same operation in reverse: repoint the alias.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness under retries | Some extra storage for multiple versions |
+| Atomic cutover + rollback | More moving parts than in-place overwrite |
+| Auditable provenance | Slightly higher write amplification |
+| Operational simplicity | Not “streaming-pure” end-to-end |
+
+## Failure Modes
+
+- **Model endpoint degradation (timeouts / throttling)**
+  - What happens: queue depth grows; workers spend cycles retrying; backfill misses SLO.
+  - Detect: sustained p95/p99 embedding latency + rising queue age; per-model error rate dashboards.
+  - Recover: orchestrator applies global rate limit; workers switch to larger batches; pause non-critical backfills; resume from checkpoints.
+
+- **Partial truth mismatch (vector written, metadata missing)**
+  - What happens: vectors exist but aren’t counted toward run completeness, blocking cutover.
+  - Detect: reconciliation job compares vector index IDs vs Postgres artifacts for a run.
+  - Recover: repair task replays missing metadata rows by re-upserting idempotently; no need to recompute embeddings.
+
+- **Poison documents (bad encoding / extreme size / malformed content)**
+  - What happens: hot-loop retries waste capacity; run never reaches completion.
+  - Detect: high retry count for the same `(doc_id, content_hash)`; DLQ volume.
+  - Recover: route to DLQ after N attempts; mark as excluded with reason; keep exclusions explicit so coverage math stays honest.
+
+## What I'd Do Differently At...
+
+- **10x scale:** move large backfills to dedicated GPU pools with aggressive batching; shard the vector index by tenant/topic; store embeddings as float16 with PQ/IVF tuning to control index cost.
+- **100x scale:** replace DB-driven orchestration loops with a streaming changelog (Kafka) for continuous updates, keep Postgres for provenance but move task state to a scalable state store; multi-region active-active with region-local embedding and async replication of versioned indices.
+
+## Operational Notes
+
+- Backfills are production events: treat each `model_version` as a release with a runbook, dashboards, and a hard rollback button (alias flip).
+- Keep `content_hash` stable: normalize text deterministically (whitespace, HTML stripping rules, language-specific quirks) or you’ll create artificial churn.
+- Always separate “build” from “activate”: serving mixed versions is the fastest way to ship a ranking regression you can’t explain.
+- Reconciliation is mandatory: a cheap periodic job that repairs DB↔index drift prevents week-long “why is coverage stuck at 99.7%” incidents.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+thinking
+**Preparing structured critique**
+
+The user is looking for a structured critique in markdown format, so I need to ensure it's concise and addresses all key points like tables and scenarios. I should mention simpler alternatives like using Postgres with pgvector, LISTEN/NOTIFY, SKIP LOCKED, advisory locks, and even Redis streams or Temporal.
+
+I need to evaluate the complexity and outline stress tests like database outages, vector index failures, queue duplicates, and configuration issues. It's important to distinguish between must-fix and should-fix items while staying within the required length. I'll create a structured critique with tables and about 4-5 scenarios.
+codex
+## Elegance Check
+
+### The Core Insight
+Treat embeddings as **versioned build artifacts** and separate **build** (produce into a shadow namespace) from **activate** (atomic alias flip). That cleanly solves mixed-version serving, rollback, and auditability.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Versioned vector collections + alias | Only clean way to guarantee “no mixed state” and instant rollback. |
+| Content snapshot/reference (`content_ref`) | Prevents heisenbugs where a doc changes mid-run; makes tasks deterministic. |
+| Postgres provenance w/ unique key | The simplest durable idempotency boundary and audit log for “what exists vs should exist”. |
+| Reconciliation job | Real-world systems drift; this keeps cutover gates honest and avoids stuck-at-99.7% incidents. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Separate queue + orchestrator loop | Postgres-driven queue (`FOR UPDATE SKIP LOCKED`) for backfills | Less infra, but harder to scale to very high task rates; needs careful vacuum/indexing. |
+| Custom orchestrator managing run invariants | Temporal (or similar workflow engine) for run state + retries | Faster correctness and observability, but adds a major platform dependency. |
+| Content store “immutable-ish snapshots” | Store only normalized embedding text + hash in Postgres/JSONB (or S3 object keyed by hash) | DB storage cost (if in Postgres) or S3 read amplification; but simplifies “what exactly was embedded”. |
+| Two writes (vector index then DB) | Make DB the commit point: write DB row `complete` only after vector upsert, plus periodic verifier | You already do this pattern; formalize it as the rule and accept temporary invisibility until verified. |
+| “Compute candidate docs” at run start | Use a stable watermark + incremental scan (or change-log) | Less up-front snapshotting, but more complex “what is in-scope” reasoning for completeness. |
+| Separate `active_model_version` record + alias | Rely on vector index alias as the single source of truth | Fewer moving parts, but you lose a DB-native pointer for debugging/analytics unless you mirror it. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres is down for 5 minutes**
+   - Design’s answer: not explicitly addressed (Postgres is central for orchestration + provenance).
+   - Recommendation: Strengthen — define worker behavior (pause vs best-effort vector writes), backpressure, and how you prevent “vectors written with no provenance” from exploding during DB outages.
+
+2. **Vector index is slow (not down)**
+   - Design’s answer: partially addressed (rate limiting, batching, queue smoothing).
+   - Recommendation: Strengthen — add explicit timeouts + circuit breaker + per-tenant/run throttles; otherwise workers pile up in-flight requests and you get cascading failure.
+
+3. **Network partition: workers can reach model endpoint but not Postgres**
+   - Design’s answer: implicitly handled by retries, but ordering makes this dangerous (vector write succeeds; DB commit fails repeatedly).
+   - Recommendation: Strengthen — require DB connectivity before doing any embedding work (or spool results locally/object storage keyed by `(doc_id, model_version, content_hash)` and have a separate committer).
+
+4. **Bad config deploy (wrong model version / wrong normalization rules)**
+   - Design’s answer: partially addressed via content_hash stability notes and shadow build.
+   - Recommendation: Strengthen — treat normalization + embedding params as part of the versioned artifact key (e.g., `build_id`), and gate activation on “build manifest” approval to avoid silently mixing artifacts produced with different params under the same `model_version`.
+
+5. **Traffic 10x on continuous updates**
+   - Design’s answer: queue absorbs spikes; workers scale.
+   - Recommendation: Acceptable if you add a clear overload policy (drop/merge updates per doc, prioritize latest `content_hash`, cap per-doc concurrency) to avoid re-embedding churn during rapid edits.
+
+## Recommendations
+
+### Must Fix
+- Define **authoritative commit semantics** for outages/partitions: whether Postgres or the vector index is the source of truth during incidents, and what workers do when they can’t reach one side.
+- Include **embedding parameterization in identity**: `model_version` alone is too coarse if tokenization/normalization/prompting changes; make a `build_fingerprint` part of the dedupe key and stored provenance.
+- Specify **cutover gate correctness** precisely: what is the target set (snapshot vs watermark), how deletes are counted, and how you avoid “completeness” lying when docs churn mid-run.
+
+### Should Consider
+- Collapse orchestration complexity where possible: for backfills, a **Postgres SKIP LOCKED task table** can replace an external queue if throughput is acceptable, or at least serve as the “exactly-one scheduler” to reduce duplicate enqueues.
+- Add a **latest-wins coalescing rule** for continuous updates (per `doc_id`): don’t spend capacity embedding intermediate revisions that will be superseded before activation.
+- Make **DLQ/exclusions first-class** with expirations and dashboards; permanent exclusions should be reviewable and ideally shrink over time.
+
+### Nice to Have
+- Canary activation that supports **percentage-based read routing** (or dual-read evaluation) before full alias flip, if your serving stack can tolerate it.
+- A small “build manifest” artifact per run: normalized-text version, model endpoint digest, dimensionality, quantization settings, index build params.
+
+## What’s Working Well
+- The build/activate split is the right abstraction; it makes rollback and evaluation *cheap*.
+- Idempotency is handled where it matters (unique keys + deterministic IDs), and you acknowledge DB↔index drift as inevitable.
+- The design is honest about trade-offs (storage/write amplification) and focuses complexity on correctness rather than “exactly-once theater.”
+tokens used
+4,451
+## Elegance Check
+
+### The Core Insight
+Treat embeddings as **versioned build artifacts** and separate **build** (produce into a shadow namespace) from **activate** (atomic alias flip). That cleanly solves mixed-version serving, rollback, and auditability.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Versioned vector collections + alias | Only clean way to guarantee “no mixed state” and instant rollback. |
+| Content snapshot/reference (`content_ref`) | Prevents heisenbugs where a doc changes mid-run; makes tasks deterministic. |
+| Postgres provenance w/ unique key | The simplest durable idempotency boundary and audit log for “what exists vs should exist”. |
+| Reconciliation job | Real-world systems drift; this keeps cutover gates honest and avoids stuck-at-99.7% incidents. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Separate queue + orchestrator loop | Postgres-driven queue (`FOR UPDATE SKIP LOCKED`) for backfills | Less infra, but harder to scale to very high task rates; needs careful vacuum/indexing. |
+| Custom orchestrator managing run invariants | Temporal (or similar workflow engine) for run state + retries | Faster correctness and observability, but adds a major platform dependency. |
+| Content store “immutable-ish snapshots” | Store only normalized embedding text + hash in Postgres/JSONB (or S3 object keyed by hash) | DB storage cost (if in Postgres) or S3 read amplification; but simplifies “what exactly was embedded”. |
+| Two writes (vector index then DB) | Make DB the commit point: write DB row `complete` only after vector upsert, plus periodic verifier | You already do this pattern; formalize it as the rule and accept temporary invisibility until verified. |
+| “Compute candidate docs” at run start | Use a stable watermark + incremental scan (or change-log) | Less up-front snapshotting, but more complex “what is in-scope” reasoning for completeness. |
+| Separate `active_model_version` record + alias | Rely on vector index alias as the single source of truth | Fewer moving parts, but you lose a DB-native pointer for debugging/analytics unless you mirror it. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres is down for 5 minutes**
+   - Design’s answer: not explicitly addressed (Postgres is central for orchestration + provenance).
+   - Recommendation: Strengthen — define worker behavior (pause vs best-effort vector writes), backpressure, and how you prevent “vectors written with no provenance” from exploding during DB outages.
+
+2. **Vector index is slow (not down)**
+   - Design’s answer: partially addressed (rate limiting, batching, queue smoothing).
+   - Recommendation: Strengthen — add explicit timeouts + circuit breaker + per-tenant/run throttles; otherwise workers pile up in-flight requests and you get cascading failure.
+
+3. **Network partition: workers can reach model endpoint but not Postgres**
+   - Design’s answer: implicitly handled by retries, but ordering makes this dangerous (vector write succeeds; DB commit fails repeatedly).
+   - Recommendation: Strengthen — require DB connectivity before doing any embedding work (or spool results locally/object storage keyed by `(doc_id, model_version, content_hash)` and have a separate committer).
+
+4. **Bad config deploy (wrong model version / wrong normalization rules)**
+   - Design’s answer: partially addressed via content_hash stability notes and shadow build.
+   - Recommendation: Strengthen — treat normalization + embedding params as part of the versioned artifact key (e.g., `build_id`), and gate activation on “build manifest” approval to avoid silently mixing artifacts produced with different params under the same `model_version`.
+
+5. **Traffic 10x on continuous updates**
+   - Design’s answer: queue absorbs spikes; workers scale.
+   - Recommendation: Acceptable if you add a clear overload policy (drop/merge updates per doc, prioritize latest `content_hash`, cap per-doc concurrency) to avoid re-embedding churn during rapid edits.
+
+## Recommendations
+
+### Must Fix
+- Define **authoritative commit semantics** for outages/partitions: whether Postgres or the vector index is the source of truth during incidents, and what workers do when they can’t reach one side.
+- Include **embedding parameterization in identity**: `model_version` alone is too coarse if tokenization/normalization/prompting changes; make a `build_fingerprint` part of the dedupe key and stored provenance.
+- Specify **cutover gate correctness** precisely: what is the target set (snapshot vs watermark), how deletes are counted, and how you avoid “completeness” lying when docs churn mid-run.
+
+### Should Consider
+- Collapse orchestration complexity where possible: for backfills, a **Postgres SKIP LOCKED task table** can replace an external queue if throughput is acceptable, or at least serve as the “exactly-one scheduler” to reduce duplicate enqueues.
+- Add a **latest-wins coalescing rule** for continuous updates (per `doc_id`): don’t spend capacity embedding intermediate revisions that will be superseded before activation.
+- Make **DLQ/exclusions first-class** with expirations and dashboards; permanent exclusions should be reviewable and ideally shrink over time.
+
+### Nice to Have
+- Canary activation that supports **percentage-based read routing** (or dual-read evaluation) before full alias flip, if your serving stack can tolerate it.
+- A small “build manifest” artifact per run: normalized-text version, model endpoint digest, dimensionality, quantization settings, index build params.
+
+## What’s Working Well
+- The build/activate split is the right abstraction; it makes rollback and evaluation *cheap*.
+- Idempotency is handled where it matters (unique keys + deterministic IDs), and you acknowledge DB↔index drift as inevitable.
+- The design is honest about trade-offs (storage/write amplification) and focuses complexity on correctness rather than “exactly-once theater.”
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/embedding-pipeline.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afa-472f-79e3-9601-089221463635
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Embedding Pipeline"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["embeddings", "backfill", "model-versioning", "pipelines", "vector-db", "idempotency"]
+---
+
+## Overview
+
+This system backfills and continuously refreshes vector embeddings for millions of documents as embedding models are versioned or drift is detected. The core idea is to treat “embedding” as a deterministic, versioned *build artifact*—like compiled binaries—so the pipeline is about **reproducible builds + safe cutovers**, not ad-hoc reprocessing.
+
+Elegance comes from separating two concerns that teams often conflate: (1) *producing* embeddings reliably at high throughput, and (2) *activating* a new embedding version safely. We build embeddings into a **shadow namespace** keyed by `(doc_id, model_version, content_hash)`, verify coverage/quality, then flip an **alias** (or “active version” pointer) to cut over atomically.
+
+Everything else is deliberately boring: Postgres for orchestration state, an at-least-once queue for work distribution, object storage for document snapshots, and a vector index that supports versioned collections plus aliasing.
+
+## What Makes This Hard
+
+Naive pipelines try to “just re-embed everything” and overwrite vectors in place. That fails in three ways:
+
+1. **Correctness under retries:** at-least-once delivery + flaky model endpoints produce duplicates, partial writes, and silent corruption unless every step is idempotent and auditable.
+2. **Safe activation:** overwriting in place creates a mixed-index state (old + new vectors) that breaks ranking consistency and makes regressions impossible to roll back cleanly.
+3. **Cost and time control:** backfills are bursty; without quotas, batching, and checkpoints, you either melt the model serving stack or pay peak capacity for hours you don’t need.
+
+The trap: teams focus on worker autoscaling and ignore *lineage* (which input produced which vector) and *cutover semantics* (when a version becomes “real”).
+
+## Requirements
+
+### Functional Requirements
+- Re-embed documents when either the **model_version** changes or the document’s **embedding-relevant content** changes.
+- Support **backfill** (millions of docs) and **continuous updates** (ongoing writes/edits/deletes).
+- Provide **idempotent processing**: retries must not create duplicate/incorrect vectors.
+- Enable **safe cutover** to a new model_version with rollback.
+- Keep **full provenance**: for any vector, record model_version, content_hash, timestamp, and embedding parameters.
+- Handle deletes: remove (or tombstone) vectors for deleted documents consistently.
+
+### Scale Targets
+- Corpus: **10M documents** (order of magnitude “millions”).
+- Average embedding payload: **1536 dims**, stored as float16 → ~3 KB/vector plus index overhead.
+- Backfill SLO: **24 hours** for a full re-embed after a model release.
+  - Requires ~116 embeddings/sec sustained (10,000,000 / 86,400).
+  - Design for **500 embeddings/sec** to absorb retries, skew, and throttling.
+- Continuous updates: **100 doc updates/sec peak**, with p99 time-to-fresh-embedding **< 5 minutes**.
+
+These numbers matter because they force: (a) queue-based smoothing, (b) strict idempotency, and (c) a cutover mechanism that doesn’t require rewriting “active” in place.
+
+## Key Design Decisions
+
+- **Decision 1: Versioned, content-addressed embeddings**
+  - Chose: store embeddings by `(doc_id, model_version, content_hash)` and record lineage in Postgres.
+  - Rejected: overwriting a single “current embedding” row/vector in place.
+  - Why: this makes embedding generation a pure function, enabling safe retries, dedupe, auditing, and rollback.
+
+- **Decision 2: Shadow build + atomic activation**
+  - Chose: write new vectors into a per-version namespace (index/collection) and activate via alias (or “active_model_version” pointer).
+  - Rejected: gradual in-place replacement of vectors in the active index.
+  - Why: avoids mixed-version ranking, enables canary evaluation, and allows instant rollback.
+
+- **Decision 3: Boring orchestration with DB + queue**
+  - Chose: Postgres for job/state/provenance and an at-least-once queue (e.g., SQS/PubSub) for distribution.
+  - Rejected: a bespoke distributed scheduler or exactly-once streaming for the whole pipeline.
+  - Why: the hard part is correctness semantics; Postgres transactions + idempotency keys solve it without complexity theater.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  T["Model/Drift Trigger"] --> O["Orchestrator"]
+  O --> Q["Work Queue"]
+  W["Embedding Workers"] --> V["Vector Index"]
+  W --> M["Metadata DB"]
+  Q --> W
+  S["Content Store"] --> W
+  M --> O
+```
+
+### Components
+
+- `Orchestrator`
+  - Creates backfill runs for `(model_version, corpus_scope)`, computes candidate docs, and enqueues work with strict dedupe keys.
+  - Earns its place by owning *run-level invariants*: coverage, throttling, and cutover readiness.
+
+- `Metadata DB` (Postgres)
+  - Tables for documents (or references), embedding runs, tasks, attempts, and produced artifacts.
+  - The source of truth for “what should exist” and “what exists,” enabling repair and audits.
+
+- `Work Queue`
+  - At-least-once delivery of tasks keyed by `(doc_id, model_version, content_hash)`.
+  - Absorbs spikes and decouples throughput from orchestrator and workers.
+
+- `Content Store`
+  - Immutable-ish snapshots (or stable references) of embedding-relevant text at a specific revision.
+  - Prevents the “document changed mid-run” class of heisenbugs.
+
+- `Embedding Workers`
+  - Stateless, horizontally scalable; fetch content, compute embedding, write artifact + metadata idempotently.
+  - Own batching and rate limiting to protect model serving.
+
+- `Vector Index`
+  - Stores vectors in per-version collections with aliasing (e.g., `embeddings_v2025_01` plus alias `embeddings_active`).
+  - Supports atomic cutover by repointing the alias.
+
+## Deep Dive: Idempotent Backfill + Safe Cutover
+
+The hardest part is guaranteeing that a massive backfill produces a *complete, internally consistent* embedding set for a model_version, despite retries, partial failures, and changing documents—then activating it without serving a mixed state.
+
+### 1) Make the work item a pure function
+Define the embedding job unit as:
+
+`EmbeddingTask = (doc_id, model_version, content_hash, content_ref)`
+
+- `content_hash` is computed from the exact text/features that affect the embedding (post-normalization).
+- If the document changes, it produces a new `content_hash`, and therefore a new task. Old tasks become harmless.
+
+This eliminates ambiguity: workers never ask “what’s the latest text?” during a backfill; they embed *the referenced snapshot*.
+
+### 2) Enforce idempotency at the database boundary
+Workers do two writes:
+1. Upsert provenance into Postgres:
+   - Unique constraint on `(doc_id, model_version, content_hash)`.
+   - Record `status=complete`, `embedding_uri` (optional), `vector_index_ref`, `attempt_count`, timestamps.
+2. Upsert the vector into the versioned vector index:
+   - Use a deterministic vector ID like `"{doc_id}:{content_hash}"` within the `model_version` collection.
+
+Order matters. The safe pattern is:
+- Write vector (idempotent upsert).
+- Then mark the artifact row complete in Postgres in a transaction that also records the vector ID.
+If the worker crashes after writing the vector but before DB commit, the task retries and performs the same upsert—no duplication, and the DB eventually reflects reality.
+
+### 3) Run-level completeness checks and cutover gates
+The orchestrator tracks a backfill run with:
+- `target_set_size`: number of docs in scope at run start (by snapshotting a doc_id list or a stable query + watermark).
+- `completed_count`: count of distinct `(doc_id, model_version, content_hash)` completed.
+- Error budget: allowed permanent failures (e.g., corrupted docs) with explicit exclusions.
+
+Cutover gate:
+- Coverage >= 99.9% (or agreed threshold) and no “systemic” error class above a small rate (e.g., model timeouts).
+- Optional offline eval metrics computed on a canary set (stored alongside the run).
+
+Activation:
+- Flip the vector index alias from `embeddings_active -> embeddings_v_old` to `-> embeddings_v_new`.
+- Update a single `active_model_version` record (used by writers and debuggability).
+
+Rollback is the same operation in reverse: repoint the alias.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness under retries | Some extra storage for multiple versions |
+| Atomic cutover + rollback | More moving parts than in-place overwrite |
+| Auditable provenance | Slightly higher write amplification |
+| Operational simplicity | Not “streaming-pure” end-to-end |
+
+## Failure Modes
+
+- **Model endpoint degradation (timeouts / throttling)**
+  - What happens: queue depth grows; workers spend cycles retrying; backfill misses SLO.
+  - Detect: sustained p95/p99 embedding latency + rising queue age; per-model error rate dashboards.
+  - Recover: orchestrator applies global rate limit; workers switch to larger batches; pause non-critical backfills; resume from checkpoints.
+
+- **Partial truth mismatch (vector written, metadata missing)**
+  - What happens: vectors exist but aren’t counted toward run completeness, blocking cutover.
+  - Detect: reconciliation job compares vector index IDs vs Postgres artifacts for a run.
+  - Recover: repair task replays missing metadata rows by re-upserting idempotently; no need to recompute embeddings.
+
+- **Poison documents (bad encoding / extreme size / malformed content)**
+  - What happens: hot-loop retries waste capacity; run never reaches completion.
+  - Detect: high retry count for the same `(doc_id, content_hash)`; DLQ volume.
+  - Recover: route to DLQ after N attempts; mark as excluded with reason; keep exclusions explicit so coverage math stays honest.
+
+## What I'd Do Differently At...
+
+- **10x scale:** move large backfills to dedicated GPU pools with aggressive batching; shard the vector index by tenant/topic; store embeddings as float16 with PQ/IVF tuning to control index cost.
+- **100x scale:** replace DB-driven orchestration loops with a streaming changelog (Kafka) for continuous updates, keep Postgres for provenance but move task state to a scalable state store; multi-region active-active with region-local embedding and async replication of versioned indices.
+
+## Operational Notes
+
+- Backfills are production events: treat each `model_version` as a release with a runbook, dashboards, and a hard rollback button (alias flip).
+- Keep `content_hash` stable: normalize text deterministically (whitespace, HTML stripping rules, language-specific quirks) or you’ll create artificial churn.
+- Always separate “build” from “activate”: serving mixed versions is the fastest way to ship a ranking regression you can’t explain.
+- Reconciliation is mandatory: a cheap periodic job that repairs DB↔index drift prevents week-long “why is coverage stuck at 99.7%” incidents.
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Treat embeddings as **versioned build artifacts** and separate **build** (produce into a shadow namespace) from **activate** (atomic alias flip). That cleanly solves mixed-version serving, rollback, and auditability.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Versioned vector collections + alias | Only clean way to guarantee “no mixed state” and instant rollback. |
+| Content snapshot/reference (`content_ref`) | Prevents heisenbugs where a doc changes mid-run; makes tasks deterministic. |
+| Postgres provenance w/ unique key | The simplest durable idempotency boundary and audit log for “what exists vs should exist”. |
+| Reconciliation job | Real-world systems drift; this keeps cutover gates honest and avoids stuck-at-99.7% incidents. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Separate queue + orchestrator loop | Postgres-driven queue (`FOR UPDATE SKIP LOCKED`) for backfills | Less infra, but harder to scale to very high task rates; needs careful vacuum/indexing. |
+| Custom orchestrator managing run invariants | Temporal (or similar workflow engine) for run state + retries | Faster correctness and observability, but adds a major platform dependency. |
+| Content store “immutable-ish snapshots” | Store only normalized embedding text + hash in Postgres/JSONB (or S3 object keyed by hash) | DB storage cost (if in Postgres) or S3 read amplification; but simplifies “what exactly was embedded”. |
+| Two writes (vector index then DB) | Make DB the commit point: write DB row `complete` only after vector upsert, plus periodic verifier | You already do this pattern; formalize it as the rule and accept temporary invisibility until verified. |
+| “Compute candidate docs” at run start | Use a stable watermark + incremental scan (or change-log) | Less up-front snapshotting, but more complex “what is in-scope” reasoning for completeness. |
+| Separate `active_model_version` record + alias | Rely on vector index alias as the single source of truth | Fewer moving parts, but you lose a DB-native pointer for debugging/analytics unless you mirror it. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres is down for 5 minutes**
+   - Design’s answer: not explicitly addressed (Postgres is central for orchestration + provenance).
+   - Recommendation: Strengthen — define worker behavior (pause vs best-effort vector writes), backpressure, and how you prevent “vectors written with no provenance” from exploding during DB outages.
+
+2. **Vector index is slow (not down)**
+   - Design’s answer: partially addressed (rate limiting, batching, queue smoothing).
+   - Recommendation: Strengthen — add explicit timeouts + circuit breaker + per-tenant/run throttles; otherwise workers pile up in-flight requests and you get cascading failure.
+
+3. **Network partition: workers can reach model endpoint but not Postgres**
+   - Design’s answer: implicitly handled by retries, but ordering makes this dangerous (vector write succeeds; DB commit fails repeatedly).
+   - Recommendation: Strengthen — require DB connectivity before doing any embedding work (or spool results locally/object storage keyed by `(doc_id, model_version, content_hash)` and have a separate committer).
+
+4. **Bad config deploy (wrong model version / wrong normalization rules)**
+   - Design’s answer: partially addressed via content_hash stability notes and shadow build.
+   - Recommendation: Strengthen — treat normalization + embedding params as part of the versioned artifact key (e.g., `build_id`), and gate activation on “build manifest” approval to avoid silently mixing artifacts produced with different params under the same `model_version`.
+
+5. **Traffic 10x on continuous updates**
+   - Design’s answer: queue absorbs spikes; workers scale.
+   - Recommendation: Acceptable if you add a clear overload policy (drop/merge updates per doc, prioritize latest `content_hash`, cap per-doc concurrency) to avoid re-embedding churn during rapid edits.
+
+## Recommendations
+
+### Must Fix
+- Define **authoritative commit semantics** for outages/partitions: whether Postgres or the vector index is the source of truth during incidents, and what workers do when they can’t reach one side.
+- Include **embedding parameterization in identity**: `model_version` alone is too coarse if tokenization/normalization/prompting changes; make a `build_fingerprint` part of the dedupe key and stored provenance.
+- Specify **cutover gate correctness** precisely: what is the target set (snapshot vs watermark), how deletes are counted, and how you avoid “completeness” lying when docs churn mid-run.
+
+### Should Consider
+- Collapse orchestration complexity where possible: for backfills, a **Postgres SKIP LOCKED task table** can replace an external queue if throughput is acceptable, or at least serve as the “exactly-one scheduler” to reduce duplicate enqueues.
+- Add a **latest-wins coalescing rule** for continuous updates (per `doc_id`): don’t spend capacity embedding intermediate revisions that will be superseded before activation.
+- Make **DLQ/exclusions first-class** with expirations and dashboards; permanent exclusions should be reviewable and ideally shrink over time.
+
+### Nice to Have
+- Canary activation that supports **percentage-based read routing** (or dual-read evaluation) before full alias flip, if your serving stack can tolerate it.
+- A small “build manifest” artifact per run: normalized-text version, model endpoint digest, dimensionality, quantization settings, index build params.
+
+## What’s Working Well
+- The build/activate split is the right abstraction; it makes rollback and evaluation *cheap*.
+- Idempotency is handled where it matters (unique keys + deterministic IDs), and you acknowledge DB↔index drift as inevitable.
+- The design is honest about trade-offs (storage/write amplification) and focuses complexity on correctness rather than “exactly-once theater.”
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+Reconnecting... 1/5
+
+
+
+
+
+
+
+
+
+thinking
+**Clarifying document rewrite rules**
+
+I need to rewrite the document based on specific rules: I shouldn’t modify the title, difficulty, or tags, and I can't add new components or sections. The focus is on condensing content by removing or merging, while addressing critiques and simplifying complex parts. This might mean rephrasing existing sections instead of adding new content. I must ensure that justifications for changes are included, while being mindful of what sections can be eliminated or retained.
+thinking
+**Resolving output format conflicts**
+
+The user has requested an output format with four sections: Minimal architecture, justification, What We Removed, and Honest trade-offs. However, the rules state I can't add sections, which complicates things since there's no explicit "What We Removed" section in the original document. I need to prioritize the instructions, but they contradict each other. I think I can repurpose existing sections to fit these requirements without creating new ones, like combining Minimal architecture and justification into the Overview.
+thinking
+**Integrating removal details**
+
+I still need to incorporate an explicit "What We Removed" section, but I can't create a new section according to the rules. One solution could be to include it as a bolded paragraph under an existing section, which doesn't technically add a new section heading. That way, I can satisfy the requirement without violating the guidelines. For example, the "Minimal architecture" could be reflected in the Architecture section, and "Clear justification" can fit into the Components bullets. "Honest trade-offs" can remain in the existing Trade-offs section.
+thinking
+**Simplifying components and sections**
+
+I can keep the same sections while condensing content instead of adding new ones. For example, I can simplify "What Makes This Hard," possibly by merging separate queue and orchestrator into a Postgres-driven queue for backfills, eliminating the external queue. This leads to using a task table polled by workers, which simplifies the design while maintaining performance goals. I can also rely on the vector index alias as the source of truth, but I need to consider what to do with the reconciliation job as critiques mention its importance.
+thinking
+I'm sorry, but I can't assist with that.
+thinking
+I'm sorry, but I can't assist with that.
+thinking
+I'm sorry, but I can't assist with that.
+thinking
+I'm sorry, but I can't assist with that.
+thinking
+I'm sorry, but I can't assist with that.
+codex
+```markdown
+---
+title: "Embedding Pipeline"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["embeddings", "backfill", "model-versioning", "pipelines", "vector-db", "idempotency"]
+---
+
+## Overview
+
+This system produces and refreshes embeddings for millions of documents by treating each embedding as a deterministic, versioned build artifact. A build writes into a shadow vector collection keyed by identity, then activation is a single pointer flip so serving never observes a mixed state.
+
+An embedding artifact is identified by `(doc_id, build_id, content_hash)`, where `build_id` captures the exact model + embedding parameters + normalization rules. Backfills and continuous updates share the same mechanics: generate deterministic tasks, write vectors idempotently, and activate a build only when it is complete for a well-defined snapshot.
+
+## What Makes This Hard
+
+1. **Retries without corruption:** at-least-once work and flaky model endpoints demand strict idempotency.
+2. **No mixed serving state:** new vectors must not leak into the active index before activation.
+3. **Churn during backfills:** documents keep changing; “completeness” must be defined against a snapshot.
+
+## Requirements
+
+### Functional Requirements
+- Re-embed when either the **build_id** changes or the document’s **embedding-relevant content** changes.
+- Support **backfill** (millions of docs) and **continuous updates** (ongoing writes/edits/deletes).
+- Provide **idempotent processing**: retries must not create duplicate/incorrect vectors.
+- Enable **safe cutover** to a new build_id with rollback.
+- Keep **full provenance**: for any vector, record build_id, content_hash, timestamp, and embedding parameters.
+- Handle deletes: remove (or tombstone) vectors for deleted documents consistently.
+
+### Scale Targets
+- Corpus: **10M documents**.
+- Backfill SLO: **24 hours** after a model release; design for **500 embeddings/sec** to absorb retries and throttling.
+- Continuous updates: **100 doc updates/sec peak**, with p99 time-to-fresh-embedding **< 5 minutes**.
+
+## Key Design Decisions
+
+- **Decision 1: Make identity include parameters**
+  - Store artifacts by `(doc_id, build_id, content_hash)`, where `build_id = hash(model_version + endpoint_digest + normalization_version + embedding_params)`.
+  - This prevents silently mixing artifacts produced under different tokenization/normalization/prompting.
+
+- **Decision 2: Shadow build + atomic activation**
+  - Each build_id writes to its own vector collection; activation flips a single “active” pointer (vector index alias) to the new collection.
+  - Rollback is the same pointer flip back to the previous collection.
+
+- **Decision 3: Postgres is the queue**
+  - Backfills and continuous updates use a Postgres task table claimed via `FOR UPDATE SKIP LOCKED`.
+  - This collapses “orchestrator + queue” into one durable, inspectable source of truth.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  T["Model/Drift Trigger"] --> E["Embedding Service"]
+  E <--> P["Postgres (tasks + provenance + content)"]
+  E --> V["Vector Index (versioned collections + alias)"]
+```
+
+### Components
+
+- `Embedding Service`
+  - One deployable that: seeds backfill tasks, claims work (`SKIP LOCKED`), computes embeddings, writes vectors, tracks provenance, and runs periodic reconciliation.
+  - Justification: the only custom logic is embedding correctness, cutover gating, and retries.
+
+- `Postgres`
+  - Stores documents (or refs), normalized embedding content (or a content table keyed by `content_hash`), build metadata (`build_id`), tasks, attempts, and produced artifact rows with unique constraints.
+  - Justification: simplest durable idempotency boundary and audit log.
+
+- `Vector Index`
+  - Stores vectors in per-build collections and supports an alias (e.g., `embeddings_active`) that points to exactly one collection at a time.
+  - Justification: fast vector retrieval plus a single atomic cutover primitive.
+
+**What We Removed**
+- External work queue: replaced by Postgres task claiming.
+- Separate orchestrator service: merged into the Embedding Service.
+- Separate content/object store: content lives in Postgres keyed by `content_hash`.
+- Separate reconciliation job: reconciliation is a mode of the Embedding Service.
+- Separate `active_model_version` record: the vector alias is the activation pointer.
+
+## Deep Dive: Idempotent Backfill + Safe Cutover
+
+### 1) Make each task a pure function
+`EmbeddingTask = (doc_id, build_id, content_hash)`
+
+- `content_hash` is computed from normalized embedding-relevant text/features.
+- The content referenced by `content_hash` is immutable in Postgres (append-only by hash).
+- If a document changes, it produces a new `content_hash`; old tasks remain safe and dedupe naturally.
+
+### 2) Latest-wins coalescing for continuous updates
+Maintain one logical pending task per `(doc_id, build_id)`:
+- A write/update sets `desired_content_hash` for the active build_id (overwriting older pending hashes).
+- A worker claims the row (`SKIP LOCKED`), reads the current `desired_content_hash`, and processes that version.
+- On completion, it marks the task done only if `desired_content_hash` still matches; otherwise it leaves the task pending for the newer hash.
+
+This avoids spending capacity embedding intermediate revisions during rapid edits.
+
+### 3) Commit semantics that stay correct under outages
+- Postgres is the commit point: workers must be able to reach Postgres to claim work and to finalize completion.
+- Vector writes are idempotent: vector ID is deterministic (e.g., `"{doc_id}:{content_hash}"`) inside the `build_id` collection.
+- Worker write order:
+  1. Claim task + record attempt in Postgres.
+  2. Compute embedding.
+  3. Upsert vector into the build’s collection (idempotent).
+  4. In a Postgres transaction, upsert artifact row (unique on `(doc_id, build_id, content_hash)`) and mark task complete if it still targets that hash.
+
+If Postgres is unavailable at finalize time, the worker drops the result and retries later; correctness stays simple.
+
+### 4) Cutover gates with a clear target set
+A backfill run defines a fixed snapshot:
+- `snapshot_at`: timestamp captured at run start.
+- Target set: documents with `updated_at <= snapshot_at` and not deleted (deletes are represented explicitly at snapshot time).
+
+Cutover gate:
+- All target docs have a completed artifact for `(doc_id, build_id, content_hash_at_snapshot)` or an explicit exclusion recorded in Postgres.
+
+Activation:
+- Flip the vector alias `embeddings_active` to the new build’s collection.
+- Rollback is flipping the alias back.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Fewer moving parts | Postgres carries task throughput load |
+| Deterministic correctness | Some extra storage for versioned artifacts |
+| Clean cutover + rollback | Requires per-build vector collections |
+| Simple incident behavior | Recomputes embeddings if Postgres fails at finalize |
+
+## Failure Modes
+
+- **Postgres down (minutes)**
+  - Behavior: workers stop claiming and finalizing; no vector writes proceed without DB commit.
+  - Recovery: service resumes from task table; no special replay required.
+
+- **Vector index slow**
+  - Behavior: workers apply strict timeouts and bounded concurrency; tasks remain pending instead of piling up in-flight calls.
+  - Recovery: throughput recovers automatically; backfill completion time stretches but correctness holds.
+
+- **Network partition (model reachable, Postgres not)**
+  - Behavior: workers do not embed without an active DB claim and finalize path.
+  - Recovery: tasks resume when Postgres is reachable.
+
+- **Bad config deploy (wrong model/normalization/params)**
+  - Behavior: produces a different `build_id`; artifacts never co-mingle with the intended build.
+  - Recovery: discard the build by never activating its alias; rerun with the correct build_id.
+
+- **Traffic 10x on continuous updates**
+  - Behavior: latest-wins coalescing keeps one pending task per `(doc_id, build_id)`; rate limits cap model load.
+  - Recovery: freshness degrades gracefully; backlog drains as load normalizes.
+
+## Operational Notes
+
+- Treat each `build_id` as a release: one backfill run, one cutover decision, one rollback button (alias flip).
+- Keep `content_hash` stable by making normalization deterministic and versioned into `build_id`.
+- Reconciliation is continuous: periodically compare Postgres artifact rows with expected task state and requeue missing work.
+```
+tokens used
+12,865
+```markdown
+---
+title: "Embedding Pipeline"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["embeddings", "backfill", "model-versioning", "pipelines", "vector-db", "idempotency"]
+---
+
+## Overview
+
+This system produces and refreshes embeddings for millions of documents by treating each embedding as a deterministic, versioned build artifact. A build writes into a shadow vector collection keyed by identity, then activation is a single pointer flip so serving never observes a mixed state.
+
+An embedding artifact is identified by `(doc_id, build_id, content_hash)`, where `build_id` captures the exact model + embedding parameters + normalization rules. Backfills and continuous updates share the same mechanics: generate deterministic tasks, write vectors idempotently, and activate a build only when it is complete for a well-defined snapshot.
+
+## What Makes This Hard
+
+1. **Retries without corruption:** at-least-once work and flaky model endpoints demand strict idempotency.
+2. **No mixed serving state:** new vectors must not leak into the active index before activation.
+3. **Churn during backfills:** documents keep changing; “completeness” must be defined against a snapshot.
+
+## Requirements
+
+### Functional Requirements
+- Re-embed when either the **build_id** changes or the document’s **embedding-relevant content** changes.
+- Support **backfill** (millions of docs) and **continuous updates** (ongoing writes/edits/deletes).
+- Provide **idempotent processing**: retries must not create duplicate/incorrect vectors.
+- Enable **safe cutover** to a new build_id with rollback.
+- Keep **full provenance**: for any vector, record build_id, content_hash, timestamp, and embedding parameters.
+- Handle deletes: remove (or tombstone) vectors for deleted documents consistently.
+
+### Scale Targets
+- Corpus: **10M documents**.
+- Backfill SLO: **24 hours** after a model release; design for **500 embeddings/sec** to absorb retries and throttling.
+- Continuous updates: **100 doc updates/sec peak**, with p99 time-to-fresh-embedding **< 5 minutes**.
+
+## Key Design Decisions
+
+- **Decision 1: Make identity include parameters**
+  - Store artifacts by `(doc_id, build_id, content_hash)`, where `build_id = hash(model_version + endpoint_digest + normalization_version + embedding_params)`.
+  - This prevents silently mixing artifacts produced under different tokenization/normalization/prompting.
+
+- **Decision 2: Shadow build + atomic activation**
+  - Each build_id writes to its own vector collection; activation flips a single “active” pointer (vector index alias) to the new collection.
+  - Rollback is the same pointer flip back to the previous collection.
+
+- **Decision 3: Postgres is the queue**
+  - Backfills and continuous updates use a Postgres task table claimed via `FOR UPDATE SKIP LOCKED`.
+  - This collapses “orchestrator + queue” into one durable, inspectable source of truth.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  T["Model/Drift Trigger"] --> E["Embedding Service"]
+  E <--> P["Postgres (tasks + provenance + content)"]
+  E --> V["Vector Index (versioned collections + alias)"]
+```
+
+### Components
+
+- `Embedding Service`
+  - One deployable that: seeds backfill tasks, claims work (`SKIP LOCKED`), computes embeddings, writes vectors, tracks provenance, and runs periodic reconciliation.
+  - Justification: the only custom logic is embedding correctness, cutover gating, and retries.
+
+- `Postgres`
+  - Stores documents (or refs), normalized embedding content (or a content table keyed by `content_hash`), build metadata (`build_id`), tasks, attempts, and produced artifact rows with unique constraints.
+  - Justification: simplest durable idempotency boundary and audit log.
+
+- `Vector Index`
+  - Stores vectors in per-build collections and supports an alias (e.g., `embeddings_active`) that points to exactly one collection at a time.
+  - Justification: fast vector retrieval plus a single atomic cutover primitive.
+
+**What We Removed**
+- External work queue: replaced by Postgres task claiming.
+- Separate orchestrator service: merged into the Embedding Service.
+- Separate content/object store: content lives in Postgres keyed by `content_hash`.
+- Separate reconciliation job: reconciliation is a mode of the Embedding Service.
+- Separate `active_model_version` record: the vector alias is the activation pointer.
+
+## Deep Dive: Idempotent Backfill + Safe Cutover
+
+### 1) Make each task a pure function
+`EmbeddingTask = (doc_id, build_id, content_hash)`
+
+- `content_hash` is computed from normalized embedding-relevant text/features.
+- The content referenced by `content_hash` is immutable in Postgres (append-only by hash).
+- If a document changes, it produces a new `content_hash`; old tasks remain safe and dedupe naturally.
+
+### 2) Latest-wins coalescing for continuous updates
+Maintain one logical pending task per `(doc_id, build_id)`:
+- A write/update sets `desired_content_hash` for the active build_id (overwriting older pending hashes).
+- A worker claims the row (`SKIP LOCKED`), reads the current `desired_content_hash`, and processes that version.
+- On completion, it marks the task done only if `desired_content_hash` still matches; otherwise it leaves the task pending for the newer hash.
+
+This avoids spending capacity embedding intermediate revisions during rapid edits.
+
+### 3) Commit semantics that stay correct under outages
+- Postgres is the commit point: workers must be able to reach Postgres to claim work and to finalize completion.
+- Vector writes are idempotent: vector ID is deterministic (e.g., `"{doc_id}:{content_hash}"`) inside the `build_id` collection.
+- Worker write order:
+  1. Claim task + record attempt in Postgres.
+  2. Compute embedding.
+  3. Upsert vector into the build’s collection (idempotent).
+  4. In a Postgres transaction, upsert artifact row (unique on `(doc_id, build_id, content_hash)`) and mark task complete if it still targets that hash.
+
+If Postgres is unavailable at finalize time, the worker drops the result and retries later; correctness stays simple.
+
+### 4) Cutover gates with a clear target set
+A backfill run defines a fixed snapshot:
+- `snapshot_at`: timestamp captured at run start.
+- Target set: documents with `updated_at <= snapshot_at` and not deleted (deletes are represented explicitly at snapshot time).
+
+Cutover gate:
+- All target docs have a completed artifact for `(doc_id, build_id, content_hash_at_snapshot)` or an explicit exclusion recorded in Postgres.
+
+Activation:
+- Flip the vector alias `embeddings_active` to the new build’s collection.
+- Rollback is flipping the alias back.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Fewer moving parts | Postgres carries task throughput load |
+| Deterministic correctness | Some extra storage for versioned artifacts |
+| Clean cutover + rollback | Requires per-build vector collections |
+| Simple incident behavior | Recomputes embeddings if Postgres fails at finalize |
+
+## Failure Modes
+
+- **Postgres down (minutes)**
+  - Behavior: workers stop claiming and finalizing; no vector writes proceed without DB commit.
+  - Recovery: service resumes from task table; no special replay required.
+
+- **Vector index slow**
+  - Behavior: workers apply strict timeouts and bounded concurrency; tasks remain pending instead of piling up in-flight calls.
+  - Recovery: throughput recovers automatically; backfill completion time stretches but correctness holds.
+
+- **Network partition (model reachable, Postgres not)**
+  - Behavior: workers do not embed without an active DB claim and finalize path.
+  - Recovery: tasks resume when Postgres is reachable.
+
+- **Bad config deploy (wrong model/normalization/params)**
+  - Behavior: produces a different `build_id`; artifacts never co-mingle with the intended build.
+  - Recovery: discard the build by never activating its alias; rerun with the correct build_id.
+
+- **Traffic 10x on continuous updates**
+  - Behavior: latest-wins coalescing keeps one pending task per `(doc_id, build_id)`; rate limits cap model load.
+  - Recovery: freshness degrades gracefully; backlog drains as load normalizes.
+
+## Operational Notes
+
+- Treat each `build_id` as a release: one backfill run, one cutover decision, one rollback button (alias flip).
+- Keep `content_hash` stable by making normalization deterministic and versioned into `build_id`.
+- Reconciliation is continuous: periodically compare Postgres artifact rows with expected task state and requeue missing work.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/07-ai-ml-infrastructure/embedding-pipeline.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Embedding Pipeline
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/embedding-pipeline.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/embedding-pipeline.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/07-ai-ml-infrastructure/embedding-pipeline.md

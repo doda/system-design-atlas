@@ -1,0 +1,327 @@
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2a94-b537-7ec1-ae6e-7bc5706b3388
+--------
+user
+You are a senior systems architect reviewing a system design document.
+
+Grade this solution on three dimensions (1-10 scale):
+
+1. **Strength** (1-10): How technically sound, complete, and production-ready is the design?
+   - Does it address scalability, reliability, and failure modes?
+   - Are the trade-offs well-reasoned?
+   - Would this actually work at scale?
+
+2. **Interestingness** (1-10): How engaging and educational is the content?
+   - Does it teach useful concepts?
+   - Are there insights that aren't obvious?
+   - Would an engineer learn something valuable?
+
+3. **Novelty** (1-10): How unique or creative is the approach?
+   - Does it go beyond textbook solutions?
+   - Are there clever simplifications or unconventional choices?
+   - Does it challenge common assumptions?
+
+Also note any major issues or particularly strong aspects.
+
+Output ONLY valid JSON in this exact format:
+{
+  "slug": "chaos-engineering-platform",
+  "strength": <1-10>,
+  "interestingness": <1-10>,
+  "novelty": <1-10>,
+  "overall": <average of three scores, 1 decimal>,
+  "summary": "<2-3 sentence summary of the design>",
+  "strengths": ["<strength 1>", "<strength 2>"],
+  "weaknesses": ["<weakness 1>", "<weakness 2>"],
+  "verdict": "<one of: exceptional, strong, adequate, weak>"
+}
+
+---
+
+## Solution to Grade
+
+---
+title: "Chaos Engineering Platform"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["chaos-engineering", "sre", "reliability", "kubernetes", "policy-as-code"]
+---
+
+## Overview
+
+This platform enables teams to run **controlled chaos experiments** (latency, packet loss, pod termination, dependency blackholes, resource pressure) to validate resilience and improve incident readiness.
+
+The defining requirement is **safety in production**:
+- strict **blast-radius limits**
+- explicit **approvals and an audit trail**
+- a **fast, independent kill switch** that halts and rolls back experiments even if the main control plane is degraded
+
+The design uses a small control plane with a durable database, plus cluster agents that enforce fault injection and rollback close to workloads.
+
+## Goals & Non-Goals
+
+### Goals
+- Safe, repeatable chaos experiments in dev/stage/prod with progressive rollout and automatic rollback.
+- Strong guardrails (policy-as-code + hard limits) and tamper-evident audit trails.
+- Integrates with existing observability (Prometheus/Datadog) and incident tooling (PagerDuty/Slack).
+- Supports Kubernetes-first environments, with optional service-mesh integration.
+
+### Non-Goals
+- Replacing incident management systems or observability stacks.
+- Arbitrary “power user” remote execution on clusters (no generic shell/exec).
+- Guaranteed zero customer impact (chaos is intentionally disruptive; the goal is bounded, learnable impact).
+
+## Requirements
+
+### Functional Requirements
+- Author, validate (dry-run), approve, schedule, and run experiments (templates + parameters).
+- Target selection by service, environment, region/AZ, cluster, namespace, labels, and traffic percentage (where applicable).
+- Guardrails: max targets, max % traffic, max zones/regions, allowlists/denylists, time-of-day windows, per-service concurrency caps.
+- Fault types (extensible):
+  - Kubernetes: pod kill, node drain (optional), CPU/memory stress, disk fill (careful), DNS failure (controlled)
+  - Network: latency/loss/jitter, bandwidth shaping, connection resets (via mesh or `tc/netem` where allowed)
+  - Dependency: HTTP abort/delay, blackhole to upstream (mesh/L7 proxy)
+- Progressive rollout: canary → expand, with health gates and timeboxed steps.
+- Real-time run timeline: actions taken, targets affected (aggregated + sampled), health checks, stop/rollback reasons.
+- Immutable audit log: who/what/when/why, including policy version and resolved targets.
+- Post-experiment report: hypothesis, observed impact, SLO burn, rollback success, and links to dashboards/traces.
+
+### Non-Functional Requirements (Concrete Targets)
+
+**Scale (steady-state)**
+- ~2,000 services across ~200 clusters and ~50,000 nodes
+- ~5,000–20,000 workloads eligible for targeting (pods/VMs/endpoints)
+- Up to **100 concurrent runs** globally (configurable), typically <20
+- Peak **200 run starts/hour** (bursty), **2,000 run events/sec** (typical), **200,000 events/sec** worst-case if per-target events are unaggregated
+
+**Latency**
+- `POST /start` acceptance (auth + policy + DB commit): P50 **100–200ms**, P99 **500ms**
+- Kill switch trip to agent begin-rollback:
+  - P50 **<1s**, P99 **<5s** (within a region)
+- UI timeline freshness: **<5s** behind real time (via stream or polling)
+
+**Availability**
+- Control plane (create/start/stop/status): **99.95%** monthly
+- Kill switch propagation path (trip + agent enforcement): **99.99%** monthly (designed to function in degraded mode)
+
+**Consistency**
+- Strong consistency for experiment specs, approvals, policy bundles, and run state.
+- At-least-once delivery for commands/events; idempotency required at orchestrator and agent.
+- Eventual consistency acceptable for dashboards, derived reports, and long-term analytics.
+
+**Durability**
+- Config + audit: RPO **≤ 5 minutes**
+- Run timeline events: best-effort acceptable, but **stop/kill events must be durable** (persisted/replicated)
+
+### Constraints & Assumptions
+- Kubernetes is the primary runtime; service mesh (Istio/Linkerd) present in many clusters but not assumed everywhere.
+- Small platform team (3–6 engineers): prefer managed Postgres and minimal moving parts.
+- Compliance: environment segregation (dev/stage/prod), least privilege, audit retention, and change control on policies.
+
+## Simplified Architecture
+
+### High-Level Diagram
+
+```mermaid
+flowchart TB
+  UI["UI / CLI"]
+  API["Control Plane API\n(Experiments, Runs, RBAC)\n+ Scheduler + Orchestrator"]
+  SAFE["Safety + Kill\n(Independent Service)"]
+  DB[(Postgres\nConfig + Run State + Audit)]
+  AG["Cluster Agent"]
+  TGT["Targets\n(K8s / Mesh / tc)"]
+  OBS["Observability\n(Prometheus/Datadog)"]
+
+  UI --> API
+  API --> DB
+  SAFE --> DB
+  SAFE --> OBS
+
+  API --> AG
+  SAFE --> AG
+  AG --> TGT
+  AG --> API
+```
+
+### Key Ideas
+- **Two small services**: a general control plane API (including scheduler + orchestrator workers) and an independent safety/kill service.
+- **One durable database**: Postgres is the source of truth for specs, approvals, run state, kill generations, and audit.
+- **No separate event bus**: agents communicate directly with the control plane over HTTPS/gRPC; background workers use Postgres as the durable work queue.
+
+## Execution Model (How a Run Works)
+
+Each run is a state machine with explicit checkpoints:
+
+1. **Resolve targets**: control plane queries inventory (K8s API/mesh via agent) and stores a run snapshot (spec + policy version + resolved target summary).
+2. **Canary step**: agent applies the fault to a small subset.
+3. **Observe window**: safety service evaluates SLO/SLI signals and maintains a per-run health state.
+4. **Expand**: orchestrator advances the run step-by-step (timeboxed), bounded by guardrails and health gates.
+5. **Rollback**: agent reverts injections and verifies rollback success; run finalizes with a report.
+
+Stop conditions:
+- User stop request
+- Safety kill switch tripped
+- Step timeout exceeded
+- Loss of safety heartbeat (fail-safe halt)
+- Agent local TTL exceeded (fail-safe rollback)
+
+## Components
+
+### Control Plane API (includes Scheduler + Orchestrator)
+**Responsibilities**
+- AuthN (OIDC/SAML), AuthZ (RBAC), request validation, rate limits.
+- CRUD for experiments, templates, approvals, and run lifecycle (start/stop/status).
+- Scheduler for cron/calendar runs and quiet-hours enforcement.
+- Orchestrator worker pool implementing the run state machine using durable checkpoints in Postgres.
+- Timeline streaming (SSE/WebSocket) or polling endpoints for UI/CLI.
+
+**How orchestration stays simple**
+- Postgres-backed work queue:
+  - `run_steps` rows represent pending work; workers claim with `SELECT ... FOR UPDATE SKIP LOCKED`.
+  - Step retries are idempotent and bounded; checkpoints are persisted per step.
+
+### Policy (embedded)
+**Responsibilities**
+- Policy-as-code evaluation at:
+  - experiment create/update
+  - dry-run validation
+  - run start (final enforcement)
+- Explanations for allow/deny and warnings (e.g., reduced blast radius in prod).
+
+**Implementation**
+- Policy bundles stored as versioned artifacts in Postgres.
+- Evaluation performed in-process (e.g., OPA/Rego via library/WASM) for low operational overhead.
+
+### Safety + Kill (independent service)
+**Responsibilities**
+- Continuously evaluate health signals for active runs using existing observability systems.
+- Trip the kill switch by incrementing a **monotonic `halt_generation`** in Postgres and writing an audit record.
+- Provide a fast agent read path:
+  - `GET /v1/runs/{run_id}/kill` supports long-poll (returns immediately on generation change) with a short polling fallback.
+
+**Signal strategy (practical defaults)**
+- Primary: SLO burn-rate (fast 1–5m + slow 30–60m).
+- Secondary: 5xx rate, p95/p99 latency, saturation (CPU/queue depth), dependency health.
+- Sustained breach + optional multi-signal confirmation to reduce false positives.
+
+### Cluster Agent
+**Responsibilities**
+- Apply/rollback injections on targets (K8s, mesh, `tc/netem` where permitted).
+- Enforce local safety limits (namespace allowlists, max concurrency, hard TTL per injection).
+- Report step outcomes and aggregated events to the control plane.
+- Halt immediately when kill generation increases; roll back on TTL/lease expiry.
+
+**Safety by design**
+- Deny-by-default capabilities; enabled fault types are explicitly configured per cluster/namespace.
+- Every injection is keyed by `injection_id` and is idempotent to re-apply and roll back.
+
+## Data Model (Postgres)
+
+Core tables (minimal set):
+
+- `experiments`: spec (jsonb), environment, owner, versioning.
+- `approvals`: approval status, approvers, expiry, notes.
+- `runs`: state, snapshot (jsonb), `halt_generation`, current step, timestamps, stop reason, safety status.
+- `run_steps`: durable queue of step work items (state, attempt count, deadlines, claimed_by/claimed_at).
+- `run_events`: timeline events (aggregated by default; sampled per-target on errors).
+- `audit_log`: append-only security/audit records, optionally hash-chained.
+
+Retention:
+- Keep detailed `run_events` for a bounded window (e.g., 7–30 days) and retain summarized run outcomes + audit per compliance.
+
+## API Design
+
+### AuthN/AuthZ
+- AuthN: OIDC (SSO), short-lived JWTs for UI/CLI.
+- AuthZ: RBAC with environment scoping (prod requires elevated role).
+- Agent auth: per-cluster identity (mTLS or signed JWT via workload identity).
+
+### Core Endpoints (REST)
+- `POST /v1/experiments`
+- `POST /v1/experiments/{experiment_id}:validate`
+- `POST /v1/experiments/{experiment_id}/runs` (idempotency key required)
+- `POST /v1/runs/{run_id}:stop` (idempotency key required; trips kill generation)
+- `GET /v1/runs/{run_id}`
+- `GET /v1/runs/{run_id}/events` (poll) and/or `GET /v1/runs/{run_id}/events:stream` (SSE)
+
+Agent-facing endpoints:
+- `POST /v1/agents/{cluster_id}/commands:pull` (long-poll for next command batch)
+- `POST /v1/agents/{cluster_id}/events` (aggregated progress + errors)
+- `GET /v1/runs/{run_id}/kill` (served by Safety + Kill; long-poll + fallback polling)
+
+## Scaling & Performance
+
+- **Event volume control (primary lever)**: agents emit per-step aggregates by default; per-target events are sampled (first N + errors) to avoid cardinality spikes.
+- **Worker scaling**: orchestrator scales horizontally; each worker claims `run_steps` via `SKIP LOCKED`.
+- **Kill propagation**: long-poll kill endpoint keeps steady connections and delivers changes immediately; agents still poll on reconnect.
+- **Safety query load**: caching/jitter (5–10s), query budgets per run, and pre-aggregations/recording rules where available.
+
+## Reliability & Failure Modes (Minimum Set)
+
+1. **Safety service unavailable during a run**
+   - Fail-safe: for prod runs, missing safety heartbeat beyond a threshold triggers a kill generation bump (once service recovers) and agents also enforce hard TTLs.
+2. **Orchestrator crashes mid-run**
+   - Recovery: workers resume from persisted checkpoints; agents roll back on TTL/lease expiry.
+3. **Agent loses connectivity**
+   - Fail-safe: injection TTL guarantees rollback; when connectivity returns, agent reconciles desired state and reports outcome.
+
+## Disaster Recovery
+
+- Postgres: managed HA with WAL archiving and standby; RPO ≤ 5 minutes.
+- Services: stateless, redeployable; scale out during incidents.
+- Runs during regional outage: agents’ TTLs ensure rollback even without control plane connectivity.
+
+## Operations
+
+Key metrics and alerts:
+- Runs: concurrent runs, completion rate, rollback time, rollback failure rate.
+- Safety: query success, evaluator lag, kill trips, kill propagation latency (agent-observed).
+- Agents: heartbeat freshness, injection failures, capability denials.
+- Postgres: transaction latency, lock contention, slow queries.
+
+Runbooks (minimum):
+- Trip “disable new runs” toggle (policy-level).
+- Force-stop a run (kill generation bump).
+- Diagnose rollback failures (agent logs + verification).
+- Quarantine a cluster/namespace from chaos capabilities.
+
+## Simplification Notes
+
+- Removed: separate API gateway, standalone scheduler, separate orchestrator service, separate policy engine service, event bus (Kafka/NATS), and object storage pipeline; direct agent↔control-plane communication plus Postgres-backed work queue provides durable execution with fewer dependencies.
+- Merged: scheduler and orchestrator into the Control Plane API deployment; policy evaluation into the same process as the API for consistent enforcement and simpler operations.
+- Complexity that remains: an independent Safety + Kill service and monotonic `halt_generation` are kept to meet the safety target (fast stop path that works in degraded control-plane conditions).
+mcp startup: no servers
+codex
+{
+  "slug": "chaos-engineering-platform",
+  "strength": 8,
+  "interestingness": 8,
+  "novelty": 7,
+  "overall": 7.7,
+  "summary": "A Kubernetes-first chaos platform with strong production safety guardrails: policy-as-code, approvals/audit, progressive rollout with health gates, and an independent kill path enforced by cluster agents with TTL-based fail-safe rollback. It intentionally minimizes moving parts by using Postgres as the durable source of truth and work queue, with agents emitting aggregated run events to control event volume.",
+  "strengths": ["Safety-first execution model (blast radius limits, approvals/audit, monotonic kill generation, agent TTL rollback) with clear failure-mode handling", "Operationally pragmatic architecture (few services, durable state machine checkpoints, idempotent steps, event-volume controls) that should be maintainable by a small team"],
+  "weaknesses": ["Postgres-centric design (work queue + run state + kill generation + events) risks becoming a bottleneck or shared failure domain at higher event/start rates without careful partitioning and backpressure", "Kill path is not fully independent if Postgres or its connectivity is impaired; the document doesn’t fully specify how agents behave when they can’t read kill state and TTLs haven’t yet expired"],
+  "verdict": "strong"
+}
+tokens used
+3,952
+{
+  "slug": "chaos-engineering-platform",
+  "strength": 8,
+  "interestingness": 8,
+  "novelty": 7,
+  "overall": 7.7,
+  "summary": "A Kubernetes-first chaos platform with strong production safety guardrails: policy-as-code, approvals/audit, progressive rollout with health gates, and an independent kill path enforced by cluster agents with TTL-based fail-safe rollback. It intentionally minimizes moving parts by using Postgres as the durable source of truth and work queue, with agents emitting aggregated run events to control event volume.",
+  "strengths": ["Safety-first execution model (blast radius limits, approvals/audit, monotonic kill generation, agent TTL rollback) with clear failure-mode handling", "Operationally pragmatic architecture (few services, durable state machine checkpoints, idempotent steps, event-volume controls) that should be maintainable by a small team"],
+  "weaknesses": ["Postgres-centric design (work queue + run state + kill generation + events) risks becoming a bottleneck or shared failure domain at higher event/start rates without careful partitioning and backpressure", "Kill path is not fully independent if Postgres or its connectivity is impaired; the document doesn’t fully specify how agents behave when they can’t read kill state and TTLs haven’t yet expired"],
+  "verdict": "strong"
+}
+Graded: chaos-engineering-platform

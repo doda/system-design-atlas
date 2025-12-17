@@ -1,0 +1,1430 @@
+==========================================
+Generating (v2): Time-Series Database
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-20bb-7c61-a921-855ea8c29ff1
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Time-Series Database
+**Category**: Storage & Data Platforms
+
+**Problem Statement**:
+Design a storage engine for IoT telemetry or metrics with high write throughput, downsampling rollups, and retention tiers.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+thinking
+**Designing a Storage Engine**
+
+I'm focusing on a distributed time-series database design. It'll utilize a simple architecture with ingest routers, storage nodes, and query nodes, but I won't go with Postgres. Instead, I'll opt for a custom engine based on Log-Structured Merge-trees (LSM), using etcd for metadata. Key design choices include time-partitioned LSM segments, an inverted index for series ID mapping, and treating rollups as first-class. I’ll also address failure modes and operational challenges while setting scalability targets. Now it's time to craft the documentation!
+codex
+```markdown
+---
+title: "Time-Series Database"
+category: "Storage & Data Platforms"
+difficulty: "Hard"
+tags: ["tsdb", "storage-engine", "lsm", "compaction", "rollups", "retention", "iot", "metrics"]
+---
+
+## Overview
+
+This system is a distributed time-series database optimized for “append-mostly” telemetry: very high write throughput, time-bounded reads, fast aggregations, and predictable retention. The key insight is to **treat time as the primary physical layout constraint**: store data in immutable, time-partitioned segments so retention becomes a metadata operation (drop whole segments), and downsampling becomes a controlled rewrite of already-ordered data rather than a query-time tax.
+
+Most teams get stuck trying to satisfy three goals at once—write speed, query speed, and rollups—using a single layout. The elegant approach is to separate concerns: **raw data optimized for ingest + range scans**, **rollup data optimized for aggregates**, and a **small metadata/index layer** that makes both cheap without storing tags on every point.
+
+## What Makes This Hard
+
+Naive implementations die from **write amplification and cardinality**. If you “just index everything” (tags, timestamps, fields) you either destroy ingest (too many random writes) or destroy storage (too much overhead per point). If you “just append logs,” queries require scanning too much data and rollups become expensive full scans.
+
+The trap: retention and downsampling look like “policy features,” but they are **storage-engine features**. If you can’t delete in big chunks and you can’t compact predictably, you’ll end up with compaction debt, spiky latency, and on-call pain.
+
+## Requirements
+
+### Functional Requirements
+- Ingest time-series points with tags/labels, timestamp, and numeric fields.
+- Query by time range + tag filters; support common aggregates (sum/avg/min/max/p95) and group-by tag(s).
+- Continuous downsampling into fixed windows (e.g., 1m, 1h) with multiple retention tiers (e.g., 7d raw, 90d 1m, 2y 1h).
+- Exactly-once is not required; **idempotent ingest** and bounded duplication is acceptable.
+- Backfill support (late/out-of-order points) within a bounded window.
+
+### Scale Targets
+- **Ingest:** 1,000,000 points/sec sustained, 3,000,000 points/sec burst (IoT fleets and scrape storms).
+- **Cardinality:** 50,000,000 active series (metrics-style labels) with daily churn.
+- **Queries:** P95 < 2s for “last 6h, filter by 2 tags, group-by 1 tag”; P95 < 5s for “last 7d rollup”.
+- These numbers matter because they force: sequential writes, bounded index work per point, retention-by-drop, and rollups that don’t contend with ingest.
+
+## Key Design Decisions
+
+- **We chose:** Time-partitioned LSM-style storage with immutable segment files (SSTables) per shard and time window.
+  - **We rejected:** B-tree / per-point updates, and “single huge log + query-time scan.”
+  - **Why:** Sequential ingest + predictable compaction; retention becomes dropping whole segment directories.
+
+- **We chose:** Series-ID indirection with a tag inverted index (tags → series IDs) and series dictionary (series key → series ID).
+  - **We rejected:** Storing full tagsets on every point or building per-tag/time secondary indexes.
+  - **Why:** Tags are high-entropy and repetitive; the only scalable approach is to pay the tag cost once per series, not per point.
+
+- **We chose:** Rollups as first-class materialized streams (raw → rollup1m → rollup1h) stored separately with their own retention.
+  - **We rejected:** Query-time downsampling and “rollups via ad-hoc batch jobs over raw.”
+  - **Why:** Query-time downsampling is the silent killer of p95 latency; rollup computation must be incremental and bounded.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Ingest API"] --> B["Router"]
+  B --> C["WAL + Memtable"]
+  C --> D["Segment Store"]
+  D --> E["Compactor"]
+  E --> D
+  D --> F["Rollup Builder"]
+  F --> G["Rollup Store"]
+  H["Query API"] --> I["Query Engine"]
+  I --> D
+  I --> G
+```
+
+### Components
+
+- `Ingest API`: Validates writes, normalizes tag order, enforces limits (max tags, max series per tenant) to prevent cardinality explosions.
+- `Router`: Maps each point to a shard (hash(series_id) + time partition) and routes to the correct storage node(s); keeps ingest stateless.
+- `WAL + Memtable`: WAL provides crash safety; memtable buffers sorted (series_id, timestamp) entries for efficient flush.
+- `Segment Store`: Immutable segment files grouped by time window (e.g., 2h) and shard; stores compressed blocks and sparse indexes.
+- `Compactor`: Merges overlapping segments, reclaims space, and enforces a bounded out-of-order window.
+- `Rollup Builder`: Consumes compacted raw segments and produces fixed-window aggregates into dedicated rollup segments.
+- `Rollup Store`: Physically separate namespace and retention policy; optimized for aggregate queries (fewer points, wider read).
+- `Query Engine`: Plans queries by first resolving tag filters to series IDs, then performing time-range scans with predicate pushdown and aggregate execution.
+
+## Deep Dive: The Hardest Part — Compaction That Doesn’t Kill Ingest
+
+The core problem is this: ingest wants **append-only sequential IO**, while queries and retention want data organized for **fast range scans and bulk deletion**. LSM compaction is the bridge—but it’s also where TSDBs fail in production. If compaction falls behind, disk fills, read amplification explodes, and latency spikes exactly when traffic is highest.
+
+This design keeps compaction predictable by making time a hard boundary. Each shard writes segments for fixed time windows (e.g., 2h). Within a window, the key is `(series_id, timestamp)`, enabling high compression and fast per-series scans. Compaction is constrained to:
+1) merging a small set of segments within the same time window, and
+2) a bounded “late data” horizon (e.g., allow out-of-order up to 30 minutes, after which late points are redirected to a small “late segment” that is compacted separately).
+
+The compactor runs with explicit budgets: max IO per second, max concurrent merges, and priority based on “read amplification” and “disk pressure.” It never competes with the WAL path: WAL fsync and memtable flush have reserved IO and CPU. Practically, that means separate threadpools and an IO scheduler policy that favors small, latency-sensitive writes over bulk merges.
+
+Rollups integrate cleanly by consuming **compacted** segments, not raw memtables. That’s the non-obvious win: rollup builders see stable, ordered data, so they can compute window aggregates with streaming scans and write their own immutable rollup segments. This avoids both double-counting (from partial compaction) and expensive reprocessing.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Sustained ingest throughput | Complex compaction subsystem |
+| Predictable retention cost (drop segments) | Less efficient for point updates/deletes |
+| Fast time-range scans + aggregates | Extra storage for rollups |
+| High-cardinality tag filters | Inverted index memory/disk overhead |
+
+## Failure Modes
+
+- **Compaction debt → disk pressure**
+  - **What happens:** Segment count grows, reads touch more files, disk fills; ingest starts failing.
+  - **Detect:** Compaction queue length, read amplification (files touched per query), disk watermark alerts.
+  - **Recover:** Throttle ingest per tenant, temporarily pause rollups, increase compaction IO budget, add nodes and rebalance shards, then compact hottest windows first.
+
+- **Cardinality explosion (tag abuse)**
+  - **What happens:** Series dictionary and inverted index balloon; memory churn and GC spikes; query fanout becomes unbounded.
+  - **Detect:** New series/sec, active series count per tenant, top-K tag values by new-series creation.
+  - **Recover:** Enforce hard tenant limits, reject writes with high-entropy tags, require allowlisted tag keys, and offer a “drop/normalize tag” ingest rule.
+
+- **Hot shard / uneven routing**
+  - **What happens:** A small subset of series dominates ingest; one node becomes WAL/CPU bound.
+  - **Detect:** Per-shard ingest rate and WAL fsync latency; router histogram of shard load.
+  - **Recover:** Increase shard count, rebalance shard ownership, add a “salt” mechanism for known-hot series, and isolate noisy tenants.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move the inverted index to a dedicated service with memory-optimized structures and snapshotting; introduce query fanout limits and precomputed “popular” aggregates.
+- **100x scale:** Split storage into hot-local + cold-object-store with remote segment reads; add multi-region ingest with local durability and asynchronous replication; redesign metadata to tolerate massive series churn (log-structured metadata + aggressive TTL).
+
+## Operational Notes
+
+- Compaction is the heartbeat: page on compaction lag and disk-watermark, not just CPU.
+- Set explicit SLO budgets for “late data” and enforce them; unbounded out-of-order points are a stealth DoS.
+- Keep rollup pipelines observable as first-class citizens: lag, window completeness, and duplicate detection.
+- Capacity planning is driven by: points/sec, compression ratio, segment size, and compaction write amplification—track all four continuously.
+```
+tokens used
+3,643
+```markdown
+---
+title: "Time-Series Database"
+category: "Storage & Data Platforms"
+difficulty: "Hard"
+tags: ["tsdb", "storage-engine", "lsm", "compaction", "rollups", "retention", "iot", "metrics"]
+---
+
+## Overview
+
+This system is a distributed time-series database optimized for “append-mostly” telemetry: very high write throughput, time-bounded reads, fast aggregations, and predictable retention. The key insight is to **treat time as the primary physical layout constraint**: store data in immutable, time-partitioned segments so retention becomes a metadata operation (drop whole segments), and downsampling becomes a controlled rewrite of already-ordered data rather than a query-time tax.
+
+Most teams get stuck trying to satisfy three goals at once—write speed, query speed, and rollups—using a single layout. The elegant approach is to separate concerns: **raw data optimized for ingest + range scans**, **rollup data optimized for aggregates**, and a **small metadata/index layer** that makes both cheap without storing tags on every point.
+
+## What Makes This Hard
+
+Naive implementations die from **write amplification and cardinality**. If you “just index everything” (tags, timestamps, fields) you either destroy ingest (too many random writes) or destroy storage (too much overhead per point). If you “just append logs,” queries require scanning too much data and rollups become expensive full scans.
+
+The trap: retention and downsampling look like “policy features,” but they are **storage-engine features**. If you can’t delete in big chunks and you can’t compact predictably, you’ll end up with compaction debt, spiky latency, and on-call pain.
+
+## Requirements
+
+### Functional Requirements
+- Ingest time-series points with tags/labels, timestamp, and numeric fields.
+- Query by time range + tag filters; support common aggregates (sum/avg/min/max/p95) and group-by tag(s).
+- Continuous downsampling into fixed windows (e.g., 1m, 1h) with multiple retention tiers (e.g., 7d raw, 90d 1m, 2y 1h).
+- Exactly-once is not required; **idempotent ingest** and bounded duplication is acceptable.
+- Backfill support (late/out-of-order points) within a bounded window.
+
+### Scale Targets
+- **Ingest:** 1,000,000 points/sec sustained, 3,000,000 points/sec burst (IoT fleets and scrape storms).
+- **Cardinality:** 50,000,000 active series (metrics-style labels) with daily churn.
+- **Queries:** P95 < 2s for “last 6h, filter by 2 tags, group-by 1 tag”; P95 < 5s for “last 7d rollup”.
+- These numbers matter because they force: sequential writes, bounded index work per point, retention-by-drop, and rollups that don’t contend with ingest.
+
+## Key Design Decisions
+
+- **We chose:** Time-partitioned LSM-style storage with immutable segment files (SSTables) per shard and time window.
+  - **We rejected:** B-tree / per-point updates, and “single huge log + query-time scan.”
+  - **Why:** Sequential ingest + predictable compaction; retention becomes dropping whole segment directories.
+
+- **We chose:** Series-ID indirection with a tag inverted index (tags → series IDs) and series dictionary (series key → series ID).
+  - **We rejected:** Storing full tagsets on every point or building per-tag/time secondary indexes.
+  - **Why:** Tags are high-entropy and repetitive; the only scalable approach is to pay the tag cost once per series, not per point.
+
+- **We chose:** Rollups as first-class materialized streams (raw → rollup1m → rollup1h) stored separately with their own retention.
+  - **We rejected:** Query-time downsampling and “rollups via ad-hoc batch jobs over raw.”
+  - **Why:** Query-time downsampling is the silent killer of p95 latency; rollup computation must be incremental and bounded.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Ingest API"] --> B["Router"]
+  B --> C["WAL + Memtable"]
+  C --> D["Segment Store"]
+  D --> E["Compactor"]
+  E --> D
+  D --> F["Rollup Builder"]
+  F --> G["Rollup Store"]
+  H["Query API"] --> I["Query Engine"]
+  I --> D
+  I --> G
+```
+
+### Components
+
+- `Ingest API`: Validates writes, normalizes tag order, enforces limits (max tags, max series per tenant) to prevent cardinality explosions.
+- `Router`: Maps each point to a shard (hash(series_id) + time partition) and routes to the correct storage node(s); keeps ingest stateless.
+- `WAL + Memtable`: WAL provides crash safety; memtable buffers sorted (series_id, timestamp) entries for efficient flush.
+- `Segment Store`: Immutable segment files grouped by time window (e.g., 2h) and shard; stores compressed blocks and sparse indexes.
+- `Compactor`: Merges overlapping segments, reclaims space, and enforces a bounded out-of-order window.
+- `Rollup Builder`: Consumes compacted raw segments and produces fixed-window aggregates into dedicated rollup segments.
+- `Rollup Store`: Physically separate namespace and retention policy; optimized for aggregate queries (fewer points, wider read).
+- `Query Engine`: Plans queries by first resolving tag filters to series IDs, then performing time-range scans with predicate pushdown and aggregate execution.
+
+## Deep Dive: The Hardest Part — Compaction That Doesn’t Kill Ingest
+
+The core problem is this: ingest wants **append-only sequential IO**, while queries and retention want data organized for **fast range scans and bulk deletion**. LSM compaction is the bridge—but it’s also where TSDBs fail in production. If compaction falls behind, disk fills, read amplification explodes, and latency spikes exactly when traffic is highest.
+
+This design keeps compaction predictable by making time a hard boundary. Each shard writes segments for fixed time windows (e.g., 2h). Within a window, the key is `(series_id, timestamp)`, enabling high compression and fast per-series scans. Compaction is constrained to:
+1) merging a small set of segments within the same time window, and
+2) a bounded “late data” horizon (e.g., allow out-of-order up to 30 minutes, after which late points are redirected to a small “late segment” that is compacted separately).
+
+The compactor runs with explicit budgets: max IO per second, max concurrent merges, and priority based on “read amplification” and “disk pressure.” It never competes with the WAL path: WAL fsync and memtable flush have reserved IO and CPU. Practically, that means separate threadpools and an IO scheduler policy that favors small, latency-sensitive writes over bulk merges.
+
+Rollups integrate cleanly by consuming **compacted** segments, not raw memtables. That’s the non-obvious win: rollup builders see stable, ordered data, so they can compute window aggregates with streaming scans and write their own immutable rollup segments. This avoids both double-counting (from partial compaction) and expensive reprocessing.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Sustained ingest throughput | Complex compaction subsystem |
+| Predictable retention cost (drop segments) | Less efficient for point updates/deletes |
+| Fast time-range scans + aggregates | Extra storage for rollups |
+| High-cardinality tag filters | Inverted index memory/disk overhead |
+
+## Failure Modes
+
+- **Compaction debt → disk pressure**
+  - **What happens:** Segment count grows, reads touch more files, disk fills; ingest starts failing.
+  - **Detect:** Compaction queue length, read amplification (files touched per query), disk watermark alerts.
+  - **Recover:** Throttle ingest per tenant, temporarily pause rollups, increase compaction IO budget, add nodes and rebalance shards, then compact hottest windows first.
+
+- **Cardinality explosion (tag abuse)**
+  - **What happens:** Series dictionary and inverted index balloon; memory churn and GC spikes; query fanout becomes unbounded.
+  - **Detect:** New series/sec, active series count per tenant, top-K tag values by new-series creation.
+  - **Recover:** Enforce hard tenant limits, reject writes with high-entropy tags, require allowlisted tag keys, and offer a “drop/normalize tag” ingest rule.
+
+- **Hot shard / uneven routing**
+  - **What happens:** A small subset of series dominates ingest; one node becomes WAL/CPU bound.
+  - **Detect:** Per-shard ingest rate and WAL fsync latency; router histogram of shard load.
+  - **Recover:** Increase shard count, rebalance shard ownership, add a “salt” mechanism for known-hot series, and isolate noisy tenants.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move the inverted index to a dedicated service with memory-optimized structures and snapshotting; introduce query fanout limits and precomputed “popular” aggregates.
+- **100x scale:** Split storage into hot-local + cold-object-store with remote segment reads; add multi-region ingest with local durability and asynchronous replication; redesign metadata to tolerate massive series churn (log-structured metadata + aggressive TTL).
+
+## Operational Notes
+
+- Compaction is the heartbeat: page on compaction lag and disk-watermark, not just CPU.
+- Set explicit SLO budgets for “late data” and enforce them; unbounded out-of-order points are a stealth DoS.
+- Keep rollup pipelines observable as first-class citizens: lag, window completeness, and duplicate detection.
+- Capacity planning is driven by: points/sec, compression ratio, segment size, and compaction write amplification—track all four continuously.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/time-series-database.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-4dc2-7092-a8f0-d7c7ace92fba
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Time-Series Database"
+category: "Storage & Data Platforms"
+difficulty: "Hard"
+tags: ["tsdb", "storage-engine", "lsm", "compaction", "rollups", "retention", "iot", "metrics"]
+---
+
+## Overview
+
+This system is a distributed time-series database optimized for “append-mostly” telemetry: very high write throughput, time-bounded reads, fast aggregations, and predictable retention. The key insight is to **treat time as the primary physical layout constraint**: store data in immutable, time-partitioned segments so retention becomes a metadata operation (drop whole segments), and downsampling becomes a controlled rewrite of already-ordered data rather than a query-time tax.
+
+Most teams get stuck trying to satisfy three goals at once—write speed, query speed, and rollups—using a single layout. The elegant approach is to separate concerns: **raw data optimized for ingest + range scans**, **rollup data optimized for aggregates**, and a **small metadata/index layer** that makes both cheap without storing tags on every point.
+
+## What Makes This Hard
+
+Naive implementations die from **write amplification and cardinality**. If you “just index everything” (tags, timestamps, fields) you either destroy ingest (too many random writes) or destroy storage (too much overhead per point). If you “just append logs,” queries require scanning too much data and rollups become expensive full scans.
+
+The trap: retention and downsampling look like “policy features,” but they are **storage-engine features**. If you can’t delete in big chunks and you can’t compact predictably, you’ll end up with compaction debt, spiky latency, and on-call pain.
+
+## Requirements
+
+### Functional Requirements
+- Ingest time-series points with tags/labels, timestamp, and numeric fields.
+- Query by time range + tag filters; support common aggregates (sum/avg/min/max/p95) and group-by tag(s).
+- Continuous downsampling into fixed windows (e.g., 1m, 1h) with multiple retention tiers (e.g., 7d raw, 90d 1m, 2y 1h).
+- Exactly-once is not required; **idempotent ingest** and bounded duplication is acceptable.
+- Backfill support (late/out-of-order points) within a bounded window.
+
+### Scale Targets
+- **Ingest:** 1,000,000 points/sec sustained, 3,000,000 points/sec burst (IoT fleets and scrape storms).
+- **Cardinality:** 50,000,000 active series (metrics-style labels) with daily churn.
+- **Queries:** P95 < 2s for “last 6h, filter by 2 tags, group-by 1 tag”; P95 < 5s for “last 7d rollup”.
+- These numbers matter because they force: sequential writes, bounded index work per point, retention-by-drop, and rollups that don’t contend with ingest.
+
+## Key Design Decisions
+
+- **We chose:** Time-partitioned LSM-style storage with immutable segment files (SSTables) per shard and time window.
+  - **We rejected:** B-tree / per-point updates, and “single huge log + query-time scan.”
+  - **Why:** Sequential ingest + predictable compaction; retention becomes dropping whole segment directories.
+
+- **We chose:** Series-ID indirection with a tag inverted index (tags → series IDs) and series dictionary (series key → series ID).
+  - **We rejected:** Storing full tagsets on every point or building per-tag/time secondary indexes.
+  - **Why:** Tags are high-entropy and repetitive; the only scalable approach is to pay the tag cost once per series, not per point.
+
+- **We chose:** Rollups as first-class materialized streams (raw → rollup1m → rollup1h) stored separately with their own retention.
+  - **We rejected:** Query-time downsampling and “rollups via ad-hoc batch jobs over raw.”
+  - **Why:** Query-time downsampling is the silent killer of p95 latency; rollup computation must be incremental and bounded.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Ingest API"] --> B["Router"]
+  B --> C["WAL + Memtable"]
+  C --> D["Segment Store"]
+  D --> E["Compactor"]
+  E --> D
+  D --> F["Rollup Builder"]
+  F --> G["Rollup Store"]
+  H["Query API"] --> I["Query Engine"]
+  I --> D
+  I --> G
+```
+
+### Components
+
+- `Ingest API`: Validates writes, normalizes tag order, enforces limits (max tags, max series per tenant) to prevent cardinality explosions.
+- `Router`: Maps each point to a shard (hash(series_id) + time partition) and routes to the correct storage node(s); keeps ingest stateless.
+- `WAL + Memtable`: WAL provides crash safety; memtable buffers sorted (series_id, timestamp) entries for efficient flush.
+- `Segment Store`: Immutable segment files grouped by time window (e.g., 2h) and shard; stores compressed blocks and sparse indexes.
+- `Compactor`: Merges overlapping segments, reclaims space, and enforces a bounded out-of-order window.
+- `Rollup Builder`: Consumes compacted raw segments and produces fixed-window aggregates into dedicated rollup segments.
+- `Rollup Store`: Physically separate namespace and retention policy; optimized for aggregate queries (fewer points, wider read).
+- `Query Engine`: Plans queries by first resolving tag filters to series IDs, then performing time-range scans with predicate pushdown and aggregate execution.
+
+## Deep Dive: The Hardest Part — Compaction That Doesn’t Kill Ingest
+
+The core problem is this: ingest wants **append-only sequential IO**, while queries and retention want data organized for **fast range scans and bulk deletion**. LSM compaction is the bridge—but it’s also where TSDBs fail in production. If compaction falls behind, disk fills, read amplification explodes, and latency spikes exactly when traffic is highest.
+
+This design keeps compaction predictable by making time a hard boundary. Each shard writes segments for fixed time windows (e.g., 2h). Within a window, the key is `(series_id, timestamp)`, enabling high compression and fast per-series scans. Compaction is constrained to:
+1) merging a small set of segments within the same time window, and
+2) a bounded “late data” horizon (e.g., allow out-of-order up to 30 minutes, after which late points are redirected to a small “late segment” that is compacted separately).
+
+The compactor runs with explicit budgets: max IO per second, max concurrent merges, and priority based on “read amplification” and “disk pressure.” It never competes with the WAL path: WAL fsync and memtable flush have reserved IO and CPU. Practically, that means separate threadpools and an IO scheduler policy that favors small, latency-sensitive writes over bulk merges.
+
+Rollups integrate cleanly by consuming **compacted** segments, not raw memtables. That’s the non-obvious win: rollup builders see stable, ordered data, so they can compute window aggregates with streaming scans and write their own immutable rollup segments. This avoids both double-counting (from partial compaction) and expensive reprocessing.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Sustained ingest throughput | Complex compaction subsystem |
+| Predictable retention cost (drop segments) | Less efficient for point updates/deletes |
+| Fast time-range scans + aggregates | Extra storage for rollups |
+| High-cardinality tag filters | Inverted index memory/disk overhead |
+
+## Failure Modes
+
+- **Compaction debt → disk pressure**
+  - **What happens:** Segment count grows, reads touch more files, disk fills; ingest starts failing.
+  - **Detect:** Compaction queue length, read amplification (files touched per query), disk watermark alerts.
+  - **Recover:** Throttle ingest per tenant, temporarily pause rollups, increase compaction IO budget, add nodes and rebalance shards, then compact hottest windows first.
+
+- **Cardinality explosion (tag abuse)**
+  - **What happens:** Series dictionary and inverted index balloon; memory churn and GC spikes; query fanout becomes unbounded.
+  - **Detect:** New series/sec, active series count per tenant, top-K tag values by new-series creation.
+  - **Recover:** Enforce hard tenant limits, reject writes with high-entropy tags, require allowlisted tag keys, and offer a “drop/normalize tag” ingest rule.
+
+- **Hot shard / uneven routing**
+  - **What happens:** A small subset of series dominates ingest; one node becomes WAL/CPU bound.
+  - **Detect:** Per-shard ingest rate and WAL fsync latency; router histogram of shard load.
+  - **Recover:** Increase shard count, rebalance shard ownership, add a “salt” mechanism for known-hot series, and isolate noisy tenants.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move the inverted index to a dedicated service with memory-optimized structures and snapshotting; introduce query fanout limits and precomputed “popular” aggregates.
+- **100x scale:** Split storage into hot-local + cold-object-store with remote segment reads; add multi-region ingest with local durability and asynchronous replication; redesign metadata to tolerate massive series churn (log-structured metadata + aggressive TTL).
+
+## Operational Notes
+
+- Compaction is the heartbeat: page on compaction lag and disk-watermark, not just CPU.
+- Set explicit SLO budgets for “late data” and enforce them; unbounded out-of-order points are a stealth DoS.
+- Keep rollup pipelines observable as first-class citizens: lag, window completeness, and duplicate detection.
+- Capacity planning is driven by: points/sec, compression ratio, segment size, and compaction write amplification—track all four continuously.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+thinking
+**Evaluating database solutions**
+
+I need to provide a critique in the specified format without tool calls. The analysis should be structured and constructive, exploring alternatives like Postgres, Redis, and Kafka. Given the scale, a custom solution might be justified. I should address aspects such as coordination, replication, and consistency, while identifying missing elements like replication strategies, schema, and failure scenarios. I can suggest simplifying with options like object stores, local caching, and technologies like Kafka for buffering. I'll recommend existing time series databases as potential solutions too.
+thinking
+**Drafting operational recommendations**
+
+I need to include details on operational aspects like debugging compaction, observability, backpressure, and bulkheads in my analysis. Creating a components table and a simplification opportunities table will help clarify the structure. I also want to outline stress tests with 3 to 5 scenarios. My recommendations need to focus on must-fix issues while remaining concise yet substantive. It's time to draft this effectively to ensure everything is clearly communicated.
+codex
+## Elegance Check
+
+### The Core Insight
+Treating **time as a hard physical boundary** (immutable, time-windowed segments) is the right “TSDB-native” move: it makes retention a delete-by-drop operation and lets rollups be a streaming rewrite over already-ordered data.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| `WAL + Memtable` | Survives crashes while keeping ingest sequential and fast. |
+| `Segment Store` | Immutable segments are the foundation for predictable retention + range scans. |
+| `Compactor` | Without bounded compaction, you’ll get read amplification and disk-pressure death spirals. |
+| `Series dictionary (series_key → series_id)` | Essential to avoid paying tagset cost per point at 50M series. |
+| `Tag inverted index (tag → series_ids)` | Makes tag filters feasible without scanning. |
+| `Rollup Builder/Store` | Keeps query p95 predictable by avoiding query-time downsampling tax. |
+| `Router` | Decouples ingest API from shard placement and enables rebalancing. |
+| `Query Engine` | Needed to plan “tag-filter → series set → time scans → aggregate”. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom segment store + compaction logic | Use an embedded LSM (`RocksDB`/`Pebble`) for raw+rollup storage, still time-partitioned at the directory/key-prefix level | Less control over TSDB-specific compaction/IO isolation; easier correctness/ops. |
+| Custom router membership + shard ownership (implied) | Use `etcd` for membership + consistent-hash ring + shard leases | Adds dependency, but massively simplifies coordination and failure recovery. |
+| Custom rollup pipeline (compacted segments → rollups) | Use a durable log (`Kafka`/`Pulsar`) to feed rollups and allow replay | More infra; but simplifies backfill, reprocessing, and “bad rollup code” recovery. |
+| Custom tag index persistence strategy (implied) | Put series dictionary + tag index in `Postgres` (partitioned tables + GIN/JSONB) up to a cap; spill to custom only if needed | Might not hit 50M active series at required QPS; but can bootstrap MVP/early scale faster. |
+| Building a TSDB from scratch | Adopt/extend an existing engine (VictoriaMetrics/M3/ClickHouse for metrics-like workloads) | Less “custom elegance”, but huge reduction in correctness + on-call surface area. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Storage node dies mid-ingest**
+   - Design’s answer: not addressed (WAL exists, but replication/HA semantics aren’t specified)
+   - Recommendation: Strengthen (define replication factor, write quorum/ack level, WAL replay, and shard failover/lease handoff)
+
+2. **Database down for 5 minutes (metadata/index path)**
+   - Design’s answer: not addressed (series dictionary + inverted index are critical-path for both ingest and query)
+   - Recommendation: Strengthen (define “metadata availability mode”: cache-on-router, local snapshots, and what happens on cache miss; otherwise ingest halts)
+
+3. **Network partition between Router and storage nodes**
+   - Design’s answer: partially addressed (stateless router, throttling), but no consistency model
+   - Recommendation: Strengthen (explicit backpressure + retry policy, idempotency keys, and “at-least-once with bounded dup” mechanics across partitions)
+
+4. **Compactor falls behind during 10x burst**
+   - Design’s answer: addressed (budgets, priority, throttling ingest, pause rollups)
+   - Recommendation: Acceptable, but add a hard safety valve (admission control tied to disk watermark + compaction lag to prevent total disk exhaustion)
+
+5. **Bad rollup code/config deployed (wrong windowing, double-count, wrong p95)**
+   - Design’s answer: not addressed (observability mentioned, but no rollback/rebuild story)
+   - Recommendation: Strengthen (make rollups replayable: version rollup schemas, write rollup “generation id”, support rebuild from raw/compacted segments, and safe cutover)
+
+## Recommendations
+
+### Must Fix
+- Specify **replication + durability semantics** end-to-end: RF, quorum vs primary-replica, write ack, and how queries behave during failover.
+- Define the **series dictionary / tag index persistence and recovery** path: snapshots, rebuild time, and what ingest does on “new series” when the index is unavailable.
+- Make **query fanout and series-set explosion** a first-class limit: cap matched series, cap group-by cardinality, and provide partial results/error modes.
+
+### Should Consider
+- Use `etcd` (or similar) for **shard leases/ring membership** to simplify safe rebalancing and avoid split-brain shard ownership.
+- Make rollups **replayable and versioned** to handle operator mistakes without manual forensics.
+- Clarify the **late data model**: how late segments merge, how queries avoid double-reading late+main, and what correctness you guarantee around the cutoff.
+
+### Nice to Have
+- Add a “**degraded modes**” section: what still works when compaction is paused, when index is stale, or when rollups lag.
+- Document IO isolation concretely (cgroups/ionice/io_uring priorities, separate disks, or explicit bandwidth limits) rather than “separate threadpools”.
+
+## What’s Working Well
+- The design correctly centers **compaction as the heartbeat** and ties it to operator-facing signals (lag, disk watermarks, read amplification).
+- The “consume **compacted** segments for rollups” insight is operationally clean and avoids subtle correctness traps.
+- You’re honest about cardinality and explicitly include **admission control hooks** (limits, reject rules, throttling), which is where TSDBs usually fail in real life.
+tokens used
+4,612
+## Elegance Check
+
+### The Core Insight
+Treating **time as a hard physical boundary** (immutable, time-windowed segments) is the right “TSDB-native” move: it makes retention a delete-by-drop operation and lets rollups be a streaming rewrite over already-ordered data.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| `WAL + Memtable` | Survives crashes while keeping ingest sequential and fast. |
+| `Segment Store` | Immutable segments are the foundation for predictable retention + range scans. |
+| `Compactor` | Without bounded compaction, you’ll get read amplification and disk-pressure death spirals. |
+| `Series dictionary (series_key → series_id)` | Essential to avoid paying tagset cost per point at 50M series. |
+| `Tag inverted index (tag → series_ids)` | Makes tag filters feasible without scanning. |
+| `Rollup Builder/Store` | Keeps query p95 predictable by avoiding query-time downsampling tax. |
+| `Router` | Decouples ingest API from shard placement and enables rebalancing. |
+| `Query Engine` | Needed to plan “tag-filter → series set → time scans → aggregate”. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom segment store + compaction logic | Use an embedded LSM (`RocksDB`/`Pebble`) for raw+rollup storage, still time-partitioned at the directory/key-prefix level | Less control over TSDB-specific compaction/IO isolation; easier correctness/ops. |
+| Custom router membership + shard ownership (implied) | Use `etcd` for membership + consistent-hash ring + shard leases | Adds dependency, but massively simplifies coordination and failure recovery. |
+| Custom rollup pipeline (compacted segments → rollups) | Use a durable log (`Kafka`/`Pulsar`) to feed rollups and allow replay | More infra; but simplifies backfill, reprocessing, and “bad rollup code” recovery. |
+| Custom tag index persistence strategy (implied) | Put series dictionary + tag index in `Postgres` (partitioned tables + GIN/JSONB) up to a cap; spill to custom only if needed | Might not hit 50M active series at required QPS; but can bootstrap MVP/early scale faster. |
+| Building a TSDB from scratch | Adopt/extend an existing engine (VictoriaMetrics/M3/ClickHouse for metrics-like workloads) | Less “custom elegance”, but huge reduction in correctness + on-call surface area. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Storage node dies mid-ingest**
+   - Design’s answer: not addressed (WAL exists, but replication/HA semantics aren’t specified)
+   - Recommendation: Strengthen (define replication factor, write quorum/ack level, WAL replay, and shard failover/lease handoff)
+
+2. **Database down for 5 minutes (metadata/index path)**
+   - Design’s answer: not addressed (series dictionary + inverted index are critical-path for both ingest and query)
+   - Recommendation: Strengthen (define “metadata availability mode”: cache-on-router, local snapshots, and what happens on cache miss; otherwise ingest halts)
+
+3. **Network partition between Router and storage nodes**
+   - Design’s answer: partially addressed (stateless router, throttling), but no consistency model
+   - Recommendation: Strengthen (explicit backpressure + retry policy, idempotency keys, and “at-least-once with bounded dup” mechanics across partitions)
+
+4. **Compactor falls behind during 10x burst**
+   - Design’s answer: addressed (budgets, priority, throttling ingest, pause rollups)
+   - Recommendation: Acceptable, but add a hard safety valve (admission control tied to disk watermark + compaction lag to prevent total disk exhaustion)
+
+5. **Bad rollup code/config deployed (wrong windowing, double-count, wrong p95)**
+   - Design’s answer: not addressed (observability mentioned, but no rollback/rebuild story)
+   - Recommendation: Strengthen (make rollups replayable: version rollup schemas, write rollup “generation id”, support rebuild from raw/compacted segments, and safe cutover)
+
+## Recommendations
+
+### Must Fix
+- Specify **replication + durability semantics** end-to-end: RF, quorum vs primary-replica, write ack, and how queries behave during failover.
+- Define the **series dictionary / tag index persistence and recovery** path: snapshots, rebuild time, and what ingest does on “new series” when the index is unavailable.
+- Make **query fanout and series-set explosion** a first-class limit: cap matched series, cap group-by cardinality, and provide partial results/error modes.
+
+### Should Consider
+- Use `etcd` (or similar) for **shard leases/ring membership** to simplify safe rebalancing and avoid split-brain shard ownership.
+- Make rollups **replayable and versioned** to handle operator mistakes without manual forensics.
+- Clarify the **late data model**: how late segments merge, how queries avoid double-reading late+main, and what correctness you guarantee around the cutoff.
+
+### Nice to Have
+- Add a “**degraded modes**” section: what still works when compaction is paused, when index is stale, or when rollups lag.
+- Document IO isolation concretely (cgroups/ionice/io_uring priorities, separate disks, or explicit bandwidth limits) rather than “separate threadpools”.
+
+## What’s Working Well
+- The design correctly centers **compaction as the heartbeat** and ties it to operator-facing signals (lag, disk watermarks, read amplification).
+- The “consume **compacted** segments for rollups” insight is operationally clean and avoids subtle correctness traps.
+- You’re honest about cardinality and explicitly include **admission control hooks** (limits, reject rules, throttling), which is where TSDBs usually fail in real life.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/time-series-database.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-d6d6-7bf3-a169-7a17fc0f2b33
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Time-Series Database"
+category: "Storage & Data Platforms"
+difficulty: "Hard"
+tags: ["tsdb", "storage-engine", "lsm", "compaction", "rollups", "retention", "iot", "metrics"]
+---
+
+## Overview
+
+This system is a distributed time-series database optimized for “append-mostly” telemetry: very high write throughput, time-bounded reads, fast aggregations, and predictable retention. The key insight is to **treat time as the primary physical layout constraint**: store data in immutable, time-partitioned segments so retention becomes a metadata operation (drop whole segments), and downsampling becomes a controlled rewrite of already-ordered data rather than a query-time tax.
+
+Most teams get stuck trying to satisfy three goals at once—write speed, query speed, and rollups—using a single layout. The elegant approach is to separate concerns: **raw data optimized for ingest + range scans**, **rollup data optimized for aggregates**, and a **small metadata/index layer** that makes both cheap without storing tags on every point.
+
+## What Makes This Hard
+
+Naive implementations die from **write amplification and cardinality**. If you “just index everything” (tags, timestamps, fields) you either destroy ingest (too many random writes) or destroy storage (too much overhead per point). If you “just append logs,” queries require scanning too much data and rollups become expensive full scans.
+
+The trap: retention and downsampling look like “policy features,” but they are **storage-engine features**. If you can’t delete in big chunks and you can’t compact predictably, you’ll end up with compaction debt, spiky latency, and on-call pain.
+
+## Requirements
+
+### Functional Requirements
+- Ingest time-series points with tags/labels, timestamp, and numeric fields.
+- Query by time range + tag filters; support common aggregates (sum/avg/min/max/p95) and group-by tag(s).
+- Continuous downsampling into fixed windows (e.g., 1m, 1h) with multiple retention tiers (e.g., 7d raw, 90d 1m, 2y 1h).
+- Exactly-once is not required; **idempotent ingest** and bounded duplication is acceptable.
+- Backfill support (late/out-of-order points) within a bounded window.
+
+### Scale Targets
+- **Ingest:** 1,000,000 points/sec sustained, 3,000,000 points/sec burst (IoT fleets and scrape storms).
+- **Cardinality:** 50,000,000 active series (metrics-style labels) with daily churn.
+- **Queries:** P95 < 2s for “last 6h, filter by 2 tags, group-by 1 tag”; P95 < 5s for “last 7d rollup”.
+- These numbers matter because they force: sequential writes, bounded index work per point, retention-by-drop, and rollups that don’t contend with ingest.
+
+## Key Design Decisions
+
+- **We chose:** Time-partitioned LSM-style storage with immutable segment files (SSTables) per shard and time window.
+  - **We rejected:** B-tree / per-point updates, and “single huge log + query-time scan.”
+  - **Why:** Sequential ingest + predictable compaction; retention becomes dropping whole segment directories.
+
+- **We chose:** Series-ID indirection with a tag inverted index (tags → series IDs) and series dictionary (series key → series ID).
+  - **We rejected:** Storing full tagsets on every point or building per-tag/time secondary indexes.
+  - **Why:** Tags are high-entropy and repetitive; the only scalable approach is to pay the tag cost once per series, not per point.
+
+- **We chose:** Rollups as first-class materialized streams (raw → rollup1m → rollup1h) stored separately with their own retention.
+  - **We rejected:** Query-time downsampling and “rollups via ad-hoc batch jobs over raw.”
+  - **Why:** Query-time downsampling is the silent killer of p95 latency; rollup computation must be incremental and bounded.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Ingest API"] --> B["Router"]
+  B --> C["WAL + Memtable"]
+  C --> D["Segment Store"]
+  D --> E["Compactor"]
+  E --> D
+  D --> F["Rollup Builder"]
+  F --> G["Rollup Store"]
+  H["Query API"] --> I["Query Engine"]
+  I --> D
+  I --> G
+```
+
+### Components
+
+- `Ingest API`: Validates writes, normalizes tag order, enforces limits (max tags, max series per tenant) to prevent cardinality explosions.
+- `Router`: Maps each point to a shard (hash(series_id) + time partition) and routes to the correct storage node(s); keeps ingest stateless.
+- `WAL + Memtable`: WAL provides crash safety; memtable buffers sorted (series_id, timestamp) entries for efficient flush.
+- `Segment Store`: Immutable segment files grouped by time window (e.g., 2h) and shard; stores compressed blocks and sparse indexes.
+- `Compactor`: Merges overlapping segments, reclaims space, and enforces a bounded out-of-order window.
+- `Rollup Builder`: Consumes compacted raw segments and produces fixed-window aggregates into dedicated rollup segments.
+- `Rollup Store`: Physically separate namespace and retention policy; optimized for aggregate queries (fewer points, wider read).
+- `Query Engine`: Plans queries by first resolving tag filters to series IDs, then performing time-range scans with predicate pushdown and aggregate execution.
+
+## Deep Dive: The Hardest Part — Compaction That Doesn’t Kill Ingest
+
+The core problem is this: ingest wants **append-only sequential IO**, while queries and retention want data organized for **fast range scans and bulk deletion**. LSM compaction is the bridge—but it’s also where TSDBs fail in production. If compaction falls behind, disk fills, read amplification explodes, and latency spikes exactly when traffic is highest.
+
+This design keeps compaction predictable by making time a hard boundary. Each shard writes segments for fixed time windows (e.g., 2h). Within a window, the key is `(series_id, timestamp)`, enabling high compression and fast per-series scans. Compaction is constrained to:
+1) merging a small set of segments within the same time window, and
+2) a bounded “late data” horizon (e.g., allow out-of-order up to 30 minutes, after which late points are redirected to a small “late segment” that is compacted separately).
+
+The compactor runs with explicit budgets: max IO per second, max concurrent merges, and priority based on “read amplification” and “disk pressure.” It never competes with the WAL path: WAL fsync and memtable flush have reserved IO and CPU. Practically, that means separate threadpools and an IO scheduler policy that favors small, latency-sensitive writes over bulk merges.
+
+Rollups integrate cleanly by consuming **compacted** segments, not raw memtables. That’s the non-obvious win: rollup builders see stable, ordered data, so they can compute window aggregates with streaming scans and write their own immutable rollup segments. This avoids both double-counting (from partial compaction) and expensive reprocessing.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Sustained ingest throughput | Complex compaction subsystem |
+| Predictable retention cost (drop segments) | Less efficient for point updates/deletes |
+| Fast time-range scans + aggregates | Extra storage for rollups |
+| High-cardinality tag filters | Inverted index memory/disk overhead |
+
+## Failure Modes
+
+- **Compaction debt → disk pressure**
+  - **What happens:** Segment count grows, reads touch more files, disk fills; ingest starts failing.
+  - **Detect:** Compaction queue length, read amplification (files touched per query), disk watermark alerts.
+  - **Recover:** Throttle ingest per tenant, temporarily pause rollups, increase compaction IO budget, add nodes and rebalance shards, then compact hottest windows first.
+
+- **Cardinality explosion (tag abuse)**
+  - **What happens:** Series dictionary and inverted index balloon; memory churn and GC spikes; query fanout becomes unbounded.
+  - **Detect:** New series/sec, active series count per tenant, top-K tag values by new-series creation.
+  - **Recover:** Enforce hard tenant limits, reject writes with high-entropy tags, require allowlisted tag keys, and offer a “drop/normalize tag” ingest rule.
+
+- **Hot shard / uneven routing**
+  - **What happens:** A small subset of series dominates ingest; one node becomes WAL/CPU bound.
+  - **Detect:** Per-shard ingest rate and WAL fsync latency; router histogram of shard load.
+  - **Recover:** Increase shard count, rebalance shard ownership, add a “salt” mechanism for known-hot series, and isolate noisy tenants.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Move the inverted index to a dedicated service with memory-optimized structures and snapshotting; introduce query fanout limits and precomputed “popular” aggregates.
+- **100x scale:** Split storage into hot-local + cold-object-store with remote segment reads; add multi-region ingest with local durability and asynchronous replication; redesign metadata to tolerate massive series churn (log-structured metadata + aggressive TTL).
+
+## Operational Notes
+
+- Compaction is the heartbeat: page on compaction lag and disk-watermark, not just CPU.
+- Set explicit SLO budgets for “late data” and enforce them; unbounded out-of-order points are a stealth DoS.
+- Keep rollup pipelines observable as first-class citizens: lag, window completeness, and duplicate detection.
+- Capacity planning is driven by: points/sec, compression ratio, segment size, and compaction write amplification—track all four continuously.
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Treating **time as a hard physical boundary** (immutable, time-windowed segments) is the right “TSDB-native” move: it makes retention a delete-by-drop operation and lets rollups be a streaming rewrite over already-ordered data.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| `WAL + Memtable` | Survives crashes while keeping ingest sequential and fast. |
+| `Segment Store` | Immutable segments are the foundation for predictable retention + range scans. |
+| `Compactor` | Without bounded compaction, you’ll get read amplification and disk-pressure death spirals. |
+| `Series dictionary (series_key → series_id)` | Essential to avoid paying tagset cost per point at 50M series. |
+| `Tag inverted index (tag → series_ids)` | Makes tag filters feasible without scanning. |
+| `Rollup Builder/Store` | Keeps query p95 predictable by avoiding query-time downsampling tax. |
+| `Router` | Decouples ingest API from shard placement and enables rebalancing. |
+| `Query Engine` | Needed to plan “tag-filter → series set → time scans → aggregate”. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom segment store + compaction logic | Use an embedded LSM (`RocksDB`/`Pebble`) for raw+rollup storage, still time-partitioned at the directory/key-prefix level | Less control over TSDB-specific compaction/IO isolation; easier correctness/ops. |
+| Custom router membership + shard ownership (implied) | Use `etcd` for membership + consistent-hash ring + shard leases | Adds dependency, but massively simplifies coordination and failure recovery. |
+| Custom rollup pipeline (compacted segments → rollups) | Use a durable log (`Kafka`/`Pulsar`) to feed rollups and allow replay | More infra; but simplifies backfill, reprocessing, and “bad rollup code” recovery. |
+| Custom tag index persistence strategy (implied) | Put series dictionary + tag index in `Postgres` (partitioned tables + GIN/JSONB) up to a cap; spill to custom only if needed | Might not hit 50M active series at required QPS; but can bootstrap MVP/early scale faster. |
+| Building a TSDB from scratch | Adopt/extend an existing engine (VictoriaMetrics/M3/ClickHouse for metrics-like workloads) | Less “custom elegance”, but huge reduction in correctness + on-call surface area. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Storage node dies mid-ingest**
+   - Design’s answer: not addressed (WAL exists, but replication/HA semantics aren’t specified)
+   - Recommendation: Strengthen (define replication factor, write quorum/ack level, WAL replay, and shard failover/lease handoff)
+
+2. **Database down for 5 minutes (metadata/index path)**
+   - Design’s answer: not addressed (series dictionary + inverted index are critical-path for both ingest and query)
+   - Recommendation: Strengthen (define “metadata availability mode”: cache-on-router, local snapshots, and what happens on cache miss; otherwise ingest halts)
+
+3. **Network partition between Router and storage nodes**
+   - Design’s answer: partially addressed (stateless router, throttling), but no consistency model
+   - Recommendation: Strengthen (explicit backpressure + retry policy, idempotency keys, and “at-least-once with bounded dup” mechanics across partitions)
+
+4. **Compactor falls behind during 10x burst**
+   - Design’s answer: addressed (budgets, priority, throttling ingest, pause rollups)
+   - Recommendation: Acceptable, but add a hard safety valve (admission control tied to disk watermark + compaction lag to prevent total disk exhaustion)
+
+5. **Bad rollup code/config deployed (wrong windowing, double-count, wrong p95)**
+   - Design’s answer: not addressed (observability mentioned, but no rollback/rebuild story)
+   - Recommendation: Strengthen (make rollups replayable: version rollup schemas, write rollup “generation id”, support rebuild from raw/compacted segments, and safe cutover)
+
+## Recommendations
+
+### Must Fix
+- Specify **replication + durability semantics** end-to-end: RF, quorum vs primary-replica, write ack, and how queries behave during failover.
+- Define the **series dictionary / tag index persistence and recovery** path: snapshots, rebuild time, and what ingest does on “new series” when the index is unavailable.
+- Make **query fanout and series-set explosion** a first-class limit: cap matched series, cap group-by cardinality, and provide partial results/error modes.
+
+### Should Consider
+- Use `etcd` (or similar) for **shard leases/ring membership** to simplify safe rebalancing and avoid split-brain shard ownership.
+- Make rollups **replayable and versioned** to handle operator mistakes without manual forensics.
+- Clarify the **late data model**: how late segments merge, how queries avoid double-reading late+main, and what correctness you guarantee around the cutoff.
+
+### Nice to Have
+- Add a “**degraded modes**” section: what still works when compaction is paused, when index is stale, or when rollups lag.
+- Document IO isolation concretely (cgroups/ionice/io_uring priorities, separate disks, or explicit bandwidth limits) rather than “separate threadpools”.
+
+## What’s Working Well
+- The design correctly centers **compaction as the heartbeat** and ties it to operator-facing signals (lag, disk watermarks, read amplification).
+- The “consume **compacted** segments for rollups” insight is operationally clean and avoids subtle correctness traps.
+- You’re honest about cardinality and explicitly include **admission control hooks** (limits, reject rules, throttling), which is where TSDBs usually fail in real life.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+Reconnecting... 1/5
+
+
+
+
+
+
+thinking
+**Simplifying design documentation**
+
+I’m considering tags like lsm and compaction. If I focus solely on ClickHouse, those tags might not apply, but I can mention that it uses LSM under the hood with MergeTree. Timescale uses Postgres, while VictoriaMetrics has a custom setup. Maybe the simplest approach is to suggest using embedded LSM (RocksDB) with Postgres metadata. I need to ensure that I condense the document ruthlessly, keeping essential sections while omitting less critical ones.
+thinking
+**Refining design components**
+
+I'm thinking about keeping the Components section and integrating justifications for each. Maybe I could rename "What Makes This Hard" to "What We Removed," though that could lose original content. But do we really need to keep "What Makes This Hard"? We could eliminate it. I must address failure scenarios like storage node failures, maintenance issues with metadata, network partitions, and bad rollup code. The simplified design might include one binary per node that manages API, storage, rollups, and queries. I'll incorporate replication strategies and discuss client load balancing as a new component.
+thinking
+**Streamlining API and sharding**
+
+I'm realizing that the original design had separate Ingest API and Query API. I think it makes sense to merge those into a single service while noting that it can be managed through an L7 load balancer. To keep it simple, I’ll just say clients can connect to any node.
+
+For sharding, I'll use a consistent hash ring based on a Postgres membership table, with periodic heartbeats from each node. Shards will be assigned through leases, acting like an internal router.
+
+For storage, I'll implement RocksDB within "partition directories" structured by shard, time window, and resolution. Keys will consist of a series_id, timestamp, and field_id. I'll also focus on metadata storage in Postgres, encompassing the necessary tables.
+thinking
+**Detailing rollups and retention**
+
+Postgres will handle the schema and rollup generation. For rollups, a background worker on the primary will process raw partitions to create rollup partitions, using a deterministic key for idempotent upserts and a rollup_generation_id for rebuilding.
+
+For retention, I plan to drop entire partition directories if they're older than 7 days, while also removing tombstones in metadata. 
+
+When it comes to backfilling, points within a 30-minute out-of-order maximum will be accepted. I'll bound the process to avoid expensive writes. 
+
+For queries, I’ll resolve tags through Postgres to get a series_id set, capping matched series and then fanning out to relevant shards for scanning; the results will be merged.
+
+Regarding failure semantics, I’ll have a replication factor of 2 (primary and replica) and define default write acknowledgement for throughput, with an optional `durability=quorum` for stronger consistency. When a node goes down, lease transfers will happen after TTL, and the new primary will replicate missing partitions from the replica.
+thinking
+**Establishing durability and handling failures**
+
+I’m weighing the trade-off between acknowledgment settings. Setting ack=1 may risk data loss, while ack=2 ensures durability at the cost of increased latency. I think choosing ack=2 by default is wise, providing synchronous replication between nodes. To simplify, I'll opt for replicating WAL entries. Each write will append to the local WAL file and send to the replica, ensuring acknowledgment after both are flushed.
+
+If Postgres goes down, ingestion will continue for known series, but new series will be rejected. For queries, I’ll allow only series_id lookups, returning errors if Postgres is unavailable. In cases of network partitioning, I'll accept local-only writes in a degraded mode and provide metrics to monitor this.
+
+Regarding compaction and rollups, I can delete rollup partitions and recompute them from raw data as needed. I'll simplify components by integrating them into RocksDB and a background worker while removing unnecessary parts. I’ll keep essential sections in the documentation, renaming "What Makes This Hard" to "What We Removed" to clearly communicate what has been changed or simplified.
+
+While maintaining existing headings without adding new ones, I'll ensure clarity in my architectural diagrams and outline key design decisions succinctly. Ultimately, the output will reflect a clear and robust design focusing on availability over durability, with an acknowledgment of acceptable data loss during specific conditions.
+thinking
+**Handling rollup duplication and outages**
+
+I'm considering how bounded duplication for aggregates works; rollups will utilize deterministic window keys. In case of a Postgres outage, the leader will still ingest data for known series using a local cache, while rejecting new series. Queries that require tag filters may fail.
+
+I'll enforce cardinality limits to control new series creation per tenant, but I can't reduce scale targets. 
+
+For consistency, I’ll maintain existing headings and replace "What Makes This Hard" with a new section titled "What We Removed." I plan to carefully output the complete markdown document, using fenced code blocks to preserve formatting while ensuring everything aligns with the user's request.
+codex
+```markdown
+---
+title: "Time-Series Database"
+category: "Storage & Data Platforms"
+difficulty: "Hard"
+tags: ["tsdb", "storage-engine", "lsm", "compaction", "rollups", "retention", "iot", "metrics"]
+---
+
+## Overview
+
+This system is a distributed time-series database for append-mostly telemetry. Data is stored in immutable, time-partitioned storage so retention is deleting whole partitions, and rollups are a bounded rewrite of already time-ordered data.
+
+Tags never live on each point. Points reference a `series_id`; tags are resolved once (series dictionary + inverted index) and reused for ingest and query planning.
+
+## What We Removed
+
+- `Router` → merged into each `TSDB Node` (any node can accept requests and forward to the right shard).
+- `Segment Store` + custom `Compactor` → replaced by an embedded LSM (RocksDB/Pebble) per shard+time partition; compaction is delegated to the embedded engine.
+- `Rollup Builder` + `Rollup Store` → merged into the same embedded LSM with separate keyspaces for raw/rollups and a background rollup worker.
+- Custom tag-index persistence layer → replaced by Postgres tables for series dictionary + tag inverted index (plus shard leases).
+
+## Requirements
+
+### Functional Requirements
+- Ingest time-series points with tags/labels, timestamp, and numeric fields.
+- Query by time range + tag filters; support common aggregates (sum/avg/min/max/p95) and group-by tag(s).
+- Continuous downsampling into fixed windows (e.g., 1m, 1h) with multiple retention tiers (e.g., 7d raw, 90d 1m, 2y 1h).
+- Exactly-once is not required; idempotent ingest and bounded duplication is acceptable.
+- Backfill support (late/out-of-order points) within a bounded window.
+
+### Scale Targets
+- Ingest: 1,000,000 points/sec sustained, 3,000,000 points/sec burst.
+- Cardinality: 50,000,000 active series with daily churn.
+- Queries: P95 < 2s for “last 6h, filter by 2 tags, group-by 1 tag”; P95 < 5s for “last 7d rollup”.
+
+## Key Design Decisions
+
+- Time is a hard boundary: data is written into per-shard, fixed time partitions (e.g., 2h directories) so retention is deleting directories, not row deletes.
+- Embedded LSM for raw + rollups: each partition is an embedded DB (or column families) with keys ordered by `(series_id, timestamp)` for sequential ingest and range scans.
+- Postgres for metadata + coordination: Postgres stores `series_key → series_id`, `tag → series_id` mappings, and shard leases for safe ownership and rebalancing.
+- Clear durability semantics: writes are acknowledged after local WAL fsync on the shard leader; replication to a follower is async (bounded loss window on leader failure, bounded duplicates on retry).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Client (Ingest + Query)"] --> B["TSDB Node(s)"]
+  B --> C["Embedded LSM Partitions (raw + rollups)"]
+  B --> D["Postgres (series + tag index + shard leases)"]
+```
+
+### Components
+
+- `TSDB Node`
+  - Why it exists: single deployable unit that handles ingest, query planning/execution, shard routing, background rollups, and replication.
+  - What it does:
+    - Ingest: normalize tags, enforce tenant limits, resolve/allocate `series_id`, forward to shard leader, append to WAL, write to embedded LSM.
+    - Query: resolve tags → `series_id` set, enforce fanout limits, scan relevant time partitions, merge + aggregate.
+    - Rollups: incremental fixed-window aggregates written to rollup keyspaces; rollups are versioned by `rollup_generation_id`.
+    - Replication: shard leader streams WAL entries to a follower for fast failover.
+
+- `Postgres (Metadata + Coordination)`
+  - Why it exists: the simplest correct persistence for series/tag mappings and shard ownership without building a custom metadata store.
+  - What it stores:
+    - Series dictionary: `(tenant_id, series_key) → series_id`.
+    - Tag inverted index: `(tenant_id, tag_key, tag_value) → series_id` (plus maintenance for churn/TTL).
+    - Shard leases: shard → (leader, follower, lease_expiry) for failover/rebalance.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Small-team buildability | Less low-level IO control than a custom segment store/compactor |
+| Predictable retention (drop partitions) | More partitions to manage (files/handles) |
+| Fast ingest + range scans | Postgres becomes a critical dependency for tag-based queries |
+| Availability during network issues | Possible bounded loss window on leader crash (async replication) |
+| Stable p95 queries (precomputed rollups) | Extra storage for rollups; rebuild limited to raw retention |
+
+## Failure Modes
+
+- Storage node dies mid-ingest
+  - Behavior: shard leases promote the follower to leader after lease expiry; clients retry and may create bounded duplicates; data not yet replicated from the old leader can be lost.
+  - Recover: reassign a new follower, resync from the new leader, and continue; enforce per-tenant backpressure during rebalancing.
+
+- Postgres down for 5 minutes (metadata/index path)
+  - Behavior: ingest continues only for already-known series via local cache; new series creation is rejected; tag-filter queries fail closed (no partial scans).
+  - Recover: when Postgres returns, refresh caches and resume new-series writes; alert on cache-miss rejection rate.
+
+- Network partition between nodes (leader ↔ follower or client ↔ cluster)
+  - Behavior: leader keeps accepting locally (ack after local WAL fsync); replication lag grows; failover is prevented by leases (no split-brain ownership).
+  - Recover: once partition heals, follower catches up from WAL stream; if leader is lost, accept bounded loss window.
+
+- Embedded LSM compaction falls behind during burst
+  - Behavior: partitions accumulate files and disk usage rises; read amplification increases.
+  - Recover: admission control tied to disk watermark + compaction lag (throttle/reject per tenant), pause rollups first, then reduce ingest until compaction stabilizes.
+
+- Bad rollup code/config deployed
+  - Behavior: rollups are isolated by `rollup_generation_id`; queries read only the current generation.
+  - Recover: bump generation, rebuild rollups from raw partitions within raw retention, then switch generation atomically.
+
+## Operational Notes
+
+- Treat disk watermark + compaction lag as paging signals; everything else is secondary.
+- Enforce fanout limits: cap matched series IDs and group-by cardinality; return a clear error when exceeded.
+- Keep rollups boring: deterministic window keys + generation gating; rebuild is delete-and-recompute within raw retention.
+- Degraded mode is explicit: “known series only” ingest when Postgres is unavailable; no tag-filter query fallbacks that silently scan.
+```
+tokens used
+6,865
+```markdown
+---
+title: "Time-Series Database"
+category: "Storage & Data Platforms"
+difficulty: "Hard"
+tags: ["tsdb", "storage-engine", "lsm", "compaction", "rollups", "retention", "iot", "metrics"]
+---
+
+## Overview
+
+This system is a distributed time-series database for append-mostly telemetry. Data is stored in immutable, time-partitioned storage so retention is deleting whole partitions, and rollups are a bounded rewrite of already time-ordered data.
+
+Tags never live on each point. Points reference a `series_id`; tags are resolved once (series dictionary + inverted index) and reused for ingest and query planning.
+
+## What We Removed
+
+- `Router` → merged into each `TSDB Node` (any node can accept requests and forward to the right shard).
+- `Segment Store` + custom `Compactor` → replaced by an embedded LSM (RocksDB/Pebble) per shard+time partition; compaction is delegated to the embedded engine.
+- `Rollup Builder` + `Rollup Store` → merged into the same embedded LSM with separate keyspaces for raw/rollups and a background rollup worker.
+- Custom tag-index persistence layer → replaced by Postgres tables for series dictionary + tag inverted index (plus shard leases).
+
+## Requirements
+
+### Functional Requirements
+- Ingest time-series points with tags/labels, timestamp, and numeric fields.
+- Query by time range + tag filters; support common aggregates (sum/avg/min/max/p95) and group-by tag(s).
+- Continuous downsampling into fixed windows (e.g., 1m, 1h) with multiple retention tiers (e.g., 7d raw, 90d 1m, 2y 1h).
+- Exactly-once is not required; idempotent ingest and bounded duplication is acceptable.
+- Backfill support (late/out-of-order points) within a bounded window.
+
+### Scale Targets
+- Ingest: 1,000,000 points/sec sustained, 3,000,000 points/sec burst.
+- Cardinality: 50,000,000 active series with daily churn.
+- Queries: P95 < 2s for “last 6h, filter by 2 tags, group-by 1 tag”; P95 < 5s for “last 7d rollup”.
+
+## Key Design Decisions
+
+- Time is a hard boundary: data is written into per-shard, fixed time partitions (e.g., 2h directories) so retention is deleting directories, not row deletes.
+- Embedded LSM for raw + rollups: each partition is an embedded DB (or column families) with keys ordered by `(series_id, timestamp)` for sequential ingest and range scans.
+- Postgres for metadata + coordination: Postgres stores `series_key → series_id`, `tag → series_id` mappings, and shard leases for safe ownership and rebalancing.
+- Clear durability semantics: writes are acknowledged after local WAL fsync on the shard leader; replication to a follower is async (bounded loss window on leader failure, bounded duplicates on retry).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Client (Ingest + Query)"] --> B["TSDB Node(s)"]
+  B --> C["Embedded LSM Partitions (raw + rollups)"]
+  B --> D["Postgres (series + tag index + shard leases)"]
+```
+
+### Components
+
+- `TSDB Node`
+  - Why it exists: single deployable unit that handles ingest, query planning/execution, shard routing, background rollups, and replication.
+  - What it does:
+    - Ingest: normalize tags, enforce tenant limits, resolve/allocate `series_id`, forward to shard leader, append to WAL, write to embedded LSM.
+    - Query: resolve tags → `series_id` set, enforce fanout limits, scan relevant time partitions, merge + aggregate.
+    - Rollups: incremental fixed-window aggregates written to rollup keyspaces; rollups are versioned by `rollup_generation_id`.
+    - Replication: shard leader streams WAL entries to a follower for fast failover.
+
+- `Postgres (Metadata + Coordination)`
+  - Why it exists: the simplest correct persistence for series/tag mappings and shard ownership without building a custom metadata store.
+  - What it stores:
+    - Series dictionary: `(tenant_id, series_key) → series_id`.
+    - Tag inverted index: `(tenant_id, tag_key, tag_value) → series_id` (plus maintenance for churn/TTL).
+    - Shard leases: shard → (leader, follower, lease_expiry) for failover/rebalance.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Small-team buildability | Less low-level IO control than a custom segment store/compactor |
+| Predictable retention (drop partitions) | More partitions to manage (files/handles) |
+| Fast ingest + range scans | Postgres becomes a critical dependency for tag-based queries |
+| Availability during network issues | Possible bounded loss window on leader crash (async replication) |
+| Stable p95 queries (precomputed rollups) | Extra storage for rollups; rebuild limited to raw retention |
+
+## Failure Modes
+
+- Storage node dies mid-ingest
+  - Behavior: shard leases promote the follower to leader after lease expiry; clients retry and may create bounded duplicates; data not yet replicated from the old leader can be lost.
+  - Recover: reassign a new follower, resync from the new leader, and continue; enforce per-tenant backpressure during rebalancing.
+
+- Postgres down for 5 minutes (metadata/index path)
+  - Behavior: ingest continues only for already-known series via local cache; new series creation is rejected; tag-filter queries fail closed (no partial scans).
+  - Recover: when Postgres returns, refresh caches and resume new-series writes; alert on cache-miss rejection rate.
+
+- Network partition between nodes (leader ↔ follower or client ↔ cluster)
+  - Behavior: leader keeps accepting locally (ack after local WAL fsync); replication lag grows; failover is prevented by leases (no split-brain ownership).
+  - Recover: once partition heals, follower catches up from WAL stream; if leader is lost, accept bounded loss window.
+
+- Embedded LSM compaction falls behind during burst
+  - Behavior: partitions accumulate files and disk usage rises; read amplification increases.
+  - Recover: admission control tied to disk watermark + compaction lag (throttle/reject per tenant), pause rollups first, then reduce ingest until compaction stabilizes.
+
+- Bad rollup code/config deployed
+  - Behavior: rollups are isolated by `rollup_generation_id`; queries read only the current generation.
+  - Recover: bump generation, rebuild rollups from raw partitions within raw retention, then switch generation atomically.
+
+## Operational Notes
+
+- Treat disk watermark + compaction lag as paging signals; everything else is secondary.
+- Enforce fanout limits: cap matched series IDs and group-by cardinality; return a clear error when exceeded.
+- Keep rollups boring: deterministic window keys + generation gating; rebuild is delete-and-recompute within raw retention.
+- Degraded mode is explicit: “known series only” ingest when Postgres is unavailable; no tag-filter query fallbacks that silently scan.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/02-storage-data-platforms/time-series-database.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Time-Series Database
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/time-series-database.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/time-series-database.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/02-storage-data-platforms/time-series-database.md

@@ -1,0 +1,393 @@
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2a94-b537-78c0-820d-3f89221c8963
+--------
+user
+You are a senior systems architect reviewing a system design document.
+
+Grade this solution on three dimensions (1-10 scale):
+
+1. **Strength** (1-10): How technically sound, complete, and production-ready is the design?
+   - Does it address scalability, reliability, and failure modes?
+   - Are the trade-offs well-reasoned?
+   - Would this actually work at scale?
+
+2. **Interestingness** (1-10): How engaging and educational is the content?
+   - Does it teach useful concepts?
+   - Are there insights that aren't obvious?
+   - Would an engineer learn something valuable?
+
+3. **Novelty** (1-10): How unique or creative is the approach?
+   - Does it go beyond textbook solutions?
+   - Are there clever simplifications or unconventional choices?
+   - Does it challenge common assumptions?
+
+Also note any major issues or particularly strong aspects.
+
+Output ONLY valid JSON in this exact format:
+{
+  "slug": "change-data-capture-platform",
+  "strength": <1-10>,
+  "interestingness": <1-10>,
+  "novelty": <1-10>,
+  "overall": <average of three scores, 1 decimal>,
+  "summary": "<2-3 sentence summary of the design>",
+  "strengths": ["<strength 1>", "<strength 2>"],
+  "weaknesses": ["<weakness 1>", "<weakness 2>"],
+  "verdict": "<one of: exceptional, strong, adequate, weak>"
+}
+
+---
+
+## Solution to Grade
+
+---
+title: "Change Data Capture (CDC) Platform"
+category: "Storage & Data Platforms"
+difficulty: "Hard"
+tags: ["cdc", "debezium", "kafka", "schema-registry", "data-warehouse", "iceberg", "delta-lake", "hudi"]
+---
+
+## Overview
+
+This CDC platform streams row-level changes (insert/update/delete) from OLTP databases into analytical destinations (warehouses and lakehouse tables) with low latency and high reliability.
+
+Correctness is anchored on two ideas:
+- The database transaction log is the source of truth.
+- Delivery is **at-least-once**, while destinations achieve **exactly-once effects** via idempotent upserts guarded by a **monotonic source position** (e.g., Postgres LSN, MySQL GTID/binlog position, SQL Server LSN).
+
+Kafka is the durability and replay boundary. Everything downstream is designed to be restartable and replayable from Kafka without corrupting destination state.
+
+---
+
+## Requirements
+
+### Functional Requirements
+- Capture row-level changes from Postgres, MySQL, and SQL Server using log-based CDC.
+- Preserve deterministic order within a defined scope and preserve transaction boundaries (begin/commit metadata where available).
+- Support initial snapshot/backfill + continuous streaming with no missed committed rows and tolerable duplicates.
+- Deliver to multiple destinations:
+  - Warehouses: Snowflake, BigQuery, Redshift.
+  - Lakehouse tables: Iceberg, Delta Lake, Hudi.
+- Handle schema evolution with explicit compatibility rules and versioning.
+- Provide a control plane for provisioning/configuration, monitoring, pausing/resuming, safe restarts, and auditing.
+- Support filtering/routing (db/schema/table) and basic transformations (PII masking, column selection).
+- Enable replay from a point in time (log position or timestamp) into isolated destinations.
+
+### Non-Functional Requirements (Concrete Targets)
+
+| Dimension | Target |
+|---|---|
+| Source count | ~200 DB instances |
+| Throughput | 50k row changes/s sustained, 200k/s peak (aggregate) |
+| Egress volume | ~5–20 TB/day |
+| Latency (steady state) | P50 `< 2s` source→bus; P99 `< 10s` source→destination (upsert mode) |
+| Availability | Control plane `99.99%`; data plane `99.9%` |
+| Durability | No loss of committed transactions within retention; duplicates allowed |
+| Recovery | RPO `≤ 1 min`, RTO `≤ 30 min` |
+| Security | TLS, encryption at rest, RBAC, audit logs, secrets management |
+| Consistency model | Total order per **(source DB, table, shard/partition key)** |
+
+### Constraints & Assumptions
+- Ordering is not global across all tables; strongest guarantee is within a table stream partitioned by a shard key.
+- Sources provide replication/log access and sufficient log retention for downstream lag.
+- Team size 4–8; prefer managed building blocks for Kafka and warehouses/lakehouse storage.
+- Compliance may require masking, retention policies, and auditable access controls.
+
+---
+
+## Simplified Architecture
+
+```mermaid
+flowchart TB
+  S[(Source DBs)]
+  C[CDC Connect]
+  K[(Kafka)]
+  R[Schema Reg]
+  L[Sink Loader]
+  D[(Destinations)]
+  Q[(DLQ)]
+  P[Control Plane]
+  M[(Meta DB)]
+  O[Obs]
+
+  S --> C --> K --> L --> D
+  C --> R
+  L --> R
+  C --> Q
+  L --> Q
+  P <--> M
+  P --> C
+  P --> L
+  C --> O
+  L --> O
+  P --> O
+```
+
+**What this architecture provides**
+- **Durability + replay**: Kafka retention is the recovery and reprocessing window.
+- **Correctness under failure**: destination upserts are idempotent based on source `commit_pos`.
+- **Operational simplicity**: one connector tier (Kafka Connect) and one loader tier (sink service), both controlled by a single control-plane service.
+
+---
+
+## Core Components
+
+### Control Plane (Single Service)
+**Responsibilities**
+- Provision and manage connectors and sink bindings (create/pause/resume/restart).
+- Validate configs and enforce policies (RBAC, approvals for risky actions like replay to production).
+- Track health and lag per stream and per destination.
+- Maintain audit logs for all control actions and configuration changes.
+
+**Persistence (Metadata DB)**
+A relational DB (Postgres) stores:
+- connector definitions and deployment state
+- stream definitions (db/schema/table, topic, shard key, mode)
+- destination bindings and options
+- checkpoints and load job history
+- schema subjects/versions and compatibility rules
+- audit log entries (who/what/when)
+
+---
+
+### CDC Connectors (Debezium on Kafka Connect)
+**Responsibilities**
+- Read transaction logs (WAL/binlog/log) and emit ordered change events.
+- Include:
+  - `commit_pos` (monotonic position)
+  - primary key fields
+  - operation (`c/u/d`)
+  - transaction metadata when available (`txid`, `commit_ts`)
+  - a schema identifier/version
+  - snapshot marker for initial loads
+
+**Deployment**
+- Run as a Kafka Connect cluster sized for ~200 sources.
+- Configure per-connector offsets, error handling, and backoff/retry.
+- Tune source-side log retention/replication slots to cover worst-case downstream lag.
+
+---
+
+### Kafka (Event Bus) + Schema Registry
+**Kafka responsibilities**
+- Durable ordered partitions, consumer groups, and retention for replay.
+- Topic strategy: one topic per table (or table family) using `{env}.{db}.{schema}.{table}`.
+- Partitioning: shard key (e.g., `tenant_id`, else hash(PK)).
+
+**Schema registry responsibilities**
+- Version schemas and enforce compatibility for producers/consumers.
+- Provide an explicit schema evolution workflow (additive changes, controlled breaks, and version pinning when needed).
+
+---
+
+### Sink Loader (Single Service with Destination Adapters)
+**Responsibilities**
+- Consume Kafka topics in partition order.
+- Apply configured filtering/masking/column selection (deterministic, per-table rules).
+- Batch writes for destination efficiency while preserving correctness.
+- Support multiple destinations via independent bindings (separate consumer groups and checkpoints).
+
+**Exactly-once effects pattern**
+- For each destination table, maintain `cdc_commit_pos` (and optional tie-breaker `cdc_op_order`).
+- Apply changes with an idempotent rule: only advance a row if the incoming `(commit_pos, op_order)` is greater than what’s stored.
+- Commit Kafka offsets only after the destination transaction/commit succeeds.
+
+---
+
+### DLQ (Quarantine Topic)
+A single DLQ topic per environment captures events that cannot be applied safely:
+- schema incompatibility / deserialization errors
+- destination constraint errors (type mismatch, invalid encoding, oversized rows)
+- missing PK for upsert-configured streams
+
+Each DLQ record includes source, topic/partition/offset, schema version, error class, and a stable fingerprint for reprocessing.
+
+---
+
+### Observability
+A standard metrics/logs/traces pipeline (OpenTelemetry-compatible) supports:
+- end-to-end lag per stream and per destination
+- connector task health and restart counts
+- Kafka produce/consume latency and consumer lag
+- sink batch size, commit time, retries, DLQ rate
+- source log retention headroom (time until truncation at current lag)
+
+---
+
+## Correctness Model
+
+### Ordering Guarantees
+- Total order within a Kafka partition, scoped to **(source DB, table, shard key)**.
+- Cross-table ordering is not guaranteed; multi-table transactions are represented via metadata for auditing and troubleshooting.
+
+### Transaction Boundaries
+- Connectors emit `tx` metadata where supported (txid, commit timestamp, commit position).
+- Sink loaders apply changes using `commit_pos` (monotonic) rather than arrival time.
+
+### Snapshot + Continuous Streaming (No Missed Rows)
+For each stream:
+1. Establish a consistent snapshot cut (engine-specific).
+2. Record `snapshot_pos` in the source log.
+3. Emit snapshot rows as CDC events marked `snapshot=true`.
+4. Start streaming from `snapshot_pos` onward.
+5. Sink idempotency (via `commit_pos`) tolerates overlap between snapshot and early streaming.
+
+---
+
+## Data Model
+
+### Canonical CDC Envelope
+Recommended fields (Avro/Protobuf via schema registry):
+- `source`: `{db, schema, table}`
+- `op`: `"c" | "u" | "d"`
+- `pk`: PK fields (required for upsert mode)
+- `before`: previous row (optional)
+- `after`: new row (nullable for deletes)
+- `ts_ms`: source event time (best-effort)
+- `tx`: `{txid, commit_ts}` (optional)
+- `commit_pos`: engine-specific monotonic position
+- `schema_version`: registry version/id
+- `snapshot`: boolean
+- `headers`: optional `{tenant, masking_policy, trace_id}`
+
+### Destination Table Contract (Upsert Mode)
+Each destination table includes:
+- business columns
+- `cdc_commit_pos` (required)
+- optional `cdc_op`, `cdc_commit_ts`, `cdc_source`
+
+Apply rule:
+- Update/delete only if `incoming.cdc_commit_pos > existing.cdc_commit_pos` (tie-break with `cdc_op_order` when needed).
+
+---
+
+## Data Flow
+
+```mermaid
+sequenceDiagram
+  participant DB as Source DB
+  participant CC as CDC Connect
+  participant K as Kafka
+  participant SL as Sink Loader
+  participant DS as Destination
+
+  DB->>CC: Read transaction log
+  CC->>K: Produce events (key=shard, commit_pos)
+  SL->>K: Consume in order
+  SL->>DS: Stage batch
+  SL->>DS: Upsert guarded by cdc_commit_pos
+  DS-->>SL: Commit OK
+  SL->>K: Commit offsets
+```
+
+---
+
+## Control Plane API (Minimal)
+
+All mutating endpoints are audited and support idempotency via `Idempotency-Key`.
+
+### Connectors
+- `POST /v1/connectors` `{name, sourceType, connectionRef, includeTables, options}`
+- `GET /v1/connectors/{id}`
+- `POST /v1/connectors/{id}:pause|resume|restart`
+
+### Streams, Destinations, Bindings
+- `POST /v1/streams` `{connectorId, db, schema, table, shardKey, mode, pkFields}`
+- `POST /v1/destinations` `{type, configRef}`
+- `POST /v1/bindings` `{streamId, destinationId, destinationSpec}`
+
+### Health, Lag, Replay
+- `GET /v1/streams/{id}/health`
+- `GET /v1/streams/{id}/lag`
+- `POST /v1/streams/{id}:snapshot`
+- `POST /v1/streams/{id}:replay` `{fromPos | fromTimestamp, destinationOverrideRef, dryRun}`
+
+Replay runs as a separate consumer group and defaults to isolated destination targets.
+
+---
+
+## Scaling & Performance
+
+### Partitioning
+- Keep per-table topics; choose partitions per table based on peak changes/sec, key skew, and destination merge throughput.
+- Use shard keys aligned with downstream merge parallelism (tenant_id when available).
+
+### Sink efficiency
+- Micro-batch per partition with adaptive sizing (target destination commit time).
+- Apply per-destination concurrency limits to avoid warehouse throttling.
+- For lakehouse tables, schedule compaction/clustering to control file counts and query cost.
+
+---
+
+## Failure Modes & Recovery
+
+### Common failures
+- **Connector restart**: duplicates are tolerated; sinks apply idempotently via `commit_pos`.
+- **Source log truncation risk**: alert on retention headroom; throttle/scale sinks; fall back to rebuild snapshot when required.
+- **Kafka issues**: replication and ISR settings protect durability; consumers resume from committed offsets after recovery.
+- **Destination throttling/merge failures**: sink retries with jitter, circuit-break per table, and keeps Kafka as buffer.
+- **Schema breaks**: registry compatibility gates; incompatible events routed to DLQ with enough context for remediation.
+
+### Disaster recovery
+- Control-plane DB uses PITR backups.
+- Kafka retention/tiered storage defines replay window; optional cross-region replication can be added for regional failover requirements.
+- Replay is the primary recovery mechanism for downstream corruption (load into isolated targets, validate, then cut over).
+
+---
+
+## Simplification Notes
+
+- Removed: separate stream-processing tier; transformations (mask/filter/select) run in `Sink Loader`, keeping the pipeline to connectors → Kafka → loaders.
+- Merged: policy engine and background workers into the single `Control Plane` service, using the `Meta DB` for state, audits, and job tracking.
+- Simplified: DLQ is a single environment-level Kafka topic with rich context, avoiding per-stage DLQ systems.
+- Simplified: observability is one standard metrics/logs/traces pipeline integrated into connectors, loaders, and control plane.
+- Complexity retained: Kafka (replay boundary), schema registry (safe schema evolution), and idempotent destination upserts (exactly-once effects) remain because they directly enforce correctness and recoverability at the stated scale.
+mcp startup: no servers
+
+
+thinking
+**Evaluating JSON Output Requirements**
+
+I’m thinking about how to produce JSON with grades on a 1-10 scale across three dimensions. It looks like I’ll need to provide an overall average with one decimal point, plus a brief summary. I need to note strengths and weaknesses in arrays, and give a verdict from listed options.
+
+The document is solid, discussing idempotent upserts, and potential issues around out-of-order updates and partitioning. There’s a risk of mismatched shard keys affecting row-level ordering and cross-table transaction boundaries not being preserved.
+thinking
+**Assessing Snapshot and Streaming Integration**
+
+I’m looking at how snapshot and streaming processes are simplified, but they lack details on maintaining consistent snapshots and avoiding missed or duplicate entries. They mention snapshot cuts, which is something, but there are concerns about heavy upserts in lakehouses when using Iceberg, Delta, or Hudi, without addressing concurrency or exactly-once semantics.
+
+For warehouses like Snowflake or BigQuery, the need for staging tables and handling deletes isn’t clearly covered. There’s also a mention of operational requirements like using Debezium on Kafka Connect for scaling and security. I’d rate strength an 8, interestingness a 7, novelty a 5, and overall 6.7.
+codex
+{
+  "slug": "change-data-capture-platform",
+  "strength": 8,
+  "interestingness": 7,
+  "novelty": 5,
+  "overall": 6.7,
+  "summary": "Solid, production-plausible CDC architecture using Debezium/Kafka as the durability and replay boundary, with downstream idempotent upserts keyed by a monotonic source position to achieve exactly-once effects. It covers core operational needs (control plane, schema registry, DLQ, observability) and acknowledges key failure modes, but leaves some hard correctness and destination-specific implementation details underspecified.",
+  "strengths": ["Clear correctness story (log as source of truth, Kafka replay, idempotent upserts using commit positions) with pragmatic at-least-once delivery.", "Good operational framing: control plane APIs, schema evolution workflow, DLQ strategy, and concrete SLO/throughput targets plus failure-mode handling."],
+  "weaknesses": ["Exactly-once effects rely on correct partitioning/keying and per-destination merge semantics; multi-table transactions/atomicity and cross-partition ordering are not fully resolved beyond metadata.", "Destination specifics (Snowflake/BigQuery/Redshift MERGE patterns, Iceberg/Delta/Hudi upsert/compaction strategies, concurrency limits, and cost/perf tuning) are high-level given the stated scale (5–20 TB/day)."],
+  "verdict": "strong"
+}
+tokens used
+4,086
+{
+  "slug": "change-data-capture-platform",
+  "strength": 8,
+  "interestingness": 7,
+  "novelty": 5,
+  "overall": 6.7,
+  "summary": "Solid, production-plausible CDC architecture using Debezium/Kafka as the durability and replay boundary, with downstream idempotent upserts keyed by a monotonic source position to achieve exactly-once effects. It covers core operational needs (control plane, schema registry, DLQ, observability) and acknowledges key failure modes, but leaves some hard correctness and destination-specific implementation details underspecified.",
+  "strengths": ["Clear correctness story (log as source of truth, Kafka replay, idempotent upserts using commit positions) with pragmatic at-least-once delivery.", "Good operational framing: control plane APIs, schema evolution workflow, DLQ strategy, and concrete SLO/throughput targets plus failure-mode handling."],
+  "weaknesses": ["Exactly-once effects rely on correct partitioning/keying and per-destination merge semantics; multi-table transactions/atomicity and cross-partition ordering are not fully resolved beyond metadata.", "Destination specifics (Snowflake/BigQuery/Redshift MERGE patterns, Iceberg/Delta/Hudi upsert/compaction strategies, concurrency limits, and cost/perf tuning) are high-level given the stated scale (5–20 TB/day)."],
+  "verdict": "strong"
+}
+Graded: change-data-capture-platform

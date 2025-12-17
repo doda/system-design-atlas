@@ -1,0 +1,364 @@
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2a95-8bd4-7d91-883a-4776cc2b9988
+--------
+user
+You are a senior systems architect reviewing a system design document.
+
+Grade this solution on three dimensions (1-10 scale):
+
+1. **Strength** (1-10): How technically sound, complete, and production-ready is the design?
+   - Does it address scalability, reliability, and failure modes?
+   - Are the trade-offs well-reasoned?
+   - Would this actually work at scale?
+
+2. **Interestingness** (1-10): How engaging and educational is the content?
+   - Does it teach useful concepts?
+   - Are there insights that aren't obvious?
+   - Would an engineer learn something valuable?
+
+3. **Novelty** (1-10): How unique or creative is the approach?
+   - Does it go beyond textbook solutions?
+   - Are there clever simplifications or unconventional choices?
+   - Does it challenge common assumptions?
+
+Also note any major issues or particularly strong aspects.
+
+Output ONLY valid JSON in this exact format:
+{
+  "slug": "trending-topics-engine",
+  "strength": <1-10>,
+  "interestingness": <1-10>,
+  "novelty": <1-10>,
+  "overall": <average of three scores, 1 decimal>,
+  "summary": "<2-3 sentence summary of the design>",
+  "strengths": ["<strength 1>", "<strength 2>"],
+  "weaknesses": ["<weakness 1>", "<weakness 2>"],
+  "verdict": "<one of: exceptional, strong, adequate, weak>"
+}
+
+---
+
+## Solution to Grade
+
+---
+title: "Trending Topics Engine"
+category: "Social & Discovery"
+difficulty: "Hard"
+tags: ["stream-processing", "heavy-hitters", "real-time-analytics", "event-time", "anti-abuse"]
+---
+
+## Overview
+
+A Trending Topics Engine identifies tokens (hashtags, entities, normalized phrases) whose popularity is surging now, not merely high-volume. The system ingests a high-throughput event stream, computes trending signals over **event-time sliding windows**, applies anti-abuse and quality checks, and serves top-N results with low latency.
+
+The design focuses on three ideas:
+- **Durable ingestion first** for replay/backfill and safe recovery.
+- **Bounded-memory candidate tracking** per segment/window to keep compute predictable.
+- **Materialized top-N serving** so reads are fast and cacheable.
+
+---
+
+## Requirements
+
+### Functional Requirements
+- Ingest high-volume events with timestamps and metadata (region, language, source, optional topic).
+- Normalize text into tokens and filter stopwords/blocked terms.
+- Compute trending tokens using **event-time sliding windows** (e.g., `1m`, `5m`, `15m`) and rank by a burst-oriented score.
+- Segment by region+language (topic optional, configurable granularity).
+- Query API returns top-N trends per segment/window with freshness metadata and stable ordering.
+- Anti-abuse: idempotent ingestion, rate limits, dedupe tolerance, allow/block lists, kill switches.
+- Replay/backfill from the event log to rebuild state or recompute with new logic.
+- Explainability metadata per trend: short-window count, baseline estimate, score breakdown, and quality flags.
+
+### Non-Functional Requirements
+- Peak ingest: **1,000,000 events/sec** globally; average **200,000/sec**.
+- Token fanout: ~**3 tokens/event** → **~3,000,000 token-events/sec** peak.
+- Read: **20,000 QPS** global for “get trending” (cacheable).
+- Latency: ingest ack **P99 < 100ms**; update freshness **P50 < 2s, P99 < 10s** for hot segments; query **P99 < 150ms** on cache hit.
+- Availability: query **99.99%**; ingestion pipeline **99.9%**.
+- Consistency: at-least-once ingestion; results eventually consistent within freshness SLOs.
+- Retention: event log **14–30 days**.
+- Privacy: serving contains only normalized tokens and aggregates.
+
+---
+
+## Simplified Architecture
+
+### High-Level Diagram
+
+```mermaid
+flowchart TB
+  P[Producers] --> G[Edge LB / WAF]
+  G --> A["Trending Service (API)"]
+  A --> K["Kafka (events)"]
+  K --> S["Stream Processor (event-time)"]
+  S --> R["Redis (trends)"]
+  A --> R
+  A --> D["Postgres (config + audit)"]
+```
+
+### What Each Part Does
+- **Trending Service (API)**: one deployable that exposes ingestion, query, and admin endpoints; reads config; enforces basic abuse controls; publishes events.
+- **Kafka (events)**: durable, replayable log for ingestion and backfill.
+- **Stream Processor**: continuous event-time windowing, candidate tracking, baseline + scoring, and materialization into Redis.
+- **Redis (trends)**: low-latency serving store for the latest materialized top-N lists and explainability metadata.
+- **Postgres (config + audit)**: versioned stopwords/blocked tokens/scoring params/kill switches + an audit trail for admin changes.
+
+---
+
+## Components
+
+### 1) Trending Service (API)
+
+**Endpoints**
+- `POST /v1/events` (ingest)
+- `GET /v1/trending` (query)
+- `POST /v1/admin/*` (config + moderation, audited)
+
+**Ingest responsibilities**
+- Validate schema and enforce `event_time_ms` bounds (e.g., reject >10m future skew).
+- Apply coarse rate limits (per API key/source/IP) and payload limits.
+- Optional idempotency guard using `SETNX` in Redis keyed by `(source, event_id)` with TTL (e.g., 24h).
+- Append to Kafka and ack only after the append succeeds.
+
+**Query responsibilities**
+- Read the latest materialized snapshot from Redis by `(segment_id, window_id)`.
+- Return `as_of_time_ms`, `watermark_ms`, `version`, and per-token explainability fields.
+- Stable ordering: `score desc`, `short_count desc`, `token asc`.
+
+**Admin responsibilities (audited)**
+- Manage stopwords/blocked tokens/segment params/kill switches.
+- Write changes to Postgres with an immutable audit record.
+- Ensure all serving and processing uses a versioned config snapshot (e.g., `config_version`).
+
+---
+
+### 2) Kafka (Events Log)
+
+- Single primary topic, e.g. `events`.
+- Retention: 14–30 days.
+- Partitioning: `hash(segment_id) XOR hash(event_id)` to spread load while keeping segment locality acceptable.
+- Producer settings: batching + compression; retries with backoff; idempotent producer enabled where supported.
+
+Kafka is the recovery source:
+- Rebuild Redis by replaying `events` from a chosen offset/time.
+- Backfill with new scoring logic by running a second stream processor deployment that writes to a new Redis key namespace (then switch reads).
+
+---
+
+### 3) Stream Processor (Event-Time Windowing + Heavy Hitters)
+
+**Core pipeline**
+1. **Normalize**: casefolding, Unicode normalization, hashtag parsing, token length/entropy gates, stopword filtering, optional lightweight entity extraction.
+2. **Segment**: derive `segment_id` from `{region, language, topic?}`.
+3. **Event-time windows**: sliding windows such as:
+   - `1m` slide `1s`
+   - `5m` slide `2s`
+   - `15m` slide `5s`
+   Use event-time with a configured grace/allowed lateness per source/segment.
+4. **Candidate tracking (bounded memory)**: maintain top-K candidates per `(segment_id, window_id)` using SpaceSaving (or similar) with a fixed K.
+5. **Baseline + scoring**: compute a baseline rate (EWMA or longer window) and a burst-oriented score; apply quality and abuse signals on candidates only.
+6. **Materialize**: write the latest top-N list + metadata to Redis at a fixed cadence (1–10s depending on segment activity).
+
+**Quality/abuse signals (candidate-only)**
+- Approx unique users (when `user_hash` exists) to detect low-diversity spam.
+- Duplicate ratio signals (from repeated `event_id`/`user_hash` patterns).
+- Source mix (post/search/click) to reduce single-channel manipulation.
+- Hard blocklist + kill switches from config.
+
+**State**
+- RocksDB-backed local state (via the stream processor runtime) with TTLs:
+  - Short windows: TTL ≈ window + lateness + safety.
+  - Baselines: TTL sized to baseline horizon.
+- At-least-once processing with idempotent materialization:
+  - Redis updates include `as_of_time_ms` so older updates never overwrite newer ones.
+
+---
+
+### 4) Redis (Trends Serving Store)
+
+**Keys**
+- `trends:{segment_id}:{window_id}` → current snapshot:
+  - `as_of_time_ms`, `watermark_ms`, `config_version`, `version`
+  - `topk[]`: `token`, `score`, `short_count`, `baseline_rate`, `rank`, `flags`
+- Optional: `trends_hist:{segment_id}:{window_id}:{as_of_bucket}` for short history (debug only, TTL’d).
+
+**Freshness behavior**
+- API returns freshness fields; clients can cache briefly with `Cache-Control: max-age=2, stale-while-revalidate=30` (or equivalent).
+- During partial outages, the API can serve the last known snapshot with explicit staleness.
+
+---
+
+### 5) Postgres (Config + Audit)
+
+**Tables**
+- `config_versions`: version metadata, author, timestamps.
+- `stopwords(language, version, token)`
+- `blocked_tokens(segment_id, version, token, reason)`
+- `scoring_params(segment_id, version, jsonb)`
+- `kill_switches(segment_id, version, enabled, reason, expires_at)`
+- `audit_log(actor, action, target, before, after, ts)`
+
+**Propagation**
+- The API serves a consistent “active config version”.
+- The stream processor refreshes config periodically (or on a lightweight notification) and tags materializations with `config_version`.
+
+---
+
+## Data Model
+
+### Event (Kafka `events`)
+```json
+{
+  "event_id": "uuid",
+  "event_time_ms": 1734370000123,
+  "source": "post|search|click",
+  "region": "us",
+  "language": "en",
+  "text": "Some text with #hashtag",
+  "user_hash": "opaque",
+  "metadata": { "topic": "sports" }
+}
+```
+
+### Trend Snapshot (Redis value)
+```json
+{
+  "segment_id": "us|en|sports",
+  "window_id": "5m",
+  "as_of_time_ms": 1734370009000,
+  "watermark_ms": 1734370007000,
+  "config_version": "cfg-2025-01-10-1",
+  "version": "scoring-v1",
+  "topk": [
+    {
+      "token": "worldcup",
+      "score": 12.4,
+      "short_count": 18200,
+      "baseline_rate": 9000.0,
+      "rank": 1,
+      "flags": ["ok"]
+    }
+  ]
+}
+```
+
+---
+
+## Data Flow
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant P as Producer
+  participant A as Trending API
+  participant K as Kafka (events)
+  participant S as Stream Processor
+  participant R as Redis (trends)
+
+  P->>A: POST /v1/events
+  A->>K: append event
+  A-->>P: 202 accepted
+  S->>K: consume events
+  S->>S: normalize + event-time windows
+  S->>S: heavy-hitter + baseline + score
+  S->>R: upsert trends snapshot
+  P->>A: GET /v1/trending
+  A->>R: fetch latest snapshot
+  R-->>A: top-N + freshness
+  A-->>P: response
+```
+
+---
+
+## API Design
+
+### Ingestion API
+
+**POST** `/v1/events`
+
+Response:
+```json
+{ "status": "accepted" }
+```
+
+Errors:
+- `400` invalid schema/timestamp
+- `429` rate limited
+- `503` cannot append to Kafka
+
+Idempotency (recommended):
+- Require `event_id`; enforce `(source, event_id)` via Redis TTL key to reduce duplicates.
+
+---
+
+### Trending Query API
+
+**GET** `/v1/trending`
+
+Query params:
+- `region` (required)
+- `language` (required)
+- `topic` (optional)
+- `window=1m|5m|15m` (required)
+- `limit` (optional, default 50, max 100)
+
+Response includes `as_of_time_ms`, `watermark_ms`, `config_version`, and per-token explainability fields.
+
+---
+
+### Admin APIs (Audited)
+
+- `POST /v1/admin/blocked-tokens`
+- `POST /v1/admin/stopwords`
+- `POST /v1/admin/scoring-params`
+- `POST /v1/admin/kill-switch`
+
+All changes:
+- Write to Postgres with an audit record.
+- Activate via a version switch to ensure atomic rollout and rollback.
+
+---
+
+## Scaling, Reliability, and Operations
+
+### Scaling knobs
+- Kafka partitions sized for peak ingest and consumer parallelism.
+- Stream processor parallelism sized by tokenization + window update cost.
+- Candidate bound `K` per segment/window to cap memory and CPU.
+- Materialization cadence per segment (hot: 1–2s, tail: 5–10s).
+
+### Failure handling
+- Kafka is the source of truth for replay/backfill.
+- Stream processor restarts from Kafka offsets; state restored from local store + changelog (runtime-dependent).
+- Redis is a derived view; rebuild by replaying from Kafka on a clean namespace, then switch reads.
+
+### Monitoring (minimum set)
+- Ingest: RPS, latency, 4xx/5xx, Kafka produce errors.
+- Kafka: produce/consume throughput, consumer lag.
+- Stream processor: watermark delay, late-event rate, processing lag, state size.
+- Serving: Redis latency, cache hit rate (if client/edge caching used), API P99, stale-serve rate.
+- Abuse: rate-limit triggers, blocked-token hits, low-diversity flags.
+
+---
+
+## Simplification Notes
+
+- Removed: separate “Trend KV Store” by using `Redis` as the serving store for materialized snapshots; the event log remains the rebuild source.
+- Removed: `trends.materialized` Kafka topic; replay/backfill is handled from the retained `events` topic, and Redis snapshots are derived.
+- Removed: dedicated schema registry dependency; schema evolution is handled via versioned payloads and compatibility checks in the API and stream processor.
+- Merged: ingest API, trending query API, and admin API into one `Trending Service (API)` to reduce deployment and operational surface area.
+- Merged: config store and audit trail into one `Postgres` database to keep moderation/config changes strongly consistent and easy to review.
+- Complexity retained: `Kafka` + an event-time `Stream Processor` because event-time sliding windows, out-of-order handling, and replay/backfill require a durable log and stateful stream computation at the stated throughput.
+- Complexity retained: bounded-memory heavy-hitter tracking and per-candidate quality signals because correctness and anti-abuse require predictable resource usage and basic adversarial robustness.
+mcp startup: no servers
+ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Dec 17th, 2025 1:06 AM.
+Warning: no last agent message; wrote empty content to /Users/dominikdabrowski/pr/system-design-atlas/grades/trending-topics-engine.json

@@ -1,0 +1,2631 @@
+==========================================
+Generating (v2): Food Delivery Logistics
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2bb1-7c63-96e2-e6ec54ee7d45
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Food Delivery Logistics
+**Category**: Commerce & Fintech
+
+**Problem Statement**:
+Design a coordination engine for 3-sided marketplaces (customer/restaurant/courier) with batching and routing optimization.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+Reconnecting... 1/5
+
+thinking
+**Creating operational notes**
+
+I need to provide operational notes for an on-call situation, likely about food delivery logistics. I should cover points like drain dispatch and degrading to greedy, but I wonder if labeling this as "hard" is accurate. I will make sure to tag the document appropriately as well. Let’s encourage clear writing so everyone involved can understand and follow the guidelines easily. I should think about the structure as I craft this document.
+codex
+```markdown
+---
+title: "Food Delivery Logistics"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["marketplace", "dispatch", "routing", "optimization", "reliability"]
+---
+
+## Overview
+
+This system is a real-time coordination engine for a 3-sided marketplace (customers, restaurants, couriers). It accepts orders, tracks restaurant prep and courier locations, and continuously decides *who should deliver what, when*—including batching multiple orders into one courier route—while meeting SLAs and keeping the marketplace “fair enough” to stay healthy.
+
+The key insight: treat dispatch as a **streaming optimization problem** with **tight time windows and imperfect information**, not as “pick nearest courier.” The elegant design is a two-stage engine: (1) aggressively narrow to plausible candidates using geo/time indexing, then (2) run a fast scoring/assignment loop that’s stable under churn and degrades gracefully when data is stale.
+
+Everything else is intentionally boring: Postgres as system of record, Redis for ephemeral state, a durable event log for replay, and a stateless dispatch service that can be restarted without losing correctness.
+
+## What Makes This Hard
+
+Naive implementations fail in two traps:
+
+1. **Churn + time windows**: courier GPS updates, accept/decline, restaurant delays, and traffic changes mean the “best” assignment changes every few seconds. If you recompute globally, you thrash; if you don’t, you miss SLAs.
+2. **Batching is a VRP**: the moment you allow “pick up 2, drop off 2,” you’re in vehicle routing with time windows (NP-hard). Teams either overbuild (research project) or underbuild (batching destroys on-time rate).
+
+The win is not perfect optimality; it’s **stable, explainable near-optimal decisions** at low latency, with explicit guardrails (SLAs, max detour, fairness, and cancellation cost).
+
+## Requirements
+
+### Functional Requirements
+- Create and update orders through states: placed → confirmed → prepping → ready → picked up → delivered/canceled.
+- Assign couriers to orders with **offers** (must handle decline/timeouts) and prevent double-assign.
+- Support **batching** (2–3 orders) with constraints: same restaurant or nearby pickups, bounded detour, per-order SLA.
+- Continuous ETA and route updates for customer + courier, driven by traffic and restaurant readiness.
+- Marketplace health controls: courier utilization, fairness (avoid starving regions/couriers), restaurant load shedding.
+- Auditability: explain “why this courier” for ops, disputes, and tuning.
+
+### Scale Targets
+- **Metro peak orders**: 50k orders/hour (~14/s) in a large city; bursts 5–10x at meal spikes → design for **150/s** order events.
+- **Courier updates**: 30k concurrent couriers reporting every 2s → **15k location updates/s** (dominant write volume).
+- **Dispatch latency**: p95 < **200ms** from “ready”/“order placed” event to offer creation; p99 < 1s during spikes.
+- **Correctness**: no double-assign; at-least-once events tolerated; idempotent state transitions.
+
+## Key Design Decisions
+
+- **Dispatch via streaming heuristic optimizer (two-stage)**
+  - Chose: candidate generation + fast assignment loop (local search / greedy with backtracking), rerun on relevant events.
+  - Rejected: exact VRPTW solvers online; “nearest courier” only.
+  - Why: exact solvers don’t converge under churn; nearest-only kills batching and SLA adherence.
+
+- **Postgres as source of truth, Redis as ephemeral real-time state**
+  - Chose: Postgres for orders/offers/audit; Redis for courier location, availability, hot indexes, locks.
+  - Rejected: “everything in Redis,” or a bespoke state store.
+  - Why: you need durability and queryability for disputes and ops; Redis keeps the hot loop fast.
+
+- **Durable event log for replay + decoupling**
+  - Chose: Kafka (or equivalent) for order/restaurant/courier events; dispatch emits offers as events.
+  - Rejected: point-to-point RPC fanout as the backbone.
+  - Why: replay is essential for debugging, simulation, and safe algorithm changes; the bus absorbs spikes.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Customer App] --> G[API Gateway]
+  R[Restaurant Tablet] --> G
+  U[Courier App] --> G
+
+  G --> O[Order Service]
+  G --> D[Dispatch Engine]
+  D --> X[Routing/ETA]
+
+  O --> P[(Postgres)]
+  D --> E[(Event Log)]
+  D --> S[(Redis)]
+  O --> E
+```
+
+### Components
+
+- `API Gateway`: auth, rate limits, request shaping; protects the dispatch loop from client chaos.
+- `Order Service`: owns order lifecycle and invariants (idempotent transitions, payments hooks, cancellation rules); writes to Postgres and emits events.
+- `Dispatch Engine`: stateless workers consuming events, maintaining ephemeral state in Redis, producing offers and assignments; the only “smart” service.
+- `Routing/ETA`: calls a routing engine (OSRM/GraphHopper + traffic provider) and exposes consistent ETA primitives to dispatch and user-facing surfaces.
+- `Redis`: courier state (location, availability, capacity), geo/time indexes, short-lived locks, and offer dedupe.
+- `Event Log`: durable stream for all state changes; enables replay, backfills, and shadow runs.
+- `Postgres`: system of record for orders, offers, assignments, courier shifts, audits; supports ops queries and reconciliation.
+
+## Deep Dive: The Hardest Part — Real-Time Batching + Stable Assignment
+
+### Model the world as constraints, not guesses
+Each order has:
+- time windows: latest pickup, latest drop-off (derived from promised SLA)
+- prep readiness distribution (restaurant-provided + learned bias)
+- cancellation/late penalty (customer experience + refund cost)
+
+Each courier has:
+- current location + heading uncertainty (GPS jitter)
+- capacity (max concurrent orders), current route commitments
+- acceptance behavior (historical accept rate, current “busy” signals)
+
+Batching is allowed only if it respects **guardrails**:
+- max additional drive time per existing order (e.g., +6 minutes)
+- max pickup spread (e.g., pickups within 800m or same restaurant)
+- hard deadline feasibility under optimistic *and* pessimistic prep/traffic estimates
+
+### Two-stage dispatch loop (the core elegance)
+1. **Candidate generation (cheap, broad, safe)**
+   - Maintain couriers in Redis by geo bucket (H3/geohash) and availability.
+   - For an event (order ready/placed, courier freed, delay update), fetch top-K couriers in expanding rings (e.g., K=50–150).
+   - Generate batch candidates by combining:
+     - same-restaurant ready orders within a short time window
+     - nearby pickups with compatible deadlines
+   - Discard anything that fails fast feasibility checks (time window bounds, capacity, max detour).
+
+2. **Scoring + assignment (fast, stable, explainable)**
+   - Compute a score for each (courier, route plan) option:
+     - on-time probability (dominant term)
+     - incremental cost (drive time, idle time)
+     - marketplace health (fairness/utilization smoothing)
+     - churn penalty (avoid reassigning unless materially better)
+   - Solve a *small* assignment problem per local region/event batch:
+     - greedy with backtracking or min-cost matching on the filtered set
+     - enforce “stickiness”: don’t revoke an offer already accepted; don’t reshuffle committed routes
+   - Emit an **Offer** with a TTL (e.g., 20s) and a cryptographic idempotency key.
+
+This is how you get batching benefits without turning dispatch into a global optimizer that thrashes.
+
+### Handling uncertainty without overfitting
+- Use **pessimistic bounds** to protect SLAs (late is expensive), but allow controlled risk when the marketplace is tight (few couriers).
+- Treat restaurant prep times as a calibrated distribution; don’t trust a single “ready in 5 min.”
+- Use a simple “confidence” measure: if location or prep signals are stale, reduce batching aggressiveness automatically.
+
+### Concurrency and correctness (where most teams bleed)
+- Offers are the concurrency boundary:
+  - One active offer per courier per “slot” (capacity unit), enforced via Redis atomic set with TTL.
+  - Accept/decline is written to Postgres with a unique constraint on `(order_id)` assignment to prevent double-assign.
+- Events are at-least-once:
+  - Every state mutation is idempotent via `(entity_id, version)` or idempotency keys.
+- Reconciliation job:
+  - Periodically compare Redis ephemeral state vs Postgres truth; heal stuck offers and orphaned assignments.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| SLA reliability under churn | Globally optimal routes |
+| Simple, restartable dispatch workers | Rich in-memory global state |
+| Fast iteration on heuristics (replay/shadow) | “Perfect” mathematical optimality |
+| Explainable decisions and guardrails | Maximum batching rate at all costs |
+
+## Failure Modes
+
+- **Stale courier locations (GPS drop / backgrounded app)**
+  - Happens: dispatch offers to “ghost” couriers; acceptance drops; SLAs slip.
+  - Detect: location age > threshold, sudden accept-rate collapse by cohort.
+  - Recover: mark courier as low-confidence, exclude from batching, require heartbeat; fall back to conservative nearest-available.
+
+- **Offer storms / thrash during spikes**
+  - Happens: too many re-computes; couriers get spammed; acceptance falls.
+  - Detect: offers per order/courier rises; high revoke/reissue rates; p95 dispatch latency climbs.
+  - Recover: introduce stickiness penalty, rate-limit reoffers, coalesce events (debounce), and temporarily disable multi-order batching.
+
+- **Split-brain assignments (duplicate offers accepted)**
+  - Happens: retries + races create multiple “winners.”
+  - Detect: unique constraint violations, mismatch between courier app state and Postgres assignment.
+  - Recover: Postgres enforces single assignment; loser offer invalidated; courier app receives authoritative correction + compensation flow.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Partition dispatch by city zones with consistent hashing; isolate hotspots.
+  - Precompute travel-time matrices per zone for short hops; reduce routing calls.
+  - Add shadow dispatch to evaluate new scoring safely from replay.
+
+- **100x scale:**
+  - Move from “event-triggered recompute” to **continuous per-zone optimization ticks** with bounded work.
+  - Introduce a dedicated, scalable state store for real-time geo queries (still keep Postgres as record).
+  - Make routing/ETA a first-class platform with caching, map updates, and strict SLOs; it becomes a top cost center.
+
+## Operational Notes
+
+- Dispatch must have a **kill switch** to disable batching and revert to conservative single-order assignment in <1 minute.
+- Keep a **replay pipeline** (from event log) to reproduce incidents and tune scoring offline; it’s the fastest path to real reliability gains.
+- Watch the leading indicators: offer spam rate, accept-rate by cohort, lateness at pickup vs drop-off (distinguishes restaurant vs routing issues).
+- On-call playbook should include “drain a zone” (stop new offers, let in-flight finish) and “freeze reassignments” during incidents.
+```
+tokens used
+2,943
+```markdown
+---
+title: "Food Delivery Logistics"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["marketplace", "dispatch", "routing", "optimization", "reliability"]
+---
+
+## Overview
+
+This system is a real-time coordination engine for a 3-sided marketplace (customers, restaurants, couriers). It accepts orders, tracks restaurant prep and courier locations, and continuously decides *who should deliver what, when*—including batching multiple orders into one courier route—while meeting SLAs and keeping the marketplace “fair enough” to stay healthy.
+
+The key insight: treat dispatch as a **streaming optimization problem** with **tight time windows and imperfect information**, not as “pick nearest courier.” The elegant design is a two-stage engine: (1) aggressively narrow to plausible candidates using geo/time indexing, then (2) run a fast scoring/assignment loop that’s stable under churn and degrades gracefully when data is stale.
+
+Everything else is intentionally boring: Postgres as system of record, Redis for ephemeral state, a durable event log for replay, and a stateless dispatch service that can be restarted without losing correctness.
+
+## What Makes This Hard
+
+Naive implementations fail in two traps:
+
+1. **Churn + time windows**: courier GPS updates, accept/decline, restaurant delays, and traffic changes mean the “best” assignment changes every few seconds. If you recompute globally, you thrash; if you don’t, you miss SLAs.
+2. **Batching is a VRP**: the moment you allow “pick up 2, drop off 2,” you’re in vehicle routing with time windows (NP-hard). Teams either overbuild (research project) or underbuild (batching destroys on-time rate).
+
+The win is not perfect optimality; it’s **stable, explainable near-optimal decisions** at low latency, with explicit guardrails (SLAs, max detour, fairness, and cancellation cost).
+
+## Requirements
+
+### Functional Requirements
+- Create and update orders through states: placed → confirmed → prepping → ready → picked up → delivered/canceled.
+- Assign couriers to orders with **offers** (must handle decline/timeouts) and prevent double-assign.
+- Support **batching** (2–3 orders) with constraints: same restaurant or nearby pickups, bounded detour, per-order SLA.
+- Continuous ETA and route updates for customer + courier, driven by traffic and restaurant readiness.
+- Marketplace health controls: courier utilization, fairness (avoid starving regions/couriers), restaurant load shedding.
+- Auditability: explain “why this courier” for ops, disputes, and tuning.
+
+### Scale Targets
+- **Metro peak orders**: 50k orders/hour (~14/s) in a large city; bursts 5–10x at meal spikes → design for **150/s** order events.
+- **Courier updates**: 30k concurrent couriers reporting every 2s → **15k location updates/s** (dominant write volume).
+- **Dispatch latency**: p95 < **200ms** from “ready”/“order placed” event to offer creation; p99 < 1s during spikes.
+- **Correctness**: no double-assign; at-least-once events tolerated; idempotent state transitions.
+
+## Key Design Decisions
+
+- **Dispatch via streaming heuristic optimizer (two-stage)**
+  - Chose: candidate generation + fast assignment loop (local search / greedy with backtracking), rerun on relevant events.
+  - Rejected: exact VRPTW solvers online; “nearest courier” only.
+  - Why: exact solvers don’t converge under churn; nearest-only kills batching and SLA adherence.
+
+- **Postgres as source of truth, Redis as ephemeral real-time state**
+  - Chose: Postgres for orders/offers/audit; Redis for courier location, availability, hot indexes, locks.
+  - Rejected: “everything in Redis,” or a bespoke state store.
+  - Why: you need durability and queryability for disputes and ops; Redis keeps the hot loop fast.
+
+- **Durable event log for replay + decoupling**
+  - Chose: Kafka (or equivalent) for order/restaurant/courier events; dispatch emits offers as events.
+  - Rejected: point-to-point RPC fanout as the backbone.
+  - Why: replay is essential for debugging, simulation, and safe algorithm changes; the bus absorbs spikes.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Customer App] --> G[API Gateway]
+  R[Restaurant Tablet] --> G
+  U[Courier App] --> G
+
+  G --> O[Order Service]
+  G --> D[Dispatch Engine]
+  D --> X[Routing/ETA]
+
+  O --> P[(Postgres)]
+  D --> E[(Event Log)]
+  D --> S[(Redis)]
+  O --> E
+```
+
+### Components
+
+- `API Gateway`: auth, rate limits, request shaping; protects the dispatch loop from client chaos.
+- `Order Service`: owns order lifecycle and invariants (idempotent transitions, payments hooks, cancellation rules); writes to Postgres and emits events.
+- `Dispatch Engine`: stateless workers consuming events, maintaining ephemeral state in Redis, producing offers and assignments; the only “smart” service.
+- `Routing/ETA`: calls a routing engine (OSRM/GraphHopper + traffic provider) and exposes consistent ETA primitives to dispatch and user-facing surfaces.
+- `Redis`: courier state (location, availability, capacity), geo/time indexes, short-lived locks, and offer dedupe.
+- `Event Log`: durable stream for all state changes; enables replay, backfills, and shadow runs.
+- `Postgres`: system of record for orders, offers, assignments, courier shifts, audits; supports ops queries and reconciliation.
+
+## Deep Dive: The Hardest Part — Real-Time Batching + Stable Assignment
+
+### Model the world as constraints, not guesses
+Each order has:
+- time windows: latest pickup, latest drop-off (derived from promised SLA)
+- prep readiness distribution (restaurant-provided + learned bias)
+- cancellation/late penalty (customer experience + refund cost)
+
+Each courier has:
+- current location + heading uncertainty (GPS jitter)
+- capacity (max concurrent orders), current route commitments
+- acceptance behavior (historical accept rate, current “busy” signals)
+
+Batching is allowed only if it respects **guardrails**:
+- max additional drive time per existing order (e.g., +6 minutes)
+- max pickup spread (e.g., pickups within 800m or same restaurant)
+- hard deadline feasibility under optimistic *and* pessimistic prep/traffic estimates
+
+### Two-stage dispatch loop (the core elegance)
+1. **Candidate generation (cheap, broad, safe)**
+   - Maintain couriers in Redis by geo bucket (H3/geohash) and availability.
+   - For an event (order ready/placed, courier freed, delay update), fetch top-K couriers in expanding rings (e.g., K=50–150).
+   - Generate batch candidates by combining:
+     - same-restaurant ready orders within a short time window
+     - nearby pickups with compatible deadlines
+   - Discard anything that fails fast feasibility checks (time window bounds, capacity, max detour).
+
+2. **Scoring + assignment (fast, stable, explainable)**
+   - Compute a score for each (courier, route plan) option:
+     - on-time probability (dominant term)
+     - incremental cost (drive time, idle time)
+     - marketplace health (fairness/utilization smoothing)
+     - churn penalty (avoid reassigning unless materially better)
+   - Solve a *small* assignment problem per local region/event batch:
+     - greedy with backtracking or min-cost matching on the filtered set
+     - enforce “stickiness”: don’t revoke an offer already accepted; don’t reshuffle committed routes
+   - Emit an **Offer** with a TTL (e.g., 20s) and a cryptographic idempotency key.
+
+This is how you get batching benefits without turning dispatch into a global optimizer that thrashes.
+
+### Handling uncertainty without overfitting
+- Use **pessimistic bounds** to protect SLAs (late is expensive), but allow controlled risk when the marketplace is tight (few couriers).
+- Treat restaurant prep times as a calibrated distribution; don’t trust a single “ready in 5 min.”
+- Use a simple “confidence” measure: if location or prep signals are stale, reduce batching aggressiveness automatically.
+
+### Concurrency and correctness (where most teams bleed)
+- Offers are the concurrency boundary:
+  - One active offer per courier per “slot” (capacity unit), enforced via Redis atomic set with TTL.
+  - Accept/decline is written to Postgres with a unique constraint on `(order_id)` assignment to prevent double-assign.
+- Events are at-least-once:
+  - Every state mutation is idempotent via `(entity_id, version)` or idempotency keys.
+- Reconciliation job:
+  - Periodically compare Redis ephemeral state vs Postgres truth; heal stuck offers and orphaned assignments.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| SLA reliability under churn | Globally optimal routes |
+| Simple, restartable dispatch workers | Rich in-memory global state |
+| Fast iteration on heuristics (replay/shadow) | “Perfect” mathematical optimality |
+| Explainable decisions and guardrails | Maximum batching rate at all costs |
+
+## Failure Modes
+
+- **Stale courier locations (GPS drop / backgrounded app)**
+  - Happens: dispatch offers to “ghost” couriers; acceptance drops; SLAs slip.
+  - Detect: location age > threshold, sudden accept-rate collapse by cohort.
+  - Recover: mark courier as low-confidence, exclude from batching, require heartbeat; fall back to conservative nearest-available.
+
+- **Offer storms / thrash during spikes**
+  - Happens: too many re-computes; couriers get spammed; acceptance falls.
+  - Detect: offers per order/courier rises; high revoke/reissue rates; p95 dispatch latency climbs.
+  - Recover: introduce stickiness penalty, rate-limit reoffers, coalesce events (debounce), and temporarily disable multi-order batching.
+
+- **Split-brain assignments (duplicate offers accepted)**
+  - Happens: retries + races create multiple “winners.”
+  - Detect: unique constraint violations, mismatch between courier app state and Postgres assignment.
+  - Recover: Postgres enforces single assignment; loser offer invalidated; courier app receives authoritative correction + compensation flow.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Partition dispatch by city zones with consistent hashing; isolate hotspots.
+  - Precompute travel-time matrices per zone for short hops; reduce routing calls.
+  - Add shadow dispatch to evaluate new scoring safely from replay.
+
+- **100x scale:**
+  - Move from “event-triggered recompute” to **continuous per-zone optimization ticks** with bounded work.
+  - Introduce a dedicated, scalable state store for real-time geo queries (still keep Postgres as record).
+  - Make routing/ETA a first-class platform with caching, map updates, and strict SLOs; it becomes a top cost center.
+
+## Operational Notes
+
+- Dispatch must have a **kill switch** to disable batching and revert to conservative single-order assignment in <1 minute.
+- Keep a **replay pipeline** (from event log) to reproduce incidents and tune scoring offline; it’s the fastest path to real reliability gains.
+- Watch the leading indicators: offer spam rate, accept-rate by cohort, lateness at pickup vs drop-off (distinguishes restaurant vs routing issues).
+- On-call playbook should include “drain a zone” (stop new offers, let in-flight finish) and “freeze reassignments” during incidents.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/food-delivery-logistics.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afc-f1e3-79b3-9742-8ffb7d44b6fc
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Food Delivery Logistics"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["marketplace", "dispatch", "routing", "optimization", "reliability"]
+---
+
+## Overview
+
+This system is a real-time coordination engine for a 3-sided marketplace (customers, restaurants, couriers). It accepts orders, tracks restaurant prep and courier locations, and continuously decides *who should deliver what, when*—including batching multiple orders into one courier route—while meeting SLAs and keeping the marketplace “fair enough” to stay healthy.
+
+The key insight: treat dispatch as a **streaming optimization problem** with **tight time windows and imperfect information**, not as “pick nearest courier.” The elegant design is a two-stage engine: (1) aggressively narrow to plausible candidates using geo/time indexing, then (2) run a fast scoring/assignment loop that’s stable under churn and degrades gracefully when data is stale.
+
+Everything else is intentionally boring: Postgres as system of record, Redis for ephemeral state, a durable event log for replay, and a stateless dispatch service that can be restarted without losing correctness.
+
+## What Makes This Hard
+
+Naive implementations fail in two traps:
+
+1. **Churn + time windows**: courier GPS updates, accept/decline, restaurant delays, and traffic changes mean the “best” assignment changes every few seconds. If you recompute globally, you thrash; if you don’t, you miss SLAs.
+2. **Batching is a VRP**: the moment you allow “pick up 2, drop off 2,” you’re in vehicle routing with time windows (NP-hard). Teams either overbuild (research project) or underbuild (batching destroys on-time rate).
+
+The win is not perfect optimality; it’s **stable, explainable near-optimal decisions** at low latency, with explicit guardrails (SLAs, max detour, fairness, and cancellation cost).
+
+## Requirements
+
+### Functional Requirements
+- Create and update orders through states: placed → confirmed → prepping → ready → picked up → delivered/canceled.
+- Assign couriers to orders with **offers** (must handle decline/timeouts) and prevent double-assign.
+- Support **batching** (2–3 orders) with constraints: same restaurant or nearby pickups, bounded detour, per-order SLA.
+- Continuous ETA and route updates for customer + courier, driven by traffic and restaurant readiness.
+- Marketplace health controls: courier utilization, fairness (avoid starving regions/couriers), restaurant load shedding.
+- Auditability: explain “why this courier” for ops, disputes, and tuning.
+
+### Scale Targets
+- **Metro peak orders**: 50k orders/hour (~14/s) in a large city; bursts 5–10x at meal spikes → design for **150/s** order events.
+- **Courier updates**: 30k concurrent couriers reporting every 2s → **15k location updates/s** (dominant write volume).
+- **Dispatch latency**: p95 < **200ms** from “ready”/“order placed” event to offer creation; p99 < 1s during spikes.
+- **Correctness**: no double-assign; at-least-once events tolerated; idempotent state transitions.
+
+## Key Design Decisions
+
+- **Dispatch via streaming heuristic optimizer (two-stage)**
+  - Chose: candidate generation + fast assignment loop (local search / greedy with backtracking), rerun on relevant events.
+  - Rejected: exact VRPTW solvers online; “nearest courier” only.
+  - Why: exact solvers don’t converge under churn; nearest-only kills batching and SLA adherence.
+
+- **Postgres as source of truth, Redis as ephemeral real-time state**
+  - Chose: Postgres for orders/offers/audit; Redis for courier location, availability, hot indexes, locks.
+  - Rejected: “everything in Redis,” or a bespoke state store.
+  - Why: you need durability and queryability for disputes and ops; Redis keeps the hot loop fast.
+
+- **Durable event log for replay + decoupling**
+  - Chose: Kafka (or equivalent) for order/restaurant/courier events; dispatch emits offers as events.
+  - Rejected: point-to-point RPC fanout as the backbone.
+  - Why: replay is essential for debugging, simulation, and safe algorithm changes; the bus absorbs spikes.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Customer App] --> G[API Gateway]
+  R[Restaurant Tablet] --> G
+  U[Courier App] --> G
+
+  G --> O[Order Service]
+  G --> D[Dispatch Engine]
+  D --> X[Routing/ETA]
+
+  O --> P[(Postgres)]
+  D --> E[(Event Log)]
+  D --> S[(Redis)]
+  O --> E
+```
+
+### Components
+
+- `API Gateway`: auth, rate limits, request shaping; protects the dispatch loop from client chaos.
+- `Order Service`: owns order lifecycle and invariants (idempotent transitions, payments hooks, cancellation rules); writes to Postgres and emits events.
+- `Dispatch Engine`: stateless workers consuming events, maintaining ephemeral state in Redis, producing offers and assignments; the only “smart” service.
+- `Routing/ETA`: calls a routing engine (OSRM/GraphHopper + traffic provider) and exposes consistent ETA primitives to dispatch and user-facing surfaces.
+- `Redis`: courier state (location, availability, capacity), geo/time indexes, short-lived locks, and offer dedupe.
+- `Event Log`: durable stream for all state changes; enables replay, backfills, and shadow runs.
+- `Postgres`: system of record for orders, offers, assignments, courier shifts, audits; supports ops queries and reconciliation.
+
+## Deep Dive: The Hardest Part — Real-Time Batching + Stable Assignment
+
+### Model the world as constraints, not guesses
+Each order has:
+- time windows: latest pickup, latest drop-off (derived from promised SLA)
+- prep readiness distribution (restaurant-provided + learned bias)
+- cancellation/late penalty (customer experience + refund cost)
+
+Each courier has:
+- current location + heading uncertainty (GPS jitter)
+- capacity (max concurrent orders), current route commitments
+- acceptance behavior (historical accept rate, current “busy” signals)
+
+Batching is allowed only if it respects **guardrails**:
+- max additional drive time per existing order (e.g., +6 minutes)
+- max pickup spread (e.g., pickups within 800m or same restaurant)
+- hard deadline feasibility under optimistic *and* pessimistic prep/traffic estimates
+
+### Two-stage dispatch loop (the core elegance)
+1. **Candidate generation (cheap, broad, safe)**
+   - Maintain couriers in Redis by geo bucket (H3/geohash) and availability.
+   - For an event (order ready/placed, courier freed, delay update), fetch top-K couriers in expanding rings (e.g., K=50–150).
+   - Generate batch candidates by combining:
+     - same-restaurant ready orders within a short time window
+     - nearby pickups with compatible deadlines
+   - Discard anything that fails fast feasibility checks (time window bounds, capacity, max detour).
+
+2. **Scoring + assignment (fast, stable, explainable)**
+   - Compute a score for each (courier, route plan) option:
+     - on-time probability (dominant term)
+     - incremental cost (drive time, idle time)
+     - marketplace health (fairness/utilization smoothing)
+     - churn penalty (avoid reassigning unless materially better)
+   - Solve a *small* assignment problem per local region/event batch:
+     - greedy with backtracking or min-cost matching on the filtered set
+     - enforce “stickiness”: don’t revoke an offer already accepted; don’t reshuffle committed routes
+   - Emit an **Offer** with a TTL (e.g., 20s) and a cryptographic idempotency key.
+
+This is how you get batching benefits without turning dispatch into a global optimizer that thrashes.
+
+### Handling uncertainty without overfitting
+- Use **pessimistic bounds** to protect SLAs (late is expensive), but allow controlled risk when the marketplace is tight (few couriers).
+- Treat restaurant prep times as a calibrated distribution; don’t trust a single “ready in 5 min.”
+- Use a simple “confidence” measure: if location or prep signals are stale, reduce batching aggressiveness automatically.
+
+### Concurrency and correctness (where most teams bleed)
+- Offers are the concurrency boundary:
+  - One active offer per courier per “slot” (capacity unit), enforced via Redis atomic set with TTL.
+  - Accept/decline is written to Postgres with a unique constraint on `(order_id)` assignment to prevent double-assign.
+- Events are at-least-once:
+  - Every state mutation is idempotent via `(entity_id, version)` or idempotency keys.
+- Reconciliation job:
+  - Periodically compare Redis ephemeral state vs Postgres truth; heal stuck offers and orphaned assignments.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| SLA reliability under churn | Globally optimal routes |
+| Simple, restartable dispatch workers | Rich in-memory global state |
+| Fast iteration on heuristics (replay/shadow) | “Perfect” mathematical optimality |
+| Explainable decisions and guardrails | Maximum batching rate at all costs |
+
+## Failure Modes
+
+- **Stale courier locations (GPS drop / backgrounded app)**
+  - Happens: dispatch offers to “ghost” couriers; acceptance drops; SLAs slip.
+  - Detect: location age > threshold, sudden accept-rate collapse by cohort.
+  - Recover: mark courier as low-confidence, exclude from batching, require heartbeat; fall back to conservative nearest-available.
+
+- **Offer storms / thrash during spikes**
+  - Happens: too many re-computes; couriers get spammed; acceptance falls.
+  - Detect: offers per order/courier rises; high revoke/reissue rates; p95 dispatch latency climbs.
+  - Recover: introduce stickiness penalty, rate-limit reoffers, coalesce events (debounce), and temporarily disable multi-order batching.
+
+- **Split-brain assignments (duplicate offers accepted)**
+  - Happens: retries + races create multiple “winners.”
+  - Detect: unique constraint violations, mismatch between courier app state and Postgres assignment.
+  - Recover: Postgres enforces single assignment; loser offer invalidated; courier app receives authoritative correction + compensation flow.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Partition dispatch by city zones with consistent hashing; isolate hotspots.
+  - Precompute travel-time matrices per zone for short hops; reduce routing calls.
+  - Add shadow dispatch to evaluate new scoring safely from replay.
+
+- **100x scale:**
+  - Move from “event-triggered recompute” to **continuous per-zone optimization ticks** with bounded work.
+  - Introduce a dedicated, scalable state store for real-time geo queries (still keep Postgres as record).
+  - Make routing/ETA a first-class platform with caching, map updates, and strict SLOs; it becomes a top cost center.
+
+## Operational Notes
+
+- Dispatch must have a **kill switch** to disable batching and revert to conservative single-order assignment in <1 minute.
+- Keep a **replay pipeline** (from event log) to reproduce incidents and tune scoring offline; it’s the fastest path to real reliability gains.
+- Watch the leading indicators: offer spam rate, accept-rate by cohort, lateness at pickup vs drop-off (distinguishes restaurant vs routing issues).
+- On-call playbook should include “drain a zone” (stop new offers, let in-flight finish) and “freeze reassignments” during incidents.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+codex
+## Elegance Check
+
+### The Core Insight
+Two-stage dispatch (cheap candidate narrowing + fast, sticky local assignment) reframes “dispatch” as a streaming optimization loop that stays stable under churn and imperfect signals, instead of chasing global optimality.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Order Service + Postgres | Clear lifecycle invariants, auditability, reconciliation, and hard uniqueness constraints for “no double-assign.” |
+| Dispatch Engine (stateless) | Keeps the only “smart” logic restartable; algorithm iteration without state-loss fear. |
+| Redis | Hot loop state (courier presence, locks, dedupe) at 15k updates/s without hammering Postgres. |
+| Durable Event Log | Replay/shadow runs and decoupling; absorbs bursts; enables deterministic postmortems. |
+| Routing/ETA | Centralizes “truth” for travel-time primitives so dispatch/user surfaces don’t diverge. |
+| API Gateway | Rate limiting and request shaping so client chaos can’t destabilize dispatch. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Redis used for “locks + dedupe + geo/time indexes” | Use Postgres for correctness boundaries only (unique constraints + `SELECT … FOR UPDATE SKIP LOCKED`), keep Redis strictly for location/geo | Higher DB load; but makes correctness story simpler and reduces “split brain” surfaces. |
+| Crypto idempotency key for offers | Plain idempotency keys with scoped uniqueness in Postgres (`offers(idempotency_key)` unique) | Less “fancy,” same property; cryptography rarely buys you much unless you’re preventing forgery across trust boundaries. |
+| Per-event recompute | Fixed per-zone tick (even at moderate scale), with event coalescing as input | Adds latency ceiling (~tick interval), but reduces thrash and makes capacity planning easier earlier. |
+| Custom fairness term in scoring | Start with simple constraints + quotas (min offers per zone/courier cohort) enforced outside scoring | Less optimal smoothing, but much more debuggable and safer to tune. |
+| Redis geo buckets | Consider a dedicated geo index only if needed; otherwise H3 buckets stored in Postgres for static-ish data (restaurants/zones) | Postgres won’t handle courier updates at 15k/s well; but for restaurant/zones it may delete a subsystem. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Kafka/event log is down for 5 minutes**
+   - Design’s answer: not addressed (assumes event backbone)
+   - Recommendation: Strengthen  
+   Add an explicit degraded mode: Order Service continues to accept orders and write Postgres; Dispatch switches to polling “ready/unassigned” via Postgres (or an outbox table) per zone until the log recovers; ensure idempotent re-emission when Kafka returns.
+
+2. **Redis is down or partially partitioned**
+   - Design’s answer: implicitly critical (hot state + locks live there)
+   - Recommendation: Strengthen  
+   Define what correctness relies on in Postgres (assignments) vs what is “best effort” (candidate sets). If Redis is down: disable batching, reduce to conservative assignment using last-known courier positions from a slower store (or “only couriers currently active in last N seconds” from a fallback presence stream). Also define Redis cluster mode, persistence expectations (AOF?) and what data loss means operationally.
+
+3. **Network partition between Dispatch and Postgres**
+   - Design’s answer: partial (Postgres uniqueness prevents double-assign, but dispatch may continue emitting offers)
+   - Recommendation: Strengthen  
+   Make “offer emission” conditional on the ability to write/confirm offer state durably (at least for accepted offers). Otherwise you’ll spam couriers with offers you can’t finalize. Consider: dispatch emits “proposed offers” to courier only after Postgres insert succeeds, or uses a local outbox that is reconciled.
+
+4. **Slow routing/ETA provider (not failing, just p95 spikes)**
+   - Design’s answer: mentions caching/precompute later, but not immediate behavior
+   - Recommendation: Strengthen  
+   Add strict budget: dispatch scoring must not block on live routing calls. Use a tiered approach: cheap heuristic ETA (grid speed + historical) in the hot path; async refine ETA and only re-offer if improvement crosses a threshold (stickiness). Also set circuit breakers and fallback profiles.
+
+5. **Bad config/algorithm rollout causes offer storm**
+   - Design’s answer: kill switch + debounce/rate-limit described
+   - Recommendation: Acceptable, but tighten  
+   Make the kill switch granular (per zone, per restaurant cohort, per batch size) and ensure it’s “fast + safe”: config served from a highly available source, audited, with a default-safe fallback on config fetch failure. Require canary + shadow evaluation gates before enabling batching changes broadly.
+
+## Recommendations
+
+### Must Fix
+- Define explicit degraded modes for loss of: event log, Redis, routing/ETA, and Postgres connectivity (what continues, what stops, and how you recover without compounding inconsistency).
+- Clarify the single source of truth for each state: offer existence, offer acceptance, assignment, courier capacity/slots, and “current route commitments” (and what happens on worker restart).
+- Make routing calls non-blocking in the dispatch critical path with a clear fallback ETA model and circuit breakers.
+
+### Should Consider
+- Consider moving from per-event recompute to bounded per-zone ticks earlier; it’s often simpler to reason about and easier to protect with budgets.
+- Simplify fairness: start with explicit quotas/guards and metrics, then evolve to a scoring term once you have stable observability.
+- Tighten operational control plane: zone drains, freeze reassignments, disable batching, disable reoffers, and “only assign ready orders” as separate toggles.
+
+### Nice to Have
+- More explicit “explainability contract”: store top-N features/constraints that caused the choice (and which guardrail eliminated other candidates).
+- Formal SLOs per dependency (Redis, Kafka, routing), and automated “mode switch” policies tied to those SLOs.
+
+## What’s Working Well
+- Clear prioritization: stable, explainable near-optimal decisions beats fragile “optimal” solvers.
+- Correctness boundary is mostly in the right place (Postgres constraints + idempotency) with Redis accelerating the hot loop.
+- Guardrails for batching and explicit “kill switch” thinking show good operational maturity.
+- Replay/shadow runs via event log is the right lever for safer iteration on heuristics and incident debugging.
+tokens used
+4,824
+## Elegance Check
+
+### The Core Insight
+Two-stage dispatch (cheap candidate narrowing + fast, sticky local assignment) reframes “dispatch” as a streaming optimization loop that stays stable under churn and imperfect signals, instead of chasing global optimality.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Order Service + Postgres | Clear lifecycle invariants, auditability, reconciliation, and hard uniqueness constraints for “no double-assign.” |
+| Dispatch Engine (stateless) | Keeps the only “smart” logic restartable; algorithm iteration without state-loss fear. |
+| Redis | Hot loop state (courier presence, locks, dedupe) at 15k updates/s without hammering Postgres. |
+| Durable Event Log | Replay/shadow runs and decoupling; absorbs bursts; enables deterministic postmortems. |
+| Routing/ETA | Centralizes “truth” for travel-time primitives so dispatch/user surfaces don’t diverge. |
+| API Gateway | Rate limiting and request shaping so client chaos can’t destabilize dispatch. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Redis used for “locks + dedupe + geo/time indexes” | Use Postgres for correctness boundaries only (unique constraints + `SELECT … FOR UPDATE SKIP LOCKED`), keep Redis strictly for location/geo | Higher DB load; but makes correctness story simpler and reduces “split brain” surfaces. |
+| Crypto idempotency key for offers | Plain idempotency keys with scoped uniqueness in Postgres (`offers(idempotency_key)` unique) | Less “fancy,” same property; cryptography rarely buys you much unless you’re preventing forgery across trust boundaries. |
+| Per-event recompute | Fixed per-zone tick (even at moderate scale), with event coalescing as input | Adds latency ceiling (~tick interval), but reduces thrash and makes capacity planning easier earlier. |
+| Custom fairness term in scoring | Start with simple constraints + quotas (min offers per zone/courier cohort) enforced outside scoring | Less optimal smoothing, but much more debuggable and safer to tune. |
+| Redis geo buckets | Consider a dedicated geo index only if needed; otherwise H3 buckets stored in Postgres for static-ish data (restaurants/zones) | Postgres won’t handle courier updates at 15k/s well; but for restaurant/zones it may delete a subsystem. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Kafka/event log is down for 5 minutes**
+   - Design’s answer: not addressed (assumes event backbone)
+   - Recommendation: Strengthen  
+   Add an explicit degraded mode: Order Service continues to accept orders and write Postgres; Dispatch switches to polling “ready/unassigned” via Postgres (or an outbox table) per zone until the log recovers; ensure idempotent re-emission when Kafka returns.
+
+2. **Redis is down or partially partitioned**
+   - Design’s answer: implicitly critical (hot state + locks live there)
+   - Recommendation: Strengthen  
+   Define what correctness relies on in Postgres (assignments) vs what is “best effort” (candidate sets). If Redis is down: disable batching, reduce to conservative assignment using last-known courier positions from a slower store (or “only couriers currently active in last N seconds” from a fallback presence stream). Also define Redis cluster mode, persistence expectations (AOF?) and what data loss means operationally.
+
+3. **Network partition between Dispatch and Postgres**
+   - Design’s answer: partial (Postgres uniqueness prevents double-assign, but dispatch may continue emitting offers)
+   - Recommendation: Strengthen  
+   Make “offer emission” conditional on the ability to write/confirm offer state durably (at least for accepted offers). Otherwise you’ll spam couriers with offers you can’t finalize. Consider: dispatch emits “proposed offers” to courier only after Postgres insert succeeds, or uses a local outbox that is reconciled.
+
+4. **Slow routing/ETA provider (not failing, just p95 spikes)**
+   - Design’s answer: mentions caching/precompute later, but not immediate behavior
+   - Recommendation: Strengthen  
+   Add strict budget: dispatch scoring must not block on live routing calls. Use a tiered approach: cheap heuristic ETA (grid speed + historical) in the hot path; async refine ETA and only re-offer if improvement crosses a threshold (stickiness). Also set circuit breakers and fallback profiles.
+
+5. **Bad config/algorithm rollout causes offer storm**
+   - Design’s answer: kill switch + debounce/rate-limit described
+   - Recommendation: Acceptable, but tighten  
+   Make the kill switch granular (per zone, per restaurant cohort, per batch size) and ensure it’s “fast + safe”: config served from a highly available source, audited, with a default-safe fallback on config fetch failure. Require canary + shadow evaluation gates before enabling batching changes broadly.
+
+## Recommendations
+
+### Must Fix
+- Define explicit degraded modes for loss of: event log, Redis, routing/ETA, and Postgres connectivity (what continues, what stops, and how you recover without compounding inconsistency).
+- Clarify the single source of truth for each state: offer existence, offer acceptance, assignment, courier capacity/slots, and “current route commitments” (and what happens on worker restart).
+- Make routing calls non-blocking in the dispatch critical path with a clear fallback ETA model and circuit breakers.
+
+### Should Consider
+- Consider moving from per-event recompute to bounded per-zone ticks earlier; it’s often simpler to reason about and easier to protect with budgets.
+- Simplify fairness: start with explicit quotas/guards and metrics, then evolve to a scoring term once you have stable observability.
+- Tighten operational control plane: zone drains, freeze reassignments, disable batching, disable reoffers, and “only assign ready orders” as separate toggles.
+
+### Nice to Have
+- More explicit “explainability contract”: store top-N features/constraints that caused the choice (and which guardrail eliminated other candidates).
+- Formal SLOs per dependency (Redis, Kafka, routing), and automated “mode switch” policies tied to those SLOs.
+
+## What’s Working Well
+- Clear prioritization: stable, explainable near-optimal decisions beats fragile “optimal” solvers.
+- Correctness boundary is mostly in the right place (Postgres constraints + idempotency) with Redis accelerating the hot loop.
+- Guardrails for batching and explicit “kill switch” thinking show good operational maturity.
+- Replay/shadow runs via event log is the right lever for safer iteration on heuristics and incident debugging.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/food-delivery-logistics.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afd-72f1-71f1-a7dd-8508bbb74f84
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Food Delivery Logistics"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["marketplace", "dispatch", "routing", "optimization", "reliability"]
+---
+
+## Overview
+
+This system is a real-time coordination engine for a 3-sided marketplace (customers, restaurants, couriers). It accepts orders, tracks restaurant prep and courier locations, and continuously decides *who should deliver what, when*—including batching multiple orders into one courier route—while meeting SLAs and keeping the marketplace “fair enough” to stay healthy.
+
+The key insight: treat dispatch as a **streaming optimization problem** with **tight time windows and imperfect information**, not as “pick nearest courier.” The elegant design is a two-stage engine: (1) aggressively narrow to plausible candidates using geo/time indexing, then (2) run a fast scoring/assignment loop that’s stable under churn and degrades gracefully when data is stale.
+
+Everything else is intentionally boring: Postgres as system of record, Redis for ephemeral state, a durable event log for replay, and a stateless dispatch service that can be restarted without losing correctness.
+
+## What Makes This Hard
+
+Naive implementations fail in two traps:
+
+1. **Churn + time windows**: courier GPS updates, accept/decline, restaurant delays, and traffic changes mean the “best” assignment changes every few seconds. If you recompute globally, you thrash; if you don’t, you miss SLAs.
+2. **Batching is a VRP**: the moment you allow “pick up 2, drop off 2,” you’re in vehicle routing with time windows (NP-hard). Teams either overbuild (research project) or underbuild (batching destroys on-time rate).
+
+The win is not perfect optimality; it’s **stable, explainable near-optimal decisions** at low latency, with explicit guardrails (SLAs, max detour, fairness, and cancellation cost).
+
+## Requirements
+
+### Functional Requirements
+- Create and update orders through states: placed → confirmed → prepping → ready → picked up → delivered/canceled.
+- Assign couriers to orders with **offers** (must handle decline/timeouts) and prevent double-assign.
+- Support **batching** (2–3 orders) with constraints: same restaurant or nearby pickups, bounded detour, per-order SLA.
+- Continuous ETA and route updates for customer + courier, driven by traffic and restaurant readiness.
+- Marketplace health controls: courier utilization, fairness (avoid starving regions/couriers), restaurant load shedding.
+- Auditability: explain “why this courier” for ops, disputes, and tuning.
+
+### Scale Targets
+- **Metro peak orders**: 50k orders/hour (~14/s) in a large city; bursts 5–10x at meal spikes → design for **150/s** order events.
+- **Courier updates**: 30k concurrent couriers reporting every 2s → **15k location updates/s** (dominant write volume).
+- **Dispatch latency**: p95 < **200ms** from “ready”/“order placed” event to offer creation; p99 < 1s during spikes.
+- **Correctness**: no double-assign; at-least-once events tolerated; idempotent state transitions.
+
+## Key Design Decisions
+
+- **Dispatch via streaming heuristic optimizer (two-stage)**
+  - Chose: candidate generation + fast assignment loop (local search / greedy with backtracking), rerun on relevant events.
+  - Rejected: exact VRPTW solvers online; “nearest courier” only.
+  - Why: exact solvers don’t converge under churn; nearest-only kills batching and SLA adherence.
+
+- **Postgres as source of truth, Redis as ephemeral real-time state**
+  - Chose: Postgres for orders/offers/audit; Redis for courier location, availability, hot indexes, locks.
+  - Rejected: “everything in Redis,” or a bespoke state store.
+  - Why: you need durability and queryability for disputes and ops; Redis keeps the hot loop fast.
+
+- **Durable event log for replay + decoupling**
+  - Chose: Kafka (or equivalent) for order/restaurant/courier events; dispatch emits offers as events.
+  - Rejected: point-to-point RPC fanout as the backbone.
+  - Why: replay is essential for debugging, simulation, and safe algorithm changes; the bus absorbs spikes.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Customer App] --> G[API Gateway]
+  R[Restaurant Tablet] --> G
+  U[Courier App] --> G
+
+  G --> O[Order Service]
+  G --> D[Dispatch Engine]
+  D --> X[Routing/ETA]
+
+  O --> P[(Postgres)]
+  D --> E[(Event Log)]
+  D --> S[(Redis)]
+  O --> E
+```
+
+### Components
+
+- `API Gateway`: auth, rate limits, request shaping; protects the dispatch loop from client chaos.
+- `Order Service`: owns order lifecycle and invariants (idempotent transitions, payments hooks, cancellation rules); writes to Postgres and emits events.
+- `Dispatch Engine`: stateless workers consuming events, maintaining ephemeral state in Redis, producing offers and assignments; the only “smart” service.
+- `Routing/ETA`: calls a routing engine (OSRM/GraphHopper + traffic provider) and exposes consistent ETA primitives to dispatch and user-facing surfaces.
+- `Redis`: courier state (location, availability, capacity), geo/time indexes, short-lived locks, and offer dedupe.
+- `Event Log`: durable stream for all state changes; enables replay, backfills, and shadow runs.
+- `Postgres`: system of record for orders, offers, assignments, courier shifts, audits; supports ops queries and reconciliation.
+
+## Deep Dive: The Hardest Part — Real-Time Batching + Stable Assignment
+
+### Model the world as constraints, not guesses
+Each order has:
+- time windows: latest pickup, latest drop-off (derived from promised SLA)
+- prep readiness distribution (restaurant-provided + learned bias)
+- cancellation/late penalty (customer experience + refund cost)
+
+Each courier has:
+- current location + heading uncertainty (GPS jitter)
+- capacity (max concurrent orders), current route commitments
+- acceptance behavior (historical accept rate, current “busy” signals)
+
+Batching is allowed only if it respects **guardrails**:
+- max additional drive time per existing order (e.g., +6 minutes)
+- max pickup spread (e.g., pickups within 800m or same restaurant)
+- hard deadline feasibility under optimistic *and* pessimistic prep/traffic estimates
+
+### Two-stage dispatch loop (the core elegance)
+1. **Candidate generation (cheap, broad, safe)**
+   - Maintain couriers in Redis by geo bucket (H3/geohash) and availability.
+   - For an event (order ready/placed, courier freed, delay update), fetch top-K couriers in expanding rings (e.g., K=50–150).
+   - Generate batch candidates by combining:
+     - same-restaurant ready orders within a short time window
+     - nearby pickups with compatible deadlines
+   - Discard anything that fails fast feasibility checks (time window bounds, capacity, max detour).
+
+2. **Scoring + assignment (fast, stable, explainable)**
+   - Compute a score for each (courier, route plan) option:
+     - on-time probability (dominant term)
+     - incremental cost (drive time, idle time)
+     - marketplace health (fairness/utilization smoothing)
+     - churn penalty (avoid reassigning unless materially better)
+   - Solve a *small* assignment problem per local region/event batch:
+     - greedy with backtracking or min-cost matching on the filtered set
+     - enforce “stickiness”: don’t revoke an offer already accepted; don’t reshuffle committed routes
+   - Emit an **Offer** with a TTL (e.g., 20s) and a cryptographic idempotency key.
+
+This is how you get batching benefits without turning dispatch into a global optimizer that thrashes.
+
+### Handling uncertainty without overfitting
+- Use **pessimistic bounds** to protect SLAs (late is expensive), but allow controlled risk when the marketplace is tight (few couriers).
+- Treat restaurant prep times as a calibrated distribution; don’t trust a single “ready in 5 min.”
+- Use a simple “confidence” measure: if location or prep signals are stale, reduce batching aggressiveness automatically.
+
+### Concurrency and correctness (where most teams bleed)
+- Offers are the concurrency boundary:
+  - One active offer per courier per “slot” (capacity unit), enforced via Redis atomic set with TTL.
+  - Accept/decline is written to Postgres with a unique constraint on `(order_id)` assignment to prevent double-assign.
+- Events are at-least-once:
+  - Every state mutation is idempotent via `(entity_id, version)` or idempotency keys.
+- Reconciliation job:
+  - Periodically compare Redis ephemeral state vs Postgres truth; heal stuck offers and orphaned assignments.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| SLA reliability under churn | Globally optimal routes |
+| Simple, restartable dispatch workers | Rich in-memory global state |
+| Fast iteration on heuristics (replay/shadow) | “Perfect” mathematical optimality |
+| Explainable decisions and guardrails | Maximum batching rate at all costs |
+
+## Failure Modes
+
+- **Stale courier locations (GPS drop / backgrounded app)**
+  - Happens: dispatch offers to “ghost” couriers; acceptance drops; SLAs slip.
+  - Detect: location age > threshold, sudden accept-rate collapse by cohort.
+  - Recover: mark courier as low-confidence, exclude from batching, require heartbeat; fall back to conservative nearest-available.
+
+- **Offer storms / thrash during spikes**
+  - Happens: too many re-computes; couriers get spammed; acceptance falls.
+  - Detect: offers per order/courier rises; high revoke/reissue rates; p95 dispatch latency climbs.
+  - Recover: introduce stickiness penalty, rate-limit reoffers, coalesce events (debounce), and temporarily disable multi-order batching.
+
+- **Split-brain assignments (duplicate offers accepted)**
+  - Happens: retries + races create multiple “winners.”
+  - Detect: unique constraint violations, mismatch between courier app state and Postgres assignment.
+  - Recover: Postgres enforces single assignment; loser offer invalidated; courier app receives authoritative correction + compensation flow.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Partition dispatch by city zones with consistent hashing; isolate hotspots.
+  - Precompute travel-time matrices per zone for short hops; reduce routing calls.
+  - Add shadow dispatch to evaluate new scoring safely from replay.
+
+- **100x scale:**
+  - Move from “event-triggered recompute” to **continuous per-zone optimization ticks** with bounded work.
+  - Introduce a dedicated, scalable state store for real-time geo queries (still keep Postgres as record).
+  - Make routing/ETA a first-class platform with caching, map updates, and strict SLOs; it becomes a top cost center.
+
+## Operational Notes
+
+- Dispatch must have a **kill switch** to disable batching and revert to conservative single-order assignment in <1 minute.
+- Keep a **replay pipeline** (from event log) to reproduce incidents and tune scoring offline; it’s the fastest path to real reliability gains.
+- Watch the leading indicators: offer spam rate, accept-rate by cohort, lateness at pickup vs drop-off (distinguishes restaurant vs routing issues).
+- On-call playbook should include “drain a zone” (stop new offers, let in-flight finish) and “freeze reassignments” during incidents.
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Two-stage dispatch (cheap candidate narrowing + fast, sticky local assignment) reframes “dispatch” as a streaming optimization loop that stays stable under churn and imperfect signals, instead of chasing global optimality.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Order Service + Postgres | Clear lifecycle invariants, auditability, reconciliation, and hard uniqueness constraints for “no double-assign.” |
+| Dispatch Engine (stateless) | Keeps the only “smart” logic restartable; algorithm iteration without state-loss fear. |
+| Redis | Hot loop state (courier presence, locks, dedupe) at 15k updates/s without hammering Postgres. |
+| Durable Event Log | Replay/shadow runs and decoupling; absorbs bursts; enables deterministic postmortems. |
+| Routing/ETA | Centralizes “truth” for travel-time primitives so dispatch/user surfaces don’t diverge. |
+| API Gateway | Rate limiting and request shaping so client chaos can’t destabilize dispatch. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Redis used for “locks + dedupe + geo/time indexes” | Use Postgres for correctness boundaries only (unique constraints + `SELECT … FOR UPDATE SKIP LOCKED`), keep Redis strictly for location/geo | Higher DB load; but makes correctness story simpler and reduces “split brain” surfaces. |
+| Crypto idempotency key for offers | Plain idempotency keys with scoped uniqueness in Postgres (`offers(idempotency_key)` unique) | Less “fancy,” same property; cryptography rarely buys you much unless you’re preventing forgery across trust boundaries. |
+| Per-event recompute | Fixed per-zone tick (even at moderate scale), with event coalescing as input | Adds latency ceiling (~tick interval), but reduces thrash and makes capacity planning easier earlier. |
+| Custom fairness term in scoring | Start with simple constraints + quotas (min offers per zone/courier cohort) enforced outside scoring | Less optimal smoothing, but much more debuggable and safer to tune. |
+| Redis geo buckets | Consider a dedicated geo index only if needed; otherwise H3 buckets stored in Postgres for static-ish data (restaurants/zones) | Postgres won’t handle courier updates at 15k/s well; but for restaurant/zones it may delete a subsystem. |
+
+## Stress Test
+
+### Failure Scenarios
+
+1. **Kafka/event log is down for 5 minutes**
+   - Design’s answer: not addressed (assumes event backbone)
+   - Recommendation: Strengthen  
+   Add an explicit degraded mode: Order Service continues to accept orders and write Postgres; Dispatch switches to polling “ready/unassigned” via Postgres (or an outbox table) per zone until the log recovers; ensure idempotent re-emission when Kafka returns.
+
+2. **Redis is down or partially partitioned**
+   - Design’s answer: implicitly critical (hot state + locks live there)
+   - Recommendation: Strengthen  
+   Define what correctness relies on in Postgres (assignments) vs what is “best effort” (candidate sets). If Redis is down: disable batching, reduce to conservative assignment using last-known courier positions from a slower store (or “only couriers currently active in last N seconds” from a fallback presence stream). Also define Redis cluster mode, persistence expectations (AOF?) and what data loss means operationally.
+
+3. **Network partition between Dispatch and Postgres**
+   - Design’s answer: partial (Postgres uniqueness prevents double-assign, but dispatch may continue emitting offers)
+   - Recommendation: Strengthen  
+   Make “offer emission” conditional on the ability to write/confirm offer state durably (at least for accepted offers). Otherwise you’ll spam couriers with offers you can’t finalize. Consider: dispatch emits “proposed offers” to courier only after Postgres insert succeeds, or uses a local outbox that is reconciled.
+
+4. **Slow routing/ETA provider (not failing, just p95 spikes)**
+   - Design’s answer: mentions caching/precompute later, but not immediate behavior
+   - Recommendation: Strengthen  
+   Add strict budget: dispatch scoring must not block on live routing calls. Use a tiered approach: cheap heuristic ETA (grid speed + historical) in the hot path; async refine ETA and only re-offer if improvement crosses a threshold (stickiness). Also set circuit breakers and fallback profiles.
+
+5. **Bad config/algorithm rollout causes offer storm**
+   - Design’s answer: kill switch + debounce/rate-limit described
+   - Recommendation: Acceptable, but tighten  
+   Make the kill switch granular (per zone, per restaurant cohort, per batch size) and ensure it’s “fast + safe”: config served from a highly available source, audited, with a default-safe fallback on config fetch failure. Require canary + shadow evaluation gates before enabling batching changes broadly.
+
+## Recommendations
+
+### Must Fix
+- Define explicit degraded modes for loss of: event log, Redis, routing/ETA, and Postgres connectivity (what continues, what stops, and how you recover without compounding inconsistency).
+- Clarify the single source of truth for each state: offer existence, offer acceptance, assignment, courier capacity/slots, and “current route commitments” (and what happens on worker restart).
+- Make routing calls non-blocking in the dispatch critical path with a clear fallback ETA model and circuit breakers.
+
+### Should Consider
+- Consider moving from per-event recompute to bounded per-zone ticks earlier; it’s often simpler to reason about and easier to protect with budgets.
+- Simplify fairness: start with explicit quotas/guards and metrics, then evolve to a scoring term once you have stable observability.
+- Tighten operational control plane: zone drains, freeze reassignments, disable batching, disable reoffers, and “only assign ready orders” as separate toggles.
+
+### Nice to Have
+- More explicit “explainability contract”: store top-N features/constraints that caused the choice (and which guardrail eliminated other candidates).
+- Formal SLOs per dependency (Redis, Kafka, routing), and automated “mode switch” policies tied to those SLOs.
+
+## What’s Working Well
+- Clear prioritization: stable, explainable near-optimal decisions beats fragile “optimal” solvers.
+- Correctness boundary is mostly in the right place (Postgres constraints + idempotency) with Redis accelerating the hot loop.
+- Guardrails for batching and explicit “kill switch” thinking show good operational maturity.
+- Replay/shadow runs via event log is the right lever for safer iteration on heuristics and incident debugging.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+
+thinking
+**Evaluating document structure**
+
+I'm considering how to adjust the sections of the document. I can’t add new sections, but I could repurpose existing ones. The Overview might briefly cover minimal architecture, while the Architecture section can have a component list with justifications. 
+
+For "What We Removed," maybe I could incorporate it as a bullet point in the Components section without creating a new header. 
+
+I could also consider removing some sections entirely, while ensuring I address critique on failure scenarios by including them in the Failure Modes and Operational Notes.
+thinking
+**Assessing architecture adjustments**
+
+I’m contemplating whether to merge the API gateway into the Order Service using the built-in ingress. However, I can't add new components, and removing the gateway could complicate authentication and rate limiting. A managed load balancer can handle this, but that feels like adding a component. 
+
+I’m also thinking of simplifying event logging by removing Kafka and using a Postgres outbox table instead. This could work as a durable event log, addressing concerns raised while reducing complexity. However, I need to consider the impact on scaling and replay/shadow run needs.
+thinking
+**Simplifying system architecture**
+
+I’m analyzing the current updates: 15k are courier location updates in Redis, while order events are about 150 per second. That seems manageable for a Postgres event log table. Replay functionality is intact, and for decoupling, I might consider logical replication or LISTEN/NOTIFY, though I wonder if that’s adding features instead of components. 
+
+Aligning with the idea of “Just use Postgres,” I can use it along with an outbox table instead of Kafka. I’ll also think about simplifying fairness, idempotency, and recomputation strategies, while keeping Redis for location updates and a simple geo index.
+thinking
+**Optimizing the architecture**
+
+I’m considering using Postgres to enforce "one active offer per courier slot" with a unique partial index to prevent split-brain scenarios. For routing, while keeping the routing and ETA components, I’ll ensure that dispatch operations don’t block—perhaps by using a cheap ETA heuristic initially and refining it asynchronously.
+
+I might merge the Order Service and Dispatch Engine into one "Core Service" to simplify the architecture. This could reduce components while addressing heavy compute demands. I'll show this as a single "Marketplace Service" in the architecture diagram.
+thinking
+**Refining the architecture design**
+
+I’m exploring the use of a managed API gateway as an ingress. For routing and ETA functionalities, I could leverage an external provider, potentially simplifying my architecture further. The proposed setup would send restaurant and courier location updates to a service that updates Redis, utilizing Redis streams while maintaining the same component count. 
+
+I need to address various failure scenarios, like what happens if the event log goes down or if Redis fails. If Postgres is operational, the outbox works seamlessly, but if it goes down, the entire system halts. In the case of Redis failure, I can stop dispatching offers while still allowing order placements. Additionally, I plan to consolidate the architecture by merging components where feasible, including a "Core Service" that integrates order and dispatch functions. This approach will achieve clarity while allowing for management of failure modes, ensuring we stay within the established constraints.
+thinking
+**Finalizing design documentation**
+
+I'm considering allowing multiple offers per order but will enforce a unique partial index for "only one active offer per order." I'll include an idempotency key for courier acceptance to handle retries, ensuring that the outbox consumption is idempotent and enforcing no double assignments through database constraints. 
+
+My aim is to keep the design manageable for a small team by limiting it to one service. I’ll remove extensive critique sections from the final document, focusing on a straightforward presentation of THE design. I plan to rename the "What I'd Do Differently At..." section to "What We Removed" and clarify the removals there. I want to incorporate simplifications while retaining top-level headings and keeping other details concise, ensuring clarity throughout the document structure.
+codex
+```markdown
+---
+title: "Food Delivery Logistics"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["marketplace", "dispatch", "routing", "optimization", "reliability"]
+---
+
+## Overview
+
+This system coordinates a 3-sided marketplace (customers, restaurants, couriers). It accepts orders, tracks restaurant readiness and courier locations, and continuously decides *who should deliver what, when*—including limited batching—while meeting SLAs and staying stable under churn.
+
+Dispatch is treated as a **streaming heuristic**: cheaply narrow candidates, then run a fast, sticky local assignment loop that prioritizes on-time delivery and avoids thrash.
+
+## What Makes This Hard
+
+1. **Churn + time windows**: GPS updates, accept/decline, prep delays, and traffic changes shift the “best” assignment every few seconds. Stability matters more than global optimality.
+2. **Batching is VRP**: even 2–3 orders per courier introduces hard routing constraints. The system wins by enforcing guardrails and making near-optimal decisions quickly.
+
+## Requirements
+
+### Functional Requirements
+- Order lifecycle: placed → confirmed → prepping → ready → picked up → delivered/canceled.
+- Courier assignment via **offers** with declines/timeouts; prevent double-assign.
+- **Batching (2–3 orders)** with strict constraints (compatible pickups, bounded detour, per-order SLA).
+- Continuous ETA updates for customer + courier; degrade safely when routing is slow.
+- Basic marketplace controls: avoid starving zones/cohorts; avoid offer spam.
+- Auditability: store “why this courier/route” at decision time.
+
+### Scale Targets
+- Peak order events: design for **150/s** bursts.
+- Courier updates: **15k location updates/s** (dominant write volume).
+- Dispatch latency: p95 < **200ms** from “ready/placed” to offer creation during normal load.
+- Correctness: no double-assign; tolerate at-least-once processing; idempotent transitions.
+
+## Key Design Decisions
+
+- **One core service, two execution modes**
+  - HTTP APIs for clients + background dispatch workers (same codebase).
+  - Why: one team can build and operate it; fewer failure boundaries.
+
+- **Postgres is the source of truth (including the durable event stream)**
+  - Orders/offers/assignments/audit live in Postgres.
+  - Dispatch consumes from an append-only `event_log`/outbox table using `SELECT ... FOR UPDATE SKIP LOCKED`.
+  - Why: replay/shadow runs and reliable idempotency without another backbone.
+
+- **Redis is strictly real-time courier presence**
+  - Stores courier location + availability with TTL and simple geo bucketing for fast candidate fetch.
+  - Why: absorbs 15k/s updates without hammering Postgres.
+
+- **Tick-based dispatch per zone**
+  - Fixed per-zone ticks coalesce events and enforce a work budget.
+  - Why: reduces recompute thrash and makes overload behavior predictable.
+
+- **Correctness boundaries live in Postgres**
+  - Offers are inserted before being sent to couriers; acceptance is only valid if the DB write succeeds.
+  - Uniqueness constraints prevent double-assign and “two active offers for one slot.”
+  - Why: eliminates split-brain as a correctness story.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Customer App] --> G[Managed Ingress]
+  R[Restaurant Tablet] --> G
+  U[Courier App] --> G
+
+  G --> S[Core Service (Order + Dispatch)]
+  S --> P[(Postgres)]
+  S --> K[(Redis)]
+  S --> T[Routing Provider API]
+```
+
+### Components
+
+- `Managed Ingress`: auth and rate limiting so client spikes don’t destabilize dispatch.
+- `Core Service (Order + Dispatch)`: owns order lifecycle, emits events to Postgres, runs the dispatch tick loop, creates offers, and records decision reasons.
+- `Postgres`: system of record for orders/offers/assignments and the durable event log for replay, backfills, and safe algorithm iteration.
+- `Redis`: courier location/availability with TTL + geo buckets for candidate generation at high write rates.
+- `Routing Provider API`: travel-time/route estimates for user-facing ETAs and non-critical refinement; dispatch hot path never blocks on it.
+
+## Deep Dive: Real-Time Batching + Stable Assignment
+
+### Guardrails (batching stays small and safe)
+Batching is only attempted when it passes fast checks:
+- pickups are same restaurant or very close
+- bounded detour for already-committed orders
+- feasible latest pickup/drop-off under conservative ETA bounds
+- courier capacity allows it
+
+If any dependency is degraded (Redis/routing/postgres connectivity), batching is disabled automatically.
+
+### Dispatch loop (per-zone tick)
+On each tick:
+1. Read pending events and unassigned “ready/eligible” work from Postgres (coalesced).
+2. For each candidate order (or small batch candidate), fetch top-K couriers from Redis geo buckets (expanding rings).
+3. Score options with a small, stable function:
+   - SLA feasibility (dominant)
+   - incremental travel/idle cost (cheap ETA model)
+   - stickiness penalty (avoid changing committed work)
+   - simple fairness guards (minimum coverage quotas per zone/cohort, enforced as constraints)
+4. Create offers in Postgres (idempotent keys + uniqueness constraints), then push to courier apps.
+5. On accept: finalize assignment in Postgres; all other offers become invalid by constraint/transition rules.
+
+### Correctness and idempotency
+- Postgres enforces:
+  - one assignment per order
+  - one active offer per order (optional) and per courier “slot”
+  - idempotent state transitions via `(entity_id, version)` or `idempotency_key` uniqueness
+- Dispatch never sends an offer unless the offer row is durably inserted.
+- At-least-once processing is handled by idempotent inserts/updates and event cursoring.
+
+### Routing/ETA behavior (never blocks dispatch)
+- Dispatch uses a cheap ETA estimate in the hot loop (distance buckets + historical speeds).
+- Routing calls run async for refinement; re-offers only happen if the improvement is large enough and the current plan is not committed.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Operational simplicity (small-team build) | Separate scalable services per concern |
+| Correctness anchored in Postgres | Some peak throughput headroom |
+| Stable decisions under churn | Globally optimal routing/assignment |
+| Predictable overload via zone ticks | Lowest possible latency in all cases |
+| Minimal dependencies | Rich streaming ecosystem features |
+
+## Failure Modes
+
+- **Postgres unavailable / partitioned from Core Service**
+  - Behavior: order placement and dispatch stop; no offers are emitted.
+  - Recovery: resume from the durable event log and current truth tables; idempotent processing prevents duplicates.
+
+- **Redis unavailable / partitioned**
+  - Behavior: dispatch pauses new offers (cannot select couriers safely); batching disabled.
+  - Recovery: resume offers when courier presence returns; TTL-based presence avoids resurrecting stale couriers.
+
+- **Routing provider slow**
+  - Behavior: dispatch continues using cheap ETA; user-facing ETAs degrade to approximate; no re-offer storms.
+  - Recovery: async refinement resumes; circuit breakers prevent backlog growth.
+
+- **Offer storm from bad rollout/config**
+  - Behavior: per-zone kill switches disable batching/reoffers and freeze reassignments; tick budget caps work per interval.
+  - Recovery: revert config, replay from Postgres event log for verification.
+
+## What We Removed
+
+- Dedicated `Event Log` backbone (Kafka): replaced by Postgres outbox/event log for durability, replay, and consumption.
+- Separate `Dispatch Engine` service: merged into the core service as background workers for fewer operational seams.
+- Separate `Routing/ETA` service: replaced by direct calls to a routing provider API with strict non-blocking behavior.
+- Redis as the correctness boundary (locks/dedupe): correctness is enforced by Postgres constraints and idempotent writes.
+- Cryptographic offer keys: plain idempotency keys with scoped uniqueness in Postgres.
+
+## Operational Notes
+
+- Kill switches are per zone: disable batching, disable reoffers, freeze reassignments, “only assign ready orders.”
+- Every offer stores a compact explainability record (top reasons + failed guardrails) for ops and disputes.
+- Leading indicators: offers per courier, accept rate by cohort, late-at-pickup vs late-at-dropoff, Redis presence freshness.
+- On-call actions: drain a zone (stop new offers), freeze reassignment, and temporarily raise conservatism (disable batching).
+```
+tokens used
+9,373
+```markdown
+---
+title: "Food Delivery Logistics"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["marketplace", "dispatch", "routing", "optimization", "reliability"]
+---
+
+## Overview
+
+This system coordinates a 3-sided marketplace (customers, restaurants, couriers). It accepts orders, tracks restaurant readiness and courier locations, and continuously decides *who should deliver what, when*—including limited batching—while meeting SLAs and staying stable under churn.
+
+Dispatch is treated as a **streaming heuristic**: cheaply narrow candidates, then run a fast, sticky local assignment loop that prioritizes on-time delivery and avoids thrash.
+
+## What Makes This Hard
+
+1. **Churn + time windows**: GPS updates, accept/decline, prep delays, and traffic changes shift the “best” assignment every few seconds. Stability matters more than global optimality.
+2. **Batching is VRP**: even 2–3 orders per courier introduces hard routing constraints. The system wins by enforcing guardrails and making near-optimal decisions quickly.
+
+## Requirements
+
+### Functional Requirements
+- Order lifecycle: placed → confirmed → prepping → ready → picked up → delivered/canceled.
+- Courier assignment via **offers** with declines/timeouts; prevent double-assign.
+- **Batching (2–3 orders)** with strict constraints (compatible pickups, bounded detour, per-order SLA).
+- Continuous ETA updates for customer + courier; degrade safely when routing is slow.
+- Basic marketplace controls: avoid starving zones/cohorts; avoid offer spam.
+- Auditability: store “why this courier/route” at decision time.
+
+### Scale Targets
+- Peak order events: design for **150/s** bursts.
+- Courier updates: **15k location updates/s** (dominant write volume).
+- Dispatch latency: p95 < **200ms** from “ready/placed” to offer creation during normal load.
+- Correctness: no double-assign; tolerate at-least-once processing; idempotent transitions.
+
+## Key Design Decisions
+
+- **One core service, two execution modes**
+  - HTTP APIs for clients + background dispatch workers (same codebase).
+  - Why: one team can build and operate it; fewer failure boundaries.
+
+- **Postgres is the source of truth (including the durable event stream)**
+  - Orders/offers/assignments/audit live in Postgres.
+  - Dispatch consumes from an append-only `event_log`/outbox table using `SELECT ... FOR UPDATE SKIP LOCKED`.
+  - Why: replay/shadow runs and reliable idempotency without another backbone.
+
+- **Redis is strictly real-time courier presence**
+  - Stores courier location + availability with TTL and simple geo bucketing for fast candidate fetch.
+  - Why: absorbs 15k/s updates without hammering Postgres.
+
+- **Tick-based dispatch per zone**
+  - Fixed per-zone ticks coalesce events and enforce a work budget.
+  - Why: reduces recompute thrash and makes overload behavior predictable.
+
+- **Correctness boundaries live in Postgres**
+  - Offers are inserted before being sent to couriers; acceptance is only valid if the DB write succeeds.
+  - Uniqueness constraints prevent double-assign and “two active offers for one slot.”
+  - Why: eliminates split-brain as a correctness story.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Customer App] --> G[Managed Ingress]
+  R[Restaurant Tablet] --> G
+  U[Courier App] --> G
+
+  G --> S[Core Service (Order + Dispatch)]
+  S --> P[(Postgres)]
+  S --> K[(Redis)]
+  S --> T[Routing Provider API]
+```
+
+### Components
+
+- `Managed Ingress`: auth and rate limiting so client spikes don’t destabilize dispatch.
+- `Core Service (Order + Dispatch)`: owns order lifecycle, emits events to Postgres, runs the dispatch tick loop, creates offers, and records decision reasons.
+- `Postgres`: system of record for orders/offers/assignments and the durable event log for replay, backfills, and safe algorithm iteration.
+- `Redis`: courier location/availability with TTL + geo buckets for candidate generation at high write rates.
+- `Routing Provider API`: travel-time/route estimates for user-facing ETAs and non-critical refinement; dispatch hot path never blocks on it.
+
+## Deep Dive: Real-Time Batching + Stable Assignment
+
+### Guardrails (batching stays small and safe)
+Batching is only attempted when it passes fast checks:
+- pickups are same restaurant or very close
+- bounded detour for already-committed orders
+- feasible latest pickup/drop-off under conservative ETA bounds
+- courier capacity allows it
+
+If any dependency is degraded (Redis/routing/postgres connectivity), batching is disabled automatically.
+
+### Dispatch loop (per-zone tick)
+On each tick:
+1. Read pending events and unassigned “ready/eligible” work from Postgres (coalesced).
+2. For each candidate order (or small batch candidate), fetch top-K couriers from Redis geo buckets (expanding rings).
+3. Score options with a small, stable function:
+   - SLA feasibility (dominant)
+   - incremental travel/idle cost (cheap ETA model)
+   - stickiness penalty (avoid changing committed work)
+   - simple fairness guards (minimum coverage quotas per zone/cohort, enforced as constraints)
+4. Create offers in Postgres (idempotent keys + uniqueness constraints), then push to courier apps.
+5. On accept: finalize assignment in Postgres; all other offers become invalid by constraint/transition rules.
+
+### Correctness and idempotency
+- Postgres enforces:
+  - one assignment per order
+  - one active offer per order (optional) and per courier “slot”
+  - idempotent state transitions via `(entity_id, version)` or `idempotency_key` uniqueness
+- Dispatch never sends an offer unless the offer row is durably inserted.
+- At-least-once processing is handled by idempotent inserts/updates and event cursoring.
+
+### Routing/ETA behavior (never blocks dispatch)
+- Dispatch uses a cheap ETA estimate in the hot loop (distance buckets + historical speeds).
+- Routing calls run async for refinement; re-offers only happen if the improvement is large enough and the current plan is not committed.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Operational simplicity (small-team build) | Separate scalable services per concern |
+| Correctness anchored in Postgres | Some peak throughput headroom |
+| Stable decisions under churn | Globally optimal routing/assignment |
+| Predictable overload via zone ticks | Lowest possible latency in all cases |
+| Minimal dependencies | Rich streaming ecosystem features |
+
+## Failure Modes
+
+- **Postgres unavailable / partitioned from Core Service**
+  - Behavior: order placement and dispatch stop; no offers are emitted.
+  - Recovery: resume from the durable event log and current truth tables; idempotent processing prevents duplicates.
+
+- **Redis unavailable / partitioned**
+  - Behavior: dispatch pauses new offers (cannot select couriers safely); batching disabled.
+  - Recovery: resume offers when courier presence returns; TTL-based presence avoids resurrecting stale couriers.
+
+- **Routing provider slow**
+  - Behavior: dispatch continues using cheap ETA; user-facing ETAs degrade to approximate; no re-offer storms.
+  - Recovery: async refinement resumes; circuit breakers prevent backlog growth.
+
+- **Offer storm from bad rollout/config**
+  - Behavior: per-zone kill switches disable batching/reoffers and freeze reassignments; tick budget caps work per interval.
+  - Recovery: revert config, replay from Postgres event log for verification.
+
+## What We Removed
+
+- Dedicated `Event Log` backbone (Kafka): replaced by Postgres outbox/event log for durability, replay, and consumption.
+- Separate `Dispatch Engine` service: merged into the core service as background workers for fewer operational seams.
+- Separate `Routing/ETA` service: replaced by direct calls to a routing provider API with strict non-blocking behavior.
+- Redis as the correctness boundary (locks/dedupe): correctness is enforced by Postgres constraints and idempotent writes.
+- Cryptographic offer keys: plain idempotency keys with scoped uniqueness in Postgres.
+
+## Operational Notes
+
+- Kill switches are per zone: disable batching, disable reoffers, freeze reassignments, “only assign ready orders.”
+- Every offer stores a compact explainability record (top reasons + failed guardrails) for ops and disputes.
+- Leading indicators: offers per courier, accept rate by cohort, late-at-pickup vs late-at-dropoff, Redis presence freshness.
+- On-call actions: drain a zone (stop new offers), freeze reassignment, and temporarily raise conservatism (disable batching).
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/06-commerce-fintech/food-delivery-logistics.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+Found invalid Mermaid diagrams, fixing...
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afe-dcad-7901-880e-b4dd3d90d7b0
+--------
+user
+Fix these Mermaid syntax errors:
+
+
+--- Block 1 ---
+flowchart LR
+  C[Customer App] --> G[Managed Ingress]
+  R[Restaurant Tablet] --> G
+  U[Courier App] --> G
+
+  G --> S[Core Service (Order + Dispatch)]
+  S --> P[(Postgres)]
+  S --> K[(Redis)]
+  S --> T[Routing Provider API]
+--- Error ---
+Generating single mermaid chart
+
+Error: Parse error on line 6:
+
+
+Common fixes:
+- Quote labels with special characters: A["Label (with parens)"]
+- Use short labels (2-4 words max)
+- Remove HTML tags
+- Keep diagrams simple (max 8 nodes)
+
+Output the complete fixed document.
+
+---
+
+```markdown
+---
+title: "Food Delivery Logistics"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["marketplace", "dispatch", "routing", "optimization", "reliability"]
+---
+
+## Overview
+
+This system coordinates a 3-sided marketplace (customers, restaurants, couriers). It accepts orders, tracks restaurant readiness and courier locations, and continuously decides *who should deliver what, when*—including limited batching—while meeting SLAs and staying stable under churn.
+
+Dispatch is treated as a **streaming heuristic**: cheaply narrow candidates, then run a fast, sticky local assignment loop that prioritizes on-time delivery and avoids thrash.
+
+## What Makes This Hard
+
+1. **Churn + time windows**: GPS updates, accept/decline, prep delays, and traffic changes shift the “best” assignment every few seconds. Stability matters more than global optimality.
+2. **Batching is VRP**: even 2–3 orders per courier introduces hard routing constraints. The system wins by enforcing guardrails and making near-optimal decisions quickly.
+
+## Requirements
+
+### Functional Requirements
+- Order lifecycle: placed → confirmed → prepping → ready → picked up → delivered/canceled.
+- Courier assignment via **offers** with declines/timeouts; prevent double-assign.
+- **Batching (2–3 orders)** with strict constraints (compatible pickups, bounded detour, per-order SLA).
+- Continuous ETA updates for customer + courier; degrade safely when routing is slow.
+- Basic marketplace controls: avoid starving zones/cohorts; avoid offer spam.
+- Auditability: store “why this courier/route” at decision time.
+
+### Scale Targets
+- Peak order events: design for **150/s** bursts.
+- Courier updates: **15k location updates/s** (dominant write volume).
+- Dispatch latency: p95 < **200ms** from “ready/placed” to offer creation during normal load.
+- Correctness: no double-assign; tolerate at-least-once processing; idempotent transitions.
+
+## Key Design Decisions
+
+- **One core service, two execution modes**
+  - HTTP APIs for clients + background dispatch workers (same codebase).
+  - Why: one team can build and operate it; fewer failure boundaries.
+
+- **Postgres is the source of truth (including the durable event stream)**
+  - Orders/offers/assignments/audit live in Postgres.
+  - Dispatch consumes from an append-only `event_log`/outbox table using `SELECT ... FOR UPDATE SKIP LOCKED`.
+  - Why: replay/shadow runs and reliable idempotency without another backbone.
+
+- **Redis is strictly real-time courier presence**
+  - Stores courier location + availability with TTL and simple geo bucketing for fast candidate fetch.
+  - Why: absorbs 15k/s updates without hammering Postgres.
+
+- **Tick-based dispatch per zone**
+  - Fixed per-zone ticks coalesce events and enforce a work budget.
+  - Why: reduces recompute thrash and makes overload behavior predictable.
+
+- **Correctness boundaries live in Postgres**
+  - Offers are inserted before being sent to couriers; acceptance is only valid if the DB write succeeds.
+  - Uniqueness constraints prevent double-assign and “two active offers for one slot.”
+  - Why: eliminates split-brain as a correctness story.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Customer App] --> G[Managed Ingress]
+  R[Restaurant Tablet] --> G
+  U[Courier App] --> G
+
+  G --> S[Core Service (Order + Dispatch)]
+  S --> P[(Postgres)]
+  S --> K[(Redis)]
+  S --> T[Routing Provider API]
+```
+
+### Components
+
+- `Managed Ingress`: auth and rate limiting so client spikes don’t destabilize dispatch.
+- `Core Service (Order + Dispatch)`: owns order lifecycle, emits events to Postgres, runs the dispatch tick loop, creates offers, and records decision reasons.
+- `Postgres`: system of record for orders/offers/assignments and the durable event log for replay, backfills, and safe algorithm iteration.
+- `Redis`: courier location/availability with TTL + geo buckets for candidate generation at high write rates.
+- `Routing Provider API`: travel-time/route estimates for user-facing ETAs and non-critical refinement; dispatch hot path never blocks on it.
+
+## Deep Dive: Real-Time Batching + Stable Assignment
+
+### Guardrails (batching stays small and safe)
+Batching is only attempted when it passes fast checks:
+- pickups are same restaurant or very close
+- bounded detour for already-committed orders
+- feasible latest pickup/drop-off under conservative ETA bounds
+- courier capacity allows it
+
+If any dependency is degraded (Redis/routing/postgres connectivity), batching is disabled automatically.
+
+### Dispatch loop (per-zone tick)
+On each tick:
+1. Read pending events and unassigned “ready/eligible” work from Postgres (coalesced).
+2. For each candidate order (or small batch candidate), fetch top-K couriers from Redis geo buckets (expanding rings).
+3. Score options with a small, stable function:
+   - SLA feasibility (dominant)
+   - incremental travel/idle cost (cheap ETA model)
+   - stickiness penalty (avoid changing committed work)
+   - simple fairness guards (minimum coverage quotas per zone/cohort, enforced as constraints)
+4. Create offers in Postgres (idempotent keys + uniqueness constraints), then push to courier apps.
+5. On accept: finalize assignment in Postgres; all other offers become invalid by constraint/transition rules.
+
+### Correctness and idempotency
+- Postgres enforces:
+  - one assignment per order
+  - one active offer per order (optional) and per courier “slot”
+  - idempotent state transitions via `(entity_id, version)` or `idempotency_key` uniqueness
+- Dispatch never sends an offer unless the offer row is durably inserted.
+- At-least-once processing is handled by idempotent inserts/updates and event cursoring.
+
+### Routing/ETA behavior (never blocks dispatch)
+- Dispatch uses a cheap ETA estimate in the hot loop (distance buckets + historical speeds).
+- Routing calls run async for refinement; re-offers only happen if the improvement is large enough and the current plan is not committed.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Operational simplicity (small-team build) | Separate scalable services per concern |
+| Correctness anchored in Postgres | Some peak throughput headroom |
+| Stable decisions under churn | Globally optimal routing/assignment |
+| Predictable overload via zone ticks | Lowest possible latency in all cases |
+| Minimal dependencies | Rich streaming ecosystem features |
+
+## Failure Modes
+
+- **Postgres unavailable / partitioned from Core Service**
+  - Behavior: order placement and dispatch stop; no offers are emitted.
+  - Recovery: resume from the durable event log and current truth tables; idempotent processing prevents duplicates.
+
+- **Redis unavailable / partitioned**
+  - Behavior: dispatch pauses new offers (cannot select couriers safely); batching disabled.
+  - Recovery: resume offers when courier presence returns; TTL-based presence avoids resurrecting stale couriers.
+
+- **Routing provider slow**
+  - Behavior: dispatch continues using cheap ETA; user-facing ETAs degrade to approximate; no re-offer storms.
+  - Recovery: async refinement resumes; circuit breakers prevent backlog growth.
+
+- **Offer storm from bad rollout/config**
+  - Behavior: per-zone kill switches disable batching/reoffers and freeze reassignments; tick budget caps work per interval.
+  - Recovery: revert config, replay from Postgres event log for verification.
+
+## What We Removed
+
+- Dedicated `Event Log` backbone (Kafka): replaced by Postgres outbox/event log for durability, replay, and consumption.
+- Separate `Dispatch Engine` service: merged into the core service as background workers for fewer operational seams.
+- Separate `Routing/ETA` service: replaced by direct calls to a routing provider API with strict non-blocking behavior.
+- Redis as the correctness boundary (locks/dedupe): correctness is enforced by Postgres constraints and idempotent writes.
+- Cryptographic offer keys: plain idempotency keys with scoped uniqueness in Postgres.
+
+## Operational Notes
+
+- Kill switches are per zone: disable batching, disable reoffers, freeze reassignments, “only assign ready orders.”
+- Every offer stores a compact explainability record (top reasons + failed guardrails) for ops and disputes.
+- Leading indicators: offers per courier, accept rate by cohort, late-at-pickup vs late-at-dropoff, Redis presence freshness.
+- On-call actions: drain a zone (stop new offers), freeze reassignment, and temporarily raise conservatism (disable batching).
+```
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+thinking
+**Fixing syntax errors**
+
+I need to address some mermaid syntax errors, specifically a parse error at line 6. It looks like the issue arises from the label "Core Service (Order + Dispatch)" containing parentheses and a plus sign. In mermaid, labels require quoting, so I’ll change it to S["Core Service (Order + Dispatch)"]. I’ll also ensure any labels with special characters are quoted. My next step is to prepare the complete document with the corrected mermaid block, applying the patch without any additional modifications.
+thinking
+**Finding workspace file**
+
+In this environment, I need to locate the workspace file. The user supplied content but didn’t specify the path. So, I’ll need to search for the file containing this document. My plan is to inspect the repository and use the command line tool `rg` with the title of the document to find it. I’ll run this in the shell to ensure I get accurate results. Let's see what I can uncover!
+exec
+/bin/zsh -lc "rg -n \"title: \\\"Food Delivery Logistics\\\"\" -S ." in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 64ms:
+./logs/food-delivery-logistics.log:235:title: "Food Delivery Logistics"
+./logs/food-delivery-logistics.log:602:title: "Food Delivery Logistics"
+./logs/food-delivery-logistics.log:1050:title: "Food Delivery Logistics"
+./logs/food-delivery-logistics.log:1421:title: "Food Delivery Logistics"
+./logs/food-delivery-logistics.log:2023:title: "Food Delivery Logistics"
+./logs/food-delivery-logistics.log:2717:title: "Food Delivery Logistics"
+./logs/food-delivery-logistics.log:3366:title: "Food Delivery Logistics"
+./logs/food-delivery-logistics.log:3628:title: "Food Delivery Logistics"
+./reviewed/food-delivery-logistics.md:2:title: "Food Delivery Logistics"
+./logs/v2/food-delivery-logistics.log:162:title: "Food Delivery Logistics"
+./logs/v2/food-delivery-logistics.log:349:title: "Food Delivery Logistics"
+./logs/v2/food-delivery-logistics.log:657:title: "Food Delivery Logistics"
+./logs/v2/food-delivery-logistics.log:1108:title: "Food Delivery Logistics"
+./logs/v2/food-delivery-logistics.log:1433:title: "Food Delivery Logistics"
+./logs/v2/food-delivery-logistics.log:1594:title: "Food Delivery Logistics"
+./logs/v2/food-delivery-logistics.log:1800:title: "Food Delivery Logistics"
+./grades/food-delivery-logistics.log:52:title: "Food Delivery Logistics"
+./drafts-v2/food-delivery-logistics.md:3:title: "Food Delivery Logistics"
+./problems.yaml:348:    title: "Food Delivery Logistics"
+./solutions-v2/06-commerce-fintech/food-delivery-logistics.md:3:title: "Food Delivery Logistics"
+exec
+/bin/zsh -lc ls in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 84ms:
+challenges
+drafts
+drafts-v2
+frontend
+grades
+logs
+problems.yaml
+prompts
+reviewed
+scripts
+solutions
+solutions-v2
+exec
+/bin/zsh -lc 'find .. -maxdepth 2 -name AGENTS.md -print' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 58ms:
+../semper/AGENTS.md
+../24h_modal/AGENTS.md
+../betterdocs/AGENTS.md
+../kafkette/AGENTS.md
+
+thinking
+**Patching documentation files**
+
+I see there are no AGENTS in the repository, so it’s time to focus on patching the main documentation files. I’m wondering which specific files to target; there are solutions and possibly other directories involved. It might be best to fix all versions to prevent repeated errors. However, since the user asked for a complete fixed document, maybe I’ll just fix the provided snippet for output. I'll patch the relevant files and ensure any modifications are properly framed in the document. Let’s get started!
+exec
+/bin/zsh -lc "rg -n \"Core Service \\(Order \\+ Dispatch\\)\" -S ." in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 89ms:
+./logs/v2/food-delivery-logistics.log:1498:  G --> S[Core Service (Order + Dispatch)]
+./logs/v2/food-delivery-logistics.log:1507:- `Core Service (Order + Dispatch)`: owns order lifecycle, emits events to Postgres, runs the dispatch tick loop, creates offers, and records decision reasons.
+./logs/v2/food-delivery-logistics.log:1659:  G --> S[Core Service (Order + Dispatch)]
+./logs/v2/food-delivery-logistics.log:1668:- `Core Service (Order + Dispatch)`: owns order lifecycle, emits events to Postgres, runs the dispatch tick loop, creates offers, and records decision reasons.
+./logs/v2/food-delivery-logistics.log:1778:  G --> S[Core Service (Order + Dispatch)]
+./logs/v2/food-delivery-logistics.log:1865:  G --> S[Core Service (Order + Dispatch)]
+./logs/v2/food-delivery-logistics.log:1874:- `Core Service (Order + Dispatch)`: owns order lifecycle, emits events to Postgres, runs the dispatch tick loop, creates offers, and records decision reasons.
+./logs/v2/food-delivery-logistics.log:1964:I need to address some mermaid syntax errors, specifically a parse error at line 6. It looks like the issue arises from the label "Core Service (Order + Dispatch)" containing parentheses and a plus sign. In mermaid, labels require quoting, so I’ll change it to S["Core Service (Order + Dispatch)"]. I’ll also ensure any labels with special characters are quoted. My next step is to prepare the complete document with the corrected mermaid block, applying the patch without any additional modifications.
+./solutions-v2/06-commerce-fintech/food-delivery-logistics.md:68:  G --> S[Core Service (Order + Dispatch)]
+./solutions-v2/06-commerce-fintech/food-delivery-logistics.md:77:- `Core Service (Order + Dispatch)`: owns order lifecycle, emits events to Postgres, runs the dispatch tick loop, creates offers, and records decision reasons.
+exec
+/bin/zsh -lc 'rg -n "flowchart LR" solutions reviewed drafts drafts-v2 solutions-v2 -S' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 64ms:
+solutions/10-strategic-problems/multi-cluster-service-mesh.md:213:flowchart LR
+solutions/04-realtime-media/live-video-streaming.md:34:flowchart LR
+reviewed/ride-hailing-dispatch.md:77:flowchart LR
+solutions/04-realtime-media/video-on-demand.md:107:flowchart LR
+solutions-v2/10-strategic-problems/offline-first-application-sync.md:45:flowchart LR
+solutions/10-strategic-problems/global-blacklisting-system.md:71:flowchart LR
+solutions-v2/10-strategic-problems/attribution-measurement-system.md:47:flowchart LR
+solutions/04-realtime-media/leaderboard-system.md:61:flowchart LR
+drafts-v2/email-delivery-platform.md:58:flowchart LR
+reviewed/recommendation-system-infrastructure.md:90:flowchart LR
+solutions-v2/10-strategic-problems/event-schema-registry.md:48:flowchart LR
+drafts-v2/retrieval-augmented-generation.md:57:flowchart LR
+solutions-v2/10-strategic-problems/self-healing-infrastructure.md:53:flowchart LR
+drafts-v2/workflow-orchestration-engine.md:59:flowchart LR
+solutions-v2/10-strategic-problems/privacy-preserving-analytics.md:54:flowchart LR
+solutions/05-social-discovery/recommendation-system-infrastructure.md:49:flowchart LR
+drafts-v2/right-to-be-forgotten-pipeline.md:67:flowchart LR
+solutions-v2/10-strategic-problems/global-blacklisting-system.md:63:flowchart LR
+solutions-v2/05-social-discovery/recommendation-system-infrastructure.md:57:flowchart LR
+solutions-v2/05-social-discovery/trending-topics-engine.md:39:flowchart LR
+exec
+/bin/zsh -lc 'ls solutions/06-commerce-fintech' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 44ms:
+digital-wallet.md
+distributed-shopping-cart.md
+flash-sale-system.md
+food-delivery-logistics.md
+fraud-detection-pipeline.md
+high-frequency-trading-gateway.md
+inventory-management-system.md
+payment-processing-gateway.md
+ride-hailing-dispatch.md
+ticket-reservation-system.md
+exec
+/bin/zsh -lc "rg -n \"Core Service \\(Order \\+ Dispatch\\)\" solutions/06-commerce-fintech/food-delivery-logistics.md -n" in /Users/dominikdabrowski/pr/system-design-atlas exited 1 in 46ms:
+
+exec
+/bin/zsh -lc "nl -ba drafts-v2/food-delivery-logistics.md | sed -n '45,120p'" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 45ms:
+    45	  - Chose: candidate generation + fast assignment loop (local search / greedy with backtracking), rerun on relevant events.
+    46	  - Rejected: exact VRPTW solvers online; “nearest courier” only.
+    47	  - Why: exact solvers don’t converge under churn; nearest-only kills batching and SLA adherence.
+    48	
+    49	- **Postgres as source of truth, Redis as ephemeral real-time state**
+    50	  - Chose: Postgres for orders/offers/audit; Redis for courier location, availability, hot indexes, locks.
+    51	  - Rejected: “everything in Redis,” or a bespoke state store.
+    52	  - Why: you need durability and queryability for disputes and ops; Redis keeps the hot loop fast.
+    53	
+    54	- **Durable event log for replay + decoupling**
+    55	  - Chose: Kafka (or equivalent) for order/restaurant/courier events; dispatch emits offers as events.
+    56	  - Rejected: point-to-point RPC fanout as the backbone.
+    57	  - Why: replay is essential for debugging, simulation, and safe algorithm changes; the bus absorbs spikes.
+    58	
+    59	## Architecture
+    60	
+    61	```mermaid
+    62	flowchart LR
+    63	  C[Customer App] --> G[API Gateway]
+    64	  R[Restaurant Tablet] --> G
+exec
+/bin/zsh -lc "nl -ba solutions/06-commerce-fintech/food-delivery-logistics.md | sed -n '50,110p'" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 43ms:
+    50	  S --> MAPS[Maps/Traffic API]
+    51	  S <--> PAY[Payment Provider]
+    52	  S <--> PUSH[APNs/FCM]
+    53	```
+    54	
+    55	### What’s inside `Logistics Service`
+    56	- **HTTP APIs** for customer/restaurant/courier (idempotent state changes)
+    57	- **Order state machine** + payment orchestration
+    58	- **Location ingest** (validation + downsampling) writing latest location to Redis
+    59	- **Dispatch worker** (assignment + batching) reading Redis hot state and writing offers/assignments to Postgres
+    60	- **ETA/routing module** using maps API with caching
+    61	- **Realtime gateway** (WebSockets) + Redis Pub/Sub for cross-instance fanout
+    62	
+    63	Major simplification: domain “services” become modules deployed together, which keeps correctness and optimization tightly integrated without distributed transactions.
+    64	
+    65	---
+    66	
+    67	## Core Workflows
+    68	
+    69	### Order Placement → Dispatch → Offer
+exec
+/bin/zsh -lc "nl -ba solutions-v2/06-commerce-fintech/food-delivery-logistics.md | sed -n '50,110p'" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 43ms:
+    50	
+    51	- **Tick-based dispatch per zone**
+    52	  - Fixed per-zone ticks coalesce events and enforce a work budget.
+    53	  - Why: reduces recompute thrash and makes overload behavior predictable.
+    54	
+    55	- **Correctness boundaries live in Postgres**
+    56	  - Offers are inserted before being sent to couriers; acceptance is only valid if the DB write succeeds.
+    57	  - Uniqueness constraints prevent double-assign and “two active offers for one slot.”
+    58	  - Why: eliminates split-brain as a correctness story.
+    59	
+    60	## Architecture
+    61	
+    62	```mermaid
+    63	flowchart LR
+    64	  C[Customer App] --> G[Managed Ingress]
+    65	  R[Restaurant Tablet] --> G
+    66	  U[Courier App] --> G
+    67	
+    68	  G --> S[Core Service (Order + Dispatch)]
+    69	  S --> P[(Postgres)]
+
+thinking
+**Investigating the user’s issue**
+
+The problem seems to lie within the solutions-v2 version of the diagram. The user’s snippet closely matches that file, though the path might differ. It seems likely they want a fix in the food-delivery-logistics.md file located in solutions-v2/06-commerce-fintech. Perhaps I should also check the reviewed/food-delivery-logistics.md for any potential fixes. Noting that logs are generated could be less relevant, but I want to ensure completeness in my approach.
+exec
+/bin/zsh -lc 'ls reviewed | rg -n "food" || true' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 57ms:
+43:food-delivery-logistics.md
+exec
+/bin/zsh -lc "nl -ba reviewed/food-delivery-logistics.md | sed -n '50,110p'" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 74ms:
+    50	#### Latency (P99)
+    51	- **Quote + place order**: P99 **< 300ms** for platform processing (excluding external payment provider latency)
+    52	- **Dispatch decision** (order eligible → offer created): P99 **< 1s** within a metro
+    53	- **Realtime tracking update** (location received → pushed update): P99 **< 2s**
+    54	- **ETA freshness**: bounded staleness **≤ 5s** in normal operation
+    55	
+    56	#### Availability (SLOs)
+    57	- **Checkout (order placement + payment)**: **99.99%**
+    58	- **Dispatch pipeline (offer creation)**: **99.95%**
+    59	- **Realtime tracking**: **99.95%** (degrades to polling if needed)
+    60	
+    61	#### Consistency Model
+    62	- **Strong consistency** for order/payment state transitions and uniqueness invariants (e.g., “at most one active assignment per order”).
+    63	- **Eventual consistency** (bounded staleness) for courier locations, ETAs, heatmaps, and ranking signals.
+    64	- **User-perceived exactly-once** for checkout and accept flows via idempotency + state machine constraints (not literal exactly-once delivery).
+    65	
+    66	#### Durability / Data Loss
+    67	- **Orders/payments**: RPO ~ **0** for committed transactions (durable WAL + replication).
+    68	- **Location telemetry**: tolerate limited loss under overload (e.g., **≤1–2%** during transient network or backpressure) while keeping “latest known location” accurate.
+    69	
+exec
+/bin/zsh -lc "sed -n '1,220p' solutions-v2/06-commerce-fintech/food-delivery-logistics.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 120ms:
+```markdown
+---
+title: "Food Delivery Logistics"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["marketplace", "dispatch", "routing", "optimization", "reliability"]
+---
+
+## Overview
+
+This system coordinates a 3-sided marketplace (customers, restaurants, couriers). It accepts orders, tracks restaurant readiness and courier locations, and continuously decides *who should deliver what, when*—including limited batching—while meeting SLAs and staying stable under churn.
+
+Dispatch is treated as a **streaming heuristic**: cheaply narrow candidates, then run a fast, sticky local assignment loop that prioritizes on-time delivery and avoids thrash.
+
+## What Makes This Hard
+
+1. **Churn + time windows**: GPS updates, accept/decline, prep delays, and traffic changes shift the “best” assignment every few seconds. Stability matters more than global optimality.
+2. **Batching is VRP**: even 2–3 orders per courier introduces hard routing constraints. The system wins by enforcing guardrails and making near-optimal decisions quickly.
+
+## Requirements
+
+
+thinking
+**Fixing the markdown code**
+
+I see that the file includes a markdown code block, and I need to make sure to fix the line for `G --> S[Core Service (Order + Dispatch)]`. The correct format should be `G --> S["Core Service (Order + Dispatch)"]` without needing to escape within the mermaid block.
+
+I realize that validating the syntax is important, but there's no need to run mermaid-cli for validation. I'll also check to ensure the label isn't defined elsewhere in subsequent lines.
+thinking
+**Applying the patch**
+
+I understand that the node definitions will stay the same, while the edges will define the nodes. For instance, `G --> S["..."]` clearly defines S, and then I can use subsequent edges like `S --> P[(Postgres)]`, leveraging S's prior definition. This approach should work seamlessly. Now, I’ll go ahead and apply the necessary patch to make sure everything is correctly set up. It's exciting to see how this will all come together!
+file update
+M /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/06-commerce-fintech/food-delivery-logistics.md
+@@ -67,3 +67,3 @@
+ 
+-  G --> S[Core Service (Order + Dispatch)]
++  G --> S["Core Service (Order + Dispatch)"]
+   S --> P[(Postgres)]
+@@ -158,2 +158,2 @@
+ - On-call actions: drain a zone (stop new offers), freeze reassignment, and temporarily raise conservatism (disable batching).
+-```
+\ No newline at end of file
++```
+apply_patch(auto_approved=true) exited 0 in 27ms:
+Success. Updated the following files:
+M solutions-v2/06-commerce-fintech/food-delivery-logistics.md
+file update:
+diff --git a/solutions-v2/06-commerce-fintech/food-delivery-logistics.md b/solutions-v2/06-commerce-fintech/food-delivery-logistics.md
+index 9d9062d51a365f0cdc45d339183e93118d8d5afa..4c9b660c8806b9b79ffea38ceb2082c7c8b17ce9
+--- a/solutions-v2/06-commerce-fintech/food-delivery-logistics.md
++++ b/solutions-v2/06-commerce-fintech/food-delivery-logistics.md
+@@ -65,7 +65,7 @@
+   R[Restaurant Tablet] --> G
+   U[Courier App] --> G
+ 
+-  G --> S[Core Service (Order + Dispatch)]
++  G --> S["Core Service (Order + Dispatch)"]
+   S --> P[(Postgres)]
+   S --> K[(Redis)]
+   S --> T[Routing Provider API]
+@@ -156,4 +156,4 @@
+ - Every offer stores a compact explainability record (top reasons + failed guardrails) for ops and disputes.
+ - Leading indicators: offers per courier, accept rate by cohort, late-at-pickup vs late-at-dropoff, Redis presence freshness.
+ - On-call actions: drain a zone (stop new offers), freeze reassignment, and temporarily raise conservatism (disable batching).
+-```
+\ No newline at end of file
++```
+
+file update:
+diff --git a/solutions-v2/06-commerce-fintech/food-delivery-logistics.md b/solutions-v2/06-commerce-fintech/food-delivery-logistics.md
+index 9d9062d51a365f0cdc45d339183e93118d8d5afa..4c9b660c8806b9b79ffea38ceb2082c7c8b17ce9
+--- a/solutions-v2/06-commerce-fintech/food-delivery-logistics.md
++++ b/solutions-v2/06-commerce-fintech/food-delivery-logistics.md
+@@ -65,7 +65,7 @@
+   R[Restaurant Tablet] --> G
+   U[Courier App] --> G
+ 
+-  G --> S[Core Service (Order + Dispatch)]
++  G --> S["Core Service (Order + Dispatch)"]
+   S --> P[(Postgres)]
+   S --> K[(Redis)]
+   S --> T[Routing Provider API]
+@@ -156,4 +156,4 @@
+ - Every offer stores a compact explainability record (top reasons + failed guardrails) for ops and disputes.
+ - Leading indicators: offers per courier, accept rate by cohort, late-at-pickup vs late-at-dropoff, Redis presence freshness.
+ - On-call actions: drain a zone (stop new offers), freeze reassignment, and temporarily raise conservatism (disable batching).
+-```
+\ No newline at end of file
++```
+
+exec
+/bin/zsh -lc 'cat solutions-v2/06-commerce-fintech/food-delivery-logistics.md' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 43ms:
+```markdown
+---
+title: "Food Delivery Logistics"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["marketplace", "dispatch", "routing", "optimization", "reliability"]
+---
+
+## Overview
+
+This system coordinates a 3-sided marketplace (customers, restaurants, couriers). It accepts orders, tracks restaurant readiness and courier locations, and continuously decides *who should deliver what, when*—including limited batching—while meeting SLAs and staying stable under churn.
+
+Dispatch is treated as a **streaming heuristic**: cheaply narrow candidates, then run a fast, sticky local assignment loop that prioritizes on-time delivery and avoids thrash.
+
+## What Makes This Hard
+
+1. **Churn + time windows**: GPS updates, accept/decline, prep delays, and traffic changes shift the “best” assignment every few seconds. Stability matters more than global optimality.
+2. **Batching is VRP**: even 2–3 orders per courier introduces hard routing constraints. The system wins by enforcing guardrails and making near-optimal decisions quickly.
+
+## Requirements
+
+thinking
+**Preparing final document response**
+
+I'm getting ready to craft the final response, and it feels quite large! It’s necessary to include everything as the user requested. I think it's best not to mention the file path in this case, just to be safe. Since the user asked for the complete fixed document, I'll respond with a markdown code block containing the full document. There's no need to plan any additional tools for this!
+codex
+```markdown
+---
+title: "Food Delivery Logistics"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["marketplace", "dispatch", "routing", "optimization", "reliability"]
+---
+
+## Overview
+
+This system coordinates a 3-sided marketplace (customers, restaurants, couriers). It accepts orders, tracks restaurant readiness and courier locations, and continuously decides *who should deliver what, when*—including limited batching—while meeting SLAs and staying stable under churn.
+
+Dispatch is treated as a **streaming heuristic**: cheaply narrow candidates, then run a fast, sticky local assignment loop that prioritizes on-time delivery and avoids thrash.
+
+## What Makes This Hard
+
+1. **Churn + time windows**: GPS updates, accept/decline, prep delays, and traffic changes shift the “best” assignment every few seconds. Stability matters more than global optimality.
+2. **Batching is VRP**: even 2–3 orders per courier introduces hard routing constraints. The system wins by enforcing guardrails and making near-optimal decisions quickly.
+
+## Requirements
+
+### Functional Requirements
+- Order lifecycle: placed → confirmed → prepping → ready → picked up → delivered/canceled.
+- Courier assignment via **offers** with declines/timeouts; prevent double-assign.
+- **Batching (2–3 orders)** with strict constraints (compatible pickups, bounded detour, per-order SLA).
+- Continuous ETA updates for customer + courier; degrade safely when routing is slow.
+- Basic marketplace controls: avoid starving zones/cohorts; avoid offer spam.
+- Auditability: store “why this courier/route” at decision time.
+
+### Scale Targets
+- Peak order events: design for **150/s** bursts.
+- Courier updates: **15k location updates/s** (dominant write volume).
+- Dispatch latency: p95 < **200ms** from “ready/placed” to offer creation during normal load.
+- Correctness: no double-assign; tolerate at-least-once processing; idempotent transitions.
+
+## Key Design Decisions
+
+- **One core service, two execution modes**
+  - HTTP APIs for clients + background dispatch workers (same codebase).
+  - Why: one team can build and operate it; fewer failure boundaries.
+
+- **Postgres is the source of truth (including the durable event stream)**
+  - Orders/offers/assignments/audit live in Postgres.
+  - Dispatch consumes from an append-only `event_log`/outbox table using `SELECT ... FOR UPDATE SKIP LOCKED`.
+  - Why: replay/shadow runs and reliable idempotency without another backbone.
+
+- **Redis is strictly real-time courier presence**
+  - Stores courier location + availability with TTL and simple geo bucketing for fast candidate fetch.
+  - Why: absorbs 15k/s updates without hammering Postgres.
+
+- **Tick-based dispatch per zone**
+  - Fixed per-zone ticks coalesce events and enforce a work budget.
+  - Why: reduces recompute thrash and makes overload behavior predictable.
+
+- **Correctness boundaries live in Postgres**
+  - Offers are inserted before being sent to couriers; acceptance is only valid if the DB write succeeds.
+  - Uniqueness constraints prevent double-assign and “two active offers for one slot.”
+  - Why: eliminates split-brain as a correctness story.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Customer App] --> G[Managed Ingress]
+  R[Restaurant Tablet] --> G
+  U[Courier App] --> G
+
+  G --> S["Core Service (Order + Dispatch)"]
+  S --> P[(Postgres)]
+  S --> K[(Redis)]
+  S --> T[Routing Provider API]
+```
+
+### Components
+
+- `Managed Ingress`: auth and rate limiting so client spikes don’t destabilize dispatch.
+- `Core Service (Order + Dispatch)`: owns order lifecycle, emits events to Postgres, runs the dispatch tick loop, creates offers, and records decision reasons.
+- `Postgres`: system of record for orders/offers/assignments and the durable event log for replay, backfills, and safe algorithm iteration.
+- `Redis`: courier location/availability with TTL + geo buckets for candidate generation at high write rates.
+- `Routing Provider API`: travel-time/route estimates for user-facing ETAs and non-critical refinement; dispatch hot path never blocks on it.
+
+## Deep Dive: Real-Time Batching + Stable Assignment
+
+### Guardrails (batching stays small and safe)
+Batching is only attempted when it passes fast checks:
+- pickups are same restaurant or very close
+- bounded detour for already-committed orders
+- feasible latest pickup/drop-off under conservative ETA bounds
+- courier capacity allows it
+
+If any dependency is degraded (Redis/routing/postgres connectivity), batching is disabled automatically.
+
+### Dispatch loop (per-zone tick)
+On each tick:
+1. Read pending events and unassigned “ready/eligible” work from Postgres (coalesced).
+2. For each candidate order (or small batch candidate), fetch top-K couriers from Redis geo buckets (expanding rings).
+3. Score options with a small, stable function:
+   - SLA feasibility (dominant)
+   - incremental travel/idle cost (cheap ETA model)
+   - stickiness penalty (avoid changing committed work)
+   - simple fairness guards (minimum coverage quotas per zone/cohort, enforced as constraints)
+4. Create offers in Postgres (idempotent keys + uniqueness constraints), then push to courier apps.
+5. On accept: finalize assignment in Postgres; all other offers become invalid by constraint/transition rules.
+
+### Correctness and idempotency
+- Postgres enforces:
+  - one assignment per order
+  - one active offer per order (optional) and per courier “slot”
+  - idempotent state transitions via `(entity_id, version)` or `idempotency_key` uniqueness
+- Dispatch never sends an offer unless the offer row is durably inserted.
+- At-least-once processing is handled by idempotent inserts/updates and event cursoring.
+
+### Routing/ETA behavior (never blocks dispatch)
+- Dispatch uses a cheap ETA estimate in the hot loop (distance buckets + historical speeds).
+- Routing calls run async for refinement; re-offers only happen if the improvement is large enough and the current plan is not committed.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Operational simplicity (small-team build) | Separate scalable services per concern |
+| Correctness anchored in Postgres | Some peak throughput headroom |
+| Stable decisions under churn | Globally optimal routing/assignment |
+| Predictable overload via zone ticks | Lowest possible latency in all cases |
+| Minimal dependencies | Rich streaming ecosystem features |
+
+## Failure Modes
+
+- **Postgres unavailable / partitioned from Core Service**
+  - Behavior: order placement and dispatch stop; no offers are emitted.
+  - Recovery: resume from the durable event log and current truth tables; idempotent processing prevents duplicates.
+
+- **Redis unavailable / partitioned**
+  - Behavior: dispatch pauses new offers (cannot select couriers safely); batching disabled.
+  - Recovery: resume offers when courier presence returns; TTL-based presence avoids resurrecting stale couriers.
+
+- **Routing provider slow**
+  - Behavior: dispatch continues using cheap ETA; user-facing ETAs degrade to approximate; no re-offer storms.
+  - Recovery: async refinement resumes; circuit breakers prevent backlog growth.
+
+- **Offer storm from bad rollout/config**
+  - Behavior: per-zone kill switches disable batching/reoffers and freeze reassignments; tick budget caps work per interval.
+  - Recovery: revert config, replay from Postgres event log for verification.
+
+## What We Removed
+
+- Dedicated `Event Log` backbone (Kafka): replaced by Postgres outbox/event log for durability, replay, and consumption.
+- Separate `Dispatch Engine` service: merged into the core service as background workers for fewer operational seams.
+- Separate `Routing/ETA` service: replaced by direct calls to a routing provider API with strict non-blocking behavior.
+- Redis as the correctness boundary (locks/dedupe): correctness is enforced by Postgres constraints and idempotent writes.
+- Cryptographic offer keys: plain idempotency keys with scoped uniqueness in Postgres.
+
+## Operational Notes
+
+- Kill switches are per zone: disable batching, disable reoffers, freeze reassignments, “only assign ready orders.”
+- Every offer stores a compact explainability record (top reasons + failed guardrails) for ops and disputes.
+- Leading indicators: offers per courier, accept rate by cohort, late-at-pickup vs late-at-dropoff, Redis presence freshness.
+- On-call actions: drain a zone (stop new offers), freeze reassignment, and temporarily raise conservatism (disable batching).
+```
+file update:
+diff --git a/solutions-v2/06-commerce-fintech/food-delivery-logistics.md b/solutions-v2/06-commerce-fintech/food-delivery-logistics.md
+index 9d9062d51a365f0cdc45d339183e93118d8d5afa..4c9b660c8806b9b79ffea38ceb2082c7c8b17ce9
+--- a/solutions-v2/06-commerce-fintech/food-delivery-logistics.md
++++ b/solutions-v2/06-commerce-fintech/food-delivery-logistics.md
+@@ -65,7 +65,7 @@
+   R[Restaurant Tablet] --> G
+   U[Courier App] --> G
+ 
+-  G --> S[Core Service (Order + Dispatch)]
++  G --> S["Core Service (Order + Dispatch)"]
+   S --> P[(Postgres)]
+   S --> K[(Redis)]
+   S --> T[Routing Provider API]
+@@ -156,4 +156,4 @@
+ - Every offer stores a compact explainability record (top reasons + failed guardrails) for ops and disputes.
+ - Leading indicators: offers per courier, accept rate by cohort, late-at-pickup vs late-at-dropoff, Redis presence freshness.
+ - On-call actions: drain a zone (stop new offers), freeze reassignment, and temporarily raise conservatism (disable batching).
+-```
+\ No newline at end of file
++```
+
+tokens used
+25,782
+```markdown
+---
+title: "Food Delivery Logistics"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["marketplace", "dispatch", "routing", "optimization", "reliability"]
+---
+
+## Overview
+
+This system coordinates a 3-sided marketplace (customers, restaurants, couriers). It accepts orders, tracks restaurant readiness and courier locations, and continuously decides *who should deliver what, when*—including limited batching—while meeting SLAs and staying stable under churn.
+
+Dispatch is treated as a **streaming heuristic**: cheaply narrow candidates, then run a fast, sticky local assignment loop that prioritizes on-time delivery and avoids thrash.
+
+## What Makes This Hard
+
+1. **Churn + time windows**: GPS updates, accept/decline, prep delays, and traffic changes shift the “best” assignment every few seconds. Stability matters more than global optimality.
+2. **Batching is VRP**: even 2–3 orders per courier introduces hard routing constraints. The system wins by enforcing guardrails and making near-optimal decisions quickly.
+
+## Requirements
+
+### Functional Requirements
+- Order lifecycle: placed → confirmed → prepping → ready → picked up → delivered/canceled.
+- Courier assignment via **offers** with declines/timeouts; prevent double-assign.
+- **Batching (2–3 orders)** with strict constraints (compatible pickups, bounded detour, per-order SLA).
+- Continuous ETA updates for customer + courier; degrade safely when routing is slow.
+- Basic marketplace controls: avoid starving zones/cohorts; avoid offer spam.
+- Auditability: store “why this courier/route” at decision time.
+
+### Scale Targets
+- Peak order events: design for **150/s** bursts.
+- Courier updates: **15k location updates/s** (dominant write volume).
+- Dispatch latency: p95 < **200ms** from “ready/placed” to offer creation during normal load.
+- Correctness: no double-assign; tolerate at-least-once processing; idempotent transitions.
+
+## Key Design Decisions
+
+- **One core service, two execution modes**
+  - HTTP APIs for clients + background dispatch workers (same codebase).
+  - Why: one team can build and operate it; fewer failure boundaries.
+
+- **Postgres is the source of truth (including the durable event stream)**
+  - Orders/offers/assignments/audit live in Postgres.
+  - Dispatch consumes from an append-only `event_log`/outbox table using `SELECT ... FOR UPDATE SKIP LOCKED`.
+  - Why: replay/shadow runs and reliable idempotency without another backbone.
+
+- **Redis is strictly real-time courier presence**
+  - Stores courier location + availability with TTL and simple geo bucketing for fast candidate fetch.
+  - Why: absorbs 15k/s updates without hammering Postgres.
+
+- **Tick-based dispatch per zone**
+  - Fixed per-zone ticks coalesce events and enforce a work budget.
+  - Why: reduces recompute thrash and makes overload behavior predictable.
+
+- **Correctness boundaries live in Postgres**
+  - Offers are inserted before being sent to couriers; acceptance is only valid if the DB write succeeds.
+  - Uniqueness constraints prevent double-assign and “two active offers for one slot.”
+  - Why: eliminates split-brain as a correctness story.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Customer App] --> G[Managed Ingress]
+  R[Restaurant Tablet] --> G
+  U[Courier App] --> G
+
+  G --> S["Core Service (Order + Dispatch)"]
+  S --> P[(Postgres)]
+  S --> K[(Redis)]
+  S --> T[Routing Provider API]
+```
+
+### Components
+
+- `Managed Ingress`: auth and rate limiting so client spikes don’t destabilize dispatch.
+- `Core Service (Order + Dispatch)`: owns order lifecycle, emits events to Postgres, runs the dispatch tick loop, creates offers, and records decision reasons.
+- `Postgres`: system of record for orders/offers/assignments and the durable event log for replay, backfills, and safe algorithm iteration.
+- `Redis`: courier location/availability with TTL + geo buckets for candidate generation at high write rates.
+- `Routing Provider API`: travel-time/route estimates for user-facing ETAs and non-critical refinement; dispatch hot path never blocks on it.
+
+## Deep Dive: Real-Time Batching + Stable Assignment
+
+### Guardrails (batching stays small and safe)
+Batching is only attempted when it passes fast checks:
+- pickups are same restaurant or very close
+- bounded detour for already-committed orders
+- feasible latest pickup/drop-off under conservative ETA bounds
+- courier capacity allows it
+
+If any dependency is degraded (Redis/routing/postgres connectivity), batching is disabled automatically.
+
+### Dispatch loop (per-zone tick)
+On each tick:
+1. Read pending events and unassigned “ready/eligible” work from Postgres (coalesced).
+2. For each candidate order (or small batch candidate), fetch top-K couriers from Redis geo buckets (expanding rings).
+3. Score options with a small, stable function:
+   - SLA feasibility (dominant)
+   - incremental travel/idle cost (cheap ETA model)
+   - stickiness penalty (avoid changing committed work)
+   - simple fairness guards (minimum coverage quotas per zone/cohort, enforced as constraints)
+4. Create offers in Postgres (idempotent keys + uniqueness constraints), then push to courier apps.
+5. On accept: finalize assignment in Postgres; all other offers become invalid by constraint/transition rules.
+
+### Correctness and idempotency
+- Postgres enforces:
+  - one assignment per order
+  - one active offer per order (optional) and per courier “slot”
+  - idempotent state transitions via `(entity_id, version)` or `idempotency_key` uniqueness
+- Dispatch never sends an offer unless the offer row is durably inserted.
+- At-least-once processing is handled by idempotent inserts/updates and event cursoring.
+
+### Routing/ETA behavior (never blocks dispatch)
+- Dispatch uses a cheap ETA estimate in the hot loop (distance buckets + historical speeds).
+- Routing calls run async for refinement; re-offers only happen if the improvement is large enough and the current plan is not committed.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Operational simplicity (small-team build) | Separate scalable services per concern |
+| Correctness anchored in Postgres | Some peak throughput headroom |
+| Stable decisions under churn | Globally optimal routing/assignment |
+| Predictable overload via zone ticks | Lowest possible latency in all cases |
+| Minimal dependencies | Rich streaming ecosystem features |
+
+## Failure Modes
+
+- **Postgres unavailable / partitioned from Core Service**
+  - Behavior: order placement and dispatch stop; no offers are emitted.
+  - Recovery: resume from the durable event log and current truth tables; idempotent processing prevents duplicates.
+
+- **Redis unavailable / partitioned**
+  - Behavior: dispatch pauses new offers (cannot select couriers safely); batching disabled.
+  - Recovery: resume offers when courier presence returns; TTL-based presence avoids resurrecting stale couriers.
+
+- **Routing provider slow**
+  - Behavior: dispatch continues using cheap ETA; user-facing ETAs degrade to approximate; no re-offer storms.
+  - Recovery: async refinement resumes; circuit breakers prevent backlog growth.
+
+- **Offer storm from bad rollout/config**
+  - Behavior: per-zone kill switches disable batching/reoffers and freeze reassignments; tick budget caps work per interval.
+  - Recovery: revert config, replay from Postgres event log for verification.
+
+## What We Removed
+
+- Dedicated `Event Log` backbone (Kafka): replaced by Postgres outbox/event log for durability, replay, and consumption.
+- Separate `Dispatch Engine` service: merged into the core service as background workers for fewer operational seams.
+- Separate `Routing/ETA` service: replaced by direct calls to a routing provider API with strict non-blocking behavior.
+- Redis as the correctness boundary (locks/dedupe): correctness is enforced by Postgres constraints and idempotent writes.
+- Cryptographic offer keys: plain idempotency keys with scoped uniqueness in Postgres.
+
+## Operational Notes
+
+- Kill switches are per zone: disable batching, disable reoffers, freeze reassignments, “only assign ready orders.”
+- Every offer stores a compact explainability record (top reasons + failed guardrails) for ops and disputes.
+- Leading indicators: offers per courier, accept rate by cohort, late-at-pickup vs late-at-dropoff, Redis presence freshness.
+- On-call actions: drain a zone (stop new offers), freeze reassignment, and temporarily raise conservatism (disable batching).
+```
+[Pass 4/4] Mermaid diagrams fixed
+
+==========================================
+Completed (v2): Food Delivery Logistics
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/food-delivery-logistics.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/food-delivery-logistics.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/06-commerce-fintech/food-delivery-logistics.md

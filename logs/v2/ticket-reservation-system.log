@@ -1,0 +1,1603 @@
+==========================================
+Generating (v2): Ticket Reservation System
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2c8c-7a63-86b8-f06cc6ca58aa
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Ticket Reservation System
+**Category**: Commerce & Fintech
+
+**Problem Statement**:
+Design a seat allocation engine for high-demand events (concerts) dealing with contention, seat maps, and bot/scalper prevention.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+thinking
+**Designing a seat allocation system**
+
+I need to create a markdown document following a specific template, focusing on opinionated design. The tricky parts include contention and fair seat allocation, anti-bot measures, and balancing consistency with performance. I’m considering using Postgres for transactions and possibly Redis for reservation holds, but I'll need to ensure that seat maps can handle transactions effectively. A single-writer approach per event with an "event shard" actor model could help manage concurrency issues while treating each event as a strongly-consistent seat ledger.
+thinking
+**Building a Seat Allocator Service**
+
+I’m planning to build a Seat Allocator service that uses consistent hashing to route events to the appropriate allocator instance via etcd. The system aims to allocate the best seats while creating hold tokens with a time-to-live. I’ll use Postgres with serializable transactions alongside an in-memory cache for fast access. For bot prevention, measures like a WAF, device attestation, and payment verification will be in place. We’ll also implement a waiting room and virtual queue to manage user load efficiently.
+thinking
+**Planning the Seat Allocation Architecture**
+
+I’m considering a system that includes a Seat Allocator, Ticketing API, Postgres, Redis, and an anti-bot/queue mechanism, along with payment processing and monitoring. I want to keep the system diagram to a maximum of 8 nodes: Client, CDN/WAF, Waiting Room, Ticketing API, Seat Allocator (sharded), Redis (holds and rates), Postgres (ledger and orders), and Payment. It’s crucial to ensure we don't allow users to directly "choose any seat" at peak times; instead, we should offer "best available" options and manage stale holds.
+codex
+```markdown
+---
+title: "Ticket Reservation System"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["ticketing", "high-contention", "consistency", "sharding", "anti-bot", "reservations"]
+---
+
+## Overview
+
+This system allocates seats for high-demand events under extreme contention while keeping the user experience predictable: either you hold seats quickly, or you get a definitive “not available”—no ambiguous limbo. The core insight is to treat each event as a **single strongly-consistent “seat ledger” with one writer**, and scale by **sharding across events**, not by trying to make seat writes multi-writer and “distributed-locky”.
+
+Most of the rest should be boring: Postgres is the source of truth for holds and purchases, Redis handles short-lived rate limits and tokens, and a waiting room shapes traffic so the allocator is sized for *sustained* throughput, not the first 30 seconds of a drop.
+
+## What Makes This Hard
+
+Naive implementations let many stateless API servers write seat state concurrently and “just use transactions”. Under a real on-sale (bots + humans), that becomes a thundering herd of conflicting updates, lock waits, deadlocks, and eventually inconsistent UX (double-sold seats, phantom availability, holds that never resolve).
+
+The trap is that seat allocation *looks* like a database problem but is really a **contention and fairness problem**. If you don’t deliberately choose a single serialization point per event, you end up building a distributed lock manager accidentally—usually at 3am, during your biggest concert.
+
+## Requirements
+
+### Functional Requirements
+- Place a **time-bound hold** on specific seats (or “best available” within constraints), returning a signed hold token.
+- Confirm purchase using the hold token; purchase must be **idempotent** and must not oversell.
+- Serve seat maps with near-real-time availability; availability can be slightly stale for reads, but **writes must be correct**.
+- Enforce anti-bot/scalper controls: per-identity limits, velocity limits, queue fairness, and instrumentation for abuse.
+- Provide an audit trail: who held what, when it expired, and why a purchase failed.
+
+### Scale Targets
+- On-sale peak: **200k requests/sec** at the edge, shaped to **20k seat-write ops/sec** into the allocator fleet.
+- Concurrency: **1M users in waiting room**; **100k actively browsing** seat maps.
+- Event size: up to **50k seats/event**; ~**10k events/day**; “hot” events dominate contention.
+- Latency SLO (post-queue): **p95 hold < 250ms**, **p95 purchase < 500ms**. These matter because holds are user-visible and short TTLs amplify retry storms.
+
+## Key Design Decisions
+
+- **We choose:** Per-event single-writer allocation (sharded “event leaders”) that serializes seat writes.
+  - **We reject:** Multi-writer seat updates with distributed locks or “just use SERIALIZABLE everywhere”.
+  - **Why:** The single-writer makes correctness and UX stable under peak contention; scaling comes from event sharding, which matches real traffic (many events, a few hot).
+
+- **We choose:** Postgres as the source of truth with explicit state machine for `seat -> held -> sold` plus idempotency keys.
+  - **We reject:** Storing the authoritative seat state only in Redis (fast but fragile) or event-sourcing everything on day 1.
+  - **Why:** Postgres gives durable correctness and simple recovery; Redis remains an accelerator, not a truth source.
+
+- **We choose:** Waiting room + deterministic admission (token-based) to shape traffic and reduce bot advantage.
+  - **We reject:** Letting everyone hit allocation endpoints directly and “rate limit later”.
+  - **Why:** Without admission control, retries and bot bursts will drown the allocator and degrade fairness.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[Users/Bots] --> WAF["CDN + WAF"]
+  WAF --> Q["Waiting Room"]
+  Q --> API["Ticketing API"]
+  API --> ALLOC["Seat Allocator (Event Shards)"]
+  ALLOC --> R["Redis (limits/tokens)"]
+  ALLOC --> DB["Postgres (holds/orders)"]
+  API --> PAY["Payment Provider"]
+  PAY --> API
+```
+
+### Components
+
+- `CDN + WAF`: Blocks obvious automation, terminates TLS, and caches static seat map assets (sections/rows geometry) so origin traffic is dominated by *availability deltas*, not SVG/JSON blobs.
+- `Waiting Room`: Issues admission tokens (signed, short-lived) and meters entry per event. This is the fairness “front door” and the main tool to keep allocator throughput stable.
+- `Ticketing API`: Stateless orchestration: validates admission + identity, calls allocator, handles purchase idempotency, and integrates with payment.
+- `Seat Allocator (Event Shards)`: The only place allowed to mutate seat availability. Routes by `event_id` to a single leader instance per shard; maintains a hot in-memory view for fast selection and emits durable writes to Postgres.
+- `Redis (limits/tokens)`: Fast checks for velocity limits, device/account quotas, token replay detection, and short-lived hold token registry (to reduce DB lookups on obviously invalid tokens).
+- `Postgres (holds/orders)`: Durable state machine and audit log. Constraints ensure “no double-sell” even if upstream logic misbehaves.
+- `Payment Provider`: External dependency; purchase flow is designed so payment callbacks can be retried safely without duplicating orders.
+
+## Deep Dive: Contention-Safe Seat Allocation
+
+The allocator runs a **single-writer loop per event**. Practically: consistent-hash `event_id` to a shard, then use a lightweight leader mechanism (etcd/consul session leases) so exactly one instance is active for that shard. All seat holds and purchases for an event are serialized through that leader. This avoids distributed locks on individual seats; the “lock” is simply “the event leader processes requests one at a time (or in a bounded batch)”.
+
+**Hold flow (write path):**
+1. API validates admission token + identity and forwards `HoldRequest(event_id, seat_ids | constraints, client_request_id)`.
+2. Allocator checks in-memory availability, selects seats (or rejects).
+3. Allocator writes a single Postgres transaction:
+   - Insert `holds(hold_id, event_id, user_id, expires_at, request_id)` with `UNIQUE(user_id, request_id)` for idempotency.
+   - Insert `held_seats(event_id, seat_id, hold_id)` with `UNIQUE(event_id, seat_id)` so a seat can only be held once.
+4. Allocator returns a **signed hold token** containing `hold_id`, `event_id`, `expires_at`, and a nonce.
+5. Expiry is enforced by time: holds past `expires_at` are treated as invalid; a background reaper updates state and frees seats (but correctness does not depend on the reaper being perfectly punctual).
+
+The critical point is that correctness is achieved by **(a) event-level serialization** for performance and **(b) database uniqueness constraints** as the last line of defense. If two requests ever race (due to failover or retry), Postgres rejects the second claim on `(event_id, seat_id)` and the allocator returns a clean “seat not available” without corrupting state.
+
+**Purchase flow (commit path):**
+- Purchase is idempotent via `UNIQUE(order_request_id)` and transitions held seats to sold in a transaction that verifies:
+  - hold exists, not expired, belongs to user, and seats match.
+  - seats are still linked to that hold.
+- Payment is handled as a two-step commit:
+  - Create `order` in `PENDING_PAYMENT` with the held seats reserved.
+  - On payment confirmation callback, transition to `PAID` and mark seats `SOLD`.
+This isolates the allocator from payment latency while preserving a single authoritative outcome per `order_request_id`.
+
+**Serving seat maps without melting the allocator:**
+- Static geometry (sections/rows/seat coordinates) is CDN-cached.
+- Dynamic availability is served as compact deltas (e.g., sold/held bitsets per section) pulled from allocator’s in-memory view, refreshed from Postgres on startup and periodically reconciled.
+- Under extreme load, degrade gracefully: disable arbitrary seat picking and offer “best available” (same correctness, far less combinatorial scanning).
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness under peak contention | Some per-event throughput ceiling (by design) |
+| Predictable UX (fast yes/no) | Perfectly real-time availability reads everywhere |
+| Simple recovery (DB truth) | Cross-event transactions (intentionally avoided) |
+| Operability for small team | Maximum hardware efficiency at microsecond level |
+
+## Failure Modes
+
+- **Allocator leader dies mid-onsale**
+  - **What happens:** Requests for affected events briefly fail or queue; holds/purchases may be retried.
+  - **Detect:** Missing shard lease heartbeat; spike in allocator 5xx; increased API timeouts for specific `event_id`.
+  - **Recover:** New leader acquires lease, warms in-memory state from Postgres (holds + sold), resumes; idempotency keys prevent duplicate outcomes.
+
+- **Redis outage / eviction**
+  - **What happens:** Rate limits and token replay detection degrade; more junk reaches API/allocator.
+  - **Detect:** Redis error rate, increased WAF pass-through, elevated allocator CPU.
+  - **Recover:** Fail open for non-critical checks but tighten waiting room admission; rely on Postgres constraints for correctness; restore Redis and re-enable strict limits.
+
+- **Payment provider latency / webhook storms**
+  - **What happens:** Many orders stuck in `PENDING_PAYMENT`; users retry purchase.
+  - **Detect:** Growing pending orders, webhook retry counts, elevated purchase retries.
+  - **Recover:** Purchase remains idempotent; seats stay reserved to the hold/order until TTL; surface clear UI timers; reconcile webhooks via periodic polling job for “unknown” payments.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Split allocator shards more finely (more leaders), move availability deltas to a dedicated read path (materialized bitsets per section), and implement a stricter admission algorithm per event to keep write QPS flat.
+- **100x scale:** Move from Postgres-centric writes to a log-based seat ledger per event (append-only + compaction) with Postgres as derived state, because the hottest events will outgrow single-node write IOPS even with sharding.
+
+## Operational Notes
+
+- Keep the “event leader” mapping visible: an on-call should be able to answer “which instance owns event 123?” in one command.
+- Alert on **per-event** metrics, not just global: hottest events hide inside averages.
+- Treat “retry storms” as a first-class incident: cap client retries, return explicit backoff headers, and let the waiting room absorb surges.
+- Always prefer correctness over availability on writes: a clean “try again” is better than a double-sold seat you can’t unwind cleanly.
+```
+tokens used
+3,726
+```markdown
+---
+title: "Ticket Reservation System"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["ticketing", "high-contention", "consistency", "sharding", "anti-bot", "reservations"]
+---
+
+## Overview
+
+This system allocates seats for high-demand events under extreme contention while keeping the user experience predictable: either you hold seats quickly, or you get a definitive “not available”—no ambiguous limbo. The core insight is to treat each event as a **single strongly-consistent “seat ledger” with one writer**, and scale by **sharding across events**, not by trying to make seat writes multi-writer and “distributed-locky”.
+
+Most of the rest should be boring: Postgres is the source of truth for holds and purchases, Redis handles short-lived rate limits and tokens, and a waiting room shapes traffic so the allocator is sized for *sustained* throughput, not the first 30 seconds of a drop.
+
+## What Makes This Hard
+
+Naive implementations let many stateless API servers write seat state concurrently and “just use transactions”. Under a real on-sale (bots + humans), that becomes a thundering herd of conflicting updates, lock waits, deadlocks, and eventually inconsistent UX (double-sold seats, phantom availability, holds that never resolve).
+
+The trap is that seat allocation *looks* like a database problem but is really a **contention and fairness problem**. If you don’t deliberately choose a single serialization point per event, you end up building a distributed lock manager accidentally—usually at 3am, during your biggest concert.
+
+## Requirements
+
+### Functional Requirements
+- Place a **time-bound hold** on specific seats (or “best available” within constraints), returning a signed hold token.
+- Confirm purchase using the hold token; purchase must be **idempotent** and must not oversell.
+- Serve seat maps with near-real-time availability; availability can be slightly stale for reads, but **writes must be correct**.
+- Enforce anti-bot/scalper controls: per-identity limits, velocity limits, queue fairness, and instrumentation for abuse.
+- Provide an audit trail: who held what, when it expired, and why a purchase failed.
+
+### Scale Targets
+- On-sale peak: **200k requests/sec** at the edge, shaped to **20k seat-write ops/sec** into the allocator fleet.
+- Concurrency: **1M users in waiting room**; **100k actively browsing** seat maps.
+- Event size: up to **50k seats/event**; ~**10k events/day**; “hot” events dominate contention.
+- Latency SLO (post-queue): **p95 hold < 250ms**, **p95 purchase < 500ms**. These matter because holds are user-visible and short TTLs amplify retry storms.
+
+## Key Design Decisions
+
+- **We choose:** Per-event single-writer allocation (sharded “event leaders”) that serializes seat writes.
+  - **We reject:** Multi-writer seat updates with distributed locks or “just use SERIALIZABLE everywhere”.
+  - **Why:** The single-writer makes correctness and UX stable under peak contention; scaling comes from event sharding, which matches real traffic (many events, a few hot).
+
+- **We choose:** Postgres as the source of truth with explicit state machine for `seat -> held -> sold` plus idempotency keys.
+  - **We reject:** Storing the authoritative seat state only in Redis (fast but fragile) or event-sourcing everything on day 1.
+  - **Why:** Postgres gives durable correctness and simple recovery; Redis remains an accelerator, not a truth source.
+
+- **We choose:** Waiting room + deterministic admission (token-based) to shape traffic and reduce bot advantage.
+  - **We reject:** Letting everyone hit allocation endpoints directly and “rate limit later”.
+  - **Why:** Without admission control, retries and bot bursts will drown the allocator and degrade fairness.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[Users/Bots] --> WAF["CDN + WAF"]
+  WAF --> Q["Waiting Room"]
+  Q --> API["Ticketing API"]
+  API --> ALLOC["Seat Allocator (Event Shards)"]
+  ALLOC --> R["Redis (limits/tokens)"]
+  ALLOC --> DB["Postgres (holds/orders)"]
+  API --> PAY["Payment Provider"]
+  PAY --> API
+```
+
+### Components
+
+- `CDN + WAF`: Blocks obvious automation, terminates TLS, and caches static seat map assets (sections/rows geometry) so origin traffic is dominated by *availability deltas*, not SVG/JSON blobs.
+- `Waiting Room`: Issues admission tokens (signed, short-lived) and meters entry per event. This is the fairness “front door” and the main tool to keep allocator throughput stable.
+- `Ticketing API`: Stateless orchestration: validates admission + identity, calls allocator, handles purchase idempotency, and integrates with payment.
+- `Seat Allocator (Event Shards)`: The only place allowed to mutate seat availability. Routes by `event_id` to a single leader instance per shard; maintains a hot in-memory view for fast selection and emits durable writes to Postgres.
+- `Redis (limits/tokens)`: Fast checks for velocity limits, device/account quotas, token replay detection, and short-lived hold token registry (to reduce DB lookups on obviously invalid tokens).
+- `Postgres (holds/orders)`: Durable state machine and audit log. Constraints ensure “no double-sell” even if upstream logic misbehaves.
+- `Payment Provider`: External dependency; purchase flow is designed so payment callbacks can be retried safely without duplicating orders.
+
+## Deep Dive: Contention-Safe Seat Allocation
+
+The allocator runs a **single-writer loop per event**. Practically: consistent-hash `event_id` to a shard, then use a lightweight leader mechanism (etcd/consul session leases) so exactly one instance is active for that shard. All seat holds and purchases for an event are serialized through that leader. This avoids distributed locks on individual seats; the “lock” is simply “the event leader processes requests one at a time (or in a bounded batch)”.
+
+**Hold flow (write path):**
+1. API validates admission token + identity and forwards `HoldRequest(event_id, seat_ids | constraints, client_request_id)`.
+2. Allocator checks in-memory availability, selects seats (or rejects).
+3. Allocator writes a single Postgres transaction:
+   - Insert `holds(hold_id, event_id, user_id, expires_at, request_id)` with `UNIQUE(user_id, request_id)` for idempotency.
+   - Insert `held_seats(event_id, seat_id, hold_id)` with `UNIQUE(event_id, seat_id)` so a seat can only be held once.
+4. Allocator returns a **signed hold token** containing `hold_id`, `event_id`, `expires_at`, and a nonce.
+5. Expiry is enforced by time: holds past `expires_at` are treated as invalid; a background reaper updates state and frees seats (but correctness does not depend on the reaper being perfectly punctual).
+
+The critical point is that correctness is achieved by **(a) event-level serialization** for performance and **(b) database uniqueness constraints** as the last line of defense. If two requests ever race (due to failover or retry), Postgres rejects the second claim on `(event_id, seat_id)` and the allocator returns a clean “seat not available” without corrupting state.
+
+**Purchase flow (commit path):**
+- Purchase is idempotent via `UNIQUE(order_request_id)` and transitions held seats to sold in a transaction that verifies:
+  - hold exists, not expired, belongs to user, and seats match.
+  - seats are still linked to that hold.
+- Payment is handled as a two-step commit:
+  - Create `order` in `PENDING_PAYMENT` with the held seats reserved.
+  - On payment confirmation callback, transition to `PAID` and mark seats `SOLD`.
+This isolates the allocator from payment latency while preserving a single authoritative outcome per `order_request_id`.
+
+**Serving seat maps without melting the allocator:**
+- Static geometry (sections/rows/seat coordinates) is CDN-cached.
+- Dynamic availability is served as compact deltas (e.g., sold/held bitsets per section) pulled from allocator’s in-memory view, refreshed from Postgres on startup and periodically reconciled.
+- Under extreme load, degrade gracefully: disable arbitrary seat picking and offer “best available” (same correctness, far less combinatorial scanning).
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness under peak contention | Some per-event throughput ceiling (by design) |
+| Predictable UX (fast yes/no) | Perfectly real-time availability reads everywhere |
+| Simple recovery (DB truth) | Cross-event transactions (intentionally avoided) |
+| Operability for small team | Maximum hardware efficiency at microsecond level |
+
+## Failure Modes
+
+- **Allocator leader dies mid-onsale**
+  - **What happens:** Requests for affected events briefly fail or queue; holds/purchases may be retried.
+  - **Detect:** Missing shard lease heartbeat; spike in allocator 5xx; increased API timeouts for specific `event_id`.
+  - **Recover:** New leader acquires lease, warms in-memory state from Postgres (holds + sold), resumes; idempotency keys prevent duplicate outcomes.
+
+- **Redis outage / eviction**
+  - **What happens:** Rate limits and token replay detection degrade; more junk reaches API/allocator.
+  - **Detect:** Redis error rate, increased WAF pass-through, elevated allocator CPU.
+  - **Recover:** Fail open for non-critical checks but tighten waiting room admission; rely on Postgres constraints for correctness; restore Redis and re-enable strict limits.
+
+- **Payment provider latency / webhook storms**
+  - **What happens:** Many orders stuck in `PENDING_PAYMENT`; users retry purchase.
+  - **Detect:** Growing pending orders, webhook retry counts, elevated purchase retries.
+  - **Recover:** Purchase remains idempotent; seats stay reserved to the hold/order until TTL; surface clear UI timers; reconcile webhooks via periodic polling job for “unknown” payments.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Split allocator shards more finely (more leaders), move availability deltas to a dedicated read path (materialized bitsets per section), and implement a stricter admission algorithm per event to keep write QPS flat.
+- **100x scale:** Move from Postgres-centric writes to a log-based seat ledger per event (append-only + compaction) with Postgres as derived state, because the hottest events will outgrow single-node write IOPS even with sharding.
+
+## Operational Notes
+
+- Keep the “event leader” mapping visible: an on-call should be able to answer “which instance owns event 123?” in one command.
+- Alert on **per-event** metrics, not just global: hottest events hide inside averages.
+- Treat “retry storms” as a first-class incident: cap client retries, return explicit backoff headers, and let the waiting room absorb surges.
+- Always prefer correctness over availability on writes: a clean “try again” is better than a double-sold seat you can’t unwind cleanly.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/ticket-reservation-system.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-af92-7b72-8110-94eb1df9fce8
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Ticket Reservation System"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["ticketing", "high-contention", "consistency", "sharding", "anti-bot", "reservations"]
+---
+
+## Overview
+
+This system allocates seats for high-demand events under extreme contention while keeping the user experience predictable: either you hold seats quickly, or you get a definitive “not available”—no ambiguous limbo. The core insight is to treat each event as a **single strongly-consistent “seat ledger” with one writer**, and scale by **sharding across events**, not by trying to make seat writes multi-writer and “distributed-locky”.
+
+Most of the rest should be boring: Postgres is the source of truth for holds and purchases, Redis handles short-lived rate limits and tokens, and a waiting room shapes traffic so the allocator is sized for *sustained* throughput, not the first 30 seconds of a drop.
+
+## What Makes This Hard
+
+Naive implementations let many stateless API servers write seat state concurrently and “just use transactions”. Under a real on-sale (bots + humans), that becomes a thundering herd of conflicting updates, lock waits, deadlocks, and eventually inconsistent UX (double-sold seats, phantom availability, holds that never resolve).
+
+The trap is that seat allocation *looks* like a database problem but is really a **contention and fairness problem**. If you don’t deliberately choose a single serialization point per event, you end up building a distributed lock manager accidentally—usually at 3am, during your biggest concert.
+
+## Requirements
+
+### Functional Requirements
+- Place a **time-bound hold** on specific seats (or “best available” within constraints), returning a signed hold token.
+- Confirm purchase using the hold token; purchase must be **idempotent** and must not oversell.
+- Serve seat maps with near-real-time availability; availability can be slightly stale for reads, but **writes must be correct**.
+- Enforce anti-bot/scalper controls: per-identity limits, velocity limits, queue fairness, and instrumentation for abuse.
+- Provide an audit trail: who held what, when it expired, and why a purchase failed.
+
+### Scale Targets
+- On-sale peak: **200k requests/sec** at the edge, shaped to **20k seat-write ops/sec** into the allocator fleet.
+- Concurrency: **1M users in waiting room**; **100k actively browsing** seat maps.
+- Event size: up to **50k seats/event**; ~**10k events/day**; “hot” events dominate contention.
+- Latency SLO (post-queue): **p95 hold < 250ms**, **p95 purchase < 500ms**. These matter because holds are user-visible and short TTLs amplify retry storms.
+
+## Key Design Decisions
+
+- **We choose:** Per-event single-writer allocation (sharded “event leaders”) that serializes seat writes.
+  - **We reject:** Multi-writer seat updates with distributed locks or “just use SERIALIZABLE everywhere”.
+  - **Why:** The single-writer makes correctness and UX stable under peak contention; scaling comes from event sharding, which matches real traffic (many events, a few hot).
+
+- **We choose:** Postgres as the source of truth with explicit state machine for `seat -> held -> sold` plus idempotency keys.
+  - **We reject:** Storing the authoritative seat state only in Redis (fast but fragile) or event-sourcing everything on day 1.
+  - **Why:** Postgres gives durable correctness and simple recovery; Redis remains an accelerator, not a truth source.
+
+- **We choose:** Waiting room + deterministic admission (token-based) to shape traffic and reduce bot advantage.
+  - **We reject:** Letting everyone hit allocation endpoints directly and “rate limit later”.
+  - **Why:** Without admission control, retries and bot bursts will drown the allocator and degrade fairness.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[Users/Bots] --> WAF["CDN + WAF"]
+  WAF --> Q["Waiting Room"]
+  Q --> API["Ticketing API"]
+  API --> ALLOC["Seat Allocator (Event Shards)"]
+  ALLOC --> R["Redis (limits/tokens)"]
+  ALLOC --> DB["Postgres (holds/orders)"]
+  API --> PAY["Payment Provider"]
+  PAY --> API
+```
+
+### Components
+
+- `CDN + WAF`: Blocks obvious automation, terminates TLS, and caches static seat map assets (sections/rows geometry) so origin traffic is dominated by *availability deltas*, not SVG/JSON blobs.
+- `Waiting Room`: Issues admission tokens (signed, short-lived) and meters entry per event. This is the fairness “front door” and the main tool to keep allocator throughput stable.
+- `Ticketing API`: Stateless orchestration: validates admission + identity, calls allocator, handles purchase idempotency, and integrates with payment.
+- `Seat Allocator (Event Shards)`: The only place allowed to mutate seat availability. Routes by `event_id` to a single leader instance per shard; maintains a hot in-memory view for fast selection and emits durable writes to Postgres.
+- `Redis (limits/tokens)`: Fast checks for velocity limits, device/account quotas, token replay detection, and short-lived hold token registry (to reduce DB lookups on obviously invalid tokens).
+- `Postgres (holds/orders)`: Durable state machine and audit log. Constraints ensure “no double-sell” even if upstream logic misbehaves.
+- `Payment Provider`: External dependency; purchase flow is designed so payment callbacks can be retried safely without duplicating orders.
+
+## Deep Dive: Contention-Safe Seat Allocation
+
+The allocator runs a **single-writer loop per event**. Practically: consistent-hash `event_id` to a shard, then use a lightweight leader mechanism (etcd/consul session leases) so exactly one instance is active for that shard. All seat holds and purchases for an event are serialized through that leader. This avoids distributed locks on individual seats; the “lock” is simply “the event leader processes requests one at a time (or in a bounded batch)”.
+
+**Hold flow (write path):**
+1. API validates admission token + identity and forwards `HoldRequest(event_id, seat_ids | constraints, client_request_id)`.
+2. Allocator checks in-memory availability, selects seats (or rejects).
+3. Allocator writes a single Postgres transaction:
+   - Insert `holds(hold_id, event_id, user_id, expires_at, request_id)` with `UNIQUE(user_id, request_id)` for idempotency.
+   - Insert `held_seats(event_id, seat_id, hold_id)` with `UNIQUE(event_id, seat_id)` so a seat can only be held once.
+4. Allocator returns a **signed hold token** containing `hold_id`, `event_id`, `expires_at`, and a nonce.
+5. Expiry is enforced by time: holds past `expires_at` are treated as invalid; a background reaper updates state and frees seats (but correctness does not depend on the reaper being perfectly punctual).
+
+The critical point is that correctness is achieved by **(a) event-level serialization** for performance and **(b) database uniqueness constraints** as the last line of defense. If two requests ever race (due to failover or retry), Postgres rejects the second claim on `(event_id, seat_id)` and the allocator returns a clean “seat not available” without corrupting state.
+
+**Purchase flow (commit path):**
+- Purchase is idempotent via `UNIQUE(order_request_id)` and transitions held seats to sold in a transaction that verifies:
+  - hold exists, not expired, belongs to user, and seats match.
+  - seats are still linked to that hold.
+- Payment is handled as a two-step commit:
+  - Create `order` in `PENDING_PAYMENT` with the held seats reserved.
+  - On payment confirmation callback, transition to `PAID` and mark seats `SOLD`.
+This isolates the allocator from payment latency while preserving a single authoritative outcome per `order_request_id`.
+
+**Serving seat maps without melting the allocator:**
+- Static geometry (sections/rows/seat coordinates) is CDN-cached.
+- Dynamic availability is served as compact deltas (e.g., sold/held bitsets per section) pulled from allocator’s in-memory view, refreshed from Postgres on startup and periodically reconciled.
+- Under extreme load, degrade gracefully: disable arbitrary seat picking and offer “best available” (same correctness, far less combinatorial scanning).
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness under peak contention | Some per-event throughput ceiling (by design) |
+| Predictable UX (fast yes/no) | Perfectly real-time availability reads everywhere |
+| Simple recovery (DB truth) | Cross-event transactions (intentionally avoided) |
+| Operability for small team | Maximum hardware efficiency at microsecond level |
+
+## Failure Modes
+
+- **Allocator leader dies mid-onsale**
+  - **What happens:** Requests for affected events briefly fail or queue; holds/purchases may be retried.
+  - **Detect:** Missing shard lease heartbeat; spike in allocator 5xx; increased API timeouts for specific `event_id`.
+  - **Recover:** New leader acquires lease, warms in-memory state from Postgres (holds + sold), resumes; idempotency keys prevent duplicate outcomes.
+
+- **Redis outage / eviction**
+  - **What happens:** Rate limits and token replay detection degrade; more junk reaches API/allocator.
+  - **Detect:** Redis error rate, increased WAF pass-through, elevated allocator CPU.
+  - **Recover:** Fail open for non-critical checks but tighten waiting room admission; rely on Postgres constraints for correctness; restore Redis and re-enable strict limits.
+
+- **Payment provider latency / webhook storms**
+  - **What happens:** Many orders stuck in `PENDING_PAYMENT`; users retry purchase.
+  - **Detect:** Growing pending orders, webhook retry counts, elevated purchase retries.
+  - **Recover:** Purchase remains idempotent; seats stay reserved to the hold/order until TTL; surface clear UI timers; reconcile webhooks via periodic polling job for “unknown” payments.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Split allocator shards more finely (more leaders), move availability deltas to a dedicated read path (materialized bitsets per section), and implement a stricter admission algorithm per event to keep write QPS flat.
+- **100x scale:** Move from Postgres-centric writes to a log-based seat ledger per event (append-only + compaction) with Postgres as derived state, because the hottest events will outgrow single-node write IOPS even with sharding.
+
+## Operational Notes
+
+- Keep the “event leader” mapping visible: an on-call should be able to answer “which instance owns event 123?” in one command.
+- Alert on **per-event** metrics, not just global: hottest events hide inside averages.
+- Treat “retry storms” as a first-class incident: cap client retries, return explicit backoff headers, and let the waiting room absorb surges.
+- Always prefer correctness over availability on writes: a clean “try again” is better than a double-sold seat you can’t unwind cleanly.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+thinking
+**Structuring critique effectively**
+
+The user wants a structured critique, but no tools are needed for this. I'll focus on providing concise yet substantive feedback. 
+
+First, I’ll identify the core insight and create a components table. Then, I should look at simplification opportunities where I can streamline the current setup. It's essential to stress test several scenarios, like if the database goes down or if there's a network partition. 
+
+I'll offer recommendations and acknowledge what’s working well while exploring alternatives like Postgres advisory locks and Redis. Maybe simplifying by using Postgres for leader election could be beneficial, though I need to think about the implications for failover and throughput. There’s also the possibility of using constraints instead of in-memory states, but I must consider performance.
+thinking
+**Optimizing hold reaper strategy**
+
+For the hold reaper, I’m thinking about leveraging a database TTL with an `expires_at` field to determine the availability of holds. This way, there's no need to constantly update the seat state. While partial unique indexes can be useful, I noticed I can't reference `now()` in the index, but I could use `held_seats` with `expires_at` and make the seat_id unique for active holds, which will need a background cleanup job. 
+
+Using Postgres `pg_cron` or partitioning for reaping might also help. I could consider treating the hold token as a capability instead of needing a Redis registry, which simplifies things, although Redis could still play a role in replay detection. It might also be beneficial to precompute seat bitsets and manage them in memory, ensuring reconciliation deals with any drift. Moreover, I need to run stress tests for various scenarios, like a leader dying post-commit and duplicate hold requests.
+thinking
+**Addressing system constraints and scenarios**
+
+When considering unique constraints, they definitely help protect data integrity, but I see potential for increased conflicts and latency. Using fencing tokens with lease revisions in the database is necessary. 
+
+I also need to think about Postgres failovers that can lead to lost prepared transactions or replication lag, especially when reading from replicas for the seat map. 
+
+There’s the issue of clock skew affecting the validity of holds and token TTL, which makes me realize we need server-side time and some leeway. If the database goes down for five minutes, I wonder what the waiting room should do—maybe it should stop admitting new holds, display a "service unavailable" banner, and preserve existing holds. 
+
+I also need to factor in issues like Redis going down and bots interfering. Another thought is about payment callbacks where a hold could expire while a payment is pending. That suggests we should establish a separate reservation TTL for orders. 
+
+And then there's the VACUUM and bloat concerns in the held_seats table, which may lead to reaper locks. To address this, using partitions per event and time could be effective. Fairness is a crucial consideration too; I’ll ensure deterministic admission per event, and within that event, I might need to implement FIFO for holds in each shard leader to prevent starvation.
+thinking
+**Refining rate limiting and system components**
+
+When it comes to rate limiting by identity, I realize that identity can be forged, so I need to consider incorporating device fingerprints, accounts, payment instruments, and IP addresses—there are tradeoffs involved.
+
+I can identify components to focus on, such as the waiting room, allocator, Postgres with constraints, etcd leader election, and a WAF. 
+
+I've identified simplification opportunities: using Postgres advisory locks instead of etcd/consul, materialized views or Redis bitsets for in-memory state, signed tokens instead of a Redis replay registry, and managing the waiting room rather than custom solutions. 
+
+Also, I must address the fencing token to prevent split-brain scenarios while ensuring explicit DB schema constraints and locking contention. It’s important to reinforce idempotency at the API and payment provider level, making sure purchases verify that holds are still valid. 
+
+I should also clarify the semantics of hold expiration with pending payments. Observability is crucial, so I’ll want to implement event-based metrics. Lastly, could I include `SELECT ... FOR UPDATE SKIP LOCKED` for seat assignments? I wonder, though, if that might avoid multi-writer situations; still, inside the leader, I could batch commits effectively.
+thinking
+**Evaluating the system architecture**
+
+I’m considering using a per-event queue, like Kafka or Redis streams, to streamline event handling instead of relying solely on an event leader. However, I need to weigh the complexity of managing a consumer group per event.
+
+Operational aspects, like locating the leader with one command and ensuring readiness from Postgres, are essential, especially when handling large events (like 50k seats). The data model can be refined by including a sold state or a separate `sold_seats` table while ensuring better handling of holds and unique constraints.
+
+I should also address the hold reaper's timing issues. To maintain availability, time-based logic in the allocator can allow "stealing" expired holds during transactions. This is crucial for UX, as it prevents seats from getting stuck. Including an `expires_at` condition simplifies updates and could eliminate the need for a slow reaper. 
+
+I’m thinking a "lazy expiration" approach could work, allowing for on-demand cleanup of expired holds when claiming new ones, which could be a more elegant solution. 
+
+Finally, in designing the waiting room, I need to ensure token binding to identity prevents resale, including fields like `user_id` and possibly `admission_token_id`. I'll format all this into a structured markdown with specific sections to keep it thorough yet concise, addressing the user’s request for clarity while ensuring I stress test the design against several failure scenarios.
+codex
+## Elegance Check
+
+### The Core Insight
+Per-event single-writer (“seat ledger”) + sharding by `event_id` is the right abstraction: it turns a messy distributed-lock problem into a bounded serialization problem with a clean UX contract (fast yes/no) and a clear scaling axis (more events → more shards).
+
+### Components That Earn Their Place
+| Component | Why It’s Necessary |
+|-----------|---------------------|
+| Waiting Room | Converts bursty, adversarial traffic into stable allocator load; fairness lever against bots. |
+| Seat Allocator (per-event leader) | Explicit serialization point that prevents DB lock herds/deadlocks and makes outcomes predictable. |
+| Postgres (holds/orders + constraints) | Durable truth + last-line-of-defense invariants (“no double-sell” even under bugs/failover). |
+| CDN + WAF | Keeps origin focused on the hard part (writes); reduces bot/noise and static asset load. |
+| Payment integration with idempotency | Externalizes long latency while keeping a single authoritative order outcome. |
+| Redis (limits/tokens) | Useful accelerator for abuse controls and cheap rejection paths (but should remain optional). |
+| Coordination store (etcd/consul) | Leader election for “exactly one active writer” semantics per shard. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| etcd/consul leases for shard leadership | Postgres advisory locks keyed by `event_id`/shard | Fewer moving parts, but PG becomes part of coordination path; need careful timeout/lock-leak handling. |
+| Background “reaper” as key seat-freeing mechanism | Lazy expiration on write path (reclaim expired holds inline) + periodic cleanup | Slightly more write-path logic, but avoids “stuck seats until reaper runs” during incidents. |
+| Redis hold-token registry for fast invalid-token reject | Pure signed capability tokens + DB check on “interesting” paths only | More DB lookups under attack; mitigated by waiting room + WAF + per-identity limits. |
+| In-memory availability view per leader with periodic reconcile | Store precomputed section bitsets in PG/Redis and serve via dedicated read service | More infra/data pipeline work, but clearer read/write separation and faster warmup/recovery. |
+| Custom waiting room | Managed/edge waiting room (Cloudflare/Akamai/Fastly) | Less control over fairness semantics; faster time-to-operate and fewer on-call pages. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres down for 5 minutes**
+   - Design’s answer: partially addressed (“PG is truth”, “prefer correctness over availability”), but admission/UX behavior isn’t fully specified.
+   - Recommendation: Strengthen — explicitly stop/slow admissions per event, return a deterministic “sales paused” response, and define what happens to existing holds (they will expire by time, but purchases should fail fast with clear messaging).
+
+2. **Network partition / split-brain leaders for the same event**
+   - Design’s answer: relies on uniqueness constraints to prevent corruption; doesn’t fully address “two leaders both think they’re active.”
+   - Recommendation: Must fix — add fencing: include a monotonic “leader epoch” (lease revision) on every write and persist it in PG, rejecting writes from stale epochs. This reduces conflict storms and makes failover behavior crisp.
+
+3. **One component is slow (PG lock waits, storage hiccup) but not down**
+   - Design’s answer: not addressed in detail; risk is allocator queue buildup → timeouts → retries → amplified contention.
+   - Recommendation: Strengthen — bound per-event in-flight/queue length, shed load with explicit backoff headers, and prefer “best available”/reduced features automatically when latency crosses thresholds.
+
+4. **Bad config / deploy (wrong shard mapping, TTLs, or token validation bug)**
+   - Design’s answer: operational notes mention visibility, but not safe rollout/guardrails.
+   - Recommendation: Strengthen — canary per event cohort, config validation with invariants (TTL bounds, key rotation windows), and a “kill switch” to force read-only / pause admissions per event.
+
+5. **Traffic 10x unexpectedly (retry storm + bots adapt)**
+   - Design’s answer: waiting room + rate limits acknowledged; good foundation.
+   - Recommendation: Acceptable if tightened — ensure client retries are capped server-side (idempotency + explicit `Retry-After`), and make the waiting room the *only* path to allocator for hot events (no bypass endpoints).
+
+## Recommendations
+
+### Must Fix
+- Add split-brain fencing (epoch/lease token persisted and checked in Postgres writes).
+- Ensure expired-hold reclamation works even if the reaper is delayed (avoid “stuck seats” under incident conditions).
+- Define hold vs `PENDING_PAYMENT` semantics (what reserves seats once payment starts, for how long, and what expires first).
+- Handle clock skew explicitly (token TTL and `expires_at` comparisons need leeway and server-time authority).
+- Specify admission behavior when PG is unavailable (pause/slow + clear UX, not vague 5xx).
+
+### Should Consider
+- Replace etcd/consul with Postgres advisory locks if your team wants fewer primitives (and you can tolerate PG being in the control plane).
+- Make Redis strictly best-effort (design so correctness and basic UX survive Redis loss without opening a bot floodgate).
+- Formalize per-event fairness inside the leader (FIFO/priority rules, starvation prevention, and deterministic tie-breaking).
+- Clarify read consistency for availability deltas (staleness bounds, and what users see during failover/warmup).
+
+### Nice to Have
+- Managed waiting room at the edge to reduce operational load.
+- Partitioning/retention strategy for `holds/held_seats/orders` to prevent bloat-driven latency incidents.
+- One-command runbooks: “who owns event X?”, “why is event X rejecting holds?”, “drain shard safely.”
+
+## What’s Working Well
+- The design is honest about the real problem (contention + fairness) and chooses an elegant serialization point instead of accidental distributed locking.
+- Defense-in-depth is strong: single-writer for performance, Postgres constraints for correctness, idempotency for retries.
+- Degradation paths (“best available”) and per-event observability focus are exactly what makes this operable under peak load.
+tokens used
+6,319
+## Elegance Check
+
+### The Core Insight
+Per-event single-writer (“seat ledger”) + sharding by `event_id` is the right abstraction: it turns a messy distributed-lock problem into a bounded serialization problem with a clean UX contract (fast yes/no) and a clear scaling axis (more events → more shards).
+
+### Components That Earn Their Place
+| Component | Why It’s Necessary |
+|-----------|---------------------|
+| Waiting Room | Converts bursty, adversarial traffic into stable allocator load; fairness lever against bots. |
+| Seat Allocator (per-event leader) | Explicit serialization point that prevents DB lock herds/deadlocks and makes outcomes predictable. |
+| Postgres (holds/orders + constraints) | Durable truth + last-line-of-defense invariants (“no double-sell” even under bugs/failover). |
+| CDN + WAF | Keeps origin focused on the hard part (writes); reduces bot/noise and static asset load. |
+| Payment integration with idempotency | Externalizes long latency while keeping a single authoritative order outcome. |
+| Redis (limits/tokens) | Useful accelerator for abuse controls and cheap rejection paths (but should remain optional). |
+| Coordination store (etcd/consul) | Leader election for “exactly one active writer” semantics per shard. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| etcd/consul leases for shard leadership | Postgres advisory locks keyed by `event_id`/shard | Fewer moving parts, but PG becomes part of coordination path; need careful timeout/lock-leak handling. |
+| Background “reaper” as key seat-freeing mechanism | Lazy expiration on write path (reclaim expired holds inline) + periodic cleanup | Slightly more write-path logic, but avoids “stuck seats until reaper runs” during incidents. |
+| Redis hold-token registry for fast invalid-token reject | Pure signed capability tokens + DB check on “interesting” paths only | More DB lookups under attack; mitigated by waiting room + WAF + per-identity limits. |
+| In-memory availability view per leader with periodic reconcile | Store precomputed section bitsets in PG/Redis and serve via dedicated read service | More infra/data pipeline work, but clearer read/write separation and faster warmup/recovery. |
+| Custom waiting room | Managed/edge waiting room (Cloudflare/Akamai/Fastly) | Less control over fairness semantics; faster time-to-operate and fewer on-call pages. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres down for 5 minutes**
+   - Design’s answer: partially addressed (“PG is truth”, “prefer correctness over availability”), but admission/UX behavior isn’t fully specified.
+   - Recommendation: Strengthen — explicitly stop/slow admissions per event, return a deterministic “sales paused” response, and define what happens to existing holds (they will expire by time, but purchases should fail fast with clear messaging).
+
+2. **Network partition / split-brain leaders for the same event**
+   - Design’s answer: relies on uniqueness constraints to prevent corruption; doesn’t fully address “two leaders both think they’re active.”
+   - Recommendation: Must fix — add fencing: include a monotonic “leader epoch” (lease revision) on every write and persist it in PG, rejecting writes from stale epochs. This reduces conflict storms and makes failover behavior crisp.
+
+3. **One component is slow (PG lock waits, storage hiccup) but not down**
+   - Design’s answer: not addressed in detail; risk is allocator queue buildup → timeouts → retries → amplified contention.
+   - Recommendation: Strengthen — bound per-event in-flight/queue length, shed load with explicit backoff headers, and prefer “best available”/reduced features automatically when latency crosses thresholds.
+
+4. **Bad config / deploy (wrong shard mapping, TTLs, or token validation bug)**
+   - Design’s answer: operational notes mention visibility, but not safe rollout/guardrails.
+   - Recommendation: Strengthen — canary per event cohort, config validation with invariants (TTL bounds, key rotation windows), and a “kill switch” to force read-only / pause admissions per event.
+
+5. **Traffic 10x unexpectedly (retry storm + bots adapt)**
+   - Design’s answer: waiting room + rate limits acknowledged; good foundation.
+   - Recommendation: Acceptable if tightened — ensure client retries are capped server-side (idempotency + explicit `Retry-After`), and make the waiting room the *only* path to allocator for hot events (no bypass endpoints).
+
+## Recommendations
+
+### Must Fix
+- Add split-brain fencing (epoch/lease token persisted and checked in Postgres writes).
+- Ensure expired-hold reclamation works even if the reaper is delayed (avoid “stuck seats” under incident conditions).
+- Define hold vs `PENDING_PAYMENT` semantics (what reserves seats once payment starts, for how long, and what expires first).
+- Handle clock skew explicitly (token TTL and `expires_at` comparisons need leeway and server-time authority).
+- Specify admission behavior when PG is unavailable (pause/slow + clear UX, not vague 5xx).
+
+### Should Consider
+- Replace etcd/consul with Postgres advisory locks if your team wants fewer primitives (and you can tolerate PG being in the control plane).
+- Make Redis strictly best-effort (design so correctness and basic UX survive Redis loss without opening a bot floodgate).
+- Formalize per-event fairness inside the leader (FIFO/priority rules, starvation prevention, and deterministic tie-breaking).
+- Clarify read consistency for availability deltas (staleness bounds, and what users see during failover/warmup).
+
+### Nice to Have
+- Managed waiting room at the edge to reduce operational load.
+- Partitioning/retention strategy for `holds/held_seats/orders` to prevent bloat-driven latency incidents.
+- One-command runbooks: “who owns event X?”, “why is event X rejecting holds?”, “drain shard safely.”
+
+## What’s Working Well
+- The design is honest about the real problem (contention + fairness) and chooses an elegant serialization point instead of accidental distributed locking.
+- Defense-in-depth is strong: single-writer for performance, Postgres constraints for correctness, idempotency for retries.
+- Degradation paths (“best available”) and per-event observability focus are exactly what makes this operable under peak load.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/ticket-reservation-system.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afe-4bc8-74b2-9a67-f822a9d91f35
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Ticket Reservation System"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["ticketing", "high-contention", "consistency", "sharding", "anti-bot", "reservations"]
+---
+
+## Overview
+
+This system allocates seats for high-demand events under extreme contention while keeping the user experience predictable: either you hold seats quickly, or you get a definitive “not available”—no ambiguous limbo. The core insight is to treat each event as a **single strongly-consistent “seat ledger” with one writer**, and scale by **sharding across events**, not by trying to make seat writes multi-writer and “distributed-locky”.
+
+Most of the rest should be boring: Postgres is the source of truth for holds and purchases, Redis handles short-lived rate limits and tokens, and a waiting room shapes traffic so the allocator is sized for *sustained* throughput, not the first 30 seconds of a drop.
+
+## What Makes This Hard
+
+Naive implementations let many stateless API servers write seat state concurrently and “just use transactions”. Under a real on-sale (bots + humans), that becomes a thundering herd of conflicting updates, lock waits, deadlocks, and eventually inconsistent UX (double-sold seats, phantom availability, holds that never resolve).
+
+The trap is that seat allocation *looks* like a database problem but is really a **contention and fairness problem**. If you don’t deliberately choose a single serialization point per event, you end up building a distributed lock manager accidentally—usually at 3am, during your biggest concert.
+
+## Requirements
+
+### Functional Requirements
+- Place a **time-bound hold** on specific seats (or “best available” within constraints), returning a signed hold token.
+- Confirm purchase using the hold token; purchase must be **idempotent** and must not oversell.
+- Serve seat maps with near-real-time availability; availability can be slightly stale for reads, but **writes must be correct**.
+- Enforce anti-bot/scalper controls: per-identity limits, velocity limits, queue fairness, and instrumentation for abuse.
+- Provide an audit trail: who held what, when it expired, and why a purchase failed.
+
+### Scale Targets
+- On-sale peak: **200k requests/sec** at the edge, shaped to **20k seat-write ops/sec** into the allocator fleet.
+- Concurrency: **1M users in waiting room**; **100k actively browsing** seat maps.
+- Event size: up to **50k seats/event**; ~**10k events/day**; “hot” events dominate contention.
+- Latency SLO (post-queue): **p95 hold < 250ms**, **p95 purchase < 500ms**. These matter because holds are user-visible and short TTLs amplify retry storms.
+
+## Key Design Decisions
+
+- **We choose:** Per-event single-writer allocation (sharded “event leaders”) that serializes seat writes.
+  - **We reject:** Multi-writer seat updates with distributed locks or “just use SERIALIZABLE everywhere”.
+  - **Why:** The single-writer makes correctness and UX stable under peak contention; scaling comes from event sharding, which matches real traffic (many events, a few hot).
+
+- **We choose:** Postgres as the source of truth with explicit state machine for `seat -> held -> sold` plus idempotency keys.
+  - **We reject:** Storing the authoritative seat state only in Redis (fast but fragile) or event-sourcing everything on day 1.
+  - **Why:** Postgres gives durable correctness and simple recovery; Redis remains an accelerator, not a truth source.
+
+- **We choose:** Waiting room + deterministic admission (token-based) to shape traffic and reduce bot advantage.
+  - **We reject:** Letting everyone hit allocation endpoints directly and “rate limit later”.
+  - **Why:** Without admission control, retries and bot bursts will drown the allocator and degrade fairness.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[Users/Bots] --> WAF["CDN + WAF"]
+  WAF --> Q["Waiting Room"]
+  Q --> API["Ticketing API"]
+  API --> ALLOC["Seat Allocator (Event Shards)"]
+  ALLOC --> R["Redis (limits/tokens)"]
+  ALLOC --> DB["Postgres (holds/orders)"]
+  API --> PAY["Payment Provider"]
+  PAY --> API
+```
+
+### Components
+
+- `CDN + WAF`: Blocks obvious automation, terminates TLS, and caches static seat map assets (sections/rows geometry) so origin traffic is dominated by *availability deltas*, not SVG/JSON blobs.
+- `Waiting Room`: Issues admission tokens (signed, short-lived) and meters entry per event. This is the fairness “front door” and the main tool to keep allocator throughput stable.
+- `Ticketing API`: Stateless orchestration: validates admission + identity, calls allocator, handles purchase idempotency, and integrates with payment.
+- `Seat Allocator (Event Shards)`: The only place allowed to mutate seat availability. Routes by `event_id` to a single leader instance per shard; maintains a hot in-memory view for fast selection and emits durable writes to Postgres.
+- `Redis (limits/tokens)`: Fast checks for velocity limits, device/account quotas, token replay detection, and short-lived hold token registry (to reduce DB lookups on obviously invalid tokens).
+- `Postgres (holds/orders)`: Durable state machine and audit log. Constraints ensure “no double-sell” even if upstream logic misbehaves.
+- `Payment Provider`: External dependency; purchase flow is designed so payment callbacks can be retried safely without duplicating orders.
+
+## Deep Dive: Contention-Safe Seat Allocation
+
+The allocator runs a **single-writer loop per event**. Practically: consistent-hash `event_id` to a shard, then use a lightweight leader mechanism (etcd/consul session leases) so exactly one instance is active for that shard. All seat holds and purchases for an event are serialized through that leader. This avoids distributed locks on individual seats; the “lock” is simply “the event leader processes requests one at a time (or in a bounded batch)”.
+
+**Hold flow (write path):**
+1. API validates admission token + identity and forwards `HoldRequest(event_id, seat_ids | constraints, client_request_id)`.
+2. Allocator checks in-memory availability, selects seats (or rejects).
+3. Allocator writes a single Postgres transaction:
+   - Insert `holds(hold_id, event_id, user_id, expires_at, request_id)` with `UNIQUE(user_id, request_id)` for idempotency.
+   - Insert `held_seats(event_id, seat_id, hold_id)` with `UNIQUE(event_id, seat_id)` so a seat can only be held once.
+4. Allocator returns a **signed hold token** containing `hold_id`, `event_id`, `expires_at`, and a nonce.
+5. Expiry is enforced by time: holds past `expires_at` are treated as invalid; a background reaper updates state and frees seats (but correctness does not depend on the reaper being perfectly punctual).
+
+The critical point is that correctness is achieved by **(a) event-level serialization** for performance and **(b) database uniqueness constraints** as the last line of defense. If two requests ever race (due to failover or retry), Postgres rejects the second claim on `(event_id, seat_id)` and the allocator returns a clean “seat not available” without corrupting state.
+
+**Purchase flow (commit path):**
+- Purchase is idempotent via `UNIQUE(order_request_id)` and transitions held seats to sold in a transaction that verifies:
+  - hold exists, not expired, belongs to user, and seats match.
+  - seats are still linked to that hold.
+- Payment is handled as a two-step commit:
+  - Create `order` in `PENDING_PAYMENT` with the held seats reserved.
+  - On payment confirmation callback, transition to `PAID` and mark seats `SOLD`.
+This isolates the allocator from payment latency while preserving a single authoritative outcome per `order_request_id`.
+
+**Serving seat maps without melting the allocator:**
+- Static geometry (sections/rows/seat coordinates) is CDN-cached.
+- Dynamic availability is served as compact deltas (e.g., sold/held bitsets per section) pulled from allocator’s in-memory view, refreshed from Postgres on startup and periodically reconciled.
+- Under extreme load, degrade gracefully: disable arbitrary seat picking and offer “best available” (same correctness, far less combinatorial scanning).
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness under peak contention | Some per-event throughput ceiling (by design) |
+| Predictable UX (fast yes/no) | Perfectly real-time availability reads everywhere |
+| Simple recovery (DB truth) | Cross-event transactions (intentionally avoided) |
+| Operability for small team | Maximum hardware efficiency at microsecond level |
+
+## Failure Modes
+
+- **Allocator leader dies mid-onsale**
+  - **What happens:** Requests for affected events briefly fail or queue; holds/purchases may be retried.
+  - **Detect:** Missing shard lease heartbeat; spike in allocator 5xx; increased API timeouts for specific `event_id`.
+  - **Recover:** New leader acquires lease, warms in-memory state from Postgres (holds + sold), resumes; idempotency keys prevent duplicate outcomes.
+
+- **Redis outage / eviction**
+  - **What happens:** Rate limits and token replay detection degrade; more junk reaches API/allocator.
+  - **Detect:** Redis error rate, increased WAF pass-through, elevated allocator CPU.
+  - **Recover:** Fail open for non-critical checks but tighten waiting room admission; rely on Postgres constraints for correctness; restore Redis and re-enable strict limits.
+
+- **Payment provider latency / webhook storms**
+  - **What happens:** Many orders stuck in `PENDING_PAYMENT`; users retry purchase.
+  - **Detect:** Growing pending orders, webhook retry counts, elevated purchase retries.
+  - **Recover:** Purchase remains idempotent; seats stay reserved to the hold/order until TTL; surface clear UI timers; reconcile webhooks via periodic polling job for “unknown” payments.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Split allocator shards more finely (more leaders), move availability deltas to a dedicated read path (materialized bitsets per section), and implement a stricter admission algorithm per event to keep write QPS flat.
+- **100x scale:** Move from Postgres-centric writes to a log-based seat ledger per event (append-only + compaction) with Postgres as derived state, because the hottest events will outgrow single-node write IOPS even with sharding.
+
+## Operational Notes
+
+- Keep the “event leader” mapping visible: an on-call should be able to answer “which instance owns event 123?” in one command.
+- Alert on **per-event** metrics, not just global: hottest events hide inside averages.
+- Treat “retry storms” as a first-class incident: cap client retries, return explicit backoff headers, and let the waiting room absorb surges.
+- Always prefer correctness over availability on writes: a clean “try again” is better than a double-sold seat you can’t unwind cleanly.
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Per-event single-writer (“seat ledger”) + sharding by `event_id` is the right abstraction: it turns a messy distributed-lock problem into a bounded serialization problem with a clean UX contract (fast yes/no) and a clear scaling axis (more events → more shards).
+
+### Components That Earn Their Place
+| Component | Why It’s Necessary |
+|-----------|---------------------|
+| Waiting Room | Converts bursty, adversarial traffic into stable allocator load; fairness lever against bots. |
+| Seat Allocator (per-event leader) | Explicit serialization point that prevents DB lock herds/deadlocks and makes outcomes predictable. |
+| Postgres (holds/orders + constraints) | Durable truth + last-line-of-defense invariants (“no double-sell” even under bugs/failover). |
+| CDN + WAF | Keeps origin focused on the hard part (writes); reduces bot/noise and static asset load. |
+| Payment integration with idempotency | Externalizes long latency while keeping a single authoritative order outcome. |
+| Redis (limits/tokens) | Useful accelerator for abuse controls and cheap rejection paths (but should remain optional). |
+| Coordination store (etcd/consul) | Leader election for “exactly one active writer” semantics per shard. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| etcd/consul leases for shard leadership | Postgres advisory locks keyed by `event_id`/shard | Fewer moving parts, but PG becomes part of coordination path; need careful timeout/lock-leak handling. |
+| Background “reaper” as key seat-freeing mechanism | Lazy expiration on write path (reclaim expired holds inline) + periodic cleanup | Slightly more write-path logic, but avoids “stuck seats until reaper runs” during incidents. |
+| Redis hold-token registry for fast invalid-token reject | Pure signed capability tokens + DB check on “interesting” paths only | More DB lookups under attack; mitigated by waiting room + WAF + per-identity limits. |
+| In-memory availability view per leader with periodic reconcile | Store precomputed section bitsets in PG/Redis and serve via dedicated read service | More infra/data pipeline work, but clearer read/write separation and faster warmup/recovery. |
+| Custom waiting room | Managed/edge waiting room (Cloudflare/Akamai/Fastly) | Less control over fairness semantics; faster time-to-operate and fewer on-call pages. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres down for 5 minutes**
+   - Design’s answer: partially addressed (“PG is truth”, “prefer correctness over availability”), but admission/UX behavior isn’t fully specified.
+   - Recommendation: Strengthen — explicitly stop/slow admissions per event, return a deterministic “sales paused” response, and define what happens to existing holds (they will expire by time, but purchases should fail fast with clear messaging).
+
+2. **Network partition / split-brain leaders for the same event**
+   - Design’s answer: relies on uniqueness constraints to prevent corruption; doesn’t fully address “two leaders both think they’re active.”
+   - Recommendation: Must fix — add fencing: include a monotonic “leader epoch” (lease revision) on every write and persist it in PG, rejecting writes from stale epochs. This reduces conflict storms and makes failover behavior crisp.
+
+3. **One component is slow (PG lock waits, storage hiccup) but not down**
+   - Design’s answer: not addressed in detail; risk is allocator queue buildup → timeouts → retries → amplified contention.
+   - Recommendation: Strengthen — bound per-event in-flight/queue length, shed load with explicit backoff headers, and prefer “best available”/reduced features automatically when latency crosses thresholds.
+
+4. **Bad config / deploy (wrong shard mapping, TTLs, or token validation bug)**
+   - Design’s answer: operational notes mention visibility, but not safe rollout/guardrails.
+   - Recommendation: Strengthen — canary per event cohort, config validation with invariants (TTL bounds, key rotation windows), and a “kill switch” to force read-only / pause admissions per event.
+
+5. **Traffic 10x unexpectedly (retry storm + bots adapt)**
+   - Design’s answer: waiting room + rate limits acknowledged; good foundation.
+   - Recommendation: Acceptable if tightened — ensure client retries are capped server-side (idempotency + explicit `Retry-After`), and make the waiting room the *only* path to allocator for hot events (no bypass endpoints).
+
+## Recommendations
+
+### Must Fix
+- Add split-brain fencing (epoch/lease token persisted and checked in Postgres writes).
+- Ensure expired-hold reclamation works even if the reaper is delayed (avoid “stuck seats” under incident conditions).
+- Define hold vs `PENDING_PAYMENT` semantics (what reserves seats once payment starts, for how long, and what expires first).
+- Handle clock skew explicitly (token TTL and `expires_at` comparisons need leeway and server-time authority).
+- Specify admission behavior when PG is unavailable (pause/slow + clear UX, not vague 5xx).
+
+### Should Consider
+- Replace etcd/consul with Postgres advisory locks if your team wants fewer primitives (and you can tolerate PG being in the control plane).
+- Make Redis strictly best-effort (design so correctness and basic UX survive Redis loss without opening a bot floodgate).
+- Formalize per-event fairness inside the leader (FIFO/priority rules, starvation prevention, and deterministic tie-breaking).
+- Clarify read consistency for availability deltas (staleness bounds, and what users see during failover/warmup).
+
+### Nice to Have
+- Managed waiting room at the edge to reduce operational load.
+- Partitioning/retention strategy for `holds/held_seats/orders` to prevent bloat-driven latency incidents.
+- One-command runbooks: “who owns event X?”, “why is event X rejecting holds?”, “drain shard safely.”
+
+## What’s Working Well
+- The design is honest about the real problem (contention + fairness) and chooses an elegant serialization point instead of accidental distributed locking.
+- Defense-in-depth is strong: single-writer for performance, Postgres constraints for correctness, idempotency for retries.
+- Degradation paths (“best available”) and per-event observability focus are exactly what makes this operable under peak load.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+
+thinking
+**Evaluating system complexity**
+
+I’m thinking that while adding components might complicate the system, it could be simpler than introducing extra infrastructure. I could use Postgres to create a `rate_limit` table keyed by identity and window, and the upsert could help here. However, managing 20k writes per second could be heavy, even with partitioning. Considering Redis as optional, I might just remove it since my goal is simplification. I still need to meet scale targets and ensure anti-bot measures in place. A WAF might be beneficial at 200k edge, and I’ll plan to implement identity limits accordingly. I’ll also consider failure modes and locking mechanisms in Postgres.
+thinking
+**Simplifying allocation strategy**
+
+To keep things simple, I’m considering using Postgres advisory locks keyed by event_id. The allocator can try to acquire the lock; if it can’t, it returns busy, which helps prevent split-brain scenarios. However, I need to consider what happens in a network partition with two allocators connecting to different replicas, since Postgres maintains a single primary. I’ll implement session-level advisory locks to avoid lock leaks or timeouts. This way, I can remove the complexity of etcd and epoch management. Fencing will be ensured through PG advisory locks, and I’ll handle cases where the leader dies. Plus, I’d implement lazy expiration on the write path with a periodic cleanup job.
+thinking
+**Clarifying hold and payment semantics**
+
+I need to define the difference between hold and PENDING_PAYMENT semantics. When a purchase is initiated, I’ll convert the hold to an order pending payment, ensuring that seats remain reserved until the order expires. The expiration time will align with the original hold, allowing a small extension. If payment confirms, I’ll mark the order as sold; otherwise, it will expire and be released through lazy reclamation. I’ll also address clock skew by having the server define the expiration, including leeway in token validation. Finally, if Postgres is unavailable, the waiting room will stop admissions, triggering a “sales paused” message. I want to avoid introducing new sections in the document, but while maintaining necessary content under existing sections. I might also consider cutting the critique section since it’s original.
+thinking
+**Streamlining the final document**
+
+I’m thinking I can remove sections like Critique to Address and Your Task, as they seem more meta and not essential to the design. The final document should focus on the design itself without including critique. I’ll also trim the critique sections entirely for simplification, but I can't add new sections—only remove what’s unnecessary. 
+
+The output format requires a “What We Removed” section for justification, and I need to incorporate that into existing sections like "Key Design Decisions" or "Operational Notes." The final design document should also have a minimal architecture, clear justification for each component, an explicit “What We Removed” section, and honest trade-offs.
+thinking
+**Finalizing design markdown**
+
+I’m considering how to streamline the final design document but can't add new sections, only remove or repurpose existing ones. Renaming sections might be seen as modifying, which I want to avoid. Incorporating a “What We Removed” section could fit under "Architecture" or "Key Design Decisions," but maybe listing it as a bullet point is better. 
+
+I should merge existing operational notes into "Failure Modes" or "Deep Dive," focusing on the minimal architecture which includes essential components like CDN, WAF, Waiting Room, Ticketing API, Seat Allocator, Postgres, and Payment Provider. I’ll ensure clarity and coherence while also tightening the justification for each component and addressing relevant failure scenarios. I’ll also consider cutting critique sections and any redundant details to keep the output minimal yet informative.
+thinking
+**Finalizing availability and design document**
+
+I’m focusing on how to present the availability structure efficiently, where geometry is cached and availability comes from the allocator's memory, degrading to the best available option if needed.
+
+For trade-offs, I’ll simplify the table. I need to update the failure modes to cover cases like Postgres downtime, network partitioning, slow responses from Postgres, bad deployments, and traffic surges. 
+
+I’ll rename the "Operational Notes" section to "What We Removed," listing components we’re cutting like etcd/consul, Redis, and others without adding new services. Also, I’ll emphasize that clock skew will be handled server-side, ensuring expiration and response behaviors are clear, while also maintaining simplicity in writing.
+
+Finally, I’ll produce the complete markdown, keeping tags and the title unchanged, and making sure everything is minimal yet comprehensive.
+codex
+```markdown
+---
+title: "Ticket Reservation System"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["ticketing", "high-contention", "consistency", "sharding", "anti-bot", "reservations"]
+---
+
+## Overview
+
+This system sells seats for high-demand events under extreme contention with a predictable UX: you either get a hold quickly or a definitive “not available”. Each event is a **single strongly-consistent seat ledger with one active writer**, and the system scales by **sharding across events**.
+
+Postgres is the source of truth for holds and orders, the allocator is the only writer for seat state, and an edge waiting room shapes bursty traffic so the write path stays stable.
+
+## What Makes This Hard
+
+If many stateless servers concurrently mutate seat state, peak on-sales turn into lock waits, deadlocks, retries, and eventually inconsistent outcomes (double-sells, phantom availability, holds that never resolve).
+
+This is primarily a **contention + fairness** problem: you need one serialization point per event, or you end up building distributed locking by accident.
+
+## Requirements
+
+### Functional Requirements
+- Place a **time-bound hold** on specific seats (or “best available” within constraints), returning a signed hold token.
+- Confirm purchase using the hold token; purchase must be **idempotent** and must not oversell.
+- Serve seat maps with near-real-time availability; reads can be slightly stale, but **writes must be correct**.
+- Enforce anti-bot/scalper controls: per-identity limits, velocity limits, queue fairness, and instrumentation for abuse.
+- Provide an audit trail: who held what, when it expired, and why a purchase failed.
+
+### Scale Targets
+- On-sale peak: **200k requests/sec** at the edge, shaped to **20k seat-write ops/sec** into the allocator.
+- Concurrency: **1M users in waiting room**; **100k actively browsing** seat maps.
+- Event size: up to **50k seats/event**; ~**10k events/day**; “hot” events dominate contention.
+- Latency SLO (post-queue): **p95 hold < 250ms**, **p95 purchase < 500ms**.
+
+## Key Design Decisions
+
+- **Per-event single writer (sharded by `event_id`)**
+  - Every hold/purchase for an event is serialized by a single active allocator worker for that event.
+
+- **Postgres is both truth and the serialization primitive**
+  - The allocator uses **Postgres advisory locks** keyed by `event_id` (or shard) so only one writer is active; if it can’t lock, it doesn’t write.
+  - Postgres constraints remain the last line of defense (“no double-sell” even under retries/failover).
+
+- **Edge waiting room is the only admission path for hot events**
+  - It meters entry per event and issues short-lived admission tokens; allocator capacity is sized for sustained throughput, not the first 30 seconds.
+
+- **Signed capability tokens + server-time authority**
+  - Hold tokens are signed and include `hold_id`, `event_id`, and `expires_at` computed by the allocator; validation uses server time with a small skew leeway.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[Users/Bots] --> EDGE["CDN + WAF + Waiting Room"]
+  EDGE --> API["Ticketing API"]
+  API --> ALLOC["Seat Allocator (Event Shards)"]
+  ALLOC --> DB["Postgres (locks + holds/orders)"]
+  API --> PAY["Payment Provider"]
+  PAY --> API
+```
+
+### Components
+
+- `CDN + WAF + Waiting Room`: Blocks obvious abuse, caches static assets, and meters per-event entry so the write path stays stable and fair.
+- `Ticketing API`: Stateless orchestration: validates admission + identity, calls allocator, handles purchase idempotency, and integrates with payment.
+- `Seat Allocator (Event Shards)`: The only writer for seat state; serializes per-event requests, selects seats, and commits holds/orders to Postgres.
+- `Postgres (locks + holds/orders)`: Durable truth, audit log, and the serialization primitive via advisory locks; uniqueness constraints prevent double-sell.
+- `Payment Provider`: External dependency; callbacks are retried safely and never create duplicate orders.
+
+## Deep Dive: Contention-Safe Seat Allocation
+
+The allocator processes holds/purchases for an event under a **Postgres advisory lock** keyed by `event_id`. That lock is the “one-writer” guarantee: if the allocator loses its DB session, it loses leadership automatically.
+
+**Hold flow (write path):**
+1. API validates admission token + identity and forwards `HoldRequest(event_id, seat_ids | constraints, client_request_id)`.
+2. Allocator acquires advisory lock for `event_id` (or returns a fast “try again” with `Retry-After`).
+3. Allocator selects seats from its in-memory view, then commits one Postgres transaction:
+   - Insert `holds(hold_id, event_id, user_id, expires_at, request_id)` with `UNIQUE(user_id, request_id)` for idempotency.
+   - Insert `held_seats(event_id, seat_id, hold_id)` with `UNIQUE(event_id, seat_id)` so a seat can only be held once.
+4. Allocator returns a signed hold token: `hold_id`, `event_id`, `expires_at`, and a nonce.
+5. Expiration is enforced by time:
+   - On write paths, the allocator reclaims expired holds inline before selecting seats (lazy cleanup).
+   - A periodic cleanup job can delete/compact old rows; correctness does not depend on its punctuality.
+
+**Purchase flow (commit path):**
+- Purchase is idempotent via `UNIQUE(order_request_id)` and a transaction that verifies:
+  - hold exists, not expired, belongs to user, seats match.
+  - seats are still linked to that hold.
+- Payment is isolated from seat correctness:
+  - Create `order` in `PENDING_PAYMENT` with an `order_expires_at` (short, server-defined) and the held seats attached.
+  - On payment confirmation callback, transition to `PAID` and mark seats `SOLD`.
+  - If payment doesn’t confirm before `order_expires_at`, the seats become reclaimable by the same lazy-expiration logic.
+
+**Serving seat maps without melting the allocator:**
+- Static geometry is CDN-cached.
+- Availability reads are served from the allocator’s in-memory view (rebuilt from Postgres on startup).
+- Under overload, offer “best available” only to reduce expensive seat-picking scans.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness under peak contention | Per-event throughput ceiling (by design) |
+| Predictable UX (fast yes/no) | Perfectly real-time availability everywhere |
+| Small-team operability | Some reliance on Postgres availability |
+
+## Failure Modes
+
+- **Postgres down**
+  - **What happens:** Holds and purchases stop; availability may be stale.
+  - **Recover:** Waiting room pauses admissions for affected events; API returns a deterministic “sales paused” response; when Postgres returns, allocator rebuilds in-memory state and resumes.
+
+- **Allocator instance dies mid-onsale**
+  - **What happens:** Requests for affected events briefly fail or back off.
+  - **Recover:** A healthy allocator reacquires the advisory lock, reloads state from Postgres, and resumes; idempotency keys prevent duplicate outcomes.
+
+- **Slow Postgres (lock waits / degraded IO)**
+  - **What happens:** Per-event queues build, timeouts cause retries, contention amplifies.
+  - **Recover:** Bound per-event in-flight/queue length in the allocator, shed load with explicit `Retry-After`, and tighten admissions until p95 recovers.
+
+- **Bad config / deploy**
+  - **What happens:** Wrong TTLs, mapping bugs, token validation issues create widespread failures.
+  - **Recover:** Canary by event cohort, hard bounds on TTL/config values, and a per-event kill switch to pause admissions.
+
+- **Traffic spikes 10x (retry storm + bots adapt)**
+  - **What happens:** Edge sees huge load; allocator must stay flat.
+  - **Recover:** Waiting room remains the only path for hot events, server-side retry caps + idempotency reduce storms, and overload responses are explicit and fast.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Increase shard count (more allocator workers), keep admissions tighter per hot event, and reduce seat-picking features earlier under load.
+- **100x scale:** Move the hottest events to a dedicated per-event ledger (append-only + compaction) with Postgres as derived state.
+
+## What We Removed
+
+- External coordination store (etcd/consul): leadership is Postgres advisory locks.
+- Redis token/hold registries: hold tokens are signed; “interesting” paths verify against Postgres.
+- A “reaper” as a correctness dependency: expiration is reclaimed inline; background cleanup is optional.
+- A separate read service / precompute pipeline: availability is served from allocator memory + CDN-cached geometry.
+- Split-brain fencing epochs: the single-writer guarantee is the database lock; no parallel leaders can write.
+```
+tokens used
+8,782
+```markdown
+---
+title: "Ticket Reservation System"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["ticketing", "high-contention", "consistency", "sharding", "anti-bot", "reservations"]
+---
+
+## Overview
+
+This system sells seats for high-demand events under extreme contention with a predictable UX: you either get a hold quickly or a definitive “not available”. Each event is a **single strongly-consistent seat ledger with one active writer**, and the system scales by **sharding across events**.
+
+Postgres is the source of truth for holds and orders, the allocator is the only writer for seat state, and an edge waiting room shapes bursty traffic so the write path stays stable.
+
+## What Makes This Hard
+
+If many stateless servers concurrently mutate seat state, peak on-sales turn into lock waits, deadlocks, retries, and eventually inconsistent outcomes (double-sells, phantom availability, holds that never resolve).
+
+This is primarily a **contention + fairness** problem: you need one serialization point per event, or you end up building distributed locking by accident.
+
+## Requirements
+
+### Functional Requirements
+- Place a **time-bound hold** on specific seats (or “best available” within constraints), returning a signed hold token.
+- Confirm purchase using the hold token; purchase must be **idempotent** and must not oversell.
+- Serve seat maps with near-real-time availability; reads can be slightly stale, but **writes must be correct**.
+- Enforce anti-bot/scalper controls: per-identity limits, velocity limits, queue fairness, and instrumentation for abuse.
+- Provide an audit trail: who held what, when it expired, and why a purchase failed.
+
+### Scale Targets
+- On-sale peak: **200k requests/sec** at the edge, shaped to **20k seat-write ops/sec** into the allocator.
+- Concurrency: **1M users in waiting room**; **100k actively browsing** seat maps.
+- Event size: up to **50k seats/event**; ~**10k events/day**; “hot” events dominate contention.
+- Latency SLO (post-queue): **p95 hold < 250ms**, **p95 purchase < 500ms**.
+
+## Key Design Decisions
+
+- **Per-event single writer (sharded by `event_id`)**
+  - Every hold/purchase for an event is serialized by a single active allocator worker for that event.
+
+- **Postgres is both truth and the serialization primitive**
+  - The allocator uses **Postgres advisory locks** keyed by `event_id` (or shard) so only one writer is active; if it can’t lock, it doesn’t write.
+  - Postgres constraints remain the last line of defense (“no double-sell” even under retries/failover).
+
+- **Edge waiting room is the only admission path for hot events**
+  - It meters entry per event and issues short-lived admission tokens; allocator capacity is sized for sustained throughput, not the first 30 seconds.
+
+- **Signed capability tokens + server-time authority**
+  - Hold tokens are signed and include `hold_id`, `event_id`, and `expires_at` computed by the allocator; validation uses server time with a small skew leeway.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[Users/Bots] --> EDGE["CDN + WAF + Waiting Room"]
+  EDGE --> API["Ticketing API"]
+  API --> ALLOC["Seat Allocator (Event Shards)"]
+  ALLOC --> DB["Postgres (locks + holds/orders)"]
+  API --> PAY["Payment Provider"]
+  PAY --> API
+```
+
+### Components
+
+- `CDN + WAF + Waiting Room`: Blocks obvious abuse, caches static assets, and meters per-event entry so the write path stays stable and fair.
+- `Ticketing API`: Stateless orchestration: validates admission + identity, calls allocator, handles purchase idempotency, and integrates with payment.
+- `Seat Allocator (Event Shards)`: The only writer for seat state; serializes per-event requests, selects seats, and commits holds/orders to Postgres.
+- `Postgres (locks + holds/orders)`: Durable truth, audit log, and the serialization primitive via advisory locks; uniqueness constraints prevent double-sell.
+- `Payment Provider`: External dependency; callbacks are retried safely and never create duplicate orders.
+
+## Deep Dive: Contention-Safe Seat Allocation
+
+The allocator processes holds/purchases for an event under a **Postgres advisory lock** keyed by `event_id`. That lock is the “one-writer” guarantee: if the allocator loses its DB session, it loses leadership automatically.
+
+**Hold flow (write path):**
+1. API validates admission token + identity and forwards `HoldRequest(event_id, seat_ids | constraints, client_request_id)`.
+2. Allocator acquires advisory lock for `event_id` (or returns a fast “try again” with `Retry-After`).
+3. Allocator selects seats from its in-memory view, then commits one Postgres transaction:
+   - Insert `holds(hold_id, event_id, user_id, expires_at, request_id)` with `UNIQUE(user_id, request_id)` for idempotency.
+   - Insert `held_seats(event_id, seat_id, hold_id)` with `UNIQUE(event_id, seat_id)` so a seat can only be held once.
+4. Allocator returns a signed hold token: `hold_id`, `event_id`, `expires_at`, and a nonce.
+5. Expiration is enforced by time:
+   - On write paths, the allocator reclaims expired holds inline before selecting seats (lazy cleanup).
+   - A periodic cleanup job can delete/compact old rows; correctness does not depend on its punctuality.
+
+**Purchase flow (commit path):**
+- Purchase is idempotent via `UNIQUE(order_request_id)` and a transaction that verifies:
+  - hold exists, not expired, belongs to user, seats match.
+  - seats are still linked to that hold.
+- Payment is isolated from seat correctness:
+  - Create `order` in `PENDING_PAYMENT` with an `order_expires_at` (short, server-defined) and the held seats attached.
+  - On payment confirmation callback, transition to `PAID` and mark seats `SOLD`.
+  - If payment doesn’t confirm before `order_expires_at`, the seats become reclaimable by the same lazy-expiration logic.
+
+**Serving seat maps without melting the allocator:**
+- Static geometry is CDN-cached.
+- Availability reads are served from the allocator’s in-memory view (rebuilt from Postgres on startup).
+- Under overload, offer “best available” only to reduce expensive seat-picking scans.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness under peak contention | Per-event throughput ceiling (by design) |
+| Predictable UX (fast yes/no) | Perfectly real-time availability everywhere |
+| Small-team operability | Some reliance on Postgres availability |
+
+## Failure Modes
+
+- **Postgres down**
+  - **What happens:** Holds and purchases stop; availability may be stale.
+  - **Recover:** Waiting room pauses admissions for affected events; API returns a deterministic “sales paused” response; when Postgres returns, allocator rebuilds in-memory state and resumes.
+
+- **Allocator instance dies mid-onsale**
+  - **What happens:** Requests for affected events briefly fail or back off.
+  - **Recover:** A healthy allocator reacquires the advisory lock, reloads state from Postgres, and resumes; idempotency keys prevent duplicate outcomes.
+
+- **Slow Postgres (lock waits / degraded IO)**
+  - **What happens:** Per-event queues build, timeouts cause retries, contention amplifies.
+  - **Recover:** Bound per-event in-flight/queue length in the allocator, shed load with explicit `Retry-After`, and tighten admissions until p95 recovers.
+
+- **Bad config / deploy**
+  - **What happens:** Wrong TTLs, mapping bugs, token validation issues create widespread failures.
+  - **Recover:** Canary by event cohort, hard bounds on TTL/config values, and a per-event kill switch to pause admissions.
+
+- **Traffic spikes 10x (retry storm + bots adapt)**
+  - **What happens:** Edge sees huge load; allocator must stay flat.
+  - **Recover:** Waiting room remains the only path for hot events, server-side retry caps + idempotency reduce storms, and overload responses are explicit and fast.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Increase shard count (more allocator workers), keep admissions tighter per hot event, and reduce seat-picking features earlier under load.
+- **100x scale:** Move the hottest events to a dedicated per-event ledger (append-only + compaction) with Postgres as derived state.
+
+## What We Removed
+
+- External coordination store (etcd/consul): leadership is Postgres advisory locks.
+- Redis token/hold registries: hold tokens are signed; “interesting” paths verify against Postgres.
+- A “reaper” as a correctness dependency: expiration is reclaimed inline; background cleanup is optional.
+- A separate read service / precompute pipeline: availability is served from allocator memory + CDN-cached geometry.
+- Split-brain fencing epochs: the single-writer guarantee is the database lock; no parallel leaders can write.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/06-commerce-fintech/ticket-reservation-system.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Ticket Reservation System
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/ticket-reservation-system.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/ticket-reservation-system.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/06-commerce-fintech/ticket-reservation-system.md

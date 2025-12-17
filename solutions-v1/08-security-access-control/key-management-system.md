@@ -1,0 +1,351 @@
+---
+title: "Key Management System (KMS)"
+category: "Security & Access Control"
+difficulty: "Hard"
+tags: ["kms", "hsm", "encryption", "envelope-encryption", "iam", "audit-logging"]
+---
+
+## Overview
+
+A Key Management System (KMS) is a centralized service for creating, protecting, and using cryptographic keys with strong access control and auditability. The core pattern is **envelope encryption**:
+
+- The KMS protects **Key Encryption Keys (KEKs)** and asymmetric private keys inside an **HSM** (non-exportable).
+- Applications encrypt bulk data using **Data Encryption Keys (DEKs)**.
+- The KMS wraps/unwraps DEKs under KEKs; applications store only encrypted DEKs and discard plaintext DEKs quickly.
+
+This keeps key material protected, reduces blast radius, supports rotation/versioning, and makes “who used which key and when” auditable.
+
+## Goals and Non-Goals
+
+### Goals
+- Centralized, policy-controlled key usage for many tenants/services.
+- HSM-backed protection for KEKs and asymmetric private keys.
+- Strong auditing and operational safety (disable/delete windows, break-glass).
+- Clear, end-to-end design with explicit trade-offs and failure handling.
+
+### Non-Goals
+- General-purpose secrets management (passwords, API tokens).
+- End-to-end encryption where the server never sees plaintext.
+- Supporting every crypto algorithm (start with a small, safe set).
+
+## Requirements
+
+### Functional Requirements
+- **Key lifecycle**: create, describe, list, tag, alias, enable/disable, schedule/cancel deletion, rotate.
+- **Crypto operations**:
+  - Symmetric: `Encrypt`, `Decrypt`, `GenerateDataKey`, `ReEncrypt` (optional).
+  - Asymmetric: `Sign`, `Verify`, `GetPublicKey`.
+- **Versioning**: encrypt with latest version; decrypt/verify with any enabled version; outputs identify key + version.
+- **Authorization**: authenticated principals + per-key resource policies (RBAC/ABAC), per-tenant isolation.
+- **Encryption context (AAD)**: bind ciphertext to `{tenant_id, service, env, …}` to prevent substitution.
+- **Audit**: tamper-evident log for all admin actions and key-usage requests (success and denied).
+- **HSM integration**: non-exportable KEKs/private keys; controlled key generation and destruction.
+- **Safe state transitions**: `ENABLED`, `DISABLED`, `PENDING_DELETION` with recovery windows.
+
+### Non-Functional Requirements (Concrete Targets)
+
+#### Scale
+- **Crypto QPS (per region)**: 50k steady-state, burst to 200k.
+- **Keys**: 5M keys total; up to 50M versions.
+- **Audit volume**: up to 1B events/day global (≈11.6k/sec avg, plan for 10× peak ingest).
+
+#### Latency (Data Plane, in-region)
+- `Encrypt/Decrypt` (≤4 KiB): **P50 15–25 ms**, **P99 ≤ 90 ms**
+- `GenerateDataKey`: **P50 20–35 ms**, **P99 ≤ 120 ms**
+- `Sign`: **P50 25–60 ms**, **P99 ≤ 200 ms**
+
+Control plane:
+- `CreateKey/Rotate/PolicyUpdate`: **P99 0.5–2 s**
+
+#### Availability
+- **Crypto + lifecycle APIs**: 99.99% per region (multi-AZ, no single points of failure).
+- **Audit ingestion**: at-least-once into durable log; delivery into WORM store within **≤60s** at P99 under normal conditions.
+
+#### Consistency
+- **Strong consistency** for lifecycle and policy writes per key.
+- **Bounded staleness** for policy enforcement:
+  - Policy/state reflected in data-plane decisions within **≤5s in-region** target.
+  - On uncertainty, **fail closed** for decrypt/sign (configurable for encrypt).
+
+#### Durability & Key Safety
+- **Key metadata**: no loss (multi-AZ storage, PITR).
+- **HSM key objects**: vendor-supported secure replication/backup + tested restore.
+- **Audit logs**: immutable storage (WORM/retention locks) + verifiable integrity.
+
+### Constraints & Assumptions
+- Multi-tenant isolation (`tenant_id` boundary everywhere) + quota enforcement.
+- HSMs available (FIPS 140-2/140-3 L3-equivalent).
+- Clients call KMS over TLS (optionally mTLS).
+- Compliance: SOC2 + common PCI/HIPAA-adjacent requirements.
+
+---
+
+## Simplified Architecture
+
+A single stateless **KMS service** provides both lifecycle and cryptographic APIs. It uses one strongly-consistent metadata store, an HSM cluster for protected key operations, and a durable audit log that is written to immutable storage.
+
+```mermaid
+graph TB
+  C["Clients / SDKs"] --> E["Edge (TLS, WAF, Rate limits)"]
+  E --> K["KMS Service"]
+  K --> P["Postgres (Key metadata)"]
+  K --> H["HSM Cluster"]
+  K --> L["Audit Log (Durable stream)"]
+  L --> W["WORM Audit Store"]
+  W --> S["SIEM / Analytics"]
+```
+
+### Multi-Region (Practical Baseline)
+- Deploy the same stack per region (multi-AZ within each region).
+- Assign each key a `home_region` for lifecycle writes (create/rotate/policy/state).
+- Replicate key metadata asynchronously cross-region (monotonic `policy_version` / `current_version`).
+- Replicate HSM key objects via vendor-supported secure replication/backup procedures.
+
+This keeps lifecycle writes linearizable per key while serving crypto operations close to callers.
+
+---
+
+## Components
+
+### Edge (TLS, WAF, Rate Limits)
+**Responsibilities**
+- TLS/mTLS termination (or passthrough), request size limits, basic validation.
+- Per-tenant rate limiting to protect KMS/HSM capacity.
+- Request IDs (`request_id`) propagated end-to-end for auditing.
+
+**Notes**
+- Keep edge behavior minimal; all authorization decisions remain in the KMS service for a single source of truth.
+
+### KMS Service (Single Service, Modular Internals)
+A stateless service scaled horizontally. Internally it has three modules:
+
+1) **Auth & Policy**
+- Verifies identity (OIDC JWT and/or mTLS identity mapping).
+- Evaluates per-key resource policy + ABAC conditions (including encryption context).
+- Enforces tenant isolation, quotas, and key state checks.
+- Produces a structured decision record used for audit (allow/deny + reason).
+
+2) **Crypto API**
+- Implements `Encrypt/Decrypt/GenerateDataKey/ReEncrypt/Sign/Verify/GetPublicKey`.
+- Uses software crypto for bulk operations; uses HSM for wrap/unwrap and private-key signing.
+- Limits payload sizes (e.g., `Encrypt/Decrypt` ≤4 KiB) to keep latency predictable.
+
+3) **Lifecycle API & Workers**
+- Implements `CreateKey`, `RotateKey`, policy updates, enable/disable, schedule/cancel deletion.
+- Runs background jobs (rotation execution, deletion execution) using a database-backed job table.
+
+### Postgres (Key Metadata)
+**Responsibilities**
+- Stores key definitions, policy, versions, aliases/tags, and lifecycle state.
+- Provides strong consistency for lifecycle operations with transactions and row-level locking per key.
+
+**Key choices**
+- Partitioning by `tenant_id` (and/or hashing `key_id`) as data grows.
+- PITR enabled; multi-AZ HA configuration.
+
+### HSM Cluster
+**Responsibilities**
+- Generates and stores KEKs and asymmetric private keys (non-exportable).
+- Performs KEK wrap/unwrap and signing operations.
+
+**Key choices**
+- Capacity planning based on wrap/unwrap and sign throughput.
+- Multi-AZ deployment with health-based routing.
+
+### Audit Log → WORM Store → SIEM
+**Responsibilities**
+- KMS emits an audit event for every admin and crypto request (success and denied).
+- Durable stream buffers bursts and provides at-least-once delivery.
+- Consumer writes immutable objects to WORM storage (retention locks) and forwards to SIEM/analytics.
+
+**Integrity**
+- Hash-chain audit events per `tenant_id` and periodically sign/anchor chain checkpoints (e.g., every minute or N events) using a dedicated audit signing key.
+
+---
+
+## Data Model
+
+### Tables (Core)
+**`keys`**
+- `key_id` (UUID, PK)
+- `tenant_id` (string, index)
+- `alias` (string, unique per tenant, nullable)
+- `type` (`SYMMETRIC` | `ASYMMETRIC`)
+- `algorithm` (`AES_256_GCM` | `RSA_3072` | `EC_P256` | `ED25519`)
+- `purpose` (`ENCRYPT_DECRYPT` | `SIGN_VERIFY`)
+- `state` (`ENABLED` | `DISABLED` | `PENDING_DELETION`)
+- `policy` (jsonb), `policy_version` (int)
+- `current_version` (int)
+- `home_region` (string)
+- `created_at`, `updated_at`
+- `deletion_scheduled_at` (timestamp, nullable)
+- `deletion_window_days` (int, nullable)
+
+**`key_versions`**
+- `key_id` (FK)
+- `version` (int)
+- `hsm_key_handle` (string) — reference/label, not key material
+- `state` (`ACTIVE` | `RETIRED`)
+- `created_at`
+- PK: (`key_id`, `version`)
+
+**`idempotency_keys`** (for lifecycle safety)
+- `tenant_id`, `idempotency_key` (PK)
+- `request_hash`, `response_blob`, `created_at`, `expires_at`
+
+**`jobs`** (rotation/deletion execution)
+- `job_id` (UUID, PK)
+- `type` (`ROTATE_KEY` | `DELETE_KEY`)
+- `key_id`, `tenant_id`
+- `run_at`, `attempts`, `state`, `last_error`
+- `created_at`, `updated_at`
+
+### Ciphertext / Encrypted-DEK Format (Versioned)
+- Ciphertext includes `{format_version, key_id, key_version, alg, nonce, aad_hash, wrapped_dek, ciphertext, auth_tag}`.
+- `aad_hash` is computed from a canonicalized encryption context.
+
+---
+
+## Data Flows
+
+### Encrypt (Small Payload)
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as Client
+  participant K as KMS
+  participant P as Postgres
+  participant H as HSM
+  participant L as Audit Log
+
+  C->>K: Encrypt(key_id, plaintext<=4KiB, context)
+  K->>P: Load key metadata (cache/refresh)
+  K->>K: AuthN/AuthZ + state/version checks
+  K->>H: Wrap DEK under KEK(version)
+  K->>K: AEAD encrypt(plaintext, DEK, AAD=context)
+  K->>L: Emit audit event (allow/deny)
+  K-->>C: ciphertext_blob (key_id, version, wrapped_dek, nonce, aad_hash)
+```
+
+### GenerateDataKey (Recommended for Large Payloads)
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as Client
+  participant K as KMS
+  participant P as Postgres
+  participant H as HSM
+  participant L as Audit Log
+
+  C->>K: GenerateDataKey(key_id, keySpec, context)
+  K->>P: Load key metadata (cache/refresh)
+  K->>K: AuthN/AuthZ + state/version checks
+  K->>H: Generate DEK + wrap under KEK(version)
+  K->>L: Emit audit event
+  K-->>C: plaintext_dek + encrypted_dek_blob
+```
+
+---
+
+## API Design
+
+Base path: `/v1` (REST) and/or `kms.v1` (gRPC). All requests require authentication (OIDC JWT and/or mTLS). Authorization is enforced by the KMS service using per-key policies and ABAC conditions (including encryption context).
+
+### Conventions
+- **Idempotency**: required for side-effecting lifecycle operations via `Idempotency-Key`.
+- **Limits**:
+  - `Encrypt/Decrypt` plaintext limit: **4 KiB** (configurable).
+  - `encryptionContext`: max keys and total size (e.g., 20 keys, 2 KiB encoded).
+- **Errors**:
+  - `400` invalid input
+  - `401` unauthenticated
+  - `403` unauthorized / policy denies
+  - `409` invalid key state or concurrency conflict
+  - `422` encryption context mismatch
+  - `429` throttled/quota exceeded
+  - `503` dependency failure (HSM/DB)
+
+Key endpoints remain:
+- `POST /v1/keys`, `GET /v1/keys/{keyId}`
+- `POST /v1/crypto:encrypt`, `POST /v1/crypto:decrypt`
+- `POST /v1/crypto:generateDataKey`
+- `POST /v1/crypto:sign`, `POST /v1/crypto:verify`, `GET /v1/keys/{keyId}/publicKey?version=...`
+- `POST /v1/keys/{keyId}:rotate`, `:enable`, `:disable`, `:scheduleDeletion`, `:cancelDeletion`
+
+---
+
+## Scaling and Performance
+
+### Where the Cost Is
+- HSM throughput and tail latency (wrap/unwrap, signing).
+- Hot keys and per-tenant bursts.
+- Audit ingestion volume.
+
+### Key Strategies
+- **Envelope encryption** as default; steer large data to `GenerateDataKey`.
+- **Strict payload limits** for `Encrypt/Decrypt`.
+- **In-process metadata cache** in the KMS service:
+  - Cache key metadata/policy for a short TTL (e.g., 1–5s for state/policy, longer for public keys).
+  - Include `policy_version` / `current_version` in cached entries; refresh on expiry.
+- **Quotas and fairness**:
+  - Per-tenant QPS/concurrency limits, plus per-operation limits (tighter for `Decrypt`/`Sign`).
+  - Load shedding when HSM queue depth exceeds thresholds.
+- **Audit batching**:
+  - KMS emits small events to the durable log; consumers batch writes into WORM storage.
+
+---
+
+## Consistency and Policy Propagation
+
+- Lifecycle writes are transactional and serialized per key (row-level lock + optimistic version checks).
+- Every lifecycle change bumps `policy_version` and/or `current_version`.
+- Data-plane enforcement uses cached metadata; TTLs are sized to meet the **≤5s in-region** propagation target.
+- On missing/expired metadata during sensitive operations, the service **fails closed** for `Decrypt` and `Sign` (and can be configurable for `Encrypt`).
+
+---
+
+## Security and Compliance
+
+### Key Controls
+- **Transport security**: TLS everywhere; optional mTLS for service identities.
+- **Least privilege**: per-key policies + ABAC constraints over principal claims and encryption context.
+- **Encryption context (AAD)**: ciphertext and wrapped DEKs are bound to a canonicalized context.
+- **HSM-backed keys**: KEKs and private keys are non-exportable.
+- **Separation of duties**: distinct roles for HSM admins, KMS operators, and auditors; dual control for sensitive HSM actions.
+- **Audit integrity**: WORM retention locks + hash chaining + periodic signed checkpoints.
+
+---
+
+## Failure Modes and Mitigations
+
+1) **HSM outage / elevated latency**
+- Health-based routing, N+1 capacity per AZ, per-tenant throttles, prioritized pools for signing.
+
+2) **Metadata store impairment**
+- Control-plane operations degraded; crypto enforcement uses cached metadata with short TTLs.
+- Fail closed for decrypt/sign if freshness cannot be ensured.
+
+3) **Compromised service credentials**
+- Tight per-tenant quotas, fast key disable, rapid policy updates, strong audit trails for investigation.
+
+4) **Audit pipeline backlog**
+- Durable stream buffers; consumers scale horizontally.
+- Optional “strict audit” mode for sensitive keys to fail requests if audit cannot be durably enqueued.
+
+---
+
+## Operations
+
+- **SLO monitoring**: per-operation P50/P99 latency, `4xx/5xx`, HSM queue depth, cache hit rate, DB latency, audit lag, WORM write success.
+- **Deployments**: canary by traffic percentage; automatic rollback on SLO regression.
+- **Runbooks**: HSM replacement/replication validation, emergency key disable, audit backlog recovery, regional failover and key home-region promotion.
+
+---
+
+## Simplification Notes
+
+- Removed separate control-plane and data-plane services: one stateless KMS service with internal modules keeps scaling straightforward while preserving distinct concerns in code and capacity planning.
+- Removed change-event pub/sub and shared Redis cache: short-TTL in-process caching with versioned metadata meets the policy propagation target and keeps the dependency set small.
+- Removed standalone audit producer service: the KMS service emits audit events directly to a durable stream, reducing hops and keeping auditing uniform.
+- Removed external IAM/policy service from the hot path: authentication and policy evaluation live in the KMS service using verified identity tokens and per-key policies for consistent enforcement.
+- Kept durable audit stream + WORM store + HSM: these remain necessary for (1) burst-tolerant, at-least-once audit capture, (2) immutable compliance retention, and (3) non-exportable key protection.

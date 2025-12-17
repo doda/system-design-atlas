@@ -1,0 +1,240 @@
+---
+title: "Calendar Scheduling System"
+category: "IoT & Edge"
+difficulty: "Hard"
+tags: ["calendaring", "time-zones", "recurrence", "conflict-detection"]
+---
+
+## Overview
+
+This system provides a full-featured calendar: one-time and recurring events, time zones and DST correctness, instance listing, free/busy, conflict detection (especially for bookable resources), invitations/RSVPs, and reliable notifications/webhooks.
+
+The core idea is simple:
+- Store **authoritative intent** (event definitions, recurrence rules, overrides, attendees, permissions) in one strongly consistent database.
+- Build **derived views** (expanded instances and merged busy intervals) in the same database using background jobs, so reads are fast and predictable while remaining rebuildable.
+
+A bounded **materialization horizon** (e.g., next 8 weeks) keeps costs predictable while still delivering accurate conflict checks and fast list/free-busy for the common case.
+
+---
+
+## Requirements
+
+### Functional Requirements
+- Create/update/delete one-time and recurring events (RFC 5545 RRULE/RDATE/EXDATE; edit modes: “only this instance”, “this and following”, “all”).
+- Support all-day and timed events; handle IANA TZ IDs, DST gaps/overlaps, and historical TZ changes.
+- List event instances for a calendar over a time range in a requested display time zone.
+- Provide free/busy for up to N calendars (e.g., 50) over a bounded range (e.g., 4 weeks).
+- Detect conflicts for organizer calendars and bookable resources/rooms; attendee conflicts are warn-by-default (configurable).
+- Invite attendees, track RSVP state, and support organizer/attendee permissions and delegated access.
+- Deliver notifications and webhooks (invite, update, cancel, reminders) with retry + deduplication.
+- Provide audit logging and GDPR deletion semantics.
+
+### Non-Functional Requirements
+- Scale: up to tens of thousands QPS reads and thousands QPS writes with strong diurnal peaks.
+- Latency: predictable reads for instances/free-busy; bounded write-time conflict checks.
+- Availability: multi-AZ; reads should degrade gracefully (stale derived views allowed with explicit freshness signals).
+- Consistency: strong per-calendar for authoritative writes; derived views and notifications are eventually consistent with bounded staleness.
+- Durability: authoritative data has no loss of committed writes; derived data rebuildable.
+
+### Constraints & Assumptions
+- TZ is stored as IANA TZ IDs; offsets are derived by expansion using a versioned TZDB.
+- Recurrence follows RFC 5545 with safety limits (max expansion density/occurrences in horizon).
+- Conflict correctness is guaranteed within the materialization horizon; beyond it, checks are on-demand and may be slower.
+- Compliance: encrypted at rest, audit log required, GDPR delete supported.
+
+---
+
+## Simplified Architecture
+
+```mermaid
+flowchart TB
+  Clients[Clients]
+  Edge[API Edge]
+  App[Calendar API + Workers]
+  DB[(Postgres)]
+  Push[Email/SMS/Webhooks]
+
+  Clients --> Edge --> App
+  App --> DB
+  App --> Push
+```
+
+**What this architecture provides**
+- One deployable application (“Calendar API + Workers”) that exposes APIs and runs background processing.
+- One database (Postgres) holding authoritative data, derived data, idempotency, the job queue, and audit logs.
+- A single background job mechanism for expansion, free/busy materialization, invitations/RSVP fan-out, reminders, and webhook delivery.
+
+---
+
+## Components
+
+### API Edge
+**Responsibilities**
+- TLS termination, routing, auth token validation (JWT/OAuth2), rate limiting, and request shaping (batch free/busy).
+- Cache-friendly headers for safe GET endpoints (short TTL; optional stale-while-revalidate).
+
+**Notes**
+- Can be a managed API gateway or a thin edge proxy + WAF; it remains stateless.
+
+### Calendar API + Workers (Single Service)
+A modular monolith with clear internal modules:
+- **AuthZ/ACL module**: permission checks, delegated access, share links; cached in-process with short TTL + ACL versioning.
+- **Calendar module**: event intent CRUD, recurrence edits (THIS / THIS_AND_FOLLOWING / ALL), validation, idempotency.
+- **Scheduling module**: invitations, RSVP updates, resource auto-accept rules.
+- **Materialization module**: expand instances and pre-merge free/busy within a rolling horizon.
+- **Notification module**: reminders and webhooks with retries and deduplication.
+- **Audit + GDPR module**: append-only audit records; deletion workflows and derived rebuild triggers.
+
+Workers are the same codebase as the API, running as separate process types (or threads) for operational simplicity.
+
+### Postgres (Authoritative + Derived + Jobs)
+Postgres is the single system of record and the read-optimized store:
+- Authoritative tables (events, overrides, attendees, ACLs, idempotency, audit).
+- Derived tables (instances, busy intervals).
+- A durable **jobs** table used as a queue (with `FOR UPDATE SKIP LOCKED`), including retries and DLQ semantics.
+
+This keeps operational surface area small while still enabling horizontal scale (read replicas, partitioning, and sharding when needed).
+
+---
+
+## Data Model (Simplified)
+
+### Authoritative tables
+- `calendars(calendar_id, tenant_id, owner_principal_id, default_tzid, created_at, updated_at)`
+- `events(event_id, calendar_id, uid, title, description, location, status, organizer_principal_id, is_all_day, tzid, dtstart_local, start_date_local, end_date_local, duration_ms, dst_disambiguation, rrule, rdate_local, exdate_local, version, created_at, updated_at)`
+- `event_overrides(event_id, recurrence_key, override_patch_json, tombstone, version, updated_at)`
+- `attendees(event_id, attendee_principal_id, role, response, updated_at)`
+- `acl(calendar_id, principal_id, role, acl_version, updated_at)`
+- `idempotency_keys(calendar_id, idempotency_key, result_event_id, result_version, expires_at)`
+- `audit_log(audit_id, tenant_id, principal_id, action, target, metadata_json, created_at)`
+
+### Derived tables (bounded horizon)
+- `instances(calendar_id, day_utc, instance_start_utc, instance_end_utc, event_id, recurrence_key, title_snapshot, source_version, computed_at)`
+- `busy_by_day(calendar_id, day_utc, busy_intervals_utc, source_version, computed_at)`
+
+### Resource conflict enforcement
+- `resource_reservations(resource_calendar_id, start_utc, end_utc, event_id, hold_expires_at)`
+  - Enforced with constraints/indexes so overlapping holds cannot both commit (exact technique depends on interval representation; range types + exclusion constraints are a good fit in Postgres).
+
+### Recurrence key (stable instance identifier)
+- `recurrence_key = (event_id, local_datetime, tzid, resolved_utc_offset_seconds)`
+- The resolved offset is chosen using `dst_disambiguation` for overlaps; DST gaps are rejected or require explicit user intent.
+
+---
+
+## Data Flow
+
+### Write path (create/update/delete)
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant A as Calendar API
+  participant D as Postgres
+  participant W as Worker
+
+  C->>A: Write request (Idempotency-Key)
+  A->>D: Txn: validate + write event/overrides/attendees + idempotency + audit + enqueue jobs
+  A-->>C: Success (eventId, version)
+
+  W->>D: Claim jobs (SKIP LOCKED)
+  W->>D: Materialize instances + busy-by-day (horizon)
+  W->>D: Send invites/reminders/webhooks (dedupe + retry)
+```
+
+**Job types**
+- `materialize_calendar(calendar_id, from_utc, to_utc, source_version)`
+- `deliver_invite(event_id, version, attendee_id)`
+- `deliver_webhook(event_id, version, destination)`
+- `send_reminder(instance_id)`
+- `rebuild_derived(calendar_id)` (e.g., after TZDB bump or GDPR deletion)
+
+### Read path (instances + free/busy)
+- **List instances**: query `instances` by `(calendar_id, day_utc)` buckets; return `computed_at` + `source_version`.
+- **Free/busy**: query `busy_by_day` for each calendar and day; merge in API response; return freshness metadata per calendar.
+
+If derived data is missing/stale for a requested range, the API can:
+- return partial results with `stale=true`, and/or
+- enqueue a high-priority materialization job and optionally perform an on-demand expansion for a small range.
+
+---
+
+## Conflict Detection
+
+Conflict detection is enforced for organizer calendars and resource calendars within the materialization horizon.
+
+1. Normalize the requested event into UTC intervals inside the horizon.
+2. Read `busy_by_day` for the organizer calendar and resource calendars for affected days.
+3. If `source_version` is fresh enough, perform overlap checks in memory.
+4. If data is stale/missing, perform a bounded on-demand expansion from authoritative rows for just the impacted calendars and range (and enqueue a refresh job).
+5. For resources/rooms, enforce correctness under concurrency by writing to `resource_reservations` in the same transaction as the event write (a short-lived hold with TTL works well for retries and partial failures).
+
+Attendee conflicts are computed similarly but returned as warnings by default.
+
+---
+
+## API Design (Minimal Set)
+
+### Create Event
+`POST /v1/calendars/{calendar_id}/events`  
+Headers: `Idempotency-Key: <uuid>`
+
+- Stores local intent (`dtstartLocal` + `tzid` + `dstDisambiguation`) for timed events.
+- Validates RRULE limits and DST semantics.
+- Enqueues materialization + invite delivery jobs.
+
+### Update Event
+`PATCH /v1/calendars/{calendar_id}/events/{event_id}?mode=THIS|THIS_AND_FOLLOWING|ALL`  
+Headers: `If-Match: "v{version}"`
+
+- Uses optimistic concurrency (`version`).
+- Writes overrides for THIS; splits/rewrites recurrence for THIS_AND_FOLLOWING; edits base rule for ALL.
+- Enqueues targeted re-materialization for impacted range.
+
+### List Instances
+`GET /v1/calendars/{calendar_id}/instances?startUtc=...&endUtc=...&tzid=...`
+
+Response includes:
+- `items[]` in requested display TZ
+- `sourceVersion` and `computedAt` so clients can understand freshness
+
+### Free/Busy Query
+`POST /v1/freebusy:query`
+
+- Batch request: up to N calendars, bounded range.
+- Returns per-calendar busy intervals plus `computedAt`, `sourceVersion`, and `stale`.
+
+---
+
+## Scaling & Operations (Practical)
+
+### Database scaling
+- Partition derived tables by time (`day_utc`) and by `calendar_id` to keep indexes small.
+- Use read replicas for instance/free-busy reads.
+- Keep authoritative writes strongly consistent per calendar; use connection pooling and careful transaction scope.
+
+### Worker scaling
+- Multiple worker processes claim jobs with `SKIP LOCKED`.
+- Separate queues by priority (interactive freshness vs background rebuilds) using a `priority` column and indexes.
+
+### Safety limits
+- RRULE expansion limits (max instances per horizon, max density).
+- Request budgets (max calendars per free/busy, max range, max attendees).
+
+### Reliability
+- Deduplication keys stored in Postgres for notifications/webhooks: `(event_id, version, recipient, type)`.
+- Retries with exponential backoff; DLQ table for poisoned jobs.
+- Audit log is append-only; all writes emit audit records in the same transaction.
+
+### GDPR deletion
+- Tombstone authoritative rows, revoke/decrypt keys (envelope encryption), purge derived rows for the affected calendar/user scope, and enqueue rebuild jobs for any shared views that must persist without the deleted data.
+
+---
+
+## Simplification Notes
+
+- Removed: separate Auth/ACL service, Scheduling service, Notification service, Outbox publisher, Expansion workers service; all responsibilities live in one deployable `Calendar API + Workers` to simplify deployments and debugging.
+- Removed: event bus (Kafka/Pulsar) and workflow engine (Temporal/Cadence); Postgres-backed jobs provide durable async processing with retries and DLQ.
+- Removed: separate Instance Store and Free/Busy Store databases; derived views are stored as tables in Postgres to keep the storage layer minimal.
+- Removed: mandatory Redis cache; performance is achieved through derived tables, read replicas, and short-lived edge caching (an optional in-process cache can cover hot lookups).
+- Merged: authoritative data, derived data, idempotency, dedupe records, audit log, and job queue into a single Postgres cluster for operational simplicity.
+- Complexity remains: recurrence + time zone correctness, bounded horizon materialization, resource conflict enforcement under concurrency, and reliable retry/dedup for notifications; these are necessary for correctness and user-visible behavior.

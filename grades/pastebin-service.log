@@ -1,0 +1,292 @@
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2a95-ab66-7fc3-afa9-f75fdc8978a2
+--------
+user
+You are a senior systems architect reviewing a system design document.
+
+Grade this solution on three dimensions (1-10 scale):
+
+1. **Strength** (1-10): How technically sound, complete, and production-ready is the design?
+   - Does it address scalability, reliability, and failure modes?
+   - Are the trade-offs well-reasoned?
+   - Would this actually work at scale?
+
+2. **Interestingness** (1-10): How engaging and educational is the content?
+   - Does it teach useful concepts?
+   - Are there insights that aren't obvious?
+   - Would an engineer learn something valuable?
+
+3. **Novelty** (1-10): How unique or creative is the approach?
+   - Does it go beyond textbook solutions?
+   - Are there clever simplifications or unconventional choices?
+   - Does it challenge common assumptions?
+
+Also note any major issues or particularly strong aspects.
+
+Output ONLY valid JSON in this exact format:
+{
+  "slug": "pastebin-service",
+  "strength": <1-10>,
+  "interestingness": <1-10>,
+  "novelty": <1-10>,
+  "overall": <average of three scores, 1 decimal>,
+  "summary": "<2-3 sentence summary of the design>",
+  "strengths": ["<strength 1>", "<strength 2>"],
+  "weaknesses": ["<weakness 1>", "<weakness 2>"],
+  "verdict": "<one of: exceptional, strong, adequate, weak>"
+}
+
+---
+
+## Solution to Grade
+
+---
+title: "Pastebin Service"
+category: "IoT & Edge"
+difficulty: "Hard"
+tags: ["content-storage", "access-control", "edge-caching", "moderation", "security"]
+---
+
+## Overview
+
+This service stores text pastes and serves them via stable URLs with three visibility modes (`public`, `unlisted`, `private`). It supports TTL, burn-after-read, per-paste ACLs (users/groups), share links (capability tokens), safe syntax-highlighted rendering, and abuse reporting with moderator workflows.
+
+The design keeps the read path fast by caching only safe content at the CDN, while keeping authorization and moderation decisions strongly consistent at the origin.
+
+---
+
+## Requirements
+
+### Functional
+- Create paste with TTL, optional burn-after-read, size limits (max 1 MB).
+- Read raw text and rendered HTML (syntax highlighted).
+- Visibility:
+  - `public`: cacheable and optionally indexable.
+  - `unlisted`: cacheable, not indexed, guess-resistant URL.
+  - `private`: authenticated + ACL evaluation; optionally via share link.
+- ACLs: owner + allow users/groups + optional capability token.
+- Abuse reporting; moderator actions: quarantine, redact, delete, restore; audit trail.
+- Rate limiting for create/read/report.
+
+### Non-Functional
+- Peak reads: 50k QPS (mostly CDN hits); peak creates: 2k QPS.
+- Latency: edge hits ~30 ms P50; origin reads ~120 ms P50.
+- Availability: reads 99.99%, writes 99.9%.
+- Strong consistency: ACL, visibility/moderation state, burn-after-read consumption, capability revocation.
+- Durability: metadata PITR (RPO ≤ 5 min); content in durable object storage.
+
+---
+
+## Simplified Architecture
+
+```mermaid
+flowchart TB
+  U["Client"] --> CDN["CDN WAF"]
+  MOD["Mod UI"] --> CDN
+  CDN --> API["Paste API"]
+  API --> DB[(Postgres)]
+  API --> OBJ[(Obj store)]
+  W["Render jobs"] --> DB
+  W --> OBJ
+```
+
+### Components
+
+#### CDN + WAF
+- Terminates TLS, blocks obvious abuse, and absorbs read traffic with edge caching for safe content.
+- Cache rules (enforced by response headers from the origin):
+  - `public/unlisted` raw/render: cacheable (`Cache-Control: public, s-maxage=300, stale-while-revalidate=600`) with `ETag`.
+  - `private` and `burn_after_read`: never cached (`Cache-Control: private, no-store`).
+- Fast invalidation:
+  - Responses include a purge key (e.g., `Surrogate-Key: paste:{paste_id}`).
+  - Moderator actions trigger a CDN purge for that paste so quarantines/redactions take effect quickly even for cached content.
+
+#### Paste API (single service)
+One codebase that owns:
+- Paste CRUD, TTL enforcement, burn-after-read semantics.
+- Authentication integration (OIDC) and authorization (ACL + optional capability token).
+- Moderation endpoints (report abuse, triage, actions) and audit logging.
+- Issuing background work via a Postgres-backed jobs table (rendering, cleanup).
+
+#### Postgres (single database)
+Stores strongly consistent state:
+- Paste metadata, ACLs, capability tokens (hashed), moderation state, audit events, abuse reports, background jobs.
+- Multi-AZ + PITR; optional read replicas for non-critical reads (admin listings, dashboards).
+
+#### Object Storage
+Stores large immutable artifacts:
+- Raw paste content (`raw.v1.txt`)
+- Rendered HTML (`rendered.v1.html`) when ready
+- Lifecycle policies delete expired objects; the API treats Postgres as the source of truth for whether a paste exists and is readable.
+
+#### Worker (same codebase as Paste API)
+Runs as a separate process/deployment using the same repository and DB:
+- Polls `jobs` with `SELECT … FOR UPDATE SKIP LOCKED`.
+- Renders syntax-highlighted HTML in a locked-down runtime (no network, CPU/memory/time limits).
+- Performs cleanup jobs (expired pastes, orphan objects, report dedupe maintenance).
+
+---
+
+## Core Flows
+
+### Create + Render (DB-backed jobs)
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant A as "Paste API"
+  participant D as Postgres
+  participant O as "Obj store"
+  participant W as Worker
+
+  C->>A: POST /v1/pastes
+  A->>O: PUT raw content
+  A->>D: INSERT paste, ACL, render job
+  A-->>C: 201 paste_id, urls
+
+  W->>D: Claim render job
+  W->>O: GET raw
+  W->>O: PUT rendered html
+  W->>D: UPDATE paste render_status=ready
+```
+
+### Read
+1. CDN serves cached `public/unlisted` pastes for `/raw` and `/render`.
+2. On cache miss, the API:
+   - Loads paste metadata (and ACL/capability checks when required).
+   - Enforces moderation state (`quarantined` blocks, `redacted` serves redacted content, `deleted/expired` returns 404).
+   - For burn-after-read, atomically consumes in Postgres before returning content.
+
+---
+
+## Data Model (Postgres)
+
+`pastes`
+- `paste_id` (PK, base62 random 96–128 bits)
+- `owner_user_id` (nullable)
+- `visibility` (`public|unlisted|private`)
+- `title` (nullable), `language`
+- `content_key`, `content_sha256`, `size_bytes`
+- `created_at`, `expires_at` (nullable)
+- `burn_after_read` (bool), `consumed_at` (nullable)
+- `moderation_state` (`active|quarantined|redacted|deleted`)
+- `render_status` (`pending|ready|failed`), `render_key` (nullable)
+- `version` (int)
+
+`paste_acl_entries`
+- `paste_id` (FK), `principal_type` (`user|group`), `principal_id`, `permission` (`read|write|owner`)
+- PK: (`paste_id`, `principal_type`, `principal_id`, `permission`)
+
+`capability_links`
+- `capability_id` (PK, UUID)
+- `paste_id` (FK)
+- `token_hash` (never store raw token)
+- `expires_at`, `revoked_at`, `created_at`, `last_used_at`
+
+`abuse_reports`
+- `report_id` (PK, UUID), `paste_id`, `reporter_user_id` (nullable)
+- `category`, `details`, `status`, `created_at`, `updated_at`
+
+`moderation_actions`
+- `action_id` (PK, UUID), `paste_id`, `moderator_user_id`
+- `action` (`quarantine|redact|delete|restore`), `reason`, `created_at`
+
+`jobs`
+- `job_id` (PK, UUID)
+- `type` (`render|expire_cleanup|...`)
+- `paste_id`
+- `run_at`, `attempts`, `locked_at`, `locked_by`, `last_error`
+
+Optional (if groups aren’t provided by the IdP): `groups`, `group_memberships`.
+
+---
+
+## API
+
+### Create Paste
+`POST /v1/pastes`
+- Validates size limits and visibility rules.
+- Writes raw content to object storage, then writes metadata + ACL and enqueues a render job.
+
+### Get Paste Metadata
+`GET /v1/pastes/{paste_id}`
+- Returns non-sensitive metadata when authorized; `404` for expired/deleted; `403` for unauthorized private.
+
+### Get Raw
+`GET /v1/pastes/{paste_id}/raw`
+- `public/unlisted` (not burn-after-read): cacheable with `ETag`.
+- `private`/`burn_after_read`: `no-store`.
+- Burn-after-read: transactional consume:
+  - `UPDATE pastes SET consumed_at=now() WHERE paste_id=? AND consumed_at IS NULL … RETURNING …`
+
+### Get Rendered
+`GET /v1/pastes/{paste_id}/render`
+- If `render_status != ready`, returns `302` to `/raw` or a small placeholder HTML.
+- Always serves sanitized HTML with strict headers.
+
+### Manage ACL (Owner)
+`PUT /v1/pastes/{paste_id}/acl`
+- Replaces allow lists; can create/rotate a capability token (returns it once).
+
+### Report Abuse
+`POST /v1/pastes/{paste_id}/abuse-reports`
+- Returns `202` with `report_id`.
+- Dedupe and rate-limit (primarily at CDN/WAF; additional origin checks for write endpoints).
+
+---
+
+## Security & Safety
+
+- Private safety: `private` and `burn_after_read` responses always include `Cache-Control: private, no-store`.
+- Capability links:
+  - Use a path token (e.g., `/s/{token}`) and set `Referrer-Policy: no-referrer`.
+  - Store only `token_hash`; support revocation/expiration; rate-limit token attempts.
+- Rendered HTML:
+  - Sanitized allowlist output only.
+  - Headers: `Content-Security-Policy: default-src 'none'; style-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'`
+  - `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`
+  - `X-Robots-Tag: noindex` for `unlisted/private`
+- Moderation enforcement:
+  - Reads check `moderation_state` at origin.
+  - Moderator actions trigger CDN purge by paste key to align cached content with the current state quickly.
+- Logging: never log paste content or raw tokens; redact sensitive headers.
+
+---
+
+## Scaling & Operations
+
+- CDN carries the read load; origin reads are primarily cache misses and private traffic.
+- Postgres:
+  - Multi-AZ primary, PITR, and optional read replicas.
+  - Indexes on `paste_id`, `expires_at`, `moderation_state`, and ACL lookup keys.
+- Worker fleet scales independently based on job lag and render throughput.
+- Object storage lifecycle handles bulk expiry deletion; the DB remains authoritative for visibility and access.
+
+Observability (minimum):
+- CDN hit ratio, origin QPS/latency, error rate by endpoint.
+- DB latency/CPU/locks, slow queries.
+- Render job lag, success/failure, sandbox timeouts.
+- Quarantine-to-block time (including purge latency).
+
+---
+
+## Simplification Notes
+
+- Removed: `API Gateway`; routing handled by `CDN + WAF` directly to the `Paste API` with standard HTTP controls.
+- Removed: `Edge Worker`; cache safety comes from strict cache headers and separate cacheable/non-cacheable endpoints, plus CDN purge on state changes.
+- Removed: `Redis Cache`; CDN caching covers the dominant read load, and the remaining origin load is handled with Postgres + connection pooling.
+- Removed: external `Event Queue`; background work uses a durable `jobs` table in Postgres with `SKIP LOCKED` workers.
+- Merged: `Paste Service` + `Moderation Service` + `Auth/Groups integration` into a single `Paste API` codebase with one Postgres schema (OIDC for auth, ACL logic in-service).
+- Removed: separate `Moderation DB`; moderation and audit data live alongside paste metadata for strong consistency and simpler operations.
+- Complexity that remains: `CDN` (latency and offload), `Object Storage` (PB-scale content durability/cost), `sandboxed rendering` (XSS and parser risk), and `CDN purge on moderation` (keeps cached content aligned with strong moderation decisions).
+mcp startup: no servers
+ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Dec 17th, 2025 1:06 AM.
+Warning: no last agent message; wrote empty content to /Users/dominikdabrowski/pr/system-design-atlas/grades/pastebin-service.json

@@ -1,0 +1,258 @@
+---
+title: "Secure File Sharing"
+category: "Security & Access Control"
+difficulty: "Hard"
+tags: ["security", "dlp", "file-sharing", "audit-logging", "kms", "abuse-prevention"]
+---
+
+## Overview
+
+This system enables secure sharing of sensitive documents with strong, server-side enforcement. Documents are uploaded directly to object storage, then held behind a control plane that enforces scanning gates (malware + DLP), fine-grained access policies, immediate revocation, download limits, and provable audit trails.
+
+Every download follows the same shape:
+
+1. Resolve the share token to a link record (strongly consistent).
+2. Apply org policy + link rules + scan state + abuse signals.
+3. Produce a controlled delivery (watermarked when required).
+4. Record an immutable audit event for the decision and outcome.
+
+The design stays intentionally small: one API service, one database, object storage, and a worker pool for scanning and rendering.
+
+---
+
+## Requirements
+
+### Functional Requirements
+
+- Direct-to-object-store, resumable uploads; validate size/type and compute checksums.
+- Share links with expiration, optional password/OTP, and recipient allowlist.
+- Malware and DLP scans with policy outcomes (allow, quarantine, block, redact-required) gating external access.
+- Downloads with per-request dynamic watermarking (viewer identity, timestamp, link ID, org).
+- Link lifecycle: view stats, revoke, extend TTL, rotate token, max-download limits.
+- Immutable audit logs for compliance (sharing, access, policy decisions, admin actions).
+- Admin policies: external sharing enablement, auth requirements, watermark templates, DLP rules, residency.
+- Abuse controls: rate limits, brute-force detection, anomaly signals.
+
+### Non-Functional Requirements (Targets)
+
+- Authorization + revoke enforcement: 99.99%
+- Upload + scanning + rendering: 99.9% (fail closed for external access)
+- Metadata: RPO ≤ 5 min, RTO ≤ 30 min (regional recovery)
+- Audit: WORM retention (1–7 years), at-least-once export with deduplication
+
+### Consistency Model
+
+- Strong consistency: link revoke/rotate/expire, permission checks, scan gate decisions
+- Eventual consistency: dashboards, analytics aggregates, long-term reporting
+
+---
+
+## Simplified Architecture
+
+```mermaid
+flowchart TB
+  C[Client Apps] --> E[CDN/WAF]
+  E --> A[Files API]
+
+  A --> P[(Postgres)]
+  A --> O[(Object Storage)]
+  A --> K[KMS]
+
+  P --> W[Worker Pool]
+  W --> O
+  W --> K
+
+  P --> I[WORM Audit Store]
+```
+
+### Key Properties
+
+- **Single control plane**: one API service owns authorization, link lifecycle, and audit emission.
+- **One primary datastore**: Postgres holds metadata, scan state, counters, and an append-only audit ledger.
+- **One async mechanism**: the worker pool uses a Postgres-backed job table for scanning and rendering tasks.
+- **Controlled delivery**: downloads are served by the API after a policy decision, with streaming watermarking when required.
+- **Fail closed**: if scan state is unknown, policy cannot be evaluated, or audit write fails, external downloads are denied.
+
+---
+
+## Components
+
+### CDN/WAF
+
+**Responsibilities**
+- TLS termination, bot protection, request normalization, coarse rate limiting, request IDs, geo/IP/ASN signals.
+
+**Controls**
+- Aggressive throttling and challenge flows on share-token endpoints.
+- Request size limits and strict content-type validation on API routes.
+
+### Files API (Modular Monolith)
+
+A single deployable service with clear internal modules:
+- **Identity**: validates user sessions (OIDC/SAML JWT verification) and supports “external recipient” flows (password/OTP).
+- **Sharing**: link creation, revocation, rotation, TTL enforcement, recipient allowlists.
+- **Authorization**: resolves tokens, evaluates org + link policy, enforces scan gates and max-download limits.
+- **Delivery**: streams originals or produces watermarked exports via worker orchestration.
+- **Audit**: writes an immutable event record per decision and per download outcome.
+
+**Token handling**
+- Generate ≥192-bit random tokens.
+- Store only a keyed hash (e.g., `HMAC-SHA256(pepper, token)`) in Postgres.
+- Compare hashes in constant time.
+
+**Two-stage download**
+- `POST /authorize` returns a short-lived, signed `download_token` (60s) embedding claims (link_id, doc_id, org_id, viewer_subject, risk tier).
+- `GET /downloads/{download_token}` re-checks link state (revoked/expired/limits) before streaming, ensuring revocation remains effective.
+
+### Postgres (Metadata + Audit + Jobs)
+
+**Responsibilities**
+- Link lifecycle, scan state, policy configuration, and counters with transactional correctness.
+- Append-only audit ledger (partitioned by time for operational queries).
+- Job queue tables for workers (using `SELECT … FOR UPDATE SKIP LOCKED`).
+
+**Operational posture**
+- Multi-AZ primary with replicas for read-heavy operational views.
+- PITR + snapshots; routine restore drills.
+- Partition large append-only tables (`audit_events`, `scan_jobs`) to control bloat and improve retention enforcement.
+
+### Object Storage (Originals + Renditions)
+
+**Responsibilities**
+- Immutable originals (versioning + lifecycle).
+- Optional short-lived renditions (watermarked exports) keyed by viewer/link to avoid unbounded variants.
+
+**Security**
+- Envelope encryption with KMS; per-tenant encryption context and optional BYOK.
+- No public ACLs; access only via service identity.
+
+### Worker Pool (Scanning + Rendering)
+
+A single worker deployment running two task types from Postgres jobs:
+
+- **Scanning tasks**
+  - Malware scan, then DLP extraction/classification.
+  - Writes results and a policy decision snapshot to Postgres.
+  - External sharing remains blocked until approved.
+
+- **Rendering tasks**
+  - Produces a watermarked export per request when required.
+  - Runs document parsing and conversion in a sandboxed subprocess (tight CPU/memory/time limits; restricted syscalls; minimal egress).
+  - Streams output back via object storage (rendition) or directly to the API for delivery.
+
+### WORM Audit Store
+
+**Responsibilities**
+- Long-term immutable retention and legal hold support.
+
+**Implementation**
+- Periodic export (e.g., hourly/daily) of new `audit_events` partitions to object storage with WORM controls (Object Lock) and integrity manifests (hashes + sequence ranges).
+- Reprocessing is safe via deterministic event IDs.
+
+---
+
+## Data Model
+
+### Core Tables
+
+**documents**
+- `document_id` (UUID, PK), `org_id`, `owner_user_id`
+- `object_key`, `size_bytes`, `sha256`, `mime_type`, `created_at`
+- `scan_state` (UPLOADING, PENDING_SCAN, APPROVED, QUARANTINED, BLOCKED, REDACT_REQUIRED)
+- `scan_decision_version` (int), `retention_policy` (jsonb)
+
+**share_links**
+- `link_id` (UUID, PK), `org_id`, `document_id`
+- `token_hash` (bytea, unique), `created_by_user_id`
+- `expires_at`, `revoked_at`
+- `require_auth`, `require_otp`, `password_hash` (nullable)
+- `allowed_recipients` (jsonb, nullable)
+- `max_downloads` (int, nullable), `download_count` (int)
+- `watermark_policy` (jsonb), `created_at`
+
+**scan_results**
+- `document_id` (UUID, PK)
+- `av_status`, `dlp_status`, `dlp_summary` (jsonb)
+- `decision` (APPROVED, QUARANTINED, BLOCKED, REDACT_REQUIRED)
+- `decision_version` (int), `decided_at`, `scanner_versions` (jsonb)
+
+### Jobs (Async Work)
+
+**jobs**
+- `job_id` (UUID, PK), `type` (SCAN, RENDER)
+- `org_id`, `document_id`, `link_id` (nullable), `viewer_subject` (nullable)
+- `state` (READY, RUNNING, DONE, FAILED), `run_after`
+- `attempts`, `last_error`, `created_at`, `updated_at`
+
+### Audit (Hot Window + Export)
+
+**audit_events** (append-only, time-partitioned)
+- `event_id` (UUID, PK), `org_id`, `document_id`, `link_id`
+- `actor_type` (USER, EXTERNAL, ANON), `actor_id` (stable subject)
+- `ip`, `user_agent`
+- `action`, `result`, `reason_code`
+- `created_at`
+
+---
+
+## API
+
+### Upload
+
+- `POST /v1/uploads:init` → returns multipart pre-signed PUT URLs and a `document_id`
+- `POST /v1/uploads:complete` → finalizes, stores checksum, enqueues `SCAN` job
+
+### Share Link
+
+- `POST /v1/documents/{document_id}/share-links`
+  - Returns `share_url` containing an opaque token.
+  - Enforces `scan_state == APPROVED` for external sharing.
+
+### Authorize + Download
+
+- `POST /v1/share-links/{token}/authorize`
+  - Validates password/OTP/recipient constraints, policy gates, scan state, abuse signals.
+  - Returns `download_token` (signed, 60s).
+
+- `GET /v1/downloads/{download_token}?mode=EXPORT`
+  - Re-checks link revoked/expired/max-downloads at start.
+  - Streams:
+    - originals when watermark is not required
+    - a per-viewer watermarked export when required (inline stream or from short-lived rendition)
+
+### Link Lifecycle
+
+- `POST /v1/share-links/{link_id}:revoke` → `204`
+- `POST /v1/share-links/{link_id}:rotate` → returns a new `share_url`
+
+All mutation endpoints accept `Idempotency-Key` scoped by `(org_id, key)`.
+
+---
+
+## Scaling and Operations
+
+- **Authorization hot path**
+  - Single indexed lookup on `share_links.token_hash` plus a small set of joined policy/scan records.
+  - Short, per-instance in-memory caching (seconds) for token-hash resolutions, with correctness preserved by DB re-checks on download.
+
+- **Rendering cost control**
+  - Enforce per-org quotas and concurrency limits.
+  - Cache short-lived renditions only when the same viewer/link repeats within minutes.
+
+- **Abuse controls**
+  - WAF rate limits + application-side counters (per token/IP) stored in Postgres with short TTL tables/partitions.
+  - Brute-force detection keyed by `(token_hash, ip_prefix)` and `(org_id, asn)`.
+
+- **Residency**
+  - Region-pinned tenants use region-local Postgres + buckets.
+  - DR via managed replicas and documented failover runbooks.
+
+---
+
+## Simplification Notes
+
+- Removed: `Redis Cache`; acceptable because correctness stays in Postgres and short-lived caching can be per-instance for latency.
+- Removed: external `Queue/Stream`; acceptable because Postgres jobs provide durable async work with `SKIP LOCKED` and simpler operations.
+- Merged: `AuthN/AuthZ`, `Share Service`, `Policy Engine`, and `Audit Log Writer` into one `Files API` deployable with internal modules.
+- Merged: malware scanning, DLP, and watermark rendering into one `Worker Pool` deployment with separate task types and sandboxed render subprocesses.
+- Complexity that remains: `KMS` (tenant encryption controls), `WAF` (abuse prevention), sandboxed rendering (untrusted document processing), and `WORM Audit Store` (compliance-grade immutability).

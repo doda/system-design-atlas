@@ -1,0 +1,234 @@
+---
+title: "IoT Device Management"
+category: "IoT & Edge"
+difficulty: "Hard"
+tags: ["iot", "ota", "device-management", "mqtt", "device-shadow", "pki", "stream-processing"]
+---
+
+## Overview
+
+This platform onboards and authenticates millions of devices, maintains a device registry and shadow (desired vs reported state), ingests heartbeats for fleet health, and runs safe OTA campaigns with guardrails. Devices primarily connect over **MQTT over mTLS** with an **HTTPS fallback** for constrained networks.
+
+The design keeps two clear responsibilities while staying operationally lean:
+
+- **Device plane**: MQTT connectivity, topic ACLs, command delivery, heartbeats.
+- **Control plane**: provisioning, registry, shadow, commands, OTA campaigns, audit, operator APIs/UI.
+
+High-volume telemetry avoids per-message durable writes; durability is focused on identity, configuration, commands/OTA state, and audit.
+
+---
+
+## Simplified Architecture
+
+```mermaid
+flowchart TB
+  D["Devices"] -->|MQTT mTLS / HTTPS| GW["MQTT Gateway"]
+  GW -->|Control topics| API["Device Mgmt API"]
+  API --> DB["Postgres"]
+  API --> R["Redis"]
+  GW -->|Heartbeats| TW["Telemetry Workers"]
+  TW --> R
+  TW -->|Transitions| DB
+  TW --> WH["Webhooks/Pager"]
+  API --> OS["Object Storage"]
+  OS --> CDN["CDN"]
+  D -->|HTTPS| CDN
+```
+
+### Components
+
+- **MQTT Gateway**
+  - Terminates MQTT connections, enforces **mTLS**, topic-level ACLs, quotas, and connection limits.
+  - Publishes commands/desired shadow updates to devices with **QoS 1** where needed.
+  - Exposes HTTPS endpoints for enrollment and device fallback operations.
+
+- **Device Mgmt API (modular monolith)**
+  - Single deployable service containing modules for provisioning, registry, shadow, commands, OTA, and audit.
+  - Provides REST APIs for operators and device HTTPS fallback.
+  - Produces MQTT messages (commands, shadow desired updates) via gateway integration.
+
+- **Postgres (control-plane source of truth)**
+  - Stores: device identity, cert bindings, lifecycle state, shadow docs (desired/reported), commands, OTA campaigns/jobs, audit log.
+  - Uses partitioning (by tenant/time where appropriate) and read replicas for scale.
+  - Strong consistency for identity and campaign state transitions.
+
+- **Redis (ephemeral, high-QPS state)**
+  - Liveness: `last_seen`, derived `status`, per-tenant online counters.
+  - Revocation/quarantine cache for fast gateway authorization checks.
+  - Short TTLs and periodic refresh from Postgres.
+
+- **Telemetry Workers**
+  - Horizontally-scaled consumers of heartbeat messages (from gateway bridge).
+  - Update Redis on every heartbeat; persist to Postgres only on **state transitions** (online↔offline) and periodic compaction.
+  - Run lightweight alert rules and send notifications (webhooks/paging).
+
+- **Object Storage + CDN**
+  - Stores immutable firmware binaries and signed manifests.
+  - Devices download directly via short-lived signed URLs; devices verify signatures before install.
+
+---
+
+## Core Workflows
+
+### 1) Provisioning & Identity
+
+**Goals**: bind device ↔ tenant, issue/rotate credentials, support revocation/quarantine.
+
+- **Factory**: device ships with a unique keypair + manufacturer chain; first connect binds fingerprint to tenant.
+- **Field**: operator provides an enrollment token (QR/code); device generates keypair and requests issuance.
+
+Flow (field provisioning):
+1. Device calls `POST /enroll` over HTTPS with enrollment token and CSR.
+2. API validates token, creates device record, signs device cert via KMS/HSM-backed CA.
+3. API writes cert binding and lifecycle state in Postgres; appends audit entry.
+4. Gateway accepts MQTT connections based on cert chain + revocation cache.
+
+**Revocation/quarantine**:
+- API updates Postgres and pushes an invalidation to Redis (per region).
+- Gateway checks Redis on connect and at session refresh intervals (short TTL) for fast enforcement.
+
+### 2) Device Shadow (Desired vs Reported)
+
+- Operators update desired state via API; devices subscribe to their desired topic.
+- Devices publish reported state; API stores it and increments `shadow_version`.
+- Concurrency uses optimistic checks (`If-Match` with `shadow_version`), plus server-side schema/size limits (e.g., 8–32 KB).
+
+Delivery behavior:
+- Online devices receive desired updates quickly (MQTT QoS 1).
+- Offline devices receive desired state on reconnect (retained message or persistent session, depending on broker capabilities).
+
+### 3) Heartbeats, Liveness, and Alerts
+
+- Devices publish heartbeats every ~60s (QoS 0 or QoS 1 depending on reliability needs).
+- Telemetry Workers maintain `last_seen` in Redis and derive `online/offline/unknown` using time windows:
+  - Online if `now - last_seen <= 2 * interval`
+  - Offline if `now - last_seen >= 5 * interval` (reduces flapping)
+- Postgres is updated on transitions (and optional periodic compaction) for durable “last known” status.
+
+Alerts:
+- Rule-based triggers (missing heartbeats, high error counters, battery thresholds) generate webhooks/pager events.
+- More advanced anomaly detection is supported as an offline/batch extension without changing the online path.
+
+### 4) Commands
+
+- API creates a command with TTL and idempotency key; writes to Postgres and audit.
+- If device is online, API publishes immediately via MQTT.
+- If offline, command remains pending in Postgres and is delivered on reconnect (gateway session event triggers a publish, or device fetches via HTTPS fallback).
+
+Devices acknowledge via MQTT/HTTPS; API marks final state and appends to audit.
+
+### 5) OTA Campaigns
+
+OTA is modeled as a campaign with per-device jobs and strict state transitions.
+
+1. Operator uploads artifact metadata; API issues an upload URL to object storage.
+2. API verifies hash, signs manifest, stores artifact record immutably.
+3. Operator creates campaign (target query + rollout + safety policy).
+4. API snapshots the target set, creates jobs in Postgres, and starts paced rollout.
+5. For each batch, API updates desired firmware version (shadow) and devices pull from CDN using signed URLs.
+6. Devices report install/verify status; API updates jobs and applies guardrails (pause/abort/rollback).
+
+```mermaid
+sequenceDiagram
+  participant Op as Operator
+  participant Api as API
+  participant Db as Postgres
+  participant Gw as MQTT
+  participant Cdn as CDN
+  participant Dev as Device
+
+  Op->>Api: Start campaign
+  Api->>Db: Create jobs + set state
+  Api->>Gw: Publish desired version
+  Dev->>Cdn: Download artifact
+  Dev->>Api: Report install status
+  Api->>Db: Update job + audit
+  Api->>Api: Apply safety rules (pause/rollback)
+```
+
+Safety defaults:
+- Canary cohort per model/region.
+- Auto-pause on install failure rate thresholds and unexpected heartbeat drop-off.
+- Rollback sets desired version to last-known-good with compatibility checks.
+
+---
+
+## Data Model (Postgres)
+
+All tables include `tenant_id` and are protected by strict tenant isolation (row-level security or application-enforced scoping).
+
+- `devices`: identity, model, tags (JSONB), lifecycle state, created_at.
+- `device_certs`: cert fingerprint, device_id, status, issued_at, revoked_at.
+- `device_shadows`: desired JSONB, reported JSONB, `shadow_version`, updated_at.
+- `commands`: command payload, TTL, idempotency key, state, timestamps.
+- `ota_artifacts`: version, compatibility constraints, hashes, manifest/binary URIs, signing key id.
+- `ota_campaigns`: target query, target snapshot id, rollout plan, safety policy, status.
+- `ota_jobs`: `(campaign_id, device_id)` state machine, attempts, last_error, timestamps.
+- `device_status`: durable snapshot fields (last_seen_at, last_status, last_region) updated on transitions/compaction.
+- `audit_log`: append-only, time-partitioned by tenant/time; periodic export to immutable object storage.
+
+Redis keys (examples):
+- `revoked:{cert_fingerprint} -> {state, expires_at}`
+- `lastseen:{tenant_id}:{device_id} -> timestamp`
+- `status:{tenant_id}:{device_id} -> online/offline/unknown`
+
+---
+
+## APIs (Minimal Surface)
+
+- Operator REST: devices, tags/queries, shadow updates, commands, OTA artifacts/campaigns, exports, audit search.
+- Device HTTPS fallback: enroll, report status, fetch pending command/desired config when MQTT is unavailable.
+- MQTT topics are tenant- and device-scoped for authorization by construction.
+
+Conventions:
+- Idempotency for mutating control-plane endpoints (`Idempotency-Key`).
+- Conditional shadow updates (`If-Match` on `shadow_version`).
+- Strict payload limits and schema validation per device model.
+
+---
+
+## Scaling & Availability
+
+- **MQTT Gateway** scales on connections and publish rate; multi-AZ per region with admission control for reconnect storms.
+- **Telemetry Workers** scale horizontally; Redis updates are O(1) per heartbeat; Postgres writes are bounded to transitions/compaction.
+- **Postgres** uses partitioning and read replicas; write load is dominated by control-plane actions and OTA/job updates.
+- **Multi-region**: regional gateways serve devices locally; control-plane API can run per region with a primary Postgres writer and regional read replicas. Revocation and policy caches are regional for fast enforcement.
+
+Targets supported by design:
+- Heartbeat ack P99 < 200ms (broker-local ack path).
+- Control APIs P99 < 500ms (Postgres primary + caching for hot reads).
+- Online command delivery median < 2s (MQTT session push).
+
+---
+
+## Security Defaults
+
+- mTLS for device connectivity; unique per-device credentials.
+- KMS/HSM-backed CA for certificate issuance and artifact signing keys; routine rotation.
+- Signed firmware manifests; devices verify signature and hash before install.
+- Least-privilege MQTT ACLs bound to `(tenant_id, device_id)`.
+- Quarantine/revocation enforced at gateway via regional cache with short TTL and fast invalidation.
+- Append-only audit log with periodic export to immutable object storage controls.
+
+---
+
+## Operations
+
+- Golden signals:
+  - Gateway: active sessions, connect rate, auth failures, throttling, publish rate.
+  - Telemetry: worker lag/backlog, Redis write latency, online/offline transition rate.
+  - Control plane: API latency/error rate, Postgres saturation, OTA pause events, command delivery latency.
+- Runbooks:
+  - Reconnect storm controls (rate limits, admission control, scaling).
+  - OTA incident response (pause/abort/rollback, artifact quarantine).
+  - Credential compromise response (revoke/quarantine, rotate, audit review).
+
+---
+
+## Simplification Notes
+
+- **Removed**: dedicated event stream + stream processing stack; heartbeats are handled by `Telemetry Workers` with Redis for per-heartbeat updates and Postgres writes only on transitions/compaction (meets high-QPS without a separate streaming platform).
+- **Removed**: separate registry DB, shadow store, snapshot store, and audit system; Postgres is the single control-plane database with partitioning and append-only audit export.
+- **Removed**: standalone command service and workflow engine; commands and OTA orchestration run as modules and background workers inside `Device Mgmt API` using Postgres job tables.
+- **Merged**: auth/policy, quotas, and device topic enforcement into the `MQTT Gateway` plus Redis-backed revocation cache.
+- **Complexity Remaining**: MQTT gateway clustering (required for millions of sessions), Redis for high-frequency liveness/revocation checks, and object storage + CDN for OTA bandwidth and artifact durability.

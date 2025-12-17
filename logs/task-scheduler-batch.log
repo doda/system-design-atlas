@@ -1,0 +1,4171 @@
+==========================================
+Generating: Task Scheduler (Batch)
+==========================================
+
+[Pass 1/3] Generating initial draft...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b29d3-810b-7fe3-84b0-24198210ee37
+--------
+user
+# System Design Solution Generator
+
+You are an expert Principal Engineer creating comprehensive system design solutions for the "System Design Atlas" - an educational resource for engineers preparing for system design interviews and architectural reviews.
+
+## Your Task
+
+Generate a complete, production-grade system design document for the given problem. Your solution should demonstrate deep technical expertise and real-world experience.
+
+## Output Format
+
+Your response must be a complete Markdown document with the following structure:
+
+```markdown
+---
+title: "{Problem Title}"
+category: "{Category Name}"
+difficulty: "{Easy|Medium|Hard}"
+tags: ["{tag1}", "{tag2}", "{tag3}"]
+---
+
+## Overview
+
+A 2-3 paragraph executive summary of the problem space, why it's challenging, and the key insight behind your solution.
+
+## Requirements
+
+### Functional Requirements
+- List 5-8 core features the system must support
+- Be specific about user-facing behaviors
+
+### Non-Functional Requirements
+- **Scale**: Expected QPS, data volume, user counts
+- **Latency**: P50, P99 targets for critical paths
+- **Availability**: Target uptime (e.g., 99.99%)
+- **Consistency**: Strong vs eventual, and where each applies
+- **Durability**: Data loss tolerance
+
+### Constraints & Assumptions
+- State key assumptions about the environment
+- Note any constraints (budget, team size, compliance)
+
+## High-Level Architecture
+
+Provide a Mermaid diagram showing the main components and data flow:
+
+```mermaid
+graph TB
+    subgraph "Client Layer"
+        ...
+    end
+    subgraph "Service Layer"
+        ...
+    end
+    subgraph "Data Layer"
+        ...
+    end
+```
+
+Follow with 2-3 paragraphs explaining the architecture and why this structure was chosen.
+
+## Component Deep-Dive
+
+For each major component (3-5 components):
+
+### {Component Name}
+
+**Responsibility**: What this component does
+
+**Key Design Decisions**:
+- Decision 1 and rationale
+- Decision 2 and rationale
+
+**Technology Choice**: Recommended tech and why
+
+**Scaling Strategy**: How this component scales
+
+## Data Model
+
+### Storage Schema
+
+Show the primary data structures (tables, documents, etc.) with field definitions.
+
+### Data Flow
+
+Explain how data moves through the system for key operations.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Service
+    participant DB
+    ...
+```
+
+## API Design
+
+Define the key APIs (REST, gRPC, or GraphQL) with:
+- Endpoint/method signatures
+- Request/response schemas
+- Error handling approach
+- Idempotency considerations
+
+## Scaling & Performance
+
+### Bottleneck Analysis
+- Identify the primary bottlenecks
+- Explain mitigation strategies
+
+### Horizontal Scaling
+- How each layer scales out
+- Sharding/partitioning strategy if applicable
+
+### Caching Strategy
+- What to cache, where, and for how long
+- Cache invalidation approach
+
+## Trade-offs & Alternatives
+
+### Key Trade-offs Made
+For each major decision, explain:
+- What was chosen
+- What was sacrificed
+- Why this trade-off makes sense
+
+### Alternative Approaches
+- Briefly describe 2-3 alternative architectures
+- Explain why they were not chosen
+
+## Failure Modes & Mitigations
+
+### Failure Scenarios
+For each critical failure mode:
+- **Scenario**: What can fail
+- **Impact**: Blast radius
+- **Detection**: How we know it failed
+- **Mitigation**: How the system recovers
+
+### Disaster Recovery
+- RTO/RPO targets
+- Backup strategy
+- Failover procedures
+
+## Operational Considerations
+
+### Monitoring & Alerting
+- Key metrics to track
+- Alert thresholds
+
+### Deployment Strategy
+- How to roll out changes safely
+- Rollback procedures
+
+## References & Further Reading
+
+- Link to relevant papers, blog posts, or documentation
+- Note any real-world implementations to study
+```
+
+## Guidelines
+
+1. **Be Specific**: Use concrete numbers for scale (e.g., "100M DAU", "10K QPS", "50ms P99")
+2. **Show Trade-offs**: Every decision has costs - acknowledge them
+3. **Think Production**: Include operational concerns, not just happy-path design
+4. **Use Mermaid**: All diagrams must be valid Mermaid syntax
+5. **Real-World Grounding**: Reference actual systems (Cassandra, Kafka, etc.) where appropriate
+6. **Interview Ready**: Structure answers as you would in a senior engineering interview
+
+---
+
+## Problem to Solve
+
+**Title**: Task Scheduler (Batch)
+**Category**: Foundational Infrastructure
+
+**Problem Statement**:
+Design a distributed job scheduler supporting priority queues, delayed execution, retries, and multi-tenant isolation.
+
+Generate the complete system design document now.
+mcp startup: no servers
+
+thinking
+**Refining architecture structure**
+
+I’m focusing on crafting an informative yet concise markdown layout with YAML frontmatter. I need to incorporate valid Mermaid diagrams, specifically a graph TB with subgraphs and a sequence diagram for submit and execute. 
+
+Key decisions revolve around multi-tenant isolation, with features like per-tenant quotas and separate partitions. I need to establish priority queues using Kafka topics. For execution, I'll explore options for retries, idempotency, and sharding by tenant_id and queue_id. Additionally, I’ll consider performance metrics like P99 for enqueue and dispatch times.
+codex
+---
+title: "Task Scheduler (Batch)"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["scheduler", "distributed-systems", "multi-tenant"]
+---
+
+## Overview
+
+A distributed batch task scheduler must reliably accept large volumes of jobs, run them at (or after) a specified time, honor priorities, and retry on failure—while preventing any single tenant from monopolizing capacity. The hard parts are correctness under failures (no “lost” jobs, bounded duplicates), efficient delayed scheduling at scale (time-based ordering is expensive), and fairness/isolation across tenants and queues.
+
+This design uses a durable metadata store for job state, a dedicated “timer” path for delayed execution, and a high-throughput ready-queue for dispatch to workers. The key insight is separating *durable scheduling decisions* (persisted state transitions with leases) from *fast delivery* (partitioned ready topics/queues), enabling at-least-once execution with strong operational control (quotas, per-tenant routing, DLQs).
+
+## Requirements
+
+### Functional Requirements
+- Submit jobs with tenant, queue, priority, payload, and optional `runAt` (delayed execution).
+- Support multiple priority levels per tenant/queue (e.g., P0–P3) with deterministic ordering rules.
+- Dispatch ready jobs to workers with acknowledgements, heartbeats, and lease timeouts.
+- Retry failed jobs with configurable policy (max attempts, backoff, jitter) and dead-letter routing.
+- Allow canceling jobs (best-effort if already running) and pausing/resuming queues.
+- Provide job status tracking (queued, scheduled, running, succeeded, failed, canceled) and attempt history.
+- Enforce multi-tenant isolation (quotas, rate limits, concurrency caps, and fair scheduling).
+- Provide administrative APIs for tenant config, queue config, and observability/debug tooling.
+
+### Non-Functional Requirements
+- **Scale**:
+  - 10K tenants, 200K active queues total
+  - 50K QPS job submissions (bursts to 200K QPS)
+  - 5K QPS cancels/updates
+  - 1M jobs/min dispatch peak
+  - Metadata: 5B jobs retained 30 days (TTL/archival), 50B attempts (cold storage)
+- **Latency**:
+  - Enqueue API: P50 20ms, P99 100ms
+  - Due-to-dispatch: P50 200ms, P99 2s (for `runAt <= now`)
+  - Worker lease renewal: P99 200ms
+- **Availability**: 99.99% for enqueue/status APIs; 99.9% for dispatch (graceful degradation).
+- **Consistency**:
+  - Strong consistency for job state transitions and idempotent submission (per job key).
+  - Eventual consistency for aggregated metrics, dashboards, and log-based views.
+- **Durability**: No job loss on acknowledged enqueue (RPO≈0). Duplicates tolerated (at-least-once) with idempotency support.
+
+### Constraints & Assumptions
+- Tenants are untrusted; strict isolation and abuse protection required.
+- Workers may be ephemeral and run in multiple regions/AZs.
+- Budget-conscious operations: prefer managed primitives (Kafka/PubSub, Postgres/CockroachDB, Redis) but design supports self-hosting.
+- Compliance: tenant-level encryption keys (KMS), audit logs for admin actions.
+
+## High-Level Architecture
+
+```mermaid
+graph TB
+    subgraph "Client Layer"
+        C1[CLI/SDK]
+        C2[Worker Agents]
+        C3[Admin Console]
+    end
+
+    subgraph "Service Layer"
+        GW[API Gateway + AuthN/Z]
+        JS[Job Service (CRUD + Idempotency)]
+        TS[Timer Service (Delayed -> Ready)]
+        DS[Dispatcher (Ready -> Lease)]
+        RS[Rate Limiter/Quota Service]
+    end
+
+    subgraph "Data Layer"
+        MDB[(Metadata DB<br/>Jobs/Attempts/Queues)]
+        RQ[(Ready Queue Bus<br/>Kafka/PubSub Topics)]
+        DLQ[(Dead Letter Queue)]
+        RED[(Redis<br/>hot quotas/locks)]
+        OBJ[(Object Storage<br/>payloads/logs)]
+        OBS[(Metrics/Logs/Traces)]
+    end
+
+    C1 --> GW --> JS --> MDB
+    JS --> OBJ
+    JS --> RS --> RED
+
+    TS --> MDB
+    TS --> RQ
+
+    DS --> RQ
+    DS --> MDB
+    DS --> RS
+
+    C2 --> DS
+    DS --> C2
+    DS --> OBS
+    JS --> OBS
+    TS --> OBS
+    DLQ --> OBS
+    RQ --> DLQ
+```
+
+The system is split into (1) a strongly consistent control plane (Job Service + Metadata DB) and (2) a high-throughput data plane for dispatch (Ready Queue Bus + Dispatcher). Delayed execution is handled by a Timer Service that scans due jobs efficiently and publishes them into priority-partitioned ready topics.
+
+Multi-tenant isolation is enforced at admission (rate limits), at scheduling (per-tenant concurrency and fairness), and at execution (worker routing by tenant/queue with hard caps). This combination prevents noisy neighbors while keeping the hot path for dispatch simple and scalable.
+
+## Component Deep-Dive
+
+### Job Service
+**Responsibility**: Accept job submissions, validate/auth, enforce idempotency, persist job records, expose status/cancel APIs.
+
+**Key Design Decisions**:
+- Idempotent enqueue via `(tenantId, idempotencyKey)` unique constraint to prevent duplicates on retries.
+- Store large payloads in object storage; keep only pointers + hashes in DB to reduce DB bloat.
+
+**Technology Choice**: Go/Java service; Metadata DB as CockroachDB/Postgres (strong transactions, unique constraints); S3/GCS for payloads.
+
+**Scaling Strategy**: Stateless horizontal scaling behind L7 load balancer; DB connection pooling; per-tenant admission control via Redis-backed quotas.
+
+### Timer Service (Delayed Scheduler)
+**Responsibility**: Move jobs from `SCHEDULED` (future `runAt`) to `READY` by publishing to ready topics when due.
+
+**Key Design Decisions**:
+- Time-bucketed scanning: partition jobs by `(shard, runAtBucket)` to avoid global index hotspots.
+- Lease-based claiming of due buckets so multiple timer instances can cooperate without double-publishing.
+
+**Technology Choice**: Same language as Job Service; DB supports indexed queries on `(shard, runAt)`; optional “timing wheel” in-memory with periodic reconciliation.
+
+**Scaling Strategy**: Scale by number of shards/buckets; each instance processes a subset via consistent hashing; backpressure if ready-queue or DB slows.
+
+### Dispatcher
+**Responsibility**: Serve workers, assign jobs fairly by tenant/queue/priority, manage leases/heartbeats, finalize attempts.
+
+**Key Design Decisions**:
+- At-least-once execution with leases: a job attempt is “owned” by a worker for a bounded time; on timeout it is retried.
+- Priority + fairness: weighted fair scheduling across tenants, then within tenant by queue weights, then by priority (P0 before P1…).
+
+**Technology Choice**: Ready Queue Bus as Kafka/PubSub; dispatcher consumes and assigns; Redis for fast counters; DB for authoritative state.
+
+**Scaling Strategy**: Shard dispatchers by ready-topic partitions; workers connect to their shard; autoscale on partition lag and active leases.
+
+### Metadata DB (Jobs/Attempts)
+**Responsibility**: Source of truth for job lifecycle, attempts, configuration, and audit.
+
+**Key Design Decisions**:
+- Immutable attempt records for audit/debug; job row is the mutable “current state”.
+- State transitions are conditional (CAS) to prevent races (e.g., only `READY -> RUNNING` if version matches).
+
+**Technology Choice**: CockroachDB (global consistency + failover) or Postgres with read replicas; partitioning by `(tenantId, jobIdHash)` and TTL/archival jobs.
+
+**Scaling Strategy**: Partition/shard by tenant hash; keep hot indexes minimal; archive old attempts to object storage/warehouse.
+
+### Quota/Isolation Service
+**Responsibility**: Enforce per-tenant limits: submit QPS, max queued jobs, max concurrent running, CPU-time budgets, queue-level caps.
+
+**Key Design Decisions**:
+- Token-bucket rate limits for admission + dispatch.
+- Hard concurrency caps enforced at dispatch time (don’t assign if tenant at limit), with optional “burst” windows.
+
+**Technology Choice**: Redis (atomic increments/expiries) + periodic reconciliation with DB; config stored in DB.
+
+**Scaling Strategy**: Redis clustered; cache configs locally with short TTL; isolate hot tenants via dedicated Redis shards if needed.
+
+## Data Model
+
+### Storage Schema
+
+**Table: `tenants`**
+- `tenant_id` (PK)
+- `status` (ACTIVE/SUSPENDED)
+- `limits` (jsonb: submit_qps, max_running, max_queued, etc.)
+- `created_at`, `updated_at`
+
+**Table: `queues`**
+- `tenant_id` (PK part)
+- `queue_id` (PK part)
+- `weight` (int)
+- `paused` (bool)
+- `max_running` (int, optional override)
+- `created_at`, `updated_at`
+
+**Table: `jobs`**
+- `tenant_id` (PK part)
+- `job_id` (PK part, ULID)
+- `idempotency_key` (unique with tenant_id)
+- `queue_id`
+- `priority` (smallint, 0 highest)
+- `state` (SCHEDULED/READY/RUNNING/SUCCEEDED/FAILED/CANCELED/DLQ)
+- `run_at` (timestamp)
+- `deadline_at` (timestamp, optional)
+- `payload_ref` (uri) + `payload_sha256`
+- `attempt` (int current attempt number)
+- `max_attempts` (int)
+- `backoff_policy` (jsonb)
+- `last_error` (text)
+- `version` (bigint for CAS)
+- `created_at`, `updated_at`
+
+**Table: `attempts`**
+- `tenant_id` (PK part)
+- `job_id` (PK part)
+- `attempt_no` (PK part)
+- `worker_id`
+- `lease_id` (uuid)
+- `started_at`, `heartbeat_at`, `finished_at`
+- `result` (SUCCEEDED/FAILED/TIMED_OUT/CANCELED)
+- `error_code`, `error_message`
+- `runtime_ms`
+
+**Table: `ready_publications`** (optional dedupe)
+- `tenant_id`, `job_id`, `attempt_no` (PK)
+- `published_at`
+
+### Data Flow
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API as Job Service
+    participant DB as Metadata DB
+    participant Timer as Timer Service
+    participant Bus as Ready Queue
+    participant Disp as Dispatcher
+    participant Worker
+
+    Client->>API: POST /v1/jobs (runAt, priority, payload)
+    API->>DB: INSERT jobs (SCHEDULED or READY) + attempts=0
+    alt runAt <= now
+        API->>Bus: publish READY(job_id, priority, shard)
+    else runAt > now
+        API-->>Client: 202 Accepted + job_id
+    end
+
+    Timer->>DB: scan due SCHEDULED where run_at <= now (by shard)
+    Timer->>DB: CAS jobs.state SCHEDULED->READY
+    Timer->>Bus: publish READY(job_id, priority, shard)
+
+    Disp->>Bus: consume READY messages
+    Worker->>Disp: PollForWork(tenant filters, capabilities)
+    Disp->>DB: CAS READY->RUNNING, create attempt + lease
+    Disp-->>Worker: JobAssignment(job_id, lease_id, payload_ref)
+
+    Worker->>Disp: Heartbeat(lease_id)
+    Worker->>Disp: Complete(lease_id, success/failure)
+    Disp->>DB: update attempt + jobs.state (SUCCEEDED or READY w/ backoff)
+    alt failure and attempts exhausted
+        Disp->>DB: jobs.state=DLQ
+        Disp->>Bus: publish DLQ event
+    end
+```
+
+## API Design
+
+### Enqueue Job
+`POST /v1/tenants/{tenantId}/jobs`
+- Headers: `Idempotency-Key: <string>`
+- Request:
+  ```json
+  {
+    "queueId": "email",
+    "priority": 1,
+    "runAt": "2025-12-17T12:00:00Z",
+    "payload": { "template": "welcome", "userId": "123" },
+    "maxAttempts": 10,
+    "backoff": { "type": "exponential", "baseMs": 5000, "maxMs": 900000, "jitter": true }
+  }
+  ```
+- Response `202`:
+  ```json
+  { "jobId": "01JFK...ULID", "state": "SCHEDULED" }
+  ```
+- Errors:
+  - `409` idempotency conflict with mismatched body hash
+  - `429` rate-limited / quota exceeded
+  - `400` invalid `runAt`/policy
+- Idempotency: keyed by `(tenantId, Idempotency-Key)`; store request hash to detect misuse.
+
+### Get Job Status
+`GET /v1/tenants/{tenantId}/jobs/{jobId}`
+- Response includes state, attempt, timestamps, last error, next run time.
+
+### Cancel Job
+`POST /v1/tenants/{tenantId}/jobs/{jobId}:cancel`
+- Behavior:
+  - If `SCHEDULED/READY`: transition to `CANCELED`.
+  - If `RUNNING`: mark `cancel_requested=true`; worker cooperatively stops; if not, lease expiry will requeue unless canceled is authoritative.
+- Idempotent: repeated cancel returns current state.
+
+### Worker Poll
+`POST /v1/worker:poll`
+- Request:
+  ```json
+  { "workerId": "w-123", "capabilities": ["email"], "maxJobs": 5, "tenantHints": ["t1","t2"] }
+  ```
+- Response:
+  ```json
+  { "assignments": [{ "jobId": "...", "leaseId": "...", "deadline": "...", "payloadRef": "s3://..." }] }
+  ```
+- Error handling: `429` if worker exceeds poll rate; `503` if dispatcher overloaded (client backs off with jitter).
+
+### Worker Heartbeat / Complete
+`POST /v1/worker:heartbeat` and `POST /v1/worker:complete`
+- Idempotency: `complete` is idempotent by `(leaseId, completionToken)`; duplicates ignored.
+
+## Scaling & Performance
+
+### Bottleneck Analysis
+- **Delayed scheduling scans**: mitigate with sharded time buckets, bounded scans, and backpressure.
+- **Metadata DB write amplification** (attempts, heartbeats): batch heartbeats, store last heartbeat in Redis with periodic DB flush, write only on state changes.
+- **Hot tenants/queues**: enforce quotas and isolate via dedicated partitions and per-tenant concurrency caps.
+- **Ready-queue lag**: autoscale dispatcher consumers; increase partitions; use compact ready messages (IDs only).
+
+### Horizontal Scaling
+- **API layer**: stateless; scale on CPU/QPS.
+- **Timer Service**: scale by shard count (e.g., 1024 shards); each shard owns a time-bucket range.
+- **Ready Queue**: partition by `(tenantShard, priority)` to parallelize consumption.
+- **Dispatcher**: scale with queue partitions; each dispatcher group owns a subset of partitions.
+- **Workers**: elastic; can be tenant-dedicated pools for strict isolation.
+
+**Partitioning strategy**:
+- `tenantShard = hash(tenantId) % N`
+- Topics: `ready.p0.<shard>`, `ready.p1.<shard>`… (or a single topic with priority + consumer-side prioritization if supported)
+- DB partitions aligned to `tenantShard` to reduce cross-shard contention.
+
+### Caching Strategy
+- **Config cache**: tenant/queue limits in-process with 30–60s TTL; source of truth in DB.
+- **Quota counters**: Redis token buckets and running-job counters with expiries.
+- **Payload caching**: workers cache payloads by `payload_sha256` for short TTL; CDN/object-store caching for large blobs.
+- Invalidation: config updates publish an event to a small “config” topic; services invalidate local caches immediately (fallback to TTL).
+
+## Trade-offs & Alternatives
+
+### Key Trade-offs Made
+- **Chosen**: at-least-once execution with leases + idempotency keys  
+  **Sacrificed**: strict exactly-once semantics  
+  **Why**: exactly-once across distributed workers is costly; interviews and real systems (Celery, SQS, Kafka consumers) typically rely on idempotent handlers.
+- **Chosen**: separate Timer Service for delayed jobs  
+  **Sacrificed**: simplicity of “single queue does everything”  
+  **Why**: delayed ordering at scale is a specialized workload; separating it avoids slowing down ready dispatch.
+- **Chosen**: fairness + quotas at dispatch time  
+  **Sacrificed**: maximum throughput for a single tenant  
+  **Why**: multi-tenant safety is a primary requirement; predictable isolation beats peak single-tenant performance.
+
+### Alternative Approaches
+- **Redis-only (sorted sets for delay + lists for ready)**: simple and fast, but harder to guarantee durability and multi-AZ correctness at large scale.
+- **DB-only scheduler (SELECT … FOR UPDATE SKIP LOCKED)**: strong correctness and fewer moving parts, but limited dispatch throughput and expensive polling at high QPS.
+- **Kubernetes CronJobs/Argo Workflows**: great for workflow orchestration, but less suited for high-QPS multi-tenant priority queues and fine-grained retries/leases.
+
+## Failure Modes & Mitigations
+
+### Failure Scenarios
+- **Scenario**: Dispatcher crashes mid-assignment  
+  **Impact**: jobs stuck in RUNNING until lease expires  
+  **Detection**: lease timeout metrics; rising “stuck running” gauge  
+  **Mitigation**: lease TTL + worker heartbeats; requeue on timeout; dispatcher stateless restart.
+- **Scenario**: Timer Service publishes READY but DB update fails (or vice versa)  
+  **Impact**: potential duplicates or missed dispatch  
+  **Detection**: reconciliation job compares DB `READY` vs ready-queue lag; dedupe table/metrics  
+  **Mitigation**: transactional outbox pattern (DB outbox -> bus), or `ready_publications` dedupe + periodic re-publish for `READY` not seen.
+- **Scenario**: Metadata DB partial outage / high latency  
+  **Impact**: enqueue slows; dispatch can’t transition states  
+  **Detection**: DB latency/error SLO alerts  
+  **Mitigation**: shed load (429), queue submissions in short-lived ingress buffer (optional), prioritize state transitions over reads, degrade dashboards.
+- **Scenario**: Hot tenant attempts to overwhelm system  
+  **Impact**: noisy neighbor, increased latencies  
+  **Detection**: per-tenant QPS/running/queued alarms  
+  **Mitigation**: admission rate limits, per-tenant concurrency caps, separate partitions/pools, automated tenant throttling.
+- **Scenario**: Worker loses network after receiving job  
+  **Impact**: job times out, retries, duplicates possible  
+  **Detection**: missed heartbeats; rising timeout rate  
+  **Mitigation**: retries with backoff + jitter; require idempotent job handlers; optional exactly-once for specific job types via dedupe keys in downstream systems.
+
+### Disaster Recovery
+- **RTO/RPO**: RTO 30 minutes (regional failover), RPO ~0 for accepted jobs (multi-AZ synchronous replication).
+- **Backup strategy**: continuous DB backups + PITR; object storage versioning; Kafka/PubSub retention sized for worst-case outage window (e.g., 24–72h).
+- **Failover procedures**: promote standby region DB (or use globally consistent DB), restart stateless services, drain/rewire workers to new dispatch endpoints, run reconciliation to republish `READY` jobs.
+
+## Operational Considerations
+
+### Monitoring & Alerting
+- Key metrics:
+  - Enqueue QPS, P99 latency, 4xx/5xx rates
+  - Ready-queue lag per partition/priority
+  - Due-to-dispatch latency (SLO), timer scan lag
+  - Running jobs per tenant/queue, throttle counts (429)
+  - Retry rate, DLQ rate, timeout rate, duplicate-complete rate
+  - DB transaction latency, lock/contention, connection pool saturation
+- Alert thresholds (examples):
+  - Due-to-dispatch P99 > 5s for 10m
+  - Ready-queue lag > 1M messages or > 5m behind
+  - DLQ rate > 0.5% of completions for 15m
+  - DB P99 write latency > 200ms for 10m
+
+### Deployment Strategy
+- Blue/green or canary for stateless services; feature flags for scheduling policy changes.
+- Backward-compatible schema migrations (expand/contract), dual-write if needed for outbox adoption.
+- Rollback: keep old consumers compatible with topic schema; version ready messages; fast rollback via traffic shift.
+
+## References & Further Reading
+- Celery architecture and at-least-once task delivery: https://docs.celeryq.dev/
+- Kafka consumer groups and delivery semantics: https://kafka.apache.org/documentation/
+- Transactional outbox pattern (reliable DB->bus publishing): https://microservices.io/patterns/data/transactional-outbox.html
+- SQS visibility timeout model (leases): https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html
+- Google Cloud Tasks (delayed execution, retries): https://cloud.google.com/tasks/docs/overview
+tokens used
+6,350
+---
+title: "Task Scheduler (Batch)"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["scheduler", "distributed-systems", "multi-tenant"]
+---
+
+## Overview
+
+A distributed batch task scheduler must reliably accept large volumes of jobs, run them at (or after) a specified time, honor priorities, and retry on failure—while preventing any single tenant from monopolizing capacity. The hard parts are correctness under failures (no “lost” jobs, bounded duplicates), efficient delayed scheduling at scale (time-based ordering is expensive), and fairness/isolation across tenants and queues.
+
+This design uses a durable metadata store for job state, a dedicated “timer” path for delayed execution, and a high-throughput ready-queue for dispatch to workers. The key insight is separating *durable scheduling decisions* (persisted state transitions with leases) from *fast delivery* (partitioned ready topics/queues), enabling at-least-once execution with strong operational control (quotas, per-tenant routing, DLQs).
+
+## Requirements
+
+### Functional Requirements
+- Submit jobs with tenant, queue, priority, payload, and optional `runAt` (delayed execution).
+- Support multiple priority levels per tenant/queue (e.g., P0–P3) with deterministic ordering rules.
+- Dispatch ready jobs to workers with acknowledgements, heartbeats, and lease timeouts.
+- Retry failed jobs with configurable policy (max attempts, backoff, jitter) and dead-letter routing.
+- Allow canceling jobs (best-effort if already running) and pausing/resuming queues.
+- Provide job status tracking (queued, scheduled, running, succeeded, failed, canceled) and attempt history.
+- Enforce multi-tenant isolation (quotas, rate limits, concurrency caps, and fair scheduling).
+- Provide administrative APIs for tenant config, queue config, and observability/debug tooling.
+
+### Non-Functional Requirements
+- **Scale**:
+  - 10K tenants, 200K active queues total
+  - 50K QPS job submissions (bursts to 200K QPS)
+  - 5K QPS cancels/updates
+  - 1M jobs/min dispatch peak
+  - Metadata: 5B jobs retained 30 days (TTL/archival), 50B attempts (cold storage)
+- **Latency**:
+  - Enqueue API: P50 20ms, P99 100ms
+  - Due-to-dispatch: P50 200ms, P99 2s (for `runAt <= now`)
+  - Worker lease renewal: P99 200ms
+- **Availability**: 99.99% for enqueue/status APIs; 99.9% for dispatch (graceful degradation).
+- **Consistency**:
+  - Strong consistency for job state transitions and idempotent submission (per job key).
+  - Eventual consistency for aggregated metrics, dashboards, and log-based views.
+- **Durability**: No job loss on acknowledged enqueue (RPO≈0). Duplicates tolerated (at-least-once) with idempotency support.
+
+### Constraints & Assumptions
+- Tenants are untrusted; strict isolation and abuse protection required.
+- Workers may be ephemeral and run in multiple regions/AZs.
+- Budget-conscious operations: prefer managed primitives (Kafka/PubSub, Postgres/CockroachDB, Redis) but design supports self-hosting.
+- Compliance: tenant-level encryption keys (KMS), audit logs for admin actions.
+
+## High-Level Architecture
+
+```mermaid
+graph TB
+    subgraph "Client Layer"
+        C1[CLI/SDK]
+        C2[Worker Agents]
+        C3[Admin Console]
+    end
+
+    subgraph "Service Layer"
+        GW[API Gateway + AuthN/Z]
+        JS[Job Service (CRUD + Idempotency)]
+        TS[Timer Service (Delayed -> Ready)]
+        DS[Dispatcher (Ready -> Lease)]
+        RS[Rate Limiter/Quota Service]
+    end
+
+    subgraph "Data Layer"
+        MDB[(Metadata DB<br/>Jobs/Attempts/Queues)]
+        RQ[(Ready Queue Bus<br/>Kafka/PubSub Topics)]
+        DLQ[(Dead Letter Queue)]
+        RED[(Redis<br/>hot quotas/locks)]
+        OBJ[(Object Storage<br/>payloads/logs)]
+        OBS[(Metrics/Logs/Traces)]
+    end
+
+    C1 --> GW --> JS --> MDB
+    JS --> OBJ
+    JS --> RS --> RED
+
+    TS --> MDB
+    TS --> RQ
+
+    DS --> RQ
+    DS --> MDB
+    DS --> RS
+
+    C2 --> DS
+    DS --> C2
+    DS --> OBS
+    JS --> OBS
+    TS --> OBS
+    DLQ --> OBS
+    RQ --> DLQ
+```
+
+The system is split into (1) a strongly consistent control plane (Job Service + Metadata DB) and (2) a high-throughput data plane for dispatch (Ready Queue Bus + Dispatcher). Delayed execution is handled by a Timer Service that scans due jobs efficiently and publishes them into priority-partitioned ready topics.
+
+Multi-tenant isolation is enforced at admission (rate limits), at scheduling (per-tenant concurrency and fairness), and at execution (worker routing by tenant/queue with hard caps). This combination prevents noisy neighbors while keeping the hot path for dispatch simple and scalable.
+
+## Component Deep-Dive
+
+### Job Service
+**Responsibility**: Accept job submissions, validate/auth, enforce idempotency, persist job records, expose status/cancel APIs.
+
+**Key Design Decisions**:
+- Idempotent enqueue via `(tenantId, idempotencyKey)` unique constraint to prevent duplicates on retries.
+- Store large payloads in object storage; keep only pointers + hashes in DB to reduce DB bloat.
+
+**Technology Choice**: Go/Java service; Metadata DB as CockroachDB/Postgres (strong transactions, unique constraints); S3/GCS for payloads.
+
+**Scaling Strategy**: Stateless horizontal scaling behind L7 load balancer; DB connection pooling; per-tenant admission control via Redis-backed quotas.
+
+### Timer Service (Delayed Scheduler)
+**Responsibility**: Move jobs from `SCHEDULED` (future `runAt`) to `READY` by publishing to ready topics when due.
+
+**Key Design Decisions**:
+- Time-bucketed scanning: partition jobs by `(shard, runAtBucket)` to avoid global index hotspots.
+- Lease-based claiming of due buckets so multiple timer instances can cooperate without double-publishing.
+
+**Technology Choice**: Same language as Job Service; DB supports indexed queries on `(shard, runAt)`; optional “timing wheel” in-memory with periodic reconciliation.
+
+**Scaling Strategy**: Scale by number of shards/buckets; each instance processes a subset via consistent hashing; backpressure if ready-queue or DB slows.
+
+### Dispatcher
+**Responsibility**: Serve workers, assign jobs fairly by tenant/queue/priority, manage leases/heartbeats, finalize attempts.
+
+**Key Design Decisions**:
+- At-least-once execution with leases: a job attempt is “owned” by a worker for a bounded time; on timeout it is retried.
+- Priority + fairness: weighted fair scheduling across tenants, then within tenant by queue weights, then by priority (P0 before P1…).
+
+**Technology Choice**: Ready Queue Bus as Kafka/PubSub; dispatcher consumes and assigns; Redis for fast counters; DB for authoritative state.
+
+**Scaling Strategy**: Shard dispatchers by ready-topic partitions; workers connect to their shard; autoscale on partition lag and active leases.
+
+### Metadata DB (Jobs/Attempts)
+**Responsibility**: Source of truth for job lifecycle, attempts, configuration, and audit.
+
+**Key Design Decisions**:
+- Immutable attempt records for audit/debug; job row is the mutable “current state”.
+- State transitions are conditional (CAS) to prevent races (e.g., only `READY -> RUNNING` if version matches).
+
+**Technology Choice**: CockroachDB (global consistency + failover) or Postgres with read replicas; partitioning by `(tenantId, jobIdHash)` and TTL/archival jobs.
+
+**Scaling Strategy**: Partition/shard by tenant hash; keep hot indexes minimal; archive old attempts to object storage/warehouse.
+
+### Quota/Isolation Service
+**Responsibility**: Enforce per-tenant limits: submit QPS, max queued jobs, max concurrent running, CPU-time budgets, queue-level caps.
+
+**Key Design Decisions**:
+- Token-bucket rate limits for admission + dispatch.
+- Hard concurrency caps enforced at dispatch time (don’t assign if tenant at limit), with optional “burst” windows.
+
+**Technology Choice**: Redis (atomic increments/expiries) + periodic reconciliation with DB; config stored in DB.
+
+**Scaling Strategy**: Redis clustered; cache configs locally with short TTL; isolate hot tenants via dedicated Redis shards if needed.
+
+## Data Model
+
+### Storage Schema
+
+**Table: `tenants`**
+- `tenant_id` (PK)
+- `status` (ACTIVE/SUSPENDED)
+- `limits` (jsonb: submit_qps, max_running, max_queued, etc.)
+- `created_at`, `updated_at`
+
+**Table: `queues`**
+- `tenant_id` (PK part)
+- `queue_id` (PK part)
+- `weight` (int)
+- `paused` (bool)
+- `max_running` (int, optional override)
+- `created_at`, `updated_at`
+
+**Table: `jobs`**
+- `tenant_id` (PK part)
+- `job_id` (PK part, ULID)
+- `idempotency_key` (unique with tenant_id)
+- `queue_id`
+- `priority` (smallint, 0 highest)
+- `state` (SCHEDULED/READY/RUNNING/SUCCEEDED/FAILED/CANCELED/DLQ)
+- `run_at` (timestamp)
+- `deadline_at` (timestamp, optional)
+- `payload_ref` (uri) + `payload_sha256`
+- `attempt` (int current attempt number)
+- `max_attempts` (int)
+- `backoff_policy` (jsonb)
+- `last_error` (text)
+- `version` (bigint for CAS)
+- `created_at`, `updated_at`
+
+**Table: `attempts`**
+- `tenant_id` (PK part)
+- `job_id` (PK part)
+- `attempt_no` (PK part)
+- `worker_id`
+- `lease_id` (uuid)
+- `started_at`, `heartbeat_at`, `finished_at`
+- `result` (SUCCEEDED/FAILED/TIMED_OUT/CANCELED)
+- `error_code`, `error_message`
+- `runtime_ms`
+
+**Table: `ready_publications`** (optional dedupe)
+- `tenant_id`, `job_id`, `attempt_no` (PK)
+- `published_at`
+
+### Data Flow
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API as Job Service
+    participant DB as Metadata DB
+    participant Timer as Timer Service
+    participant Bus as Ready Queue
+    participant Disp as Dispatcher
+    participant Worker
+
+    Client->>API: POST /v1/jobs (runAt, priority, payload)
+    API->>DB: INSERT jobs (SCHEDULED or READY) + attempts=0
+    alt runAt <= now
+        API->>Bus: publish READY(job_id, priority, shard)
+    else runAt > now
+        API-->>Client: 202 Accepted + job_id
+    end
+
+    Timer->>DB: scan due SCHEDULED where run_at <= now (by shard)
+    Timer->>DB: CAS jobs.state SCHEDULED->READY
+    Timer->>Bus: publish READY(job_id, priority, shard)
+
+    Disp->>Bus: consume READY messages
+    Worker->>Disp: PollForWork(tenant filters, capabilities)
+    Disp->>DB: CAS READY->RUNNING, create attempt + lease
+    Disp-->>Worker: JobAssignment(job_id, lease_id, payload_ref)
+
+    Worker->>Disp: Heartbeat(lease_id)
+    Worker->>Disp: Complete(lease_id, success/failure)
+    Disp->>DB: update attempt + jobs.state (SUCCEEDED or READY w/ backoff)
+    alt failure and attempts exhausted
+        Disp->>DB: jobs.state=DLQ
+        Disp->>Bus: publish DLQ event
+    end
+```
+
+## API Design
+
+### Enqueue Job
+`POST /v1/tenants/{tenantId}/jobs`
+- Headers: `Idempotency-Key: <string>`
+- Request:
+  ```json
+  {
+    "queueId": "email",
+    "priority": 1,
+    "runAt": "2025-12-17T12:00:00Z",
+    "payload": { "template": "welcome", "userId": "123" },
+    "maxAttempts": 10,
+    "backoff": { "type": "exponential", "baseMs": 5000, "maxMs": 900000, "jitter": true }
+  }
+  ```
+- Response `202`:
+  ```json
+  { "jobId": "01JFK...ULID", "state": "SCHEDULED" }
+  ```
+- Errors:
+  - `409` idempotency conflict with mismatched body hash
+  - `429` rate-limited / quota exceeded
+  - `400` invalid `runAt`/policy
+- Idempotency: keyed by `(tenantId, Idempotency-Key)`; store request hash to detect misuse.
+
+### Get Job Status
+`GET /v1/tenants/{tenantId}/jobs/{jobId}`
+- Response includes state, attempt, timestamps, last error, next run time.
+
+### Cancel Job
+`POST /v1/tenants/{tenantId}/jobs/{jobId}:cancel`
+- Behavior:
+  - If `SCHEDULED/READY`: transition to `CANCELED`.
+  - If `RUNNING`: mark `cancel_requested=true`; worker cooperatively stops; if not, lease expiry will requeue unless canceled is authoritative.
+- Idempotent: repeated cancel returns current state.
+
+### Worker Poll
+`POST /v1/worker:poll`
+- Request:
+  ```json
+  { "workerId": "w-123", "capabilities": ["email"], "maxJobs": 5, "tenantHints": ["t1","t2"] }
+  ```
+- Response:
+  ```json
+  { "assignments": [{ "jobId": "...", "leaseId": "...", "deadline": "...", "payloadRef": "s3://..." }] }
+  ```
+- Error handling: `429` if worker exceeds poll rate; `503` if dispatcher overloaded (client backs off with jitter).
+
+### Worker Heartbeat / Complete
+`POST /v1/worker:heartbeat` and `POST /v1/worker:complete`
+- Idempotency: `complete` is idempotent by `(leaseId, completionToken)`; duplicates ignored.
+
+## Scaling & Performance
+
+### Bottleneck Analysis
+- **Delayed scheduling scans**: mitigate with sharded time buckets, bounded scans, and backpressure.
+- **Metadata DB write amplification** (attempts, heartbeats): batch heartbeats, store last heartbeat in Redis with periodic DB flush, write only on state changes.
+- **Hot tenants/queues**: enforce quotas and isolate via dedicated partitions and per-tenant concurrency caps.
+- **Ready-queue lag**: autoscale dispatcher consumers; increase partitions; use compact ready messages (IDs only).
+
+### Horizontal Scaling
+- **API layer**: stateless; scale on CPU/QPS.
+- **Timer Service**: scale by shard count (e.g., 1024 shards); each shard owns a time-bucket range.
+- **Ready Queue**: partition by `(tenantShard, priority)` to parallelize consumption.
+- **Dispatcher**: scale with queue partitions; each dispatcher group owns a subset of partitions.
+- **Workers**: elastic; can be tenant-dedicated pools for strict isolation.
+
+**Partitioning strategy**:
+- `tenantShard = hash(tenantId) % N`
+- Topics: `ready.p0.<shard>`, `ready.p1.<shard>`… (or a single topic with priority + consumer-side prioritization if supported)
+- DB partitions aligned to `tenantShard` to reduce cross-shard contention.
+
+### Caching Strategy
+- **Config cache**: tenant/queue limits in-process with 30–60s TTL; source of truth in DB.
+- **Quota counters**: Redis token buckets and running-job counters with expiries.
+- **Payload caching**: workers cache payloads by `payload_sha256` for short TTL; CDN/object-store caching for large blobs.
+- Invalidation: config updates publish an event to a small “config” topic; services invalidate local caches immediately (fallback to TTL).
+
+## Trade-offs & Alternatives
+
+### Key Trade-offs Made
+- **Chosen**: at-least-once execution with leases + idempotency keys  
+  **Sacrificed**: strict exactly-once semantics  
+  **Why**: exactly-once across distributed workers is costly; interviews and real systems (Celery, SQS, Kafka consumers) typically rely on idempotent handlers.
+- **Chosen**: separate Timer Service for delayed jobs  
+  **Sacrificed**: simplicity of “single queue does everything”  
+  **Why**: delayed ordering at scale is a specialized workload; separating it avoids slowing down ready dispatch.
+- **Chosen**: fairness + quotas at dispatch time  
+  **Sacrificed**: maximum throughput for a single tenant  
+  **Why**: multi-tenant safety is a primary requirement; predictable isolation beats peak single-tenant performance.
+
+### Alternative Approaches
+- **Redis-only (sorted sets for delay + lists for ready)**: simple and fast, but harder to guarantee durability and multi-AZ correctness at large scale.
+- **DB-only scheduler (SELECT … FOR UPDATE SKIP LOCKED)**: strong correctness and fewer moving parts, but limited dispatch throughput and expensive polling at high QPS.
+- **Kubernetes CronJobs/Argo Workflows**: great for workflow orchestration, but less suited for high-QPS multi-tenant priority queues and fine-grained retries/leases.
+
+## Failure Modes & Mitigations
+
+### Failure Scenarios
+- **Scenario**: Dispatcher crashes mid-assignment  
+  **Impact**: jobs stuck in RUNNING until lease expires  
+  **Detection**: lease timeout metrics; rising “stuck running” gauge  
+  **Mitigation**: lease TTL + worker heartbeats; requeue on timeout; dispatcher stateless restart.
+- **Scenario**: Timer Service publishes READY but DB update fails (or vice versa)  
+  **Impact**: potential duplicates or missed dispatch  
+  **Detection**: reconciliation job compares DB `READY` vs ready-queue lag; dedupe table/metrics  
+  **Mitigation**: transactional outbox pattern (DB outbox -> bus), or `ready_publications` dedupe + periodic re-publish for `READY` not seen.
+- **Scenario**: Metadata DB partial outage / high latency  
+  **Impact**: enqueue slows; dispatch can’t transition states  
+  **Detection**: DB latency/error SLO alerts  
+  **Mitigation**: shed load (429), queue submissions in short-lived ingress buffer (optional), prioritize state transitions over reads, degrade dashboards.
+- **Scenario**: Hot tenant attempts to overwhelm system  
+  **Impact**: noisy neighbor, increased latencies  
+  **Detection**: per-tenant QPS/running/queued alarms  
+  **Mitigation**: admission rate limits, per-tenant concurrency caps, separate partitions/pools, automated tenant throttling.
+- **Scenario**: Worker loses network after receiving job  
+  **Impact**: job times out, retries, duplicates possible  
+  **Detection**: missed heartbeats; rising timeout rate  
+  **Mitigation**: retries with backoff + jitter; require idempotent job handlers; optional exactly-once for specific job types via dedupe keys in downstream systems.
+
+### Disaster Recovery
+- **RTO/RPO**: RTO 30 minutes (regional failover), RPO ~0 for accepted jobs (multi-AZ synchronous replication).
+- **Backup strategy**: continuous DB backups + PITR; object storage versioning; Kafka/PubSub retention sized for worst-case outage window (e.g., 24–72h).
+- **Failover procedures**: promote standby region DB (or use globally consistent DB), restart stateless services, drain/rewire workers to new dispatch endpoints, run reconciliation to republish `READY` jobs.
+
+## Operational Considerations
+
+### Monitoring & Alerting
+- Key metrics:
+  - Enqueue QPS, P99 latency, 4xx/5xx rates
+  - Ready-queue lag per partition/priority
+  - Due-to-dispatch latency (SLO), timer scan lag
+  - Running jobs per tenant/queue, throttle counts (429)
+  - Retry rate, DLQ rate, timeout rate, duplicate-complete rate
+  - DB transaction latency, lock/contention, connection pool saturation
+- Alert thresholds (examples):
+  - Due-to-dispatch P99 > 5s for 10m
+  - Ready-queue lag > 1M messages or > 5m behind
+  - DLQ rate > 0.5% of completions for 15m
+  - DB P99 write latency > 200ms for 10m
+
+### Deployment Strategy
+- Blue/green or canary for stateless services; feature flags for scheduling policy changes.
+- Backward-compatible schema migrations (expand/contract), dual-write if needed for outbox adoption.
+- Rollback: keep old consumers compatible with topic schema; version ready messages; fast rollback via traffic shift.
+
+## References & Further Reading
+- Celery architecture and at-least-once task delivery: https://docs.celeryq.dev/
+- Kafka consumer groups and delivery semantics: https://kafka.apache.org/documentation/
+- Transactional outbox pattern (reliable DB->bus publishing): https://microservices.io/patterns/data/transactional-outbox.html
+- SQS visibility timeout model (leases): https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html
+- Google Cloud Tasks (delayed execution, retries): https://cloud.google.com/tasks/docs/overview
+
+[Pass 1/3] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts/task-scheduler-batch.md
+
+[Pass 2/3] Reviewing and improving draft...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b29d4-f814-72b0-9606-36fad0401c0d
+--------
+user
+# System Design Solution Reviewer
+
+You are a Staff/Principal Engineer reviewing a system design document for the "System Design Atlas" educational resource.
+
+## Your Task
+
+Review the provided system design draft and improve it. Your goal is to ensure the document is:
+- Technically accurate and production-ready
+- Complete with no missing critical sections
+- Consistent in formatting and style
+- Clear and educational for the target audience
+
+## Review Checklist
+
+### Technical Accuracy
+- [ ] Are the scale estimates realistic?
+- [ ] Are the latency targets achievable with the proposed architecture?
+- [ ] Are the technology choices appropriate for the requirements?
+- [ ] Are there any architectural flaws or anti-patterns?
+- [ ] Is the consistency model correctly applied?
+- [ ] Are failure modes properly addressed?
+
+### Completeness
+- [ ] YAML frontmatter present with title, category, difficulty, tags
+- [ ] All required sections present (Overview, Requirements, Architecture, Components, Data Model, API, Scaling, Trade-offs, Failure Modes, Operations)
+- [ ] Mermaid diagrams included for architecture and data flow
+- [ ] Concrete numbers for scale, latency, availability
+- [ ] At least 3 trade-offs discussed
+- [ ] At least 3 failure scenarios covered
+
+### Clarity & Style
+- [ ] Consistent heading levels and formatting
+- [ ] Technical jargon explained or linked
+- [ ] Diagrams are clear and properly formatted
+- [ ] Code/API examples are syntactically correct
+- [ ] No redundant or contradictory information
+
+### Educational Value
+- [ ] Would this help someone in a system design interview?
+- [ ] Are the "why" explanations sufficient?
+- [ ] Are alternative approaches mentioned?
+- [ ] Are real-world references included?
+
+## Output Format
+
+Return the **complete, improved document** - not just the changes. The output should be a polished, publication-ready Markdown file.
+
+When making improvements:
+1. Fix any technical inaccuracies
+2. Add missing sections or details
+3. Improve Mermaid diagrams for clarity
+4. Strengthen trade-off discussions
+5. Add concrete numbers where vague
+6. Ensure all Mermaid syntax is valid
+7. Improve flow and readability
+
+## Quality Bar
+
+The final document should be something a Principal Engineer would be proud to present in an architecture review. It should demonstrate both breadth (covering all aspects of the system) and depth (showing mastery of the hard problems).
+
+Do NOT add commentary about your changes - just output the improved document.
+
+---
+
+## Draft to Review
+
+---
+title: "Task Scheduler (Batch)"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["scheduler", "distributed-systems", "multi-tenant"]
+---
+
+## Overview
+
+A distributed batch task scheduler must reliably accept large volumes of jobs, run them at (or after) a specified time, honor priorities, and retry on failure—while preventing any single tenant from monopolizing capacity. The hard parts are correctness under failures (no “lost” jobs, bounded duplicates), efficient delayed scheduling at scale (time-based ordering is expensive), and fairness/isolation across tenants and queues.
+
+This design uses a durable metadata store for job state, a dedicated “timer” path for delayed execution, and a high-throughput ready-queue for dispatch to workers. The key insight is separating *durable scheduling decisions* (persisted state transitions with leases) from *fast delivery* (partitioned ready topics/queues), enabling at-least-once execution with strong operational control (quotas, per-tenant routing, DLQs).
+
+## Requirements
+
+### Functional Requirements
+- Submit jobs with tenant, queue, priority, payload, and optional `runAt` (delayed execution).
+- Support multiple priority levels per tenant/queue (e.g., P0–P3) with deterministic ordering rules.
+- Dispatch ready jobs to workers with acknowledgements, heartbeats, and lease timeouts.
+- Retry failed jobs with configurable policy (max attempts, backoff, jitter) and dead-letter routing.
+- Allow canceling jobs (best-effort if already running) and pausing/resuming queues.
+- Provide job status tracking (queued, scheduled, running, succeeded, failed, canceled) and attempt history.
+- Enforce multi-tenant isolation (quotas, rate limits, concurrency caps, and fair scheduling).
+- Provide administrative APIs for tenant config, queue config, and observability/debug tooling.
+
+### Non-Functional Requirements
+- **Scale**:
+  - 10K tenants, 200K active queues total
+  - 50K QPS job submissions (bursts to 200K QPS)
+  - 5K QPS cancels/updates
+  - 1M jobs/min dispatch peak
+  - Metadata: 5B jobs retained 30 days (TTL/archival), 50B attempts (cold storage)
+- **Latency**:
+  - Enqueue API: P50 20ms, P99 100ms
+  - Due-to-dispatch: P50 200ms, P99 2s (for `runAt <= now`)
+  - Worker lease renewal: P99 200ms
+- **Availability**: 99.99% for enqueue/status APIs; 99.9% for dispatch (graceful degradation).
+- **Consistency**:
+  - Strong consistency for job state transitions and idempotent submission (per job key).
+  - Eventual consistency for aggregated metrics, dashboards, and log-based views.
+- **Durability**: No job loss on acknowledged enqueue (RPO≈0). Duplicates tolerated (at-least-once) with idempotency support.
+
+### Constraints & Assumptions
+- Tenants are untrusted; strict isolation and abuse protection required.
+- Workers may be ephemeral and run in multiple regions/AZs.
+- Budget-conscious operations: prefer managed primitives (Kafka/PubSub, Postgres/CockroachDB, Redis) but design supports self-hosting.
+- Compliance: tenant-level encryption keys (KMS), audit logs for admin actions.
+
+## High-Level Architecture
+
+```mermaid
+graph TB
+    subgraph "Client Layer"
+        C1[CLI/SDK]
+        C2[Worker Agents]
+        C3[Admin Console]
+    end
+
+    subgraph "Service Layer"
+        GW[API Gateway + AuthN/Z]
+        JS[Job Service (CRUD + Idempotency)]
+        TS[Timer Service (Delayed -> Ready)]
+        DS[Dispatcher (Ready -> Lease)]
+        RS[Rate Limiter/Quota Service]
+    end
+
+    subgraph "Data Layer"
+        MDB[(Metadata DB<br/>Jobs/Attempts/Queues)]
+        RQ[(Ready Queue Bus<br/>Kafka/PubSub Topics)]
+        DLQ[(Dead Letter Queue)]
+        RED[(Redis<br/>hot quotas/locks)]
+        OBJ[(Object Storage<br/>payloads/logs)]
+        OBS[(Metrics/Logs/Traces)]
+    end
+
+    C1 --> GW --> JS --> MDB
+    JS --> OBJ
+    JS --> RS --> RED
+
+    TS --> MDB
+    TS --> RQ
+
+    DS --> RQ
+    DS --> MDB
+    DS --> RS
+
+    C2 --> DS
+    DS --> C2
+    DS --> OBS
+    JS --> OBS
+    TS --> OBS
+    DLQ --> OBS
+    RQ --> DLQ
+```
+
+The system is split into (1) a strongly consistent control plane (Job Service + Metadata DB) and (2) a high-throughput data plane for dispatch (Ready Queue Bus + Dispatcher). Delayed execution is handled by a Timer Service that scans due jobs efficiently and publishes them into priority-partitioned ready topics.
+
+Multi-tenant isolation is enforced at admission (rate limits), at scheduling (per-tenant concurrency and fairness), and at execution (worker routing by tenant/queue with hard caps). This combination prevents noisy neighbors while keeping the hot path for dispatch simple and scalable.
+
+## Component Deep-Dive
+
+### Job Service
+**Responsibility**: Accept job submissions, validate/auth, enforce idempotency, persist job records, expose status/cancel APIs.
+
+**Key Design Decisions**:
+- Idempotent enqueue via `(tenantId, idempotencyKey)` unique constraint to prevent duplicates on retries.
+- Store large payloads in object storage; keep only pointers + hashes in DB to reduce DB bloat.
+
+**Technology Choice**: Go/Java service; Metadata DB as CockroachDB/Postgres (strong transactions, unique constraints); S3/GCS for payloads.
+
+**Scaling Strategy**: Stateless horizontal scaling behind L7 load balancer; DB connection pooling; per-tenant admission control via Redis-backed quotas.
+
+### Timer Service (Delayed Scheduler)
+**Responsibility**: Move jobs from `SCHEDULED` (future `runAt`) to `READY` by publishing to ready topics when due.
+
+**Key Design Decisions**:
+- Time-bucketed scanning: partition jobs by `(shard, runAtBucket)` to avoid global index hotspots.
+- Lease-based claiming of due buckets so multiple timer instances can cooperate without double-publishing.
+
+**Technology Choice**: Same language as Job Service; DB supports indexed queries on `(shard, runAt)`; optional “timing wheel” in-memory with periodic reconciliation.
+
+**Scaling Strategy**: Scale by number of shards/buckets; each instance processes a subset via consistent hashing; backpressure if ready-queue or DB slows.
+
+### Dispatcher
+**Responsibility**: Serve workers, assign jobs fairly by tenant/queue/priority, manage leases/heartbeats, finalize attempts.
+
+**Key Design Decisions**:
+- At-least-once execution with leases: a job attempt is “owned” by a worker for a bounded time; on timeout it is retried.
+- Priority + fairness: weighted fair scheduling across tenants, then within tenant by queue weights, then by priority (P0 before P1…).
+
+**Technology Choice**: Ready Queue Bus as Kafka/PubSub; dispatcher consumes and assigns; Redis for fast counters; DB for authoritative state.
+
+**Scaling Strategy**: Shard dispatchers by ready-topic partitions; workers connect to their shard; autoscale on partition lag and active leases.
+
+### Metadata DB (Jobs/Attempts)
+**Responsibility**: Source of truth for job lifecycle, attempts, configuration, and audit.
+
+**Key Design Decisions**:
+- Immutable attempt records for audit/debug; job row is the mutable “current state”.
+- State transitions are conditional (CAS) to prevent races (e.g., only `READY -> RUNNING` if version matches).
+
+**Technology Choice**: CockroachDB (global consistency + failover) or Postgres with read replicas; partitioning by `(tenantId, jobIdHash)` and TTL/archival jobs.
+
+**Scaling Strategy**: Partition/shard by tenant hash; keep hot indexes minimal; archive old attempts to object storage/warehouse.
+
+### Quota/Isolation Service
+**Responsibility**: Enforce per-tenant limits: submit QPS, max queued jobs, max concurrent running, CPU-time budgets, queue-level caps.
+
+**Key Design Decisions**:
+- Token-bucket rate limits for admission + dispatch.
+- Hard concurrency caps enforced at dispatch time (don’t assign if tenant at limit), with optional “burst” windows.
+
+**Technology Choice**: Redis (atomic increments/expiries) + periodic reconciliation with DB; config stored in DB.
+
+**Scaling Strategy**: Redis clustered; cache configs locally with short TTL; isolate hot tenants via dedicated Redis shards if needed.
+
+## Data Model
+
+### Storage Schema
+
+**Table: `tenants`**
+- `tenant_id` (PK)
+- `status` (ACTIVE/SUSPENDED)
+- `limits` (jsonb: submit_qps, max_running, max_queued, etc.)
+- `created_at`, `updated_at`
+
+**Table: `queues`**
+- `tenant_id` (PK part)
+- `queue_id` (PK part)
+- `weight` (int)
+- `paused` (bool)
+- `max_running` (int, optional override)
+- `created_at`, `updated_at`
+
+**Table: `jobs`**
+- `tenant_id` (PK part)
+- `job_id` (PK part, ULID)
+- `idempotency_key` (unique with tenant_id)
+- `queue_id`
+- `priority` (smallint, 0 highest)
+- `state` (SCHEDULED/READY/RUNNING/SUCCEEDED/FAILED/CANCELED/DLQ)
+- `run_at` (timestamp)
+- `deadline_at` (timestamp, optional)
+- `payload_ref` (uri) + `payload_sha256`
+- `attempt` (int current attempt number)
+- `max_attempts` (int)
+- `backoff_policy` (jsonb)
+- `last_error` (text)
+- `version` (bigint for CAS)
+- `created_at`, `updated_at`
+
+**Table: `attempts`**
+- `tenant_id` (PK part)
+- `job_id` (PK part)
+- `attempt_no` (PK part)
+- `worker_id`
+- `lease_id` (uuid)
+- `started_at`, `heartbeat_at`, `finished_at`
+- `result` (SUCCEEDED/FAILED/TIMED_OUT/CANCELED)
+- `error_code`, `error_message`
+- `runtime_ms`
+
+**Table: `ready_publications`** (optional dedupe)
+- `tenant_id`, `job_id`, `attempt_no` (PK)
+- `published_at`
+
+### Data Flow
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API as Job Service
+    participant DB as Metadata DB
+    participant Timer as Timer Service
+    participant Bus as Ready Queue
+    participant Disp as Dispatcher
+    participant Worker
+
+    Client->>API: POST /v1/jobs (runAt, priority, payload)
+    API->>DB: INSERT jobs (SCHEDULED or READY) + attempts=0
+    alt runAt <= now
+        API->>Bus: publish READY(job_id, priority, shard)
+    else runAt > now
+        API-->>Client: 202 Accepted + job_id
+    end
+
+    Timer->>DB: scan due SCHEDULED where run_at <= now (by shard)
+    Timer->>DB: CAS jobs.state SCHEDULED->READY
+    Timer->>Bus: publish READY(job_id, priority, shard)
+
+    Disp->>Bus: consume READY messages
+    Worker->>Disp: PollForWork(tenant filters, capabilities)
+    Disp->>DB: CAS READY->RUNNING, create attempt + lease
+    Disp-->>Worker: JobAssignment(job_id, lease_id, payload_ref)
+
+    Worker->>Disp: Heartbeat(lease_id)
+    Worker->>Disp: Complete(lease_id, success/failure)
+    Disp->>DB: update attempt + jobs.state (SUCCEEDED or READY w/ backoff)
+    alt failure and attempts exhausted
+        Disp->>DB: jobs.state=DLQ
+        Disp->>Bus: publish DLQ event
+    end
+```
+
+## API Design
+
+### Enqueue Job
+`POST /v1/tenants/{tenantId}/jobs`
+- Headers: `Idempotency-Key: <string>`
+- Request:
+  ```json
+  {
+    "queueId": "email",
+    "priority": 1,
+    "runAt": "2025-12-17T12:00:00Z",
+    "payload": { "template": "welcome", "userId": "123" },
+    "maxAttempts": 10,
+    "backoff": { "type": "exponential", "baseMs": 5000, "maxMs": 900000, "jitter": true }
+  }
+  ```
+- Response `202`:
+  ```json
+  { "jobId": "01JFK...ULID", "state": "SCHEDULED" }
+  ```
+- Errors:
+  - `409` idempotency conflict with mismatched body hash
+  - `429` rate-limited / quota exceeded
+  - `400` invalid `runAt`/policy
+- Idempotency: keyed by `(tenantId, Idempotency-Key)`; store request hash to detect misuse.
+
+### Get Job Status
+`GET /v1/tenants/{tenantId}/jobs/{jobId}`
+- Response includes state, attempt, timestamps, last error, next run time.
+
+### Cancel Job
+`POST /v1/tenants/{tenantId}/jobs/{jobId}:cancel`
+- Behavior:
+  - If `SCHEDULED/READY`: transition to `CANCELED`.
+  - If `RUNNING`: mark `cancel_requested=true`; worker cooperatively stops; if not, lease expiry will requeue unless canceled is authoritative.
+- Idempotent: repeated cancel returns current state.
+
+### Worker Poll
+`POST /v1/worker:poll`
+- Request:
+  ```json
+  { "workerId": "w-123", "capabilities": ["email"], "maxJobs": 5, "tenantHints": ["t1","t2"] }
+  ```
+- Response:
+  ```json
+  { "assignments": [{ "jobId": "...", "leaseId": "...", "deadline": "...", "payloadRef": "s3://..." }] }
+  ```
+- Error handling: `429` if worker exceeds poll rate; `503` if dispatcher overloaded (client backs off with jitter).
+
+### Worker Heartbeat / Complete
+`POST /v1/worker:heartbeat` and `POST /v1/worker:complete`
+- Idempotency: `complete` is idempotent by `(leaseId, completionToken)`; duplicates ignored.
+
+## Scaling & Performance
+
+### Bottleneck Analysis
+- **Delayed scheduling scans**: mitigate with sharded time buckets, bounded scans, and backpressure.
+- **Metadata DB write amplification** (attempts, heartbeats): batch heartbeats, store last heartbeat in Redis with periodic DB flush, write only on state changes.
+- **Hot tenants/queues**: enforce quotas and isolate via dedicated partitions and per-tenant concurrency caps.
+- **Ready-queue lag**: autoscale dispatcher consumers; increase partitions; use compact ready messages (IDs only).
+
+### Horizontal Scaling
+- **API layer**: stateless; scale on CPU/QPS.
+- **Timer Service**: scale by shard count (e.g., 1024 shards); each shard owns a time-bucket range.
+- **Ready Queue**: partition by `(tenantShard, priority)` to parallelize consumption.
+- **Dispatcher**: scale with queue partitions; each dispatcher group owns a subset of partitions.
+- **Workers**: elastic; can be tenant-dedicated pools for strict isolation.
+
+**Partitioning strategy**:
+- `tenantShard = hash(tenantId) % N`
+- Topics: `ready.p0.<shard>`, `ready.p1.<shard>`… (or a single topic with priority + consumer-side prioritization if supported)
+- DB partitions aligned to `tenantShard` to reduce cross-shard contention.
+
+### Caching Strategy
+- **Config cache**: tenant/queue limits in-process with 30–60s TTL; source of truth in DB.
+- **Quota counters**: Redis token buckets and running-job counters with expiries.
+- **Payload caching**: workers cache payloads by `payload_sha256` for short TTL; CDN/object-store caching for large blobs.
+- Invalidation: config updates publish an event to a small “config” topic; services invalidate local caches immediately (fallback to TTL).
+
+## Trade-offs & Alternatives
+
+### Key Trade-offs Made
+- **Chosen**: at-least-once execution with leases + idempotency keys  
+  **Sacrificed**: strict exactly-once semantics  
+  **Why**: exactly-once across distributed workers is costly; interviews and real systems (Celery, SQS, Kafka consumers) typically rely on idempotent handlers.
+- **Chosen**: separate Timer Service for delayed jobs  
+  **Sacrificed**: simplicity of “single queue does everything”  
+  **Why**: delayed ordering at scale is a specialized workload; separating it avoids slowing down ready dispatch.
+- **Chosen**: fairness + quotas at dispatch time  
+  **Sacrificed**: maximum throughput for a single tenant  
+  **Why**: multi-tenant safety is a primary requirement; predictable isolation beats peak single-tenant performance.
+
+### Alternative Approaches
+- **Redis-only (sorted sets for delay + lists for ready)**: simple and fast, but harder to guarantee durability and multi-AZ correctness at large scale.
+- **DB-only scheduler (SELECT … FOR UPDATE SKIP LOCKED)**: strong correctness and fewer moving parts, but limited dispatch throughput and expensive polling at high QPS.
+- **Kubernetes CronJobs/Argo Workflows**: great for workflow orchestration, but less suited for high-QPS multi-tenant priority queues and fine-grained retries/leases.
+
+## Failure Modes & Mitigations
+
+### Failure Scenarios
+- **Scenario**: Dispatcher crashes mid-assignment  
+  **Impact**: jobs stuck in RUNNING until lease expires  
+  **Detection**: lease timeout metrics; rising “stuck running” gauge  
+  **Mitigation**: lease TTL + worker heartbeats; requeue on timeout; dispatcher stateless restart.
+- **Scenario**: Timer Service publishes READY but DB update fails (or vice versa)  
+  **Impact**: potential duplicates or missed dispatch  
+  **Detection**: reconciliation job compares DB `READY` vs ready-queue lag; dedupe table/metrics  
+  **Mitigation**: transactional outbox pattern (DB outbox -> bus), or `ready_publications` dedupe + periodic re-publish for `READY` not seen.
+- **Scenario**: Metadata DB partial outage / high latency  
+  **Impact**: enqueue slows; dispatch can’t transition states  
+  **Detection**: DB latency/error SLO alerts  
+  **Mitigation**: shed load (429), queue submissions in short-lived ingress buffer (optional), prioritize state transitions over reads, degrade dashboards.
+- **Scenario**: Hot tenant attempts to overwhelm system  
+  **Impact**: noisy neighbor, increased latencies  
+  **Detection**: per-tenant QPS/running/queued alarms  
+  **Mitigation**: admission rate limits, per-tenant concurrency caps, separate partitions/pools, automated tenant throttling.
+- **Scenario**: Worker loses network after receiving job  
+  **Impact**: job times out, retries, duplicates possible  
+  **Detection**: missed heartbeats; rising timeout rate  
+  **Mitigation**: retries with backoff + jitter; require idempotent job handlers; optional exactly-once for specific job types via dedupe keys in downstream systems.
+
+### Disaster Recovery
+- **RTO/RPO**: RTO 30 minutes (regional failover), RPO ~0 for accepted jobs (multi-AZ synchronous replication).
+- **Backup strategy**: continuous DB backups + PITR; object storage versioning; Kafka/PubSub retention sized for worst-case outage window (e.g., 24–72h).
+- **Failover procedures**: promote standby region DB (or use globally consistent DB), restart stateless services, drain/rewire workers to new dispatch endpoints, run reconciliation to republish `READY` jobs.
+
+## Operational Considerations
+
+### Monitoring & Alerting
+- Key metrics:
+  - Enqueue QPS, P99 latency, 4xx/5xx rates
+  - Ready-queue lag per partition/priority
+  - Due-to-dispatch latency (SLO), timer scan lag
+  - Running jobs per tenant/queue, throttle counts (429)
+  - Retry rate, DLQ rate, timeout rate, duplicate-complete rate
+  - DB transaction latency, lock/contention, connection pool saturation
+- Alert thresholds (examples):
+  - Due-to-dispatch P99 > 5s for 10m
+  - Ready-queue lag > 1M messages or > 5m behind
+  - DLQ rate > 0.5% of completions for 15m
+  - DB P99 write latency > 200ms for 10m
+
+### Deployment Strategy
+- Blue/green or canary for stateless services; feature flags for scheduling policy changes.
+- Backward-compatible schema migrations (expand/contract), dual-write if needed for outbox adoption.
+- Rollback: keep old consumers compatible with topic schema; version ready messages; fast rollback via traffic shift.
+
+## References & Further Reading
+- Celery architecture and at-least-once task delivery: https://docs.celeryq.dev/
+- Kafka consumer groups and delivery semantics: https://kafka.apache.org/documentation/
+- Transactional outbox pattern (reliable DB->bus publishing): https://microservices.io/patterns/data/transactional-outbox.html
+- SQS visibility timeout model (leases): https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html
+- Google Cloud Tasks (delayed execution, retries): https://cloud.google.com/tasks/docs/overview
+
+---
+
+Output the complete, improved document now.
+mcp startup: no servers
+
+
+
+
+
+thinking
+**Considering algorithm enhancements**
+
+I’m thinking of adding a fairness algorithm, possibly DRR or WFQ, with some pseudocode that’s minimal. I should make sure to include notes on priority inversion and starvation, maybe implementing aging or per-priority quotas. For the Data Model improvements, I could include fields like `state_reason`, `cancel_requested`, `lease_expires_at`, and `locked_by`, along with a `ready_partition` field. I also need to address worker capabilities and routing while mentioning operations like reprocessing DLQ. Let’s create a polished markdown for the complete document.
+thinking
+**Structuring the task scheduler documentation**
+
+I'm organizing the structure for the task scheduler documentation, starting with the frontmatter. The overview will outline the key elements along with functional and non-functional requirements, touching on aspects like scale, latency, and security. I might mention out-of-scope elements too. 
+
+For the architecture, I will delineate goals, include high-level diagrams, and execution lifecycles. Components like the API Gateway, Job Service, and Worker Agents will be detailed. I also want to cover the data model, API endpoints, scheduling fairness, and scaling performance metrics. Let’s plan for clarity!
+thinking
+**Analyzing dispatch and job metrics**
+
+I'm realizing that each dispatch represents a database transaction, and at 33k/s, it seems heavy but plausible with a sharded CockroachDB setup. While a dispatch rate of 1M/min translates to about 16.7k/s, I need to consider submissions. If retention implies 5B jobs over 30 days, that calculates to an average of 1.9k/s, which is significantly lower than 50k. 
+
+I might need to lower the average jobs or adjust retention to have some jobs archived after seven days. So, let's go with a sustained rate of 1k qps for calculations, allowing for bursts up to 50k. This way, our data looks manageable while being realistic.
+thinking
+**Estimating job row size and storage**
+
+I'm aiming to provide estimates for the job row size and overall storage. Let’s assume each job metadata row is about 1KB in the hot database. With 2.6B jobs, that leads to 2.6TB, which feels unrealistic, so archival will be necessary. I'll set hot retention to 7 days, ensuring that data gets aggregated and compressed accordingly. 
+
+It's essential to make the document production-ready by mentioning storage layering, failure modes like message bus outages or Redis failures, and creating runbooks for operations. I'll also add sections on trade-offs, security measures, and adjust the diagrams for clarity. Finally, using the right Mermaid syntax will be crucial!
+thinking
+**Refining compatibility and components**
+
+To ensure compatibility, I’ll use the `\n` character in Mermaid diagrams, reflecting it like `["Metadata DB\n(CockroachDB/Postgres)"]` since that’s supported. It's important to clarify that `RQ --> DLQ` doesn't imply that the whole ready queue moves to the DLQ, but rather that it's based on max attempts. I need to correct the architecture, maybe adjusting `DS --> DLQ` to `Dispatcher --> DLQ Topic`. 
+
+Also, adding an Outbox table and Publisher component could be beneficial. Although the user didn't specifically ask for it, including “Interview Notes” or “Key Insights” may enhance educational value, alongside an "Operations" section with SLOs. Let's keep it polished yet minimal!
+codex
+---
+title: "Task Scheduler (Batch)"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["scheduler", "distributed-systems", "multi-tenant", "kafka", "leases", "outbox"]
+---
+
+## Overview
+
+A distributed batch task scheduler accepts large volumes of jobs, runs them at (or after) a specified time, enforces priorities and retries, and prevents any single tenant from monopolizing capacity. The core challenges are:
+
+- **Correctness under failures**: no “lost” jobs after an acknowledged enqueue; bounded duplicates (at-least-once).
+- **Efficient delayed scheduling**: time-based ordering is expensive at scale; naive polling creates DB hotspots.
+- **Fairness and isolation**: enforce tenant/queue limits without destroying throughput.
+- **Operational control**: debuggable state, replay, DLQs, auditability.
+
+This design separates a **durable control plane** (job metadata + state transitions) from a **high-throughput data plane** (ready notifications + dispatch). Job state is authoritative in the metadata store; the queue bus is treated as a delivery accelerator, not the source of truth.
+
+---
+
+## Requirements
+
+### Functional Requirements
+
+- Submit jobs with `tenantId`, `queueId`, `priority`, payload, and optional `runAt` (delayed execution).
+- Deterministic ordering within a queue:
+  - Higher priority first (P0 before P1…).
+  - Within the same priority: earlier `runAt` first.
+  - Tie-breaker: `jobId` (ULID) ascending for stability.
+- Dispatch ready jobs to workers with **leases**, heartbeats, and lease timeouts.
+- Retry failures with configurable policy (max attempts, exponential backoff, jitter) and DLQ routing.
+- Cancel jobs (best-effort if already running) and pause/resume queues.
+- Provide status tracking and attempt history for audit/debug.
+- Enforce multi-tenant isolation:
+  - Admission rate limits (enqueue/cancel/status).
+  - Max queued / max running per tenant and per queue.
+  - Fair scheduling across tenants (no starvation).
+- Admin controls:
+  - Tenant and queue configuration.
+  - Requeue/DLQ replay tooling.
+  - Observability (metrics/traces/logs) and audit logs.
+
+### Non-Functional Requirements
+
+**Scale targets (example sizing for an educational “big system”)**
+- Tenants: ~10,000
+- Queues: ~200,000 total (many sparse)
+- Enqueue: 5,000 QPS sustained, bursts up to 200,000 QPS for minutes
+- Cancel/update: 2,000 QPS sustained, bursts to 20,000 QPS
+- Dispatch: peak 1,000,000 jobs/min (~16,700/sec) across all priorities
+- Retention:
+  - Hot metadata in DB: 7–14 days
+  - Long-term history (jobs + attempts): 30–90 days in object storage / warehouse
+  - Reasoning: at 5,000 QPS average, you create ~432M jobs/day; storing full-fidelity attempt history for 30 days in an OLTP DB is usually cost-prohibitive.
+
+**Latency / freshness**
+- Enqueue API: P50 20ms, P99 150ms (regional)
+- Due-to-dispatch (jobs with `runAt <= now`):
+  - P50 250ms, P99 2s (under normal load)
+  - P99 10s during partial degradation (backpressure allowed)
+- Status reads: P99 200ms (with cache), P99 500ms (DB-only)
+- Lease heartbeat endpoint: P99 200ms
+
+**Availability**
+- Enqueue/status APIs: 99.99% (multi-AZ)
+- Dispatch: 99.9% (graceful degradation allowed; workers retry)
+
+**Consistency model**
+- **Strong consistency** for job state transitions and idempotent enqueue.
+- **At-least-once** execution (duplicates possible); provide primitives for idempotent consumers.
+- **Eventual consistency** for aggregated metrics, dashboards, and log-derived views.
+
+**Durability**
+- After a successful enqueue response: **no job loss** (RPO ≈ 0).
+- RTO: 30–60 minutes for regional failover (configurable).
+
+### Assumptions / Out of Scope
+
+- Jobs are “single-step” tasks; DAG/workflow orchestration is out of scope (Airflow/Temporal/Argo are better fits).
+- Worker execution environment and business logic are owned by tenants; the scheduler provides delivery, retry, and isolation.
+- Exactly-once execution is not provided end-to-end (typically infeasible without constraining workloads).
+
+---
+
+## Architecture
+
+### High-Level Diagram
+
+```mermaid
+flowchart TB
+  subgraph Client["Clients"]
+    C1["CLI / SDK"]
+    C2["Admin Console"]
+    W["Worker Agents"]
+  end
+
+  subgraph Edge["Edge"]
+    GW["API Gateway\nAuthN/Z, routing, WAF"]
+  end
+
+  subgraph Control["Control Plane (Durable)"]
+    JS["Job Service\nCRUD, idempotency, config"]
+    MDB[("Metadata DB\nJobs, Attempts, Tenants, Queues, Outbox")]
+    OBJ[("Object Storage\nLarge payloads, logs, archives")]
+  end
+
+  subgraph Data["Data Plane (High Throughput)"]
+    TS["Timer Service\nDelayed -> Ready"]
+    OP["Outbox Publisher\nDB -> Bus"]
+    BUS[("Ready Event Bus\nKafka / PubSub")]
+    DS["Dispatcher\nFair scheduling + leases"]
+    DLQ[("DLQ Topic / Queue")]
+  end
+
+  subgraph Isolation["Isolation / Limits"]
+    QS["Quota Service\nrate limits + concurrency caps"]
+    RED[("Redis / KV\ncounters, short TTL state")]
+  end
+
+  subgraph Obs["Observability"]
+    OBS[("Metrics / Logs / Traces")]
+    AUD[("Audit Log")]
+  end
+
+  C1 --> GW --> JS
+  C2 --> GW --> JS
+  JS --> MDB
+  JS --> OBJ
+  JS --> QS
+  QS --> RED
+
+  TS --> MDB
+  TS --> MDB
+  MDB --> OP --> BUS
+
+  DS --> BUS
+  W --> DS
+  DS --> MDB
+  DS --> QS
+
+  DS --> DLQ
+  DLQ --> OBS
+
+  JS --> OBS
+  TS --> OBS
+  OP --> OBS
+  DS --> OBS
+  JS --> AUD
+```
+
+### Key Principles
+
+- **DB is the source of truth**: a job is “ready” because the DB says so, not because a message exists.
+- **Messages are notifications**: the ready bus accelerates wakeups and load distribution; it is safe to drop or duplicate messages.
+- **Leases prevent lost work**: job assignments are time-bounded; timeouts trigger retries.
+- **Fairness is enforced at dispatch**: admission control alone cannot prevent queued jobs from monopolizing execution.
+
+---
+
+## Components
+
+### Job Service
+
+**Responsibilities**
+- Validate/authenticate requests; enforce tenant and queue policies.
+- Idempotent enqueue; persist job records and (optional) payload pointer.
+- Expose status, list, cancel, and admin endpoints (pause/resume queue, limits).
+
+**Notes**
+- Idempotency is typically `(tenantId, Idempotency-Key)` with a stored request hash.
+- Large payloads go to object storage; DB stores `payload_ref` + checksum.
+
+### Timer Service (Delayed Scheduler)
+
+**Responsibilities**
+- Promote jobs from `SCHEDULED` to `READY` when `run_at <= now`.
+- Avoid global scanning hotspots.
+
+**Implementation approach**
+- Partition delayed jobs by `tenantShard` and scan in bounded windows:
+  - Example query pattern: “for shard S, fetch next N due jobs ordered by `run_at`”.
+- Use **claim/lease** mechanics for scanning ownership (per shard or per time-bucket) to distribute work.
+
+### Outbox Publisher (Reliable DB → Bus)
+
+**Responsibilities**
+- Publish “job is ready” notifications reliably after DB commit.
+
+**Why it matters**
+- Without an outbox, you risk “DB updated but message not published” (missed wakeup) or “message published but DB not updated” (spurious wakeup). The outbox pattern makes this deterministic.
+
+**Mechanics**
+- Transaction writes:
+  - Update `jobs.state = READY`
+  - Insert `outbox` row (event type `JOB_READY`, key = jobId)
+- Publisher reads outbox rows and publishes to the bus, then marks them delivered.
+
+### Ready Event Bus (Kafka/PubSub)
+
+**Responsibilities**
+- Carry lightweight ready notifications (`jobId`, `tenantId`, `priority`, `shard`, `runAt`).
+- Provide partitioned parallelism and backpressure visibility (lag).
+
+**Partitioning**
+- Partition key typically includes `tenantShard` (and optionally priority) to balance load and preserve locality.
+
+### Dispatcher (Fair Scheduling + Leases)
+
+**Responsibilities**
+- Consume ready notifications, build an in-memory view of “candidates”.
+- When workers poll, pick jobs with fairness + priority, then atomically lease them in the DB.
+- Record attempts and completions; schedule retries (backoff) or DLQ.
+
+**Fairness model (practical)**
+- Two-stage selection:
+  1. Choose a tenant via weighted fairness (e.g., deficit round-robin / WFQ using tenant weights and current running count).
+  2. Choose a queue within that tenant (queue weights), then choose highest priority job available.
+- Add **anti-starvation** by reserving a small fraction of capacity for lower priorities or using priority aging (optional).
+
+### Quota Service (Isolation)
+
+**Responsibilities**
+- Enforce admission rate limits (token buckets).
+- Enforce concurrency caps:
+  - Tenant-level max running
+  - Queue-level max running
+- Provide safe degradation:
+  - Return `429` (retry with jitter) instead of melting the DB/dispatch layer.
+
+**Implementation**
+- Redis for fast counters with TTL; periodic reconciliation from DB to correct drift.
+
+### Workers
+
+**Responsibilities**
+- Poll for work, execute job, heartbeat, and complete.
+- Must be built assuming at-least-once delivery (idempotent or dedupe downstream).
+
+---
+
+## Data Model
+
+### State Machine
+
+- `SCHEDULED` → `READY` → `RUNNING` → `SUCCEEDED`
+- `RUNNING` → `READY` (retry after failure/backoff or lease timeout)
+- Any state → `CANCELED` (subject to rules below)
+- `RUNNING/READY` → `DLQ` when attempts exhausted or policy says “do not retry”
+
+**Cancel semantics**
+- If not yet leased: cancel is authoritative (job will not run).
+- If already leased/running: set `cancel_requested=true`; worker cooperatively stops. Late completions are accepted only if they match the active lease and job is not canceled.
+
+### Tables (Illustrative)
+
+**Table: `tenants`**
+- `tenant_id` (PK)
+- `status` (ACTIVE/SUSPENDED)
+- `limits` (jsonb: submit_qps, max_running, max_queued, etc.)
+- `weight` (int default 1)
+- `created_at`, `updated_at`
+
+**Table: `queues`**
+- `tenant_id` (PK part)
+- `queue_id` (PK part)
+- `weight` (int)
+- `paused` (bool)
+- `max_running` (int, optional override)
+- `created_at`, `updated_at`
+
+**Table: `jobs`**
+- `tenant_id` (PK part)
+- `job_id` (PK part, ULID)
+- `idempotency_key` (unique with tenant_id)
+- `queue_id`
+- `priority` (smallint, 0 highest)
+- `state` (SCHEDULED/READY/RUNNING/SUCCEEDED/FAILED/CANCELED/DLQ)
+- `run_at` (timestamp)
+- `next_run_at` (timestamp; for backoff scheduling)
+- `deadline_at` (timestamp, optional)
+- `payload_ref` (uri) + `payload_sha256`
+- `attempt` (int current attempt number)
+- `max_attempts` (int)
+- `backoff_policy` (jsonb)
+- `cancel_requested` (bool)
+- `active_lease_id` (uuid, nullable)
+- `lease_expires_at` (timestamp, nullable)
+- `last_error` (text)
+- `version` (bigint for CAS)
+- `created_at`, `updated_at`
+
+**Table: `attempts`**
+- `tenant_id` (PK part)
+- `job_id` (PK part)
+- `attempt_no` (PK part)
+- `lease_id` (uuid)
+- `worker_id`
+- `started_at`, `heartbeat_at`, `finished_at`
+- `result` (SUCCEEDED/FAILED/TIMED_OUT/CANCELED)
+- `error_code`, `error_message`
+- `runtime_ms`
+
+**Table: `outbox`**
+- `event_id` (PK, ULID/UUID)
+- `event_type` (e.g., JOB_READY)
+- `aggregate_key` (e.g., tenantId/jobId)
+- `payload` (jsonb, small)
+- `created_at`
+- `delivered_at` (nullable)
+
+### Indexing / Partitioning
+
+- Partition/shard by `tenantShard = hash(tenant_id) % N`.
+- Hot indexes:
+  - `jobs(tenantShard, state, priority, next_run_at)` for scanning due READY/retry work (bounded).
+  - `jobs(tenant_id, idempotency_key)` unique for idempotent enqueue.
+- Attempts can be partitioned similarly and/or written to cold storage after N days.
+
+---
+
+## Data Flow
+
+```mermaid
+sequenceDiagram
+  participant Client
+  participant API as Job Service
+  participant DB as Metadata DB
+  participant Timer as Timer Service
+  participant Outbox as Outbox Publisher
+  participant Bus as Ready Bus
+  participant Disp as Dispatcher
+  participant Worker
+
+  Client->>API: POST /v1/tenants/{t}/jobs (runAt, priority, payload)
+  API->>DB: TXN: insert job (SCHEDULED or READY)
+  alt runAt <= now
+    API->>DB: TXN: insert outbox event JOB_READY
+    API-->>Client: 202 Accepted (jobId, READY)
+  else runAt > now
+    API-->>Client: 202 Accepted (jobId, SCHEDULED)
+  end
+
+  Timer->>DB: Claim shard/bucket lease
+  Timer->>DB: TXN: SCHEDULED -> READY for due jobs
+  Timer->>DB: TXN: insert outbox JOB_READY (per job)
+
+  Outbox->>DB: Read undelivered outbox rows
+  Outbox->>Bus: Publish JOB_READY notifications
+  Outbox->>DB: Mark delivered
+
+  Disp->>Bus: Consume JOB_READY notifications
+  Worker->>Disp: POST /v1/worker:poll (maxJobs, capabilities)
+  Disp->>DB: TXN: CAS READY->RUNNING + set lease (lease_id, expires_at) + insert attempt
+  Disp-->>Worker: assignments (jobId, leaseId, payloadRef, deadline)
+
+  Worker->>Disp: POST /v1/worker:heartbeat (leaseId)
+  Worker->>Disp: POST /v1/worker:complete (leaseId, success/failure)
+  Disp->>DB: TXN: finalize attempt; update job state
+  alt failure and retry
+    Disp->>DB: set next_run_at (backoff) + state=SCHEDULED
+  else attempts exhausted
+    Disp->>DB: state=DLQ
+    Disp->>Bus: (optional) publish JOB_DLQ event
+  end
+```
+
+---
+
+## API Design
+
+### Enqueue Job
+
+`POST /v1/tenants/{tenantId}/jobs`  
+Headers: `Idempotency-Key: <string>`
+
+Request:
+```json
+{
+  "queueId": "email",
+  "priority": 1,
+  "runAt": "2025-12-17T12:00:00Z",
+  "payload": { "template": "welcome", "userId": "123" },
+  "maxAttempts": 10,
+  "backoff": { "type": "exponential", "baseMs": 5000, "maxMs": 900000, "jitter": true },
+  "deadlineAt": "2025-12-17T13:00:00Z"
+}
+```
+
+Response `202`:
+```json
+{ "jobId": "01JFK...ULID", "state": "SCHEDULED" }
+```
+
+Errors:
+- `409` idempotency key reused with different request hash
+- `429` rate-limited / quota exceeded
+- `400` invalid policy / timestamps / queue
+
+### Get Job Status
+
+`GET /v1/tenants/{tenantId}/jobs/{jobId}`
+
+Response (example):
+```json
+{
+  "jobId": "01JFK...ULID",
+  "queueId": "email",
+  "priority": 1,
+  "state": "RUNNING",
+  "runAt": "2025-12-17T12:00:00Z",
+  "attempt": 3,
+  "leaseExpiresAt": "2025-12-17T12:01:30Z",
+  "lastError": "timeout contacting downstream",
+  "updatedAt": "2025-12-17T12:00:40Z"
+}
+```
+
+### Cancel Job
+
+`POST /v1/tenants/{tenantId}/jobs/{jobId}:cancel`
+
+Behavior:
+- If `SCHEDULED/READY`: transition to `CANCELED` (authoritative).
+- If `RUNNING`: set `cancel_requested=true` and (optionally) shorten `lease_expires_at` to accelerate reclaim; completion is accepted only if it matches the active lease and job is not canceled.
+
+### Pause / Resume Queue (Admin)
+
+`POST /v1/tenants/{tenantId}/queues/{queueId}:pause`  
+`POST /v1/tenants/{tenantId}/queues/{queueId}:resume`
+
+### Worker Poll
+
+`POST /v1/worker:poll`
+
+Request:
+```json
+{
+  "workerId": "w-123",
+  "capabilities": ["email"],
+  "maxJobs": 5,
+  "tenantHints": ["t1", "t2"]
+}
+```
+
+Response:
+```json
+{
+  "assignments": [
+    {
+      "jobId": "01JFK...ULID",
+      "leaseId": "2f2c2a6a-6f1d-4a10-8c2d-6b0d5b0b9ef1",
+      "leaseExpiresAt": "2025-12-17T12:01:30Z",
+      "payloadRef": "s3://bucket/payloads/01JFK...",
+      "payloadSha256": "..."
+    }
+  ]
+}
+```
+
+### Worker Heartbeat / Complete
+
+`POST /v1/worker:heartbeat`  
+`POST /v1/worker:complete`
+
+Idempotency:
+- `complete` is idempotent by `(leaseId, completionToken)` or by enforcing “only finalize once per leaseId” in the DB.
+
+Error handling:
+- `429` if worker exceeds poll rate
+- `503` if dispatch is overloaded (worker backs off with jitter)
+
+---
+
+## Scheduling, Isolation, and Correctness
+
+### Leases and Timeouts
+
+- Dispatcher assigns a lease with TTL (e.g., 60–120s) and requires heartbeats (e.g., every 15–30s).
+- If heartbeats stop and `lease_expires_at` passes, the job becomes eligible for retry.
+- Lease renewals should be lightweight; avoid writing every heartbeat to the DB (store last heartbeat in Redis and write to DB on completion / timeout).
+
+### Retry and Backoff
+
+- On failure:
+  - Increment attempt count.
+  - Compute `next_run_at = now + backoff(attempt_no)` with jitter.
+  - Transition to `SCHEDULED` with `run_at = next_run_at` (so the same delayed path handles retries).
+- DLQ when:
+  - Attempts exhausted, or
+  - Policy marks error as non-retryable (e.g., `error_code` matches denylist).
+
+### Idempotency Guidance for Tenants
+
+Because execution is at-least-once, job handlers should be idempotent using one of:
+- A downstream dedupe key (e.g., `jobId`) stored in a database with “insert-if-not-exists”.
+- Exactly-once semantics within a single downstream system (e.g., transactional writes keyed by `jobId`).
+
+---
+
+## Scaling & Performance
+
+### Bottlenecks and Mitigations
+
+- **Delayed scheduling scans**
+  - Use shard-based bounded scans and bucket leases.
+  - Keep queries index-friendly (`state=SCHEDULED AND run_at<=now` on a shard).
+- **DB write amplification**
+  - Avoid DB writes on every heartbeat; batch or store ephemeral heartbeat in Redis.
+  - Keep “hot path” writes limited to state transitions and attempt finalization.
+- **Hot tenants / noisy neighbors**
+  - Enforce admission limits and dispatch concurrency caps.
+  - Isolate heavy tenants into dedicated worker pools or partitions (optional premium tier).
+- **Ready-bus lag**
+  - Autoscale consumers; increase partitions.
+  - Keep messages tiny (IDs + routing), never embed payloads.
+
+### Horizontal Scaling Strategy
+
+- **API layer**: stateless; scale on CPU/QPS.
+- **Timer service**: scale by shard count; each instance owns a subset of shards via consistent hashing + leases.
+- **Bus**: partitions sized for peak dispatch; monitor lag and rebalance.
+- **Dispatcher**: horizontally scale consumers and worker-facing endpoints; shard workers by dispatch group to reduce contention.
+- **Workers**: elastic; optionally dedicated pools per tenant for strict isolation.
+
+### Partitioning Recommendations
+
+- `tenantShard = hash(tenantId) % N` (start with N=512–2048, grow with re-sharding strategy)
+- Bus topic: `job.ready` with partition key = `tenantShard` (priority in message; dispatcher maintains per-priority queues), or separate per-priority topics if the platform supports strong consumer-side priority poorly.
+
+---
+
+## Trade-offs & Alternatives
+
+### Key Trade-offs
+
+- **At-least-once + leases (chosen)** vs **exactly-once (not chosen)**  
+  Exactly-once across distributed workers usually requires constraining workloads or coupling to a single transactional system; most production schedulers rely on idempotency.
+- **DB as source of truth + bus as notification (chosen)** vs **queue as source of truth (alternative)**  
+  Using the bus as truth complicates cancellation, auditing, and deterministic state transitions; DB truth simplifies correctness at the cost of more DB work.
+- **Dedicated Timer path (chosen)** vs **single unified ready queue**  
+  Delayed scheduling benefits from specialized scanning/claiming; mixing it into the ready path increases contention and tail latency.
+- **Dispatch-time fairness (chosen)** vs **admission-only isolation**  
+  Admission limits can’t prevent already-queued work from dominating execution; fairness at dispatch is necessary for true multi-tenant safety.
+
+### Alternative Approaches
+
+- **Redis-only (sorted sets for delay + lists/streams for ready)**  
+  Very fast, but durability and multi-AZ correctness are harder at high scale; careful persistence and replay are required.
+- **DB-only scheduler (`SELECT ... FOR UPDATE SKIP LOCKED`)**  
+  Strong correctness and fewer moving parts, but polling and row-lock contention limit throughput at very high dispatch rates.
+- **Kubernetes CronJobs / Argo / Airflow / Temporal**  
+  Great for workflows and orchestration; less suitable for ultra-high-QPS multi-tenant priority queues with fine-grained fairness and per-job leases.
+
+---
+
+## Failure Modes & Mitigations
+
+### Failure Scenarios (Examples)
+
+1. **Dispatcher crashes mid-assignment**
+   - Impact: jobs remain `RUNNING` until lease expires; workers may retry poll.
+   - Mitigation: leases + timeouts; dispatcher stateless restart; worker retries with jitter.
+
+2. **Message published but DB state not updated (or vice versa)**
+   - Impact: spurious or missed wakeups.
+   - Mitigation: transactional outbox; treat bus as notification; periodic reconciliation for stuck `READY`/due `SCHEDULED`.
+
+3. **Metadata DB partial outage or high latency**
+   - Impact: enqueue slows/fails; dispatch cannot lease jobs.
+   - Mitigation: shed load (`429`), degrade non-critical reads, prioritize state transitions, circuit breakers, multi-AZ DB, retries with jitter.
+
+4. **Redis/quota store outage**
+   - Impact: inability to enforce limits precisely.
+   - Mitigation: fail “closed” for abusive endpoints (conservative rate limiting), fall back to DB-based caps for critical paths, short outage tolerance with cached limits.
+
+5. **Clock skew (timer/dispatcher/workers)**
+   - Impact: early/late scheduling; incorrect lease expiration.
+   - Mitigation: rely on DB `now()` for authoritative comparisons; NTP; keep TTLs with slack.
+
+6. **Bus partition outage / consumer lag**
+   - Impact: delayed wakeups; increased due-to-dispatch latency.
+   - Mitigation: reconciliation job scans for `READY` jobs older than a threshold and re-enqueues notifications; autoscale consumers; alert on lag.
+
+### Disaster Recovery
+
+- **RPO**: ~0 for acknowledged enqueues (multi-AZ synchronous replication or strongly consistent DB).
+- **RTO**: 30–60 minutes for regional failover (depends on DB strategy).
+- **Backups**: continuous DB backups + PITR; object storage versioning; bus retention sized for worst-case outage window (24–72h).
+- **Failover**: promote standby/global DB, restart stateless services, re-point workers, run reconciliation to republish notifications for eligible jobs.
+
+---
+
+## Operations
+
+### Monitoring & Alerting
+
+Key metrics:
+- API: enqueue QPS, P99 latency, 4xx/5xx, `429` rate by tenant
+- Scheduling: timer scan lag, due-to-ready lag, outbox undelivered count/age
+- Dispatch: due-to-dispatch SLO, active leases, lease timeout rate, worker poll/assignment success
+- Bus: per-partition lag, publish errors, consumer rebalance frequency
+- DB: P99 txn latency, contention/lock waits, retries/abort rate, connection pool saturation
+- Reliability: retry rate, DLQ rate, duplicate completion rate (same job completed multiple times)
+
+Example alerts:
+- Due-to-dispatch P99 > 5s for 10m
+- Outbox oldest undelivered > 30s for 5m
+- Bus lag > 5m behind (any priority) for 10m
+- Lease timeout rate > baseline + 3σ for 15m
+- DB P99 write latency > 250ms for 10m
+
+### Deployment & Schema Changes
+
+- Canary/blue-green for stateless services; feature flags for scheduling policy changes.
+- DB migrations follow expand/contract; keep old/new consumers compatible.
+- Version ready messages; prefer backward-compatible additions.
+
+### Debuggability / Tooling
+
+- Per-job timeline: state transitions, attempts, worker IDs, errors, lease history.
+- “Stuck job” tools:
+  - `READY` too long → republish notification
+  - `RUNNING` past lease without heartbeat → force timeout and retry
+- DLQ tooling:
+  - inspect reason, sample payload pointers, replay with throttling and audit trail
+
+### Security & Compliance
+
+- AuthN/Z: tenant-scoped tokens; admin actions require stronger auth and are audited.
+- Encryption:
+  - TLS in transit; encryption at rest for DB/object store.
+  - Optional tenant-level envelope keys via KMS.
+- Abuse protection: WAF, per-tenant quotas, payload size limits, input validation, audit logs.
+
+---
+
+## References & Further Reading
+
+- Celery architecture and delivery semantics: https://docs.celeryq.dev/
+- Kafka consumer groups and delivery semantics: https://kafka.apache.org/documentation/
+- Transactional outbox pattern: https://microservices.io/patterns/data/transactional-outbox.html
+- SQS visibility timeout (lease model): https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html
+- Google Cloud Tasks (delays, retries): https://cloud.google.com/tasks/docs/overview
+tokens used
+13,447
+---
+title: "Task Scheduler (Batch)"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["scheduler", "distributed-systems", "multi-tenant", "kafka", "leases", "outbox"]
+---
+
+## Overview
+
+A distributed batch task scheduler accepts large volumes of jobs, runs them at (or after) a specified time, enforces priorities and retries, and prevents any single tenant from monopolizing capacity. The core challenges are:
+
+- **Correctness under failures**: no “lost” jobs after an acknowledged enqueue; bounded duplicates (at-least-once).
+- **Efficient delayed scheduling**: time-based ordering is expensive at scale; naive polling creates DB hotspots.
+- **Fairness and isolation**: enforce tenant/queue limits without destroying throughput.
+- **Operational control**: debuggable state, replay, DLQs, auditability.
+
+This design separates a **durable control plane** (job metadata + state transitions) from a **high-throughput data plane** (ready notifications + dispatch). Job state is authoritative in the metadata store; the queue bus is treated as a delivery accelerator, not the source of truth.
+
+---
+
+## Requirements
+
+### Functional Requirements
+
+- Submit jobs with `tenantId`, `queueId`, `priority`, payload, and optional `runAt` (delayed execution).
+- Deterministic ordering within a queue:
+  - Higher priority first (P0 before P1…).
+  - Within the same priority: earlier `runAt` first.
+  - Tie-breaker: `jobId` (ULID) ascending for stability.
+- Dispatch ready jobs to workers with **leases**, heartbeats, and lease timeouts.
+- Retry failures with configurable policy (max attempts, exponential backoff, jitter) and DLQ routing.
+- Cancel jobs (best-effort if already running) and pause/resume queues.
+- Provide status tracking and attempt history for audit/debug.
+- Enforce multi-tenant isolation:
+  - Admission rate limits (enqueue/cancel/status).
+  - Max queued / max running per tenant and per queue.
+  - Fair scheduling across tenants (no starvation).
+- Admin controls:
+  - Tenant and queue configuration.
+  - Requeue/DLQ replay tooling.
+  - Observability (metrics/traces/logs) and audit logs.
+
+### Non-Functional Requirements
+
+**Scale targets (example sizing for an educational “big system”)**
+- Tenants: ~10,000
+- Queues: ~200,000 total (many sparse)
+- Enqueue: 5,000 QPS sustained, bursts up to 200,000 QPS for minutes
+- Cancel/update: 2,000 QPS sustained, bursts to 20,000 QPS
+- Dispatch: peak 1,000,000 jobs/min (~16,700/sec) across all priorities
+- Retention:
+  - Hot metadata in DB: 7–14 days
+  - Long-term history (jobs + attempts): 30–90 days in object storage / warehouse
+  - Reasoning: at 5,000 QPS average, you create ~432M jobs/day; storing full-fidelity attempt history for 30 days in an OLTP DB is usually cost-prohibitive.
+
+**Latency / freshness**
+- Enqueue API: P50 20ms, P99 150ms (regional)
+- Due-to-dispatch (jobs with `runAt <= now`):
+  - P50 250ms, P99 2s (under normal load)
+  - P99 10s during partial degradation (backpressure allowed)
+- Status reads: P99 200ms (with cache), P99 500ms (DB-only)
+- Lease heartbeat endpoint: P99 200ms
+
+**Availability**
+- Enqueue/status APIs: 99.99% (multi-AZ)
+- Dispatch: 99.9% (graceful degradation allowed; workers retry)
+
+**Consistency model**
+- **Strong consistency** for job state transitions and idempotent enqueue.
+- **At-least-once** execution (duplicates possible); provide primitives for idempotent consumers.
+- **Eventual consistency** for aggregated metrics, dashboards, and log-derived views.
+
+**Durability**
+- After a successful enqueue response: **no job loss** (RPO ≈ 0).
+- RTO: 30–60 minutes for regional failover (configurable).
+
+### Assumptions / Out of Scope
+
+- Jobs are “single-step” tasks; DAG/workflow orchestration is out of scope (Airflow/Temporal/Argo are better fits).
+- Worker execution environment and business logic are owned by tenants; the scheduler provides delivery, retry, and isolation.
+- Exactly-once execution is not provided end-to-end (typically infeasible without constraining workloads).
+
+---
+
+## Architecture
+
+### High-Level Diagram
+
+```mermaid
+flowchart TB
+  subgraph Client["Clients"]
+    C1["CLI / SDK"]
+    C2["Admin Console"]
+    W["Worker Agents"]
+  end
+
+  subgraph Edge["Edge"]
+    GW["API Gateway\nAuthN/Z, routing, WAF"]
+  end
+
+  subgraph Control["Control Plane (Durable)"]
+    JS["Job Service\nCRUD, idempotency, config"]
+    MDB[("Metadata DB\nJobs, Attempts, Tenants, Queues, Outbox")]
+    OBJ[("Object Storage\nLarge payloads, logs, archives")]
+  end
+
+  subgraph Data["Data Plane (High Throughput)"]
+    TS["Timer Service\nDelayed -> Ready"]
+    OP["Outbox Publisher\nDB -> Bus"]
+    BUS[("Ready Event Bus\nKafka / PubSub")]
+    DS["Dispatcher\nFair scheduling + leases"]
+    DLQ[("DLQ Topic / Queue")]
+  end
+
+  subgraph Isolation["Isolation / Limits"]
+    QS["Quota Service\nrate limits + concurrency caps"]
+    RED[("Redis / KV\ncounters, short TTL state")]
+  end
+
+  subgraph Obs["Observability"]
+    OBS[("Metrics / Logs / Traces")]
+    AUD[("Audit Log")]
+  end
+
+  C1 --> GW --> JS
+  C2 --> GW --> JS
+  JS --> MDB
+  JS --> OBJ
+  JS --> QS
+  QS --> RED
+
+  TS --> MDB
+  TS --> MDB
+  MDB --> OP --> BUS
+
+  DS --> BUS
+  W --> DS
+  DS --> MDB
+  DS --> QS
+
+  DS --> DLQ
+  DLQ --> OBS
+
+  JS --> OBS
+  TS --> OBS
+  OP --> OBS
+  DS --> OBS
+  JS --> AUD
+```
+
+### Key Principles
+
+- **DB is the source of truth**: a job is “ready” because the DB says so, not because a message exists.
+- **Messages are notifications**: the ready bus accelerates wakeups and load distribution; it is safe to drop or duplicate messages.
+- **Leases prevent lost work**: job assignments are time-bounded; timeouts trigger retries.
+- **Fairness is enforced at dispatch**: admission control alone cannot prevent queued jobs from monopolizing execution.
+
+---
+
+## Components
+
+### Job Service
+
+**Responsibilities**
+- Validate/authenticate requests; enforce tenant and queue policies.
+- Idempotent enqueue; persist job records and (optional) payload pointer.
+- Expose status, list, cancel, and admin endpoints (pause/resume queue, limits).
+
+**Notes**
+- Idempotency is typically `(tenantId, Idempotency-Key)` with a stored request hash.
+- Large payloads go to object storage; DB stores `payload_ref` + checksum.
+
+### Timer Service (Delayed Scheduler)
+
+**Responsibilities**
+- Promote jobs from `SCHEDULED` to `READY` when `run_at <= now`.
+- Avoid global scanning hotspots.
+
+**Implementation approach**
+- Partition delayed jobs by `tenantShard` and scan in bounded windows:
+  - Example query pattern: “for shard S, fetch next N due jobs ordered by `run_at`”.
+- Use **claim/lease** mechanics for scanning ownership (per shard or per time-bucket) to distribute work.
+
+### Outbox Publisher (Reliable DB → Bus)
+
+**Responsibilities**
+- Publish “job is ready” notifications reliably after DB commit.
+
+**Why it matters**
+- Without an outbox, you risk “DB updated but message not published” (missed wakeup) or “message published but DB not updated” (spurious wakeup). The outbox pattern makes this deterministic.
+
+**Mechanics**
+- Transaction writes:
+  - Update `jobs.state = READY`
+  - Insert `outbox` row (event type `JOB_READY`, key = jobId)
+- Publisher reads outbox rows and publishes to the bus, then marks them delivered.
+
+### Ready Event Bus (Kafka/PubSub)
+
+**Responsibilities**
+- Carry lightweight ready notifications (`jobId`, `tenantId`, `priority`, `shard`, `runAt`).
+- Provide partitioned parallelism and backpressure visibility (lag).
+
+**Partitioning**
+- Partition key typically includes `tenantShard` (and optionally priority) to balance load and preserve locality.
+
+### Dispatcher (Fair Scheduling + Leases)
+
+**Responsibilities**
+- Consume ready notifications, build an in-memory view of “candidates”.
+- When workers poll, pick jobs with fairness + priority, then atomically lease them in the DB.
+- Record attempts and completions; schedule retries (backoff) or DLQ.
+
+**Fairness model (practical)**
+- Two-stage selection:
+  1. Choose a tenant via weighted fairness (e.g., deficit round-robin / WFQ using tenant weights and current running count).
+  2. Choose a queue within that tenant (queue weights), then choose highest priority job available.
+- Add **anti-starvation** by reserving a small fraction of capacity for lower priorities or using priority aging (optional).
+
+### Quota Service (Isolation)
+
+**Responsibilities**
+- Enforce admission rate limits (token buckets).
+- Enforce concurrency caps:
+  - Tenant-level max running
+  - Queue-level max running
+- Provide safe degradation:
+  - Return `429` (retry with jitter) instead of melting the DB/dispatch layer.
+
+**Implementation**
+- Redis for fast counters with TTL; periodic reconciliation from DB to correct drift.
+
+### Workers
+
+**Responsibilities**
+- Poll for work, execute job, heartbeat, and complete.
+- Must be built assuming at-least-once delivery (idempotent or dedupe downstream).
+
+---
+
+## Data Model
+
+### State Machine
+
+- `SCHEDULED` → `READY` → `RUNNING` → `SUCCEEDED`
+- `RUNNING` → `READY` (retry after failure/backoff or lease timeout)
+- Any state → `CANCELED` (subject to rules below)
+- `RUNNING/READY` → `DLQ` when attempts exhausted or policy says “do not retry”
+
+**Cancel semantics**
+- If not yet leased: cancel is authoritative (job will not run).
+- If already leased/running: set `cancel_requested=true`; worker cooperatively stops. Late completions are accepted only if they match the active lease and job is not canceled.
+
+### Tables (Illustrative)
+
+**Table: `tenants`**
+- `tenant_id` (PK)
+- `status` (ACTIVE/SUSPENDED)
+- `limits` (jsonb: submit_qps, max_running, max_queued, etc.)
+- `weight` (int default 1)
+- `created_at`, `updated_at`
+
+**Table: `queues`**
+- `tenant_id` (PK part)
+- `queue_id` (PK part)
+- `weight` (int)
+- `paused` (bool)
+- `max_running` (int, optional override)
+- `created_at`, `updated_at`
+
+**Table: `jobs`**
+- `tenant_id` (PK part)
+- `job_id` (PK part, ULID)
+- `idempotency_key` (unique with tenant_id)
+- `queue_id`
+- `priority` (smallint, 0 highest)
+- `state` (SCHEDULED/READY/RUNNING/SUCCEEDED/FAILED/CANCELED/DLQ)
+- `run_at` (timestamp)
+- `next_run_at` (timestamp; for backoff scheduling)
+- `deadline_at` (timestamp, optional)
+- `payload_ref` (uri) + `payload_sha256`
+- `attempt` (int current attempt number)
+- `max_attempts` (int)
+- `backoff_policy` (jsonb)
+- `cancel_requested` (bool)
+- `active_lease_id` (uuid, nullable)
+- `lease_expires_at` (timestamp, nullable)
+- `last_error` (text)
+- `version` (bigint for CAS)
+- `created_at`, `updated_at`
+
+**Table: `attempts`**
+- `tenant_id` (PK part)
+- `job_id` (PK part)
+- `attempt_no` (PK part)
+- `lease_id` (uuid)
+- `worker_id`
+- `started_at`, `heartbeat_at`, `finished_at`
+- `result` (SUCCEEDED/FAILED/TIMED_OUT/CANCELED)
+- `error_code`, `error_message`
+- `runtime_ms`
+
+**Table: `outbox`**
+- `event_id` (PK, ULID/UUID)
+- `event_type` (e.g., JOB_READY)
+- `aggregate_key` (e.g., tenantId/jobId)
+- `payload` (jsonb, small)
+- `created_at`
+- `delivered_at` (nullable)
+
+### Indexing / Partitioning
+
+- Partition/shard by `tenantShard = hash(tenant_id) % N`.
+- Hot indexes:
+  - `jobs(tenantShard, state, priority, next_run_at)` for scanning due READY/retry work (bounded).
+  - `jobs(tenant_id, idempotency_key)` unique for idempotent enqueue.
+- Attempts can be partitioned similarly and/or written to cold storage after N days.
+
+---
+
+## Data Flow
+
+```mermaid
+sequenceDiagram
+  participant Client
+  participant API as Job Service
+  participant DB as Metadata DB
+  participant Timer as Timer Service
+  participant Outbox as Outbox Publisher
+  participant Bus as Ready Bus
+  participant Disp as Dispatcher
+  participant Worker
+
+  Client->>API: POST /v1/tenants/{t}/jobs (runAt, priority, payload)
+  API->>DB: TXN: insert job (SCHEDULED or READY)
+  alt runAt <= now
+    API->>DB: TXN: insert outbox event JOB_READY
+    API-->>Client: 202 Accepted (jobId, READY)
+  else runAt > now
+    API-->>Client: 202 Accepted (jobId, SCHEDULED)
+  end
+
+  Timer->>DB: Claim shard/bucket lease
+  Timer->>DB: TXN: SCHEDULED -> READY for due jobs
+  Timer->>DB: TXN: insert outbox JOB_READY (per job)
+
+  Outbox->>DB: Read undelivered outbox rows
+  Outbox->>Bus: Publish JOB_READY notifications
+  Outbox->>DB: Mark delivered
+
+  Disp->>Bus: Consume JOB_READY notifications
+  Worker->>Disp: POST /v1/worker:poll (maxJobs, capabilities)
+  Disp->>DB: TXN: CAS READY->RUNNING + set lease (lease_id, expires_at) + insert attempt
+  Disp-->>Worker: assignments (jobId, leaseId, payloadRef, deadline)
+
+  Worker->>Disp: POST /v1/worker:heartbeat (leaseId)
+  Worker->>Disp: POST /v1/worker:complete (leaseId, success/failure)
+  Disp->>DB: TXN: finalize attempt; update job state
+  alt failure and retry
+    Disp->>DB: set next_run_at (backoff) + state=SCHEDULED
+  else attempts exhausted
+    Disp->>DB: state=DLQ
+    Disp->>Bus: (optional) publish JOB_DLQ event
+  end
+```
+
+---
+
+## API Design
+
+### Enqueue Job
+
+`POST /v1/tenants/{tenantId}/jobs`  
+Headers: `Idempotency-Key: <string>`
+
+Request:
+```json
+{
+  "queueId": "email",
+  "priority": 1,
+  "runAt": "2025-12-17T12:00:00Z",
+  "payload": { "template": "welcome", "userId": "123" },
+  "maxAttempts": 10,
+  "backoff": { "type": "exponential", "baseMs": 5000, "maxMs": 900000, "jitter": true },
+  "deadlineAt": "2025-12-17T13:00:00Z"
+}
+```
+
+Response `202`:
+```json
+{ "jobId": "01JFK...ULID", "state": "SCHEDULED" }
+```
+
+Errors:
+- `409` idempotency key reused with different request hash
+- `429` rate-limited / quota exceeded
+- `400` invalid policy / timestamps / queue
+
+### Get Job Status
+
+`GET /v1/tenants/{tenantId}/jobs/{jobId}`
+
+Response (example):
+```json
+{
+  "jobId": "01JFK...ULID",
+  "queueId": "email",
+  "priority": 1,
+  "state": "RUNNING",
+  "runAt": "2025-12-17T12:00:00Z",
+  "attempt": 3,
+  "leaseExpiresAt": "2025-12-17T12:01:30Z",
+  "lastError": "timeout contacting downstream",
+  "updatedAt": "2025-12-17T12:00:40Z"
+}
+```
+
+### Cancel Job
+
+`POST /v1/tenants/{tenantId}/jobs/{jobId}:cancel`
+
+Behavior:
+- If `SCHEDULED/READY`: transition to `CANCELED` (authoritative).
+- If `RUNNING`: set `cancel_requested=true` and (optionally) shorten `lease_expires_at` to accelerate reclaim; completion is accepted only if it matches the active lease and job is not canceled.
+
+### Pause / Resume Queue (Admin)
+
+`POST /v1/tenants/{tenantId}/queues/{queueId}:pause`  
+`POST /v1/tenants/{tenantId}/queues/{queueId}:resume`
+
+### Worker Poll
+
+`POST /v1/worker:poll`
+
+Request:
+```json
+{
+  "workerId": "w-123",
+  "capabilities": ["email"],
+  "maxJobs": 5,
+  "tenantHints": ["t1", "t2"]
+}
+```
+
+Response:
+```json
+{
+  "assignments": [
+    {
+      "jobId": "01JFK...ULID",
+      "leaseId": "2f2c2a6a-6f1d-4a10-8c2d-6b0d5b0b9ef1",
+      "leaseExpiresAt": "2025-12-17T12:01:30Z",
+      "payloadRef": "s3://bucket/payloads/01JFK...",
+      "payloadSha256": "..."
+    }
+  ]
+}
+```
+
+### Worker Heartbeat / Complete
+
+`POST /v1/worker:heartbeat`  
+`POST /v1/worker:complete`
+
+Idempotency:
+- `complete` is idempotent by `(leaseId, completionToken)` or by enforcing “only finalize once per leaseId” in the DB.
+
+Error handling:
+- `429` if worker exceeds poll rate
+- `503` if dispatch is overloaded (worker backs off with jitter)
+
+---
+
+## Scheduling, Isolation, and Correctness
+
+### Leases and Timeouts
+
+- Dispatcher assigns a lease with TTL (e.g., 60–120s) and requires heartbeats (e.g., every 15–30s).
+- If heartbeats stop and `lease_expires_at` passes, the job becomes eligible for retry.
+- Lease renewals should be lightweight; avoid writing every heartbeat to the DB (store last heartbeat in Redis and write to DB on completion / timeout).
+
+### Retry and Backoff
+
+- On failure:
+  - Increment attempt count.
+  - Compute `next_run_at = now + backoff(attempt_no)` with jitter.
+  - Transition to `SCHEDULED` with `run_at = next_run_at` (so the same delayed path handles retries).
+- DLQ when:
+  - Attempts exhausted, or
+  - Policy marks error as non-retryable (e.g., `error_code` matches denylist).
+
+### Idempotency Guidance for Tenants
+
+Because execution is at-least-once, job handlers should be idempotent using one of:
+- A downstream dedupe key (e.g., `jobId`) stored in a database with “insert-if-not-exists”.
+- Exactly-once semantics within a single downstream system (e.g., transactional writes keyed by `jobId`).
+
+---
+
+## Scaling & Performance
+
+### Bottlenecks and Mitigations
+
+- **Delayed scheduling scans**
+  - Use shard-based bounded scans and bucket leases.
+  - Keep queries index-friendly (`state=SCHEDULED AND run_at<=now` on a shard).
+- **DB write amplification**
+  - Avoid DB writes on every heartbeat; batch or store ephemeral heartbeat in Redis.
+  - Keep “hot path” writes limited to state transitions and attempt finalization.
+- **Hot tenants / noisy neighbors**
+  - Enforce admission limits and dispatch concurrency caps.
+  - Isolate heavy tenants into dedicated worker pools or partitions (optional premium tier).
+- **Ready-bus lag**
+  - Autoscale consumers; increase partitions.
+  - Keep messages tiny (IDs + routing), never embed payloads.
+
+### Horizontal Scaling Strategy
+
+- **API layer**: stateless; scale on CPU/QPS.
+- **Timer service**: scale by shard count; each instance owns a subset of shards via consistent hashing + leases.
+- **Bus**: partitions sized for peak dispatch; monitor lag and rebalance.
+- **Dispatcher**: horizontally scale consumers and worker-facing endpoints; shard workers by dispatch group to reduce contention.
+- **Workers**: elastic; optionally dedicated pools per tenant for strict isolation.
+
+### Partitioning Recommendations
+
+- `tenantShard = hash(tenantId) % N` (start with N=512–2048, grow with re-sharding strategy)
+- Bus topic: `job.ready` with partition key = `tenantShard` (priority in message; dispatcher maintains per-priority queues), or separate per-priority topics if the platform supports strong consumer-side priority poorly.
+
+---
+
+## Trade-offs & Alternatives
+
+### Key Trade-offs
+
+- **At-least-once + leases (chosen)** vs **exactly-once (not chosen)**  
+  Exactly-once across distributed workers usually requires constraining workloads or coupling to a single transactional system; most production schedulers rely on idempotency.
+- **DB as source of truth + bus as notification (chosen)** vs **queue as source of truth (alternative)**  
+  Using the bus as truth complicates cancellation, auditing, and deterministic state transitions; DB truth simplifies correctness at the cost of more DB work.
+- **Dedicated Timer path (chosen)** vs **single unified ready queue**  
+  Delayed scheduling benefits from specialized scanning/claiming; mixing it into the ready path increases contention and tail latency.
+- **Dispatch-time fairness (chosen)** vs **admission-only isolation**  
+  Admission limits can’t prevent already-queued work from dominating execution; fairness at dispatch is necessary for true multi-tenant safety.
+
+### Alternative Approaches
+
+- **Redis-only (sorted sets for delay + lists/streams for ready)**  
+  Very fast, but durability and multi-AZ correctness are harder at high scale; careful persistence and replay are required.
+- **DB-only scheduler (`SELECT ... FOR UPDATE SKIP LOCKED`)**  
+  Strong correctness and fewer moving parts, but polling and row-lock contention limit throughput at very high dispatch rates.
+- **Kubernetes CronJobs / Argo / Airflow / Temporal**  
+  Great for workflows and orchestration; less suitable for ultra-high-QPS multi-tenant priority queues with fine-grained fairness and per-job leases.
+
+---
+
+## Failure Modes & Mitigations
+
+### Failure Scenarios (Examples)
+
+1. **Dispatcher crashes mid-assignment**
+   - Impact: jobs remain `RUNNING` until lease expires; workers may retry poll.
+   - Mitigation: leases + timeouts; dispatcher stateless restart; worker retries with jitter.
+
+2. **Message published but DB state not updated (or vice versa)**
+   - Impact: spurious or missed wakeups.
+   - Mitigation: transactional outbox; treat bus as notification; periodic reconciliation for stuck `READY`/due `SCHEDULED`.
+
+3. **Metadata DB partial outage or high latency**
+   - Impact: enqueue slows/fails; dispatch cannot lease jobs.
+   - Mitigation: shed load (`429`), degrade non-critical reads, prioritize state transitions, circuit breakers, multi-AZ DB, retries with jitter.
+
+4. **Redis/quota store outage**
+   - Impact: inability to enforce limits precisely.
+   - Mitigation: fail “closed” for abusive endpoints (conservative rate limiting), fall back to DB-based caps for critical paths, short outage tolerance with cached limits.
+
+5. **Clock skew (timer/dispatcher/workers)**
+   - Impact: early/late scheduling; incorrect lease expiration.
+   - Mitigation: rely on DB `now()` for authoritative comparisons; NTP; keep TTLs with slack.
+
+6. **Bus partition outage / consumer lag**
+   - Impact: delayed wakeups; increased due-to-dispatch latency.
+   - Mitigation: reconciliation job scans for `READY` jobs older than a threshold and re-enqueues notifications; autoscale consumers; alert on lag.
+
+### Disaster Recovery
+
+- **RPO**: ~0 for acknowledged enqueues (multi-AZ synchronous replication or strongly consistent DB).
+- **RTO**: 30–60 minutes for regional failover (depends on DB strategy).
+- **Backups**: continuous DB backups + PITR; object storage versioning; bus retention sized for worst-case outage window (24–72h).
+- **Failover**: promote standby/global DB, restart stateless services, re-point workers, run reconciliation to republish notifications for eligible jobs.
+
+---
+
+## Operations
+
+### Monitoring & Alerting
+
+Key metrics:
+- API: enqueue QPS, P99 latency, 4xx/5xx, `429` rate by tenant
+- Scheduling: timer scan lag, due-to-ready lag, outbox undelivered count/age
+- Dispatch: due-to-dispatch SLO, active leases, lease timeout rate, worker poll/assignment success
+- Bus: per-partition lag, publish errors, consumer rebalance frequency
+- DB: P99 txn latency, contention/lock waits, retries/abort rate, connection pool saturation
+- Reliability: retry rate, DLQ rate, duplicate completion rate (same job completed multiple times)
+
+Example alerts:
+- Due-to-dispatch P99 > 5s for 10m
+- Outbox oldest undelivered > 30s for 5m
+- Bus lag > 5m behind (any priority) for 10m
+- Lease timeout rate > baseline + 3σ for 15m
+- DB P99 write latency > 250ms for 10m
+
+### Deployment & Schema Changes
+
+- Canary/blue-green for stateless services; feature flags for scheduling policy changes.
+- DB migrations follow expand/contract; keep old/new consumers compatible.
+- Version ready messages; prefer backward-compatible additions.
+
+### Debuggability / Tooling
+
+- Per-job timeline: state transitions, attempts, worker IDs, errors, lease history.
+- “Stuck job” tools:
+  - `READY` too long → republish notification
+  - `RUNNING` past lease without heartbeat → force timeout and retry
+- DLQ tooling:
+  - inspect reason, sample payload pointers, replay with throttling and audit trail
+
+### Security & Compliance
+
+- AuthN/Z: tenant-scoped tokens; admin actions require stronger auth and are audited.
+- Encryption:
+  - TLS in transit; encryption at rest for DB/object store.
+  - Optional tenant-level envelope keys via KMS.
+- Abuse protection: WAF, per-tenant quotas, payload size limits, input validation, audit logs.
+
+---
+
+## References & Further Reading
+
+- Celery architecture and delivery semantics: https://docs.celeryq.dev/
+- Kafka consumer groups and delivery semantics: https://kafka.apache.org/documentation/
+- Transactional outbox pattern: https://microservices.io/patterns/data/transactional-outbox.html
+- SQS visibility timeout (lease model): https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html
+- Google Cloud Tasks (delays, retries): https://cloud.google.com/tasks/docs/overview
+
+[Pass 2/3] Reviewed version saved to: /Users/dominikdabrowski/pr/system-design-atlas/reviewed/task-scheduler-batch.md
+
+[Pass 3/3] Simplifying for clarity...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b29d7-338f-7c90-8fc5-7a04e6f65d23
+--------
+user
+# System Design Simplifier
+
+You are a pragmatic Staff Engineer who believes the best systems are the simplest ones that meet the requirements. Your job is to challenge every component and dependency in this design.
+
+## Your Task
+
+Review the system design and aggressively simplify it. For every component, service, database, cache, queue, or dependency, ask:
+
+1. **Do we actually need this?** What breaks if we remove it?
+2. **Can we merge this with something else?** Two services doing related things → one service
+3. **Can we use a simpler alternative?** Kafka → Redis streams? Cassandra → Postgres? Microservice → library?
+4. **Are we over-engineering for scale we don't have?** Start simple, scale later
+5. **Is this dependency worth the operational cost?** Every new technology = on-call burden
+
+## Simplification Principles
+
+### Remove Before You Add
+- Question every cache layer - do we need it at this scale?
+- Question every queue - can we use synchronous calls?
+- Question every separate service - can it be a library or module?
+- Question every "scalable" database - would Postgres work?
+
+### Merge When Possible
+- Combine services that always deploy together
+- Use one database instead of three specialized ones
+- Use existing infrastructure before adding new
+
+### Challenge Complexity
+- "Eventually consistent" → Can we just use strong consistency?
+- "Sharded across regions" → Do we need multi-region yet?
+- "Event-driven architecture" → Would request/response be simpler?
+- "Microservices" → Would a modular monolith work?
+
+### Keep What's Essential
+- Don't remove things that are genuinely needed for correctness
+- Keep redundancy that's required for the stated availability target
+- Keep components that handle genuinely different scaling dimensions
+
+## Output Format
+
+Return the **complete, simplified document** with:
+
+1. **Simplified architecture** - Fewer boxes in the diagram
+2. **Merged components** - Combine where possible
+3. **Removed dependencies** - Cut unnecessary tech
+4. **Justified complexity** - What remains should have clear reasons
+
+For each major simplification, briefly note what was removed/merged and why it's acceptable.
+
+Add a "## Simplification Notes" section at the end listing:
+- What was removed and why
+- What was merged and why
+- What complexity remains and why it's necessary
+
+Do NOT add other commentary - just output the simplified document.
+
+---
+
+## Document to Simplify
+
+---
+title: "Task Scheduler (Batch)"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["scheduler", "distributed-systems", "multi-tenant", "kafka", "leases", "outbox"]
+---
+
+## Overview
+
+A distributed batch task scheduler accepts large volumes of jobs, runs them at (or after) a specified time, enforces priorities and retries, and prevents any single tenant from monopolizing capacity. The core challenges are:
+
+- **Correctness under failures**: no “lost” jobs after an acknowledged enqueue; bounded duplicates (at-least-once).
+- **Efficient delayed scheduling**: time-based ordering is expensive at scale; naive polling creates DB hotspots.
+- **Fairness and isolation**: enforce tenant/queue limits without destroying throughput.
+- **Operational control**: debuggable state, replay, DLQs, auditability.
+
+This design separates a **durable control plane** (job metadata + state transitions) from a **high-throughput data plane** (ready notifications + dispatch). Job state is authoritative in the metadata store; the queue bus is treated as a delivery accelerator, not the source of truth.
+
+---
+
+## Requirements
+
+### Functional Requirements
+
+- Submit jobs with `tenantId`, `queueId`, `priority`, payload, and optional `runAt` (delayed execution).
+- Deterministic ordering within a queue:
+  - Higher priority first (P0 before P1…).
+  - Within the same priority: earlier `runAt` first.
+  - Tie-breaker: `jobId` (ULID) ascending for stability.
+- Dispatch ready jobs to workers with **leases**, heartbeats, and lease timeouts.
+- Retry failures with configurable policy (max attempts, exponential backoff, jitter) and DLQ routing.
+- Cancel jobs (best-effort if already running) and pause/resume queues.
+- Provide status tracking and attempt history for audit/debug.
+- Enforce multi-tenant isolation:
+  - Admission rate limits (enqueue/cancel/status).
+  - Max queued / max running per tenant and per queue.
+  - Fair scheduling across tenants (no starvation).
+- Admin controls:
+  - Tenant and queue configuration.
+  - Requeue/DLQ replay tooling.
+  - Observability (metrics/traces/logs) and audit logs.
+
+### Non-Functional Requirements
+
+**Scale targets (example sizing for an educational “big system”)**
+- Tenants: ~10,000
+- Queues: ~200,000 total (many sparse)
+- Enqueue: 5,000 QPS sustained, bursts up to 200,000 QPS for minutes
+- Cancel/update: 2,000 QPS sustained, bursts to 20,000 QPS
+- Dispatch: peak 1,000,000 jobs/min (~16,700/sec) across all priorities
+- Retention:
+  - Hot metadata in DB: 7–14 days
+  - Long-term history (jobs + attempts): 30–90 days in object storage / warehouse
+  - Reasoning: at 5,000 QPS average, you create ~432M jobs/day; storing full-fidelity attempt history for 30 days in an OLTP DB is usually cost-prohibitive.
+
+**Latency / freshness**
+- Enqueue API: P50 20ms, P99 150ms (regional)
+- Due-to-dispatch (jobs with `runAt <= now`):
+  - P50 250ms, P99 2s (under normal load)
+  - P99 10s during partial degradation (backpressure allowed)
+- Status reads: P99 200ms (with cache), P99 500ms (DB-only)
+- Lease heartbeat endpoint: P99 200ms
+
+**Availability**
+- Enqueue/status APIs: 99.99% (multi-AZ)
+- Dispatch: 99.9% (graceful degradation allowed; workers retry)
+
+**Consistency model**
+- **Strong consistency** for job state transitions and idempotent enqueue.
+- **At-least-once** execution (duplicates possible); provide primitives for idempotent consumers.
+- **Eventual consistency** for aggregated metrics, dashboards, and log-derived views.
+
+**Durability**
+- After a successful enqueue response: **no job loss** (RPO ≈ 0).
+- RTO: 30–60 minutes for regional failover (configurable).
+
+### Assumptions / Out of Scope
+
+- Jobs are “single-step” tasks; DAG/workflow orchestration is out of scope (Airflow/Temporal/Argo are better fits).
+- Worker execution environment and business logic are owned by tenants; the scheduler provides delivery, retry, and isolation.
+- Exactly-once execution is not provided end-to-end (typically infeasible without constraining workloads).
+
+---
+
+## Architecture
+
+### High-Level Diagram
+
+```mermaid
+flowchart TB
+  subgraph Client["Clients"]
+    C1["CLI / SDK"]
+    C2["Admin Console"]
+    W["Worker Agents"]
+  end
+
+  subgraph Edge["Edge"]
+    GW["API Gateway\nAuthN/Z, routing, WAF"]
+  end
+
+  subgraph Control["Control Plane (Durable)"]
+    JS["Job Service\nCRUD, idempotency, config"]
+    MDB[("Metadata DB\nJobs, Attempts, Tenants, Queues, Outbox")]
+    OBJ[("Object Storage\nLarge payloads, logs, archives")]
+  end
+
+  subgraph Data["Data Plane (High Throughput)"]
+    TS["Timer Service\nDelayed -> Ready"]
+    OP["Outbox Publisher\nDB -> Bus"]
+    BUS[("Ready Event Bus\nKafka / PubSub")]
+    DS["Dispatcher\nFair scheduling + leases"]
+    DLQ[("DLQ Topic / Queue")]
+  end
+
+  subgraph Isolation["Isolation / Limits"]
+    QS["Quota Service\nrate limits + concurrency caps"]
+    RED[("Redis / KV\ncounters, short TTL state")]
+  end
+
+  subgraph Obs["Observability"]
+    OBS[("Metrics / Logs / Traces")]
+    AUD[("Audit Log")]
+  end
+
+  C1 --> GW --> JS
+  C2 --> GW --> JS
+  JS --> MDB
+  JS --> OBJ
+  JS --> QS
+  QS --> RED
+
+  TS --> MDB
+  TS --> MDB
+  MDB --> OP --> BUS
+
+  DS --> BUS
+  W --> DS
+  DS --> MDB
+  DS --> QS
+
+  DS --> DLQ
+  DLQ --> OBS
+
+  JS --> OBS
+  TS --> OBS
+  OP --> OBS
+  DS --> OBS
+  JS --> AUD
+```
+
+### Key Principles
+
+- **DB is the source of truth**: a job is “ready” because the DB says so, not because a message exists.
+- **Messages are notifications**: the ready bus accelerates wakeups and load distribution; it is safe to drop or duplicate messages.
+- **Leases prevent lost work**: job assignments are time-bounded; timeouts trigger retries.
+- **Fairness is enforced at dispatch**: admission control alone cannot prevent queued jobs from monopolizing execution.
+
+---
+
+## Components
+
+### Job Service
+
+**Responsibilities**
+- Validate/authenticate requests; enforce tenant and queue policies.
+- Idempotent enqueue; persist job records and (optional) payload pointer.
+- Expose status, list, cancel, and admin endpoints (pause/resume queue, limits).
+
+**Notes**
+- Idempotency is typically `(tenantId, Idempotency-Key)` with a stored request hash.
+- Large payloads go to object storage; DB stores `payload_ref` + checksum.
+
+### Timer Service (Delayed Scheduler)
+
+**Responsibilities**
+- Promote jobs from `SCHEDULED` to `READY` when `run_at <= now`.
+- Avoid global scanning hotspots.
+
+**Implementation approach**
+- Partition delayed jobs by `tenantShard` and scan in bounded windows:
+  - Example query pattern: “for shard S, fetch next N due jobs ordered by `run_at`”.
+- Use **claim/lease** mechanics for scanning ownership (per shard or per time-bucket) to distribute work.
+
+### Outbox Publisher (Reliable DB → Bus)
+
+**Responsibilities**
+- Publish “job is ready” notifications reliably after DB commit.
+
+**Why it matters**
+- Without an outbox, you risk “DB updated but message not published” (missed wakeup) or “message published but DB not updated” (spurious wakeup). The outbox pattern makes this deterministic.
+
+**Mechanics**
+- Transaction writes:
+  - Update `jobs.state = READY`
+  - Insert `outbox` row (event type `JOB_READY`, key = jobId)
+- Publisher reads outbox rows and publishes to the bus, then marks them delivered.
+
+### Ready Event Bus (Kafka/PubSub)
+
+**Responsibilities**
+- Carry lightweight ready notifications (`jobId`, `tenantId`, `priority`, `shard`, `runAt`).
+- Provide partitioned parallelism and backpressure visibility (lag).
+
+**Partitioning**
+- Partition key typically includes `tenantShard` (and optionally priority) to balance load and preserve locality.
+
+### Dispatcher (Fair Scheduling + Leases)
+
+**Responsibilities**
+- Consume ready notifications, build an in-memory view of “candidates”.
+- When workers poll, pick jobs with fairness + priority, then atomically lease them in the DB.
+- Record attempts and completions; schedule retries (backoff) or DLQ.
+
+**Fairness model (practical)**
+- Two-stage selection:
+  1. Choose a tenant via weighted fairness (e.g., deficit round-robin / WFQ using tenant weights and current running count).
+  2. Choose a queue within that tenant (queue weights), then choose highest priority job available.
+- Add **anti-starvation** by reserving a small fraction of capacity for lower priorities or using priority aging (optional).
+
+### Quota Service (Isolation)
+
+**Responsibilities**
+- Enforce admission rate limits (token buckets).
+- Enforce concurrency caps:
+  - Tenant-level max running
+  - Queue-level max running
+- Provide safe degradation:
+  - Return `429` (retry with jitter) instead of melting the DB/dispatch layer.
+
+**Implementation**
+- Redis for fast counters with TTL; periodic reconciliation from DB to correct drift.
+
+### Workers
+
+**Responsibilities**
+- Poll for work, execute job, heartbeat, and complete.
+- Must be built assuming at-least-once delivery (idempotent or dedupe downstream).
+
+---
+
+## Data Model
+
+### State Machine
+
+- `SCHEDULED` → `READY` → `RUNNING` → `SUCCEEDED`
+- `RUNNING` → `READY` (retry after failure/backoff or lease timeout)
+- Any state → `CANCELED` (subject to rules below)
+- `RUNNING/READY` → `DLQ` when attempts exhausted or policy says “do not retry”
+
+**Cancel semantics**
+- If not yet leased: cancel is authoritative (job will not run).
+- If already leased/running: set `cancel_requested=true`; worker cooperatively stops. Late completions are accepted only if they match the active lease and job is not canceled.
+
+### Tables (Illustrative)
+
+**Table: `tenants`**
+- `tenant_id` (PK)
+- `status` (ACTIVE/SUSPENDED)
+- `limits` (jsonb: submit_qps, max_running, max_queued, etc.)
+- `weight` (int default 1)
+- `created_at`, `updated_at`
+
+**Table: `queues`**
+- `tenant_id` (PK part)
+- `queue_id` (PK part)
+- `weight` (int)
+- `paused` (bool)
+- `max_running` (int, optional override)
+- `created_at`, `updated_at`
+
+**Table: `jobs`**
+- `tenant_id` (PK part)
+- `job_id` (PK part, ULID)
+- `idempotency_key` (unique with tenant_id)
+- `queue_id`
+- `priority` (smallint, 0 highest)
+- `state` (SCHEDULED/READY/RUNNING/SUCCEEDED/FAILED/CANCELED/DLQ)
+- `run_at` (timestamp)
+- `next_run_at` (timestamp; for backoff scheduling)
+- `deadline_at` (timestamp, optional)
+- `payload_ref` (uri) + `payload_sha256`
+- `attempt` (int current attempt number)
+- `max_attempts` (int)
+- `backoff_policy` (jsonb)
+- `cancel_requested` (bool)
+- `active_lease_id` (uuid, nullable)
+- `lease_expires_at` (timestamp, nullable)
+- `last_error` (text)
+- `version` (bigint for CAS)
+- `created_at`, `updated_at`
+
+**Table: `attempts`**
+- `tenant_id` (PK part)
+- `job_id` (PK part)
+- `attempt_no` (PK part)
+- `lease_id` (uuid)
+- `worker_id`
+- `started_at`, `heartbeat_at`, `finished_at`
+- `result` (SUCCEEDED/FAILED/TIMED_OUT/CANCELED)
+- `error_code`, `error_message`
+- `runtime_ms`
+
+**Table: `outbox`**
+- `event_id` (PK, ULID/UUID)
+- `event_type` (e.g., JOB_READY)
+- `aggregate_key` (e.g., tenantId/jobId)
+- `payload` (jsonb, small)
+- `created_at`
+- `delivered_at` (nullable)
+
+### Indexing / Partitioning
+
+- Partition/shard by `tenantShard = hash(tenant_id) % N`.
+- Hot indexes:
+  - `jobs(tenantShard, state, priority, next_run_at)` for scanning due READY/retry work (bounded).
+  - `jobs(tenant_id, idempotency_key)` unique for idempotent enqueue.
+- Attempts can be partitioned similarly and/or written to cold storage after N days.
+
+---
+
+## Data Flow
+
+```mermaid
+sequenceDiagram
+  participant Client
+  participant API as Job Service
+  participant DB as Metadata DB
+  participant Timer as Timer Service
+  participant Outbox as Outbox Publisher
+  participant Bus as Ready Bus
+  participant Disp as Dispatcher
+  participant Worker
+
+  Client->>API: POST /v1/tenants/{t}/jobs (runAt, priority, payload)
+  API->>DB: TXN: insert job (SCHEDULED or READY)
+  alt runAt <= now
+    API->>DB: TXN: insert outbox event JOB_READY
+    API-->>Client: 202 Accepted (jobId, READY)
+  else runAt > now
+    API-->>Client: 202 Accepted (jobId, SCHEDULED)
+  end
+
+  Timer->>DB: Claim shard/bucket lease
+  Timer->>DB: TXN: SCHEDULED -> READY for due jobs
+  Timer->>DB: TXN: insert outbox JOB_READY (per job)
+
+  Outbox->>DB: Read undelivered outbox rows
+  Outbox->>Bus: Publish JOB_READY notifications
+  Outbox->>DB: Mark delivered
+
+  Disp->>Bus: Consume JOB_READY notifications
+  Worker->>Disp: POST /v1/worker:poll (maxJobs, capabilities)
+  Disp->>DB: TXN: CAS READY->RUNNING + set lease (lease_id, expires_at) + insert attempt
+  Disp-->>Worker: assignments (jobId, leaseId, payloadRef, deadline)
+
+  Worker->>Disp: POST /v1/worker:heartbeat (leaseId)
+  Worker->>Disp: POST /v1/worker:complete (leaseId, success/failure)
+  Disp->>DB: TXN: finalize attempt; update job state
+  alt failure and retry
+    Disp->>DB: set next_run_at (backoff) + state=SCHEDULED
+  else attempts exhausted
+    Disp->>DB: state=DLQ
+    Disp->>Bus: (optional) publish JOB_DLQ event
+  end
+```
+
+---
+
+## API Design
+
+### Enqueue Job
+
+`POST /v1/tenants/{tenantId}/jobs`  
+Headers: `Idempotency-Key: <string>`
+
+Request:
+```json
+{
+  "queueId": "email",
+  "priority": 1,
+  "runAt": "2025-12-17T12:00:00Z",
+  "payload": { "template": "welcome", "userId": "123" },
+  "maxAttempts": 10,
+  "backoff": { "type": "exponential", "baseMs": 5000, "maxMs": 900000, "jitter": true },
+  "deadlineAt": "2025-12-17T13:00:00Z"
+}
+```
+
+Response `202`:
+```json
+{ "jobId": "01JFK...ULID", "state": "SCHEDULED" }
+```
+
+Errors:
+- `409` idempotency key reused with different request hash
+- `429` rate-limited / quota exceeded
+- `400` invalid policy / timestamps / queue
+
+### Get Job Status
+
+`GET /v1/tenants/{tenantId}/jobs/{jobId}`
+
+Response (example):
+```json
+{
+  "jobId": "01JFK...ULID",
+  "queueId": "email",
+  "priority": 1,
+  "state": "RUNNING",
+  "runAt": "2025-12-17T12:00:00Z",
+  "attempt": 3,
+  "leaseExpiresAt": "2025-12-17T12:01:30Z",
+  "lastError": "timeout contacting downstream",
+  "updatedAt": "2025-12-17T12:00:40Z"
+}
+```
+
+### Cancel Job
+
+`POST /v1/tenants/{tenantId}/jobs/{jobId}:cancel`
+
+Behavior:
+- If `SCHEDULED/READY`: transition to `CANCELED` (authoritative).
+- If `RUNNING`: set `cancel_requested=true` and (optionally) shorten `lease_expires_at` to accelerate reclaim; completion is accepted only if it matches the active lease and job is not canceled.
+
+### Pause / Resume Queue (Admin)
+
+`POST /v1/tenants/{tenantId}/queues/{queueId}:pause`  
+`POST /v1/tenants/{tenantId}/queues/{queueId}:resume`
+
+### Worker Poll
+
+`POST /v1/worker:poll`
+
+Request:
+```json
+{
+  "workerId": "w-123",
+  "capabilities": ["email"],
+  "maxJobs": 5,
+  "tenantHints": ["t1", "t2"]
+}
+```
+
+Response:
+```json
+{
+  "assignments": [
+    {
+      "jobId": "01JFK...ULID",
+      "leaseId": "2f2c2a6a-6f1d-4a10-8c2d-6b0d5b0b9ef1",
+      "leaseExpiresAt": "2025-12-17T12:01:30Z",
+      "payloadRef": "s3://bucket/payloads/01JFK...",
+      "payloadSha256": "..."
+    }
+  ]
+}
+```
+
+### Worker Heartbeat / Complete
+
+`POST /v1/worker:heartbeat`  
+`POST /v1/worker:complete`
+
+Idempotency:
+- `complete` is idempotent by `(leaseId, completionToken)` or by enforcing “only finalize once per leaseId” in the DB.
+
+Error handling:
+- `429` if worker exceeds poll rate
+- `503` if dispatch is overloaded (worker backs off with jitter)
+
+---
+
+## Scheduling, Isolation, and Correctness
+
+### Leases and Timeouts
+
+- Dispatcher assigns a lease with TTL (e.g., 60–120s) and requires heartbeats (e.g., every 15–30s).
+- If heartbeats stop and `lease_expires_at` passes, the job becomes eligible for retry.
+- Lease renewals should be lightweight; avoid writing every heartbeat to the DB (store last heartbeat in Redis and write to DB on completion / timeout).
+
+### Retry and Backoff
+
+- On failure:
+  - Increment attempt count.
+  - Compute `next_run_at = now + backoff(attempt_no)` with jitter.
+  - Transition to `SCHEDULED` with `run_at = next_run_at` (so the same delayed path handles retries).
+- DLQ when:
+  - Attempts exhausted, or
+  - Policy marks error as non-retryable (e.g., `error_code` matches denylist).
+
+### Idempotency Guidance for Tenants
+
+Because execution is at-least-once, job handlers should be idempotent using one of:
+- A downstream dedupe key (e.g., `jobId`) stored in a database with “insert-if-not-exists”.
+- Exactly-once semantics within a single downstream system (e.g., transactional writes keyed by `jobId`).
+
+---
+
+## Scaling & Performance
+
+### Bottlenecks and Mitigations
+
+- **Delayed scheduling scans**
+  - Use shard-based bounded scans and bucket leases.
+  - Keep queries index-friendly (`state=SCHEDULED AND run_at<=now` on a shard).
+- **DB write amplification**
+  - Avoid DB writes on every heartbeat; batch or store ephemeral heartbeat in Redis.
+  - Keep “hot path” writes limited to state transitions and attempt finalization.
+- **Hot tenants / noisy neighbors**
+  - Enforce admission limits and dispatch concurrency caps.
+  - Isolate heavy tenants into dedicated worker pools or partitions (optional premium tier).
+- **Ready-bus lag**
+  - Autoscale consumers; increase partitions.
+  - Keep messages tiny (IDs + routing), never embed payloads.
+
+### Horizontal Scaling Strategy
+
+- **API layer**: stateless; scale on CPU/QPS.
+- **Timer service**: scale by shard count; each instance owns a subset of shards via consistent hashing + leases.
+- **Bus**: partitions sized for peak dispatch; monitor lag and rebalance.
+- **Dispatcher**: horizontally scale consumers and worker-facing endpoints; shard workers by dispatch group to reduce contention.
+- **Workers**: elastic; optionally dedicated pools per tenant for strict isolation.
+
+### Partitioning Recommendations
+
+- `tenantShard = hash(tenantId) % N` (start with N=512–2048, grow with re-sharding strategy)
+- Bus topic: `job.ready` with partition key = `tenantShard` (priority in message; dispatcher maintains per-priority queues), or separate per-priority topics if the platform supports strong consumer-side priority poorly.
+
+---
+
+## Trade-offs & Alternatives
+
+### Key Trade-offs
+
+- **At-least-once + leases (chosen)** vs **exactly-once (not chosen)**  
+  Exactly-once across distributed workers usually requires constraining workloads or coupling to a single transactional system; most production schedulers rely on idempotency.
+- **DB as source of truth + bus as notification (chosen)** vs **queue as source of truth (alternative)**  
+  Using the bus as truth complicates cancellation, auditing, and deterministic state transitions; DB truth simplifies correctness at the cost of more DB work.
+- **Dedicated Timer path (chosen)** vs **single unified ready queue**  
+  Delayed scheduling benefits from specialized scanning/claiming; mixing it into the ready path increases contention and tail latency.
+- **Dispatch-time fairness (chosen)** vs **admission-only isolation**  
+  Admission limits can’t prevent already-queued work from dominating execution; fairness at dispatch is necessary for true multi-tenant safety.
+
+### Alternative Approaches
+
+- **Redis-only (sorted sets for delay + lists/streams for ready)**  
+  Very fast, but durability and multi-AZ correctness are harder at high scale; careful persistence and replay are required.
+- **DB-only scheduler (`SELECT ... FOR UPDATE SKIP LOCKED`)**  
+  Strong correctness and fewer moving parts, but polling and row-lock contention limit throughput at very high dispatch rates.
+- **Kubernetes CronJobs / Argo / Airflow / Temporal**  
+  Great for workflows and orchestration; less suitable for ultra-high-QPS multi-tenant priority queues with fine-grained fairness and per-job leases.
+
+---
+
+## Failure Modes & Mitigations
+
+### Failure Scenarios (Examples)
+
+1. **Dispatcher crashes mid-assignment**
+   - Impact: jobs remain `RUNNING` until lease expires; workers may retry poll.
+   - Mitigation: leases + timeouts; dispatcher stateless restart; worker retries with jitter.
+
+2. **Message published but DB state not updated (or vice versa)**
+   - Impact: spurious or missed wakeups.
+   - Mitigation: transactional outbox; treat bus as notification; periodic reconciliation for stuck `READY`/due `SCHEDULED`.
+
+3. **Metadata DB partial outage or high latency**
+   - Impact: enqueue slows/fails; dispatch cannot lease jobs.
+   - Mitigation: shed load (`429`), degrade non-critical reads, prioritize state transitions, circuit breakers, multi-AZ DB, retries with jitter.
+
+4. **Redis/quota store outage**
+   - Impact: inability to enforce limits precisely.
+   - Mitigation: fail “closed” for abusive endpoints (conservative rate limiting), fall back to DB-based caps for critical paths, short outage tolerance with cached limits.
+
+5. **Clock skew (timer/dispatcher/workers)**
+   - Impact: early/late scheduling; incorrect lease expiration.
+   - Mitigation: rely on DB `now()` for authoritative comparisons; NTP; keep TTLs with slack.
+
+6. **Bus partition outage / consumer lag**
+   - Impact: delayed wakeups; increased due-to-dispatch latency.
+   - Mitigation: reconciliation job scans for `READY` jobs older than a threshold and re-enqueues notifications; autoscale consumers; alert on lag.
+
+### Disaster Recovery
+
+- **RPO**: ~0 for acknowledged enqueues (multi-AZ synchronous replication or strongly consistent DB).
+- **RTO**: 30–60 minutes for regional failover (depends on DB strategy).
+- **Backups**: continuous DB backups + PITR; object storage versioning; bus retention sized for worst-case outage window (24–72h).
+- **Failover**: promote standby/global DB, restart stateless services, re-point workers, run reconciliation to republish notifications for eligible jobs.
+
+---
+
+## Operations
+
+### Monitoring & Alerting
+
+Key metrics:
+- API: enqueue QPS, P99 latency, 4xx/5xx, `429` rate by tenant
+- Scheduling: timer scan lag, due-to-ready lag, outbox undelivered count/age
+- Dispatch: due-to-dispatch SLO, active leases, lease timeout rate, worker poll/assignment success
+- Bus: per-partition lag, publish errors, consumer rebalance frequency
+- DB: P99 txn latency, contention/lock waits, retries/abort rate, connection pool saturation
+- Reliability: retry rate, DLQ rate, duplicate completion rate (same job completed multiple times)
+
+Example alerts:
+- Due-to-dispatch P99 > 5s for 10m
+- Outbox oldest undelivered > 30s for 5m
+- Bus lag > 5m behind (any priority) for 10m
+- Lease timeout rate > baseline + 3σ for 15m
+- DB P99 write latency > 250ms for 10m
+
+### Deployment & Schema Changes
+
+- Canary/blue-green for stateless services; feature flags for scheduling policy changes.
+- DB migrations follow expand/contract; keep old/new consumers compatible.
+- Version ready messages; prefer backward-compatible additions.
+
+### Debuggability / Tooling
+
+- Per-job timeline: state transitions, attempts, worker IDs, errors, lease history.
+- “Stuck job” tools:
+  - `READY` too long → republish notification
+  - `RUNNING` past lease without heartbeat → force timeout and retry
+- DLQ tooling:
+  - inspect reason, sample payload pointers, replay with throttling and audit trail
+
+### Security & Compliance
+
+- AuthN/Z: tenant-scoped tokens; admin actions require stronger auth and are audited.
+- Encryption:
+  - TLS in transit; encryption at rest for DB/object store.
+  - Optional tenant-level envelope keys via KMS.
+- Abuse protection: WAF, per-tenant quotas, payload size limits, input validation, audit logs.
+
+---
+
+## References & Further Reading
+
+- Celery architecture and delivery semantics: https://docs.celeryq.dev/
+- Kafka consumer groups and delivery semantics: https://kafka.apache.org/documentation/
+- Transactional outbox pattern: https://microservices.io/patterns/data/transactional-outbox.html
+- SQS visibility timeout (lease model): https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html
+- Google Cloud Tasks (delays, retries): https://cloud.google.com/tasks/docs/overview
+
+---
+
+Output the complete, simplified document now.
+mcp startup: no servers
+
+
+
+
+
+thinking
+**Simplifying the document**
+
+The user needs a simplified document without commentary, including an architecture diagram and simplification notes. I'm thinking of consolidating several components like Job Service, Timer, Dispatcher, and Quota into a single "Scheduler Service." This means removing Kafka bus, outbox, Redis quota, and heartbeat storage, while using Postgres as a metadata store with techniques like LISTEN/NOTIFY or SKIP LOCKED for dispatching. However, I have to balance simplification with requirements like fairness and delayed scheduling, aiming for a minimal viable solution.
+thinking
+**Simplifying delayed job processing**
+
+For managing delayed jobs, I'm thinking of not having a separate timer service. Instead, the dispatcher will poll for scheduled jobs where the run time is due and transition them to ready or running within the same transaction. This helps eliminate the need for a timer and associated components. For rate limiting, a simple approach could involve using database counts and token buckets, or even API gateway rate limits. Mult-instance APIs typically need shared counters in Redis, but for simplicity, I could use coarse limits at the gateway while managing tenant-specific counts in the database for updates.
+thinking
+**Streamlining job processing**
+
+I could consider extending the lease during polling and having workers send heartbeats less frequently. However, since the heartbeat requirement specifies a 200ms P99 response, I can update the `jobs.lease_expires_at` during each heartbeat. To simplify, I'll use longer leases (like 5 minutes) and fewer heartbeats (every minute), accepting the risk of duplicates. I might still need object storage for large payloads, but that can remain optional. Additionally, audit logs could be stored in a database with retention policies, avoiding a separate audit service. Overall, the architecture can be clients connecting to the scheduler service and Postgres, with workers also communicating with the scheduler.
+thinking
+**Crafting the simplified document**
+
+I need to ensure that outputs are retained and prepare a simplified diagram using Mermaid. The simplified document should include notes at the end, highlighting what was removed, merged, and any remaining complexities. My focus is on creating a modular monolith called "Scheduler API" that will manage enqueueing, dispatching, admin functions, quotas, timers, and leases, utilizing Postgres for jobs, attempts, tenants, queues, and idempotency, possibly with `job_events` for tracking. 
+
+For delay scheduling, I’ll ensure that `SCHEDULED` jobs become eligible when their run time is due. While worker polling selects due jobs fairly, I can implement per-tenant and per-queue limits, likely using round-robin fairness or window functions in SQL to select candidates sorted by priority, run time, or job ID. I'll pick candidates from different tenants in a weighted way.
+thinking
+**Creating the simplified document**
+
+To implement fairness, I plan to build a list of tenants with due work through a query, but that could be heavy. Instead, I can try to approximate fairness by using `ORDER BY next_eligible_time`. I could simplify by enforcing strict per-tenant concurrency caps and selecting the highest priority job globally among eligible jobs. This avoids monopolization of resources while ensuring active tenants are served. 
+
+I'll keep track of `tenant_running` and `queue_running` counters in the database, updated with transactions. The admission process can rely on `max_queued` caps by counting scheduled jobs per tenant or queue with `SELECT COUNT(*)` as needed. 
+
+Finally, I’ll simplify the architecture to focus on a single service with Postgres and include an optional object store. The simplified documentation will include all necessary sections: an overview, architecture diagram, data model, data flow, isolation methods, failure modes, and operations notes. Simplification notes will highlight what was removed and retained for clarity.
+codex
+---
+title: "Task Scheduler (Batch) — Simplified"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["scheduler", "distributed-systems", "multi-tenant", "postgres", "leases"]
+---
+
+## Overview
+
+A multi-tenant batch task scheduler accepts jobs, runs them at/after `runAt`, enforces priority + retries, and prevents tenant monopolization. The simplest design that preserves correctness is:
+
+- **One service** (a modular monolith) that exposes APIs and dispatches work to workers.
+- **One strongly consistent database** (Postgres) as the source of truth for job state, leases, and history.
+- **Optional object storage** only for oversized payloads and long retention exports.
+
+No separate event bus, outbox, timer service, quota service, or Redis is required to meet the core requirements.
+
+---
+
+## Requirements
+
+### Functional Requirements
+
+- Submit jobs with `tenantId`, `queueId`, `priority`, payload, and optional `runAt`.
+- Deterministic ordering within a queue:
+  - Higher priority first (P0 before P1…).
+  - Within same priority: earlier `runAt` first.
+  - Tie-breaker: `jobId` (ULID) ascending.
+- Dispatch to workers with leases, heartbeats, and lease timeouts.
+- Retry failures with configurable policy (max attempts, exponential backoff, jitter) and DLQ routing.
+- Cancel jobs (best-effort if already running) and pause/resume queues.
+- Status tracking and attempt history.
+- Multi-tenant isolation:
+  - Admission limits (enqueue/cancel/status).
+  - Max queued / max running per tenant and per queue.
+  - Fairness across tenants (no starvation).
+- Admin controls: tenant/queue config, requeue/DLQ replay, observability, auditability.
+
+### Non-Functional Requirements (Pragmatic Baseline)
+
+- **Strong consistency** for job state transitions and idempotent enqueue.
+- **At-least-once** execution (bounded duplicates via leases and idempotent completion).
+- Multi-AZ availability for API + DB.
+- Start DB-only for reads/writes; add caches/queues only when proven necessary.
+
+---
+
+## Simplified Architecture
+
+```mermaid
+flowchart TB
+  subgraph Client["Clients"]
+    C1["CLI / SDK"]
+    C2["Admin Console"]
+    W["Worker Agents"]
+  end
+
+  subgraph Edge["Edge"]
+    LB["Load Balancer / API Auth\n(optional API gateway)"]
+  end
+
+  subgraph App["Scheduler Service (Modular Monolith)"]
+    API["HTTP API\nenqueue/status/cancel/admin\nworker poll/heartbeat/complete"]
+    CORE["Scheduler Core\nordering + fairness + leases + retries"]
+  end
+
+  subgraph Data["Storage"]
+    PG[("Postgres\nJobs, Attempts, Tenants, Queues,\nIdempotency, Audit")]
+    OBJ[("Object Storage (optional)\nLarge payloads, cold exports")]
+  end
+
+  subgraph Obs["Observability"]
+    OBS[("Metrics / Logs / Traces")]
+  end
+
+  C1 --> LB --> API
+  C2 --> LB --> API
+  W --> LB --> API
+
+  API --> CORE
+  CORE --> PG
+  API --> PG
+  API --> OBJ
+
+  API --> OBS
+  CORE --> OBS
+  PG --> OBS
+```
+
+### Merged Components
+
+- **Job Service + Dispatcher + Timer + Quota Service** → one `Scheduler Service` with internal modules.
+- **DLQ “topic/queue”** → `jobs.state = DLQ` (queryable + replayable from DB).
+- **Audit log service** → append-only audit table in Postgres (with retention/partitioning).
+
+### Removed Dependencies
+
+- Kafka/PubSub ready bus
+- Transactional outbox + publisher
+- Redis/KV for counters/heartbeats
+- Separate timer service
+- Separate quota service
+- Status cache layer
+
+---
+
+## Core Design (DB-First)
+
+### Key Principle
+
+**The database is the queue.** A job is “ready” when `run_at <= now()` and its state is eligible. Dispatching is implemented as atomic DB transitions using row locks.
+
+### Scheduling Model (No Promotion Pipeline)
+
+- Jobs are stored as:
+  - `SCHEDULED` when `run_at > now()` (delayed)
+  - `READY` when eligible (optional; can also skip directly to `RUNNING` at dispatch)
+- No separate “Timer Service” is needed. Eligibility is computed at dispatch time via indexed queries on `run_at`.
+
+### Dispatch Model (Leases)
+
+When a worker polls, the scheduler:
+- Selects eligible jobs in deterministic order.
+- Atomically transitions them to `RUNNING` and assigns a lease (`lease_id`, `lease_expires_at`) in a single transaction.
+- Records an `attempts` row.
+
+Use `SELECT ... FOR UPDATE SKIP LOCKED` to avoid duplicate assignments across scheduler instances.
+
+---
+
+## Components (Simplified)
+
+### Scheduler Service (Single Deployable)
+
+**Responsibilities**
+- Enqueue (idempotent), status, cancel, admin (pause/resume, limits).
+- Worker APIs: poll, heartbeat (lease extension), complete.
+- Isolation: enforce max running/max queued per tenant/queue.
+- Fairness: ensure tenants with available capacity aren’t starved by a single heavy tenant.
+
+**Fairness (Simple, Correct, Good-Enough)**
+- Enforce strict **per-tenant max_running** and **per-queue max_running** caps.
+- Dispatch selection is “best available” among tenants with remaining capacity:
+  - Candidate selection filters out tenants/queues at cap.
+  - Within each queue: priority/runAt/jobId ordering.
+- This prevents monopolization without needing a separate bus or complex in-memory schedulers.
+
+### Postgres (Only Required Stateful System)
+
+**Responsibilities**
+- Source of truth for jobs, attempts, leases, idempotency, configuration, audit trail.
+- Supports concurrency via row locks and SKIP LOCKED.
+- Partitioning/retention via native partitioned tables where needed.
+
+### Object Storage (Optional)
+
+Used only if:
+- Payloads are too large/expensive to keep in Postgres.
+- You need cheaper long-term archives or exports.
+
+---
+
+## Data Model (Simplified)
+
+### State Machine
+
+- `SCHEDULED` → `RUNNING` → `SUCCEEDED`
+- `RUNNING` → `SCHEDULED` (retry with backoff; set `run_at = next_run_at`)
+- Any state → `CANCELED` (authoritative if not running; cooperative if running)
+- `RUNNING` → `DLQ` when attempts exhausted or non-retryable
+
+### Tables (Illustrative)
+
+**Table: `tenants`**
+- `tenant_id` (PK), `status`, `limits` (jsonb), `weight` (optional), timestamps
+
+**Table: `queues`**
+- `(tenant_id, queue_id)` (PK), `paused`, `weight` (optional), `max_running` override, timestamps
+
+**Table: `jobs`**
+- `(tenant_id, job_id)` (PK, ULID)
+- `idempotency_key` (unique per tenant)
+- `queue_id`, `priority`
+- `state` (SCHEDULED/RUNNING/SUCCEEDED/FAILED/CANCELED/DLQ)
+- `run_at` (timestamp; “next eligible time”, used for initial delay and retries)
+- `payload_json` (jsonb, optional small) OR `payload_ref` + `payload_sha256` (optional)
+- `attempt`, `max_attempts`, `backoff_policy` (jsonb)
+- `cancel_requested` (bool)
+- `active_lease_id` (uuid), `lease_expires_at` (timestamp)
+- `last_error`, `created_at`, `updated_at`
+
+**Table: `attempts`**
+- `(tenant_id, job_id, attempt_no)` (PK)
+- `lease_id`, `worker_id`
+- `started_at`, `heartbeat_at`, `finished_at`
+- `result`, `error_code`, `error_message`, `runtime_ms`
+
+**Table: `audit_events`** (optional but simple)
+- `event_id` (PK), `tenant_id` (nullable), `actor`, `action`, `target`, `metadata` (jsonb), `created_at`
+
+### Indexes (Minimal Set)
+
+- `jobs(state, run_at, priority, job_id)` (plus `tenant_id, queue_id` as needed for filters)
+- `jobs(tenant_id, idempotency_key)` unique
+- `jobs(tenant_id, queue_id, state, run_at, priority, job_id)` for per-queue ordering
+- `jobs(lease_expires_at)` for reclaiming expired leases
+
+---
+
+## Data Flow (Simplified)
+
+```mermaid
+sequenceDiagram
+  participant Client
+  participant API as Scheduler Service
+  participant DB as Postgres
+  participant Worker
+
+  Client->>API: POST /v1/tenants/{t}/jobs (runAt, priority, payload)
+  API->>DB: TXN: upsert idempotency key + insert job (state=SCHEDULED, run_at=runAt)
+  API-->>Client: 202 Accepted (jobId, state)
+
+  Worker->>API: POST /v1/worker:poll (maxJobs, capabilities)
+  API->>DB: TXN: select eligible jobs (state=SCHEDULED, run_at<=now) FOR UPDATE SKIP LOCKED
+  API->>DB: TXN: set state=RUNNING, set lease_id/expires_at, insert attempt
+  API-->>Worker: assignments (jobId, leaseId, payload/payloadRef)
+
+  Worker->>API: POST /v1/worker:heartbeat (leaseId)
+  API->>DB: update lease_expires_at (+ heartbeat_at)
+
+  Worker->>API: POST /v1/worker:complete (leaseId, success/failure)
+  API->>DB: TXN: finalize attempt + update job state
+  alt failure and retry
+    API->>DB: set state=SCHEDULED, run_at=now+backoff
+  else attempts exhausted
+    API->>DB: set state=DLQ
+  end
+```
+
+---
+
+## Scheduling, Isolation, and Correctness
+
+### Leases and Timeouts
+
+- Lease TTL (e.g., 2–5 minutes) with heartbeats (e.g., every 30–60s).
+- If `lease_expires_at < now()` and job is still `RUNNING`, it becomes reclaimable:
+  - Next poll can re-lease it as a retry (attempt increments and backoff policy applies).
+
+### Retry and Backoff
+
+- On failure:
+  - Increment attempt
+  - Compute `run_at = now + backoff(attempt_no)` with jitter
+  - Transition to `SCHEDULED`
+- DLQ is a state in `jobs` (inspectable and replayable via admin APIs).
+
+### Idempotency
+
+- Enqueue idempotency: `(tenant_id, idempotency_key)` stored with request hash.
+- Completion idempotency: finalize-at-most-once per `(tenant_id, job_id, active_lease_id)`.
+
+### Isolation (Minimal, Strong, DB-Enforced)
+
+- Concurrency caps:
+  - Enforced during leasing (don’t assign if tenant/queue is at cap).
+- Admission caps:
+  - Enforced at enqueue with simple checks (start with DB queries; add counters later only if needed).
+- This prevents a tenant from monopolizing running capacity without introducing Redis or a separate quota service.
+
+---
+
+## Operations
+
+### Monitoring
+
+- Enqueue QPS, P99 latency, error rate, `429` rate (if admission limiting enabled)
+- Dispatch latency (due-to-dispatch), poll latency, assignment rate
+- Active leases, lease expirations/timeouts, retries, DLQ rate
+- DB: transaction latency, lock waits, connection saturation
+
+### Deployment
+
+- Scheduler service is stateless; scale horizontally.
+- Postgres is multi-AZ; use PITR and regular backups.
+- Optional partitioning on `jobs/attempts` for retention and vacuum control.
+
+---
+
+## Simplification Notes
+
+- Removed: `Ready Event Bus (Kafka/PubSub)` — acceptable because workers already poll; DB + SKIP LOCKED provides correct, parallel dispatch without a separate delivery accelerator.
+- Removed: `Outbox Publisher` — acceptable because there is no DB→bus dual-write; state transitions and dispatch are entirely DB-driven.
+- Removed: `Timer Service` — acceptable because eligibility is `run_at <= now()` and can be evaluated at dispatch time with indexed queries.
+- Removed: `Quota Service` + `Redis counters/heartbeats` — acceptable because isolation can be enforced transactionally at lease time; heartbeats can update Postgres directly (simpler, higher write load).
+- Removed: `DLQ Topic/Queue` — acceptable because DLQ is a DB state with admin tooling for inspection and replay.
+- Removed: `Status cache` — acceptable because DB-only status reads meet correctness; add caching later only if DB read load demands it.
+- Merged: Job CRUD + dispatch + scheduling + limits into one `Scheduler Service` — acceptable because these functions share the same data and must evolve together.
+- Complexity remains: `Postgres locking/transactions`, `leases + at-least-once semantics`, and `multi-AZ DB operations` — necessary for correctness (no lost jobs after ack) and safe concurrency.
+tokens used
+11,083
+---
+title: "Task Scheduler (Batch) — Simplified"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["scheduler", "distributed-systems", "multi-tenant", "postgres", "leases"]
+---
+
+## Overview
+
+A multi-tenant batch task scheduler accepts jobs, runs them at/after `runAt`, enforces priority + retries, and prevents tenant monopolization. The simplest design that preserves correctness is:
+
+- **One service** (a modular monolith) that exposes APIs and dispatches work to workers.
+- **One strongly consistent database** (Postgres) as the source of truth for job state, leases, and history.
+- **Optional object storage** only for oversized payloads and long retention exports.
+
+No separate event bus, outbox, timer service, quota service, or Redis is required to meet the core requirements.
+
+---
+
+## Requirements
+
+### Functional Requirements
+
+- Submit jobs with `tenantId`, `queueId`, `priority`, payload, and optional `runAt`.
+- Deterministic ordering within a queue:
+  - Higher priority first (P0 before P1…).
+  - Within same priority: earlier `runAt` first.
+  - Tie-breaker: `jobId` (ULID) ascending.
+- Dispatch to workers with leases, heartbeats, and lease timeouts.
+- Retry failures with configurable policy (max attempts, exponential backoff, jitter) and DLQ routing.
+- Cancel jobs (best-effort if already running) and pause/resume queues.
+- Status tracking and attempt history.
+- Multi-tenant isolation:
+  - Admission limits (enqueue/cancel/status).
+  - Max queued / max running per tenant and per queue.
+  - Fairness across tenants (no starvation).
+- Admin controls: tenant/queue config, requeue/DLQ replay, observability, auditability.
+
+### Non-Functional Requirements (Pragmatic Baseline)
+
+- **Strong consistency** for job state transitions and idempotent enqueue.
+- **At-least-once** execution (bounded duplicates via leases and idempotent completion).
+- Multi-AZ availability for API + DB.
+- Start DB-only for reads/writes; add caches/queues only when proven necessary.
+
+---
+
+## Simplified Architecture
+
+```mermaid
+flowchart TB
+  subgraph Client["Clients"]
+    C1["CLI / SDK"]
+    C2["Admin Console"]
+    W["Worker Agents"]
+  end
+
+  subgraph Edge["Edge"]
+    LB["Load Balancer / API Auth\n(optional API gateway)"]
+  end
+
+  subgraph App["Scheduler Service (Modular Monolith)"]
+    API["HTTP API\nenqueue/status/cancel/admin\nworker poll/heartbeat/complete"]
+    CORE["Scheduler Core\nordering + fairness + leases + retries"]
+  end
+
+  subgraph Data["Storage"]
+    PG[("Postgres\nJobs, Attempts, Tenants, Queues,\nIdempotency, Audit")]
+    OBJ[("Object Storage (optional)\nLarge payloads, cold exports")]
+  end
+
+  subgraph Obs["Observability"]
+    OBS[("Metrics / Logs / Traces")]
+  end
+
+  C1 --> LB --> API
+  C2 --> LB --> API
+  W --> LB --> API
+
+  API --> CORE
+  CORE --> PG
+  API --> PG
+  API --> OBJ
+
+  API --> OBS
+  CORE --> OBS
+  PG --> OBS
+```
+
+### Merged Components
+
+- **Job Service + Dispatcher + Timer + Quota Service** → one `Scheduler Service` with internal modules.
+- **DLQ “topic/queue”** → `jobs.state = DLQ` (queryable + replayable from DB).
+- **Audit log service** → append-only audit table in Postgres (with retention/partitioning).
+
+### Removed Dependencies
+
+- Kafka/PubSub ready bus
+- Transactional outbox + publisher
+- Redis/KV for counters/heartbeats
+- Separate timer service
+- Separate quota service
+- Status cache layer
+
+---
+
+## Core Design (DB-First)
+
+### Key Principle
+
+**The database is the queue.** A job is “ready” when `run_at <= now()` and its state is eligible. Dispatching is implemented as atomic DB transitions using row locks.
+
+### Scheduling Model (No Promotion Pipeline)
+
+- Jobs are stored as:
+  - `SCHEDULED` when `run_at > now()` (delayed)
+  - `READY` when eligible (optional; can also skip directly to `RUNNING` at dispatch)
+- No separate “Timer Service” is needed. Eligibility is computed at dispatch time via indexed queries on `run_at`.
+
+### Dispatch Model (Leases)
+
+When a worker polls, the scheduler:
+- Selects eligible jobs in deterministic order.
+- Atomically transitions them to `RUNNING` and assigns a lease (`lease_id`, `lease_expires_at`) in a single transaction.
+- Records an `attempts` row.
+
+Use `SELECT ... FOR UPDATE SKIP LOCKED` to avoid duplicate assignments across scheduler instances.
+
+---
+
+## Components (Simplified)
+
+### Scheduler Service (Single Deployable)
+
+**Responsibilities**
+- Enqueue (idempotent), status, cancel, admin (pause/resume, limits).
+- Worker APIs: poll, heartbeat (lease extension), complete.
+- Isolation: enforce max running/max queued per tenant/queue.
+- Fairness: ensure tenants with available capacity aren’t starved by a single heavy tenant.
+
+**Fairness (Simple, Correct, Good-Enough)**
+- Enforce strict **per-tenant max_running** and **per-queue max_running** caps.
+- Dispatch selection is “best available” among tenants with remaining capacity:
+  - Candidate selection filters out tenants/queues at cap.
+  - Within each queue: priority/runAt/jobId ordering.
+- This prevents monopolization without needing a separate bus or complex in-memory schedulers.
+
+### Postgres (Only Required Stateful System)
+
+**Responsibilities**
+- Source of truth for jobs, attempts, leases, idempotency, configuration, audit trail.
+- Supports concurrency via row locks and SKIP LOCKED.
+- Partitioning/retention via native partitioned tables where needed.
+
+### Object Storage (Optional)
+
+Used only if:
+- Payloads are too large/expensive to keep in Postgres.
+- You need cheaper long-term archives or exports.
+
+---
+
+## Data Model (Simplified)
+
+### State Machine
+
+- `SCHEDULED` → `RUNNING` → `SUCCEEDED`
+- `RUNNING` → `SCHEDULED` (retry with backoff; set `run_at = next_run_at`)
+- Any state → `CANCELED` (authoritative if not running; cooperative if running)
+- `RUNNING` → `DLQ` when attempts exhausted or non-retryable
+
+### Tables (Illustrative)
+
+**Table: `tenants`**
+- `tenant_id` (PK), `status`, `limits` (jsonb), `weight` (optional), timestamps
+
+**Table: `queues`**
+- `(tenant_id, queue_id)` (PK), `paused`, `weight` (optional), `max_running` override, timestamps
+
+**Table: `jobs`**
+- `(tenant_id, job_id)` (PK, ULID)
+- `idempotency_key` (unique per tenant)
+- `queue_id`, `priority`
+- `state` (SCHEDULED/RUNNING/SUCCEEDED/FAILED/CANCELED/DLQ)
+- `run_at` (timestamp; “next eligible time”, used for initial delay and retries)
+- `payload_json` (jsonb, optional small) OR `payload_ref` + `payload_sha256` (optional)
+- `attempt`, `max_attempts`, `backoff_policy` (jsonb)
+- `cancel_requested` (bool)
+- `active_lease_id` (uuid), `lease_expires_at` (timestamp)
+- `last_error`, `created_at`, `updated_at`
+
+**Table: `attempts`**
+- `(tenant_id, job_id, attempt_no)` (PK)
+- `lease_id`, `worker_id`
+- `started_at`, `heartbeat_at`, `finished_at`
+- `result`, `error_code`, `error_message`, `runtime_ms`
+
+**Table: `audit_events`** (optional but simple)
+- `event_id` (PK), `tenant_id` (nullable), `actor`, `action`, `target`, `metadata` (jsonb), `created_at`
+
+### Indexes (Minimal Set)
+
+- `jobs(state, run_at, priority, job_id)` (plus `tenant_id, queue_id` as needed for filters)
+- `jobs(tenant_id, idempotency_key)` unique
+- `jobs(tenant_id, queue_id, state, run_at, priority, job_id)` for per-queue ordering
+- `jobs(lease_expires_at)` for reclaiming expired leases
+
+---
+
+## Data Flow (Simplified)
+
+```mermaid
+sequenceDiagram
+  participant Client
+  participant API as Scheduler Service
+  participant DB as Postgres
+  participant Worker
+
+  Client->>API: POST /v1/tenants/{t}/jobs (runAt, priority, payload)
+  API->>DB: TXN: upsert idempotency key + insert job (state=SCHEDULED, run_at=runAt)
+  API-->>Client: 202 Accepted (jobId, state)
+
+  Worker->>API: POST /v1/worker:poll (maxJobs, capabilities)
+  API->>DB: TXN: select eligible jobs (state=SCHEDULED, run_at<=now) FOR UPDATE SKIP LOCKED
+  API->>DB: TXN: set state=RUNNING, set lease_id/expires_at, insert attempt
+  API-->>Worker: assignments (jobId, leaseId, payload/payloadRef)
+
+  Worker->>API: POST /v1/worker:heartbeat (leaseId)
+  API->>DB: update lease_expires_at (+ heartbeat_at)
+
+  Worker->>API: POST /v1/worker:complete (leaseId, success/failure)
+  API->>DB: TXN: finalize attempt + update job state
+  alt failure and retry
+    API->>DB: set state=SCHEDULED, run_at=now+backoff
+  else attempts exhausted
+    API->>DB: set state=DLQ
+  end
+```
+
+---
+
+## Scheduling, Isolation, and Correctness
+
+### Leases and Timeouts
+
+- Lease TTL (e.g., 2–5 minutes) with heartbeats (e.g., every 30–60s).
+- If `lease_expires_at < now()` and job is still `RUNNING`, it becomes reclaimable:
+  - Next poll can re-lease it as a retry (attempt increments and backoff policy applies).
+
+### Retry and Backoff
+
+- On failure:
+  - Increment attempt
+  - Compute `run_at = now + backoff(attempt_no)` with jitter
+  - Transition to `SCHEDULED`
+- DLQ is a state in `jobs` (inspectable and replayable via admin APIs).
+
+### Idempotency
+
+- Enqueue idempotency: `(tenant_id, idempotency_key)` stored with request hash.
+- Completion idempotency: finalize-at-most-once per `(tenant_id, job_id, active_lease_id)`.
+
+### Isolation (Minimal, Strong, DB-Enforced)
+
+- Concurrency caps:
+  - Enforced during leasing (don’t assign if tenant/queue is at cap).
+- Admission caps:
+  - Enforced at enqueue with simple checks (start with DB queries; add counters later only if needed).
+- This prevents a tenant from monopolizing running capacity without introducing Redis or a separate quota service.
+
+---
+
+## Operations
+
+### Monitoring
+
+- Enqueue QPS, P99 latency, error rate, `429` rate (if admission limiting enabled)
+- Dispatch latency (due-to-dispatch), poll latency, assignment rate
+- Active leases, lease expirations/timeouts, retries, DLQ rate
+- DB: transaction latency, lock waits, connection saturation
+
+### Deployment
+
+- Scheduler service is stateless; scale horizontally.
+- Postgres is multi-AZ; use PITR and regular backups.
+- Optional partitioning on `jobs/attempts` for retention and vacuum control.
+
+---
+
+## Simplification Notes
+
+- Removed: `Ready Event Bus (Kafka/PubSub)` — acceptable because workers already poll; DB + SKIP LOCKED provides correct, parallel dispatch without a separate delivery accelerator.
+- Removed: `Outbox Publisher` — acceptable because there is no DB→bus dual-write; state transitions and dispatch are entirely DB-driven.
+- Removed: `Timer Service` — acceptable because eligibility is `run_at <= now()` and can be evaluated at dispatch time with indexed queries.
+- Removed: `Quota Service` + `Redis counters/heartbeats` — acceptable because isolation can be enforced transactionally at lease time; heartbeats can update Postgres directly (simpler, higher write load).
+- Removed: `DLQ Topic/Queue` — acceptable because DLQ is a DB state with admin tooling for inspection and replay.
+- Removed: `Status cache` — acceptable because DB-only status reads meet correctness; add caching later only if DB read load demands it.
+- Merged: Job CRUD + dispatch + scheduling + limits into one `Scheduler Service` — acceptable because these functions share the same data and must evolve together.
+- Complexity remains: `Postgres locking/transactions`, `leases + at-least-once semantics`, and `multi-AZ DB operations` — necessary for correctness (no lost jobs after ack) and safe concurrency.
+
+[Pass 3/3] Final solution saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions/01-foundational-infrastructure/task-scheduler-batch.md
+
+==========================================
+Completed: Task Scheduler (Batch)
+==========================================

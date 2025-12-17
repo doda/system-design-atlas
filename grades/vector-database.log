@@ -1,0 +1,454 @@
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2a94-b537-7d01-8e2d-bc2b93e107ac
+--------
+user
+You are a senior systems architect reviewing a system design document.
+
+Grade this solution on three dimensions (1-10 scale):
+
+1. **Strength** (1-10): How technically sound, complete, and production-ready is the design?
+   - Does it address scalability, reliability, and failure modes?
+   - Are the trade-offs well-reasoned?
+   - Would this actually work at scale?
+
+2. **Interestingness** (1-10): How engaging and educational is the content?
+   - Does it teach useful concepts?
+   - Are there insights that aren't obvious?
+   - Would an engineer learn something valuable?
+
+3. **Novelty** (1-10): How unique or creative is the approach?
+   - Does it go beyond textbook solutions?
+   - Are there clever simplifications or unconventional choices?
+   - Does it challenge common assumptions?
+
+Also note any major issues or particularly strong aspects.
+
+Output ONLY valid JSON in this exact format:
+{
+  "slug": "vector-database",
+  "strength": <1-10>,
+  "interestingness": <1-10>,
+  "novelty": <1-10>,
+  "overall": <average of three scores, 1 decimal>,
+  "summary": "<2-3 sentence summary of the design>",
+  "strengths": ["<strength 1>", "<strength 2>"],
+  "weaknesses": ["<weakness 1>", "<weakness 2>"],
+  "verdict": "<one of: exceptional, strong, adequate, weak>"
+}
+
+---
+
+## Solution to Grade
+
+---
+title: "Vector Database"
+category: "Storage & Data Platforms"
+difficulty: "Hard"
+tags: ["vector-search", "ann", "distributed-systems"]
+---
+
+## Overview
+
+A vector database stores high-dimensional embeddings (typically 384–3072 dimensions) and serves “nearest neighbor” queries (`topK`) efficiently, often with metadata filters (tenant, language, timestamp, ACL tags). Exact k-NN is too expensive at large scale, so the system relies on **approximate nearest neighbor (ANN)** indexes while still supporting **upserts, deletes, filtering, replication, and predictable tail latency**.
+
+This design keeps the system operationally small:
+- A stateless **API service** handles auth, schema validation, query planning, and fanout.
+- A highly available **Postgres control database** stores all cluster metadata and operational state (collections, shard maps, leases, manifests, idempotency, audit).
+- **Shard nodes** store vectors in immutable segments on NVMe, replicate a write-ahead log (WAL) for durability, and serve queries using per-segment ANN + filter indexes.
+- **Object storage** holds segment snapshots for restore and cost-effective warm storage.
+
+---
+
+## Requirements
+
+### Functional Requirements
+
+- Collections:
+  - Create/update collection configuration: dimensions, distance metric, index policy, replication factor, TTL, and indexed metadata fields.
+  - Schema validation for metadata types and indexed fields.
+- Write path:
+  - Upsert vectors by ID with metadata; optional per-record version (optimistic concurrency).
+  - Delete vectors (soft/hard) and keep tombstones to prevent “resurrection” from older segments.
+  - Bulk upsert/delete with backpressure and progress reporting.
+  - Idempotency keys for safe retries.
+- Read path:
+  - ANN search: `topK` nearest neighbors with optional metadata filters and optional reranking.
+  - Point read by ID (vector + metadata + version) for debugging/verification.
+  - Optional “read-your-writes” (RYW) for clients that need freshness guarantees.
+- Multi-tenancy:
+  - Per-tenant authn/z, quotas, isolation, and audit logs.
+- Maintenance:
+  - Compaction, tombstone purge, index build/rebuild, rebalancing, snapshot/restore, and tiering (hot NVMe vs warm object storage).
+
+### Non-Functional Requirements (Targets)
+
+**Workload model (representative, not worst-case simultaneously):**
+- Typical collection: **50M vectors**
+- Cluster-wide: **up to 10B vectors**
+- Search throughput: **10k–50k QPS** (topK ≤ 100; moderate filters)
+- Bulk ingest: **50k–200k vectors/sec sustained** (across cluster)
+
+**Latency SLOs (topK=20, dims≈768, moderate filter selectivity 1–20%):**
+- P50: **20–50 ms**
+- P95: **80–150 ms**
+- P99: **150–300 ms**
+- Hard timeout budget: **200–500 ms** (client-selectable; server-enforced max)
+
+**Availability:**
+- Reads: **99.99%** (multi-AZ)
+- Writes: **99.9%** (planned maintenance allowed)
+
+**Durability:**
+- No acknowledged write loss: **RPO ≈ 0** for committed writes (quorum persisted)
+- May lose in-flight/uncommitted batches only
+
+**Consistency:**
+- Cluster metadata: **strong consistency** (transactional control DB)
+- Data plane:
+  - Point reads: strong within a shard if requested (quorum read) or eventual by default
+  - Search freshness: configurable **eventual** vs **RYW** (sequence barrier)
+  - ANN index visibility: eventual; correctness relies on a freshness-aware “delta” layer
+
+### Constraints & Assumptions
+
+- Vectors stored as `float16` (hot) and/or compressed (PQ codes) for cost; distance kernels optimized with SIMD.
+- Supported filters are limited and predictable: equality/in-set, numeric/date ranges, boolean, and optional prefix for low-cardinality fields.
+- Query vectors are small (≤ 3072 dims), `topK <= 100`, filter selectivity commonly 1–50%.
+- Security: TLS everywhere, encryption at rest, per-tenant isolation, audit logs, and least-privilege access.
+
+---
+
+## Simplified Architecture
+
+```mermaid
+flowchart TB
+  C[Client SDK] --> LB[HTTPS Load Balancer]
+  LB --> API[API Service]
+
+  API --> META[(Postgres\nControl DB)]
+  API -->|fanout| SN[Shard Nodes]
+
+  SN --> NV[(Local NVMe)]
+  SN --> OBJ[(Object Storage)]
+```
+
+### What this architecture does
+
+- **API Service**: single stateless entrypoint for reads/writes, auth, validation, routing, and merging results.
+- **Postgres Control DB**: authoritative cluster state (collections, shard map, replica membership, leader leases, segment manifests), plus idempotency and audit logs.
+- **Shard Nodes**: store/serve shard replicas, replicate WAL for committed writes, build indexes and compact segments in the background.
+- **NVMe + Object Storage**: NVMe keeps the hot working set and indexes; object storage provides durable snapshots and warm tier.
+
+---
+
+## Components
+
+### API Service (stateless)
+
+**Responsibilities**
+- TLS, authentication/authorization (tenant + collection ACLs)
+- Rate limiting and request shaping (max dims, max `topK`, timeout caps, filter complexity caps, max metadata size)
+- Collection management (create/update config, validate schemas)
+- Query planning and fanout to shard replicas
+- Bulk ingest coordination (backpressure, progress reporting)
+- Result merging and response shaping
+
+**Routing model**
+- Read shard map + leader leases from Postgres (cached in-memory with short TTL).
+- For searches, pick one replica per shard by default; retry another replica on timeout within the client deadline.
+- For writes, route to the current shard leader (per Postgres lease).
+
+**Multi-tenancy**
+- Enforce tenant scoping in every request and include `tenant_id` in all keys.
+- Apply per-tenant quotas (QPS, concurrent requests, storage bytes, ingest rate).
+- Write audit records to Postgres asynchronously (non-blocking, bounded queue in-process).
+
+---
+
+### Postgres Control DB (strongly consistent)
+
+**Responsibilities**
+- Collections and schemas
+- Shard mapping and replica membership
+- Leader leases (with expirations) for each shard
+- Immutable segment manifests (what segments exist and where)
+- Idempotency keys and outcomes
+- Operational metadata (rebalance operations, maintenance jobs, audit logs)
+
+**Availability**
+- Run as a managed HA Postgres (multi-AZ) or Postgres with synchronous replication and automated failover.
+- The API service treats Postgres as the single source of truth for routing and recovery decisions.
+
+---
+
+### Shard Node (data plane)
+
+Each shard is replicated across multiple shard nodes (RF typically 3). One replica holds the **leader lease** and accepts writes; followers replicate the WAL and serve reads.
+
+**Responsibilities**
+- Accept writes (leader), replicate WAL to followers, apply operations in order
+- Serve shard-local search and point reads
+- Maintain storage structures:
+  - **Replicated WAL**
+  - **Delta store** (mutable recent writes + tombstones)
+  - **Immutable segments** with ANN + filter indexes
+- Run background maintenance:
+  - Flush delta to new segments
+  - Build ANN + filter indexes
+  - Compact segments and purge tombstones
+  - Upload segment snapshots to object storage and optionally evict cold segments from NVMe
+
+**Storage layout (per shard replica)**
+- **WAL (durable)**: append-only log of `{op, vector_id, version, embedding, metadata}` with monotonic sequence numbers.
+- **Delta store (mutable)**: small structure for recent writes and tombstones; searched alongside segments for freshness and delete correctness.
+- **Segments (immutable)**:
+  - vector blocks (`float16`) and/or PQ codes
+  - `vector_id -> internal_id` mapping
+  - metadata columns for indexed fields
+  - filter indexes (bitmaps for categorical/boolean; range structures for numeric/date)
+  - ANN index per segment (e.g., HNSW for hot segments; optional IVF-PQ for very large tiers)
+
+**Write durability**
+- Default: acknowledge after WAL fsync on a quorum of replicas (`quorum`).
+- Optional: acknowledge after leader fsync (`leader_only`) for lower latency at lower durability.
+
+---
+
+### Object Storage (durability and warm tier)
+
+**Responsibilities**
+- Store segment snapshots and manifests for restore and fast re-replication
+- Hold cold/warm segments to reduce NVMe footprint
+- Enable snapshot/restore and disaster recovery workflows
+
+---
+
+## Data Model
+
+### Control DB schema (conceptual)
+
+**collections**
+- `collection_id`, `tenant_id`, `name`
+- `dims`, `distance`
+- `replication_factor`
+- `index_policy` (type + params)
+- `ttl_seconds`
+- `indexed_fields` (name → type + indexing mode)
+- timestamps
+
+**shards**
+- `shard_id`, `collection_id`
+- hash range (`start`, `end`)
+- `replicas` (node IDs)
+
+**leader_leases**
+- `shard_id` (pk)
+- `leader_node_id`
+- `lease_expires_at`
+- compare-and-swap updates in a transaction (renew, transfer, or revoke)
+
+**segments**
+- `segment_id`, `shard_id`
+- `min_seq`, `max_seq`
+- `state` (`building|ready|deleting`)
+- `location` (`nvme|object|both`)
+- `manifest` (paths, checksums, codec versions, stats)
+
+**idempotency**
+- `(tenant_id, endpoint, idempotency_key)` → request hash + stored outcome + expiry
+
+**audit_logs**
+- tenant-scoped append-only records for control-plane and data access events (configurable retention)
+
+### Data plane keys
+
+- Vector primary key: `(tenant_id, collection_id, vector_id)`
+- Versioning:
+  - Upsert can carry `expectedVersion`; server assigns a new `version`.
+  - Deletes create tombstones with a `version` to prevent older segment data from resurfacing.
+
+---
+
+## Query Execution
+
+### Shard-local search
+
+1. **Candidate generation**
+   - Search delta store (fresh writes and tombstones).
+   - Search relevant segment ANN indexes with oversampling (`k' = topK * factor`).
+2. **Filtering**
+   - Use per-segment filter indexes (bitmaps/range) to apply predicates efficiently.
+3. **Reranking**
+   - Compute exact distance (float16/float32) for surviving candidates and select topK.
+4. **Return**
+   - TopK IDs, scores, and optional metadata.
+
+### API service merge
+
+- Fan out to the shard set, collect per-shard topK, and merge into global topK.
+- Enforce coverage rules:
+  - Default: require all shards for the collection’s partition range.
+  - Optional: allow partial results when `allowPartial=true`.
+
+---
+
+## Write Path & Freshness
+
+### Write flow (simplified)
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant API as API Service
+  participant DB as Postgres
+  participant L as Shard Leader
+  participant F as Shard Follower
+
+  C->>API: Upsert/Delete (Idempotency-Key)
+  API->>DB: resolve shard + leader lease
+  API->>L: write batch
+  L->>L: append WAL + fsync
+  L->>F: replicate WAL entry
+  F-->>L: ack persisted
+  L-->>API: ack (quorum)
+  API-->>C: writeToken (minSeq)
+```
+
+### Read-your-writes (RYW)
+
+- The leader returns a `writeToken` (e.g., `{shardId, minSeq}`) for acknowledged writes.
+- A search can include this token:
+  - The API service routes the request to a replica that has applied at least `minSeq`, or waits up to the request deadline.
+- Without a token, searches are eventually consistent with very recent writes; tombstones in the delta store prevent deleted items from reappearing.
+
+---
+
+## API Design (HTTP JSON)
+
+### Collections
+- `POST /v1/collections`
+- `GET /v1/collections/{collectionId}`
+- `PATCH /v1/collections/{collectionId}` (async for index policy changes; returns `operationId`)
+
+### Upsert / Delete
+- `POST /v1/collections/{collectionId}/vectors:upsert` (header `Idempotency-Key`)
+- `POST /v1/collections/{collectionId}/vectors:delete`
+
+### Search
+- `POST /v1/collections/{collectionId}/search`
+  - Supports `topK`, `filter`, `timeoutMs`, `allowPartial`, and optional `readYourWrites.writeToken`
+
+### Point Read
+- `GET /v1/collections/{collectionId}/vectors/{id}`
+
+---
+
+## Scaling & Performance
+
+### Storage and compute (dims=768)
+
+- Float16 payload: `768 * 2 bytes ≈ 1.5 KB/vector`
+  - 50M vectors ≈ **75 GB** raw vectors (before replication/indexes/metadata)
+  - 10B vectors ≈ **15 TB** raw vectors
+- With replication RF=3 and index overhead, plan for **multiple ×** raw payload and compaction headroom.
+
+### Sharding
+
+- Shard by `hash(vector_id)` within `(tenant, collection)`.
+- Aim for shard counts that keep fanout low for latency (commonly 8–16 shards per large collection; more for very large collections).
+
+### Tail latency controls
+
+- Propagate timeouts end-to-end and cancel in-flight shard requests when the deadline is reached.
+- Enforce query cost limits (filter complexity, `topK`, ANN params) and shed load under saturation.
+- Retry a second replica within the remaining deadline when a shard is slow.
+
+---
+
+## Operations
+
+### Background maintenance (on shard nodes)
+
+- Flush delta store to new segments on thresholds (size/time).
+- Build ANN + filter indexes for new segments.
+- Compact segments and purge tombstones based on TTL/retention.
+- Upload segment snapshots to object storage; optionally evict cold segments from NVMe.
+
+### SLIs
+
+- Search latency (P50/P95/P99), QPS, error/timeout rate, partial response rate
+- WAL fsync latency, quorum commit latency, replica apply lag
+- Compaction/index backlog, segment counts, disk usage and IO wait
+- Postgres health (availability, replication lag)
+
+### Backup & recovery
+
+- Postgres: periodic backups and tested restore.
+- Segments: object storage snapshots plus manifests; restore by rehydrating segments and replaying WAL as needed.
+
+### Security
+
+- TLS for client and inter-node traffic.
+- Encryption at rest (NVMe disk encryption; object storage SSE-KMS).
+- Strict tenant scoping, quotas, and audit logs.
+
+---
+
+## Simplification Notes
+
+- Removed: Separate `API Gateway`, `Query Coordinator`, and `Ingest Service`; consolidated into a single stateless `API Service` for fewer deployable units and a single request lifecycle.
+- Removed: Dedicated “controllers” around a Raft KV; the `Postgres Control DB` holds metadata, leases, idempotency, and audit logs with transactional consistency and HA deployment.
+- Merged: `Index Builder & Compactor` into the `Shard Node` as background maintenance workers to keep the data plane self-contained.
+- Complexity kept: Shard replication with quorum WAL acks (durability/availability), immutable segments + background compaction (predictable reads), delta store + sequence tokens (freshness/RYW), and object storage (restore and warm tier at large data sizes).
+mcp startup: no servers
+
+thinking
+**Evaluating HNSW Usage**
+
+I need to mention HNSW per segment since it’s mutable, but building it for each segment can be heavy work. Looks like I can build it offline instead. I should also think about segment retrieval from an object. Tail latency strategies are important here. I’m rating the strength at 7, interestingness at 7, and novelty around 5, which puts the overall score at about 6.3. I’ll provide valid JSON only for the output.
+codex
+{
+  "slug": "vector-database",
+  "strength": 7,
+  "interestingness": 7,
+  "novelty": 5,
+  "overall": 6.3,
+  "summary": "Solid high-level vector DB design with a clear separation of control plane (Postgres metadata/leases) and data plane (replicated WAL + delta store + immutable segments + ANN indexes), plus object storage for snapshots and warm tier. It covers many production concerns—idempotency, tombstones, compaction, tail-latency controls, and optional read-your-writes—while keeping the component count low.",
+  "strengths": [
+    "Good end-to-end story for durability and freshness (quorum WAL acks, delta layer, tombstones, RYW token/barrier) that matches real vector DB needs",
+    "Operationally pragmatic architecture with well-chosen SLIs, background maintenance loops, and explicit tail-latency controls (timeouts, retries, load shedding, partial results)"
+  ],
+  "weaknesses": [
+    "Leader lease + WAL replication scheme risks split-brain and write anomalies under partitions without a clearly specified consensus/fencing mechanism (epochs, monotonic terms, replica quorum rules, failover choreography)",
+    "Control plane dependence on Postgres for routing/leasing at very high QPS needs tighter mitigation details (cache invalidation, thundering-herd on failover, lease renewal failure modes, degraded-read behavior when Postgres is impaired)"
+  ],
+  "verdict": "strong"
+}
+tokens used
+4,487
+{
+  "slug": "vector-database",
+  "strength": 7,
+  "interestingness": 7,
+  "novelty": 5,
+  "overall": 6.3,
+  "summary": "Solid high-level vector DB design with a clear separation of control plane (Postgres metadata/leases) and data plane (replicated WAL + delta store + immutable segments + ANN indexes), plus object storage for snapshots and warm tier. It covers many production concerns—idempotency, tombstones, compaction, tail-latency controls, and optional read-your-writes—while keeping the component count low.",
+  "strengths": [
+    "Good end-to-end story for durability and freshness (quorum WAL acks, delta layer, tombstones, RYW token/barrier) that matches real vector DB needs",
+    "Operationally pragmatic architecture with well-chosen SLIs, background maintenance loops, and explicit tail-latency controls (timeouts, retries, load shedding, partial results)"
+  ],
+  "weaknesses": [
+    "Leader lease + WAL replication scheme risks split-brain and write anomalies under partitions without a clearly specified consensus/fencing mechanism (epochs, monotonic terms, replica quorum rules, failover choreography)",
+    "Control plane dependence on Postgres for routing/leasing at very high QPS needs tighter mitigation details (cache invalidation, thundering-herd on failover, lease renewal failure modes, degraded-read behavior when Postgres is impaired)"
+  ],
+  "verdict": "strong"
+}
+Graded: vector-database

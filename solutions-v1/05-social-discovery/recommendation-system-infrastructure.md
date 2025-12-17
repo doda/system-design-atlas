@@ -1,0 +1,315 @@
+---
+title: "Recommendation System Infrastructure"
+category: "Social & Discovery"
+difficulty: "Hard"
+tags: ["recommendations", "ml-platform", "ranking", "feature-store", "experimentation"]
+---
+
+## Overview
+
+This system serves personalized feeds with a tight online latency budget while continuously improving models using a trustworthy learning loop. It treats **versioned artifacts** (models, feature definitions, ranking/policy config) as the contract between online serving and offline learning so every decision can be audited and reproduced.
+
+At a high level:
+- **Online path (critical)**: retrieve candidates → score/rank → enforce policy/constraints → respond → log.
+- **Learning loop (throughput + correctness)**: ingest events → build aggregates/datasets → train/evaluate → publish model + config → monitor.
+
+## Goals & Non-Goals
+
+### Goals
+- Serve personalized feeds with deterministic safety/policy enforcement.
+- Support multiple candidate sources (graph, embeddings, content, trending, overrides).
+- Enable fast iteration with reproducible training and safe rollouts.
+- Maintain auditability: trace each response to model + features + config.
+
+### Non-Goals
+- Specify a single “best” model architecture.
+- Guarantee globally consistent personalization across regions in real time (optimize for locality + eventual convergence).
+
+## Requirements
+
+### Functional Requirements
+- Candidate generation from graph/embeddings/trending/editorial/safety overrides.
+- Scoring and ranking with versioned models and versioned feature definitions.
+- Constraints: dedup, freshness, diversity, exploration, blocks/mutes, region/language, safety classification.
+- Experiments: A/B and staged rollouts (shadow → canary → ramp).
+- Training-grade logging sufficient to reconstruct serving decisions.
+- Periodic retraining plus faster incremental updates for lightweight models/features.
+- Detect drift, schema/data quality issues, and bot/abuse signals.
+
+### Non-Functional Targets (example)
+- 50M DAU, 40K QPS avg / 200K QPS peak feed requests
+- P50 80 ms, P95 140 ms, P99 220 ms, hard timeout 300 ms
+- Serving API 99.99% regional, 99.95% global
+- Event ingestion 99.99% accept rate, at-least-once delivery
+- Strong enforcement for safety/privacy actions at serving time
+
+## Simplified Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> E[Edge]
+  E --> R[Recommendation Service]
+
+  R --> P[(Postgres)]
+  R --> S[(Event Stream)]
+  R --> O[(Object Storage)]
+
+  S --> J[Data Jobs]
+  J --> P
+  J --> O
+```
+
+**Key properties**
+- A single **Recommendation Service** owns the online critical path (retrieval, ranking, policy, experiments, logging).
+- **Postgres** is the primary low-latency state store (policy, feature snapshots, retrieval indexes where feasible, and model/config metadata).
+- **Event Stream** provides durable buffering for high-volume interaction events and request logs.
+- **Data Jobs** handle validation, enrichment, aggregate/features refresh, dataset builds, training/eval, and publishing artifacts.
+- **Object Storage** is the long-term system of record for immutable raw logs, training datasets, and model artifacts.
+
+## Request Lifecycle
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as Client
+  participant E as Edge
+  participant R as Rec Service
+  participant P as Postgres
+  participant S as Event Stream
+
+  C->>E: Request feed (user, surface, cursor)
+  E->>R: Forward + auth context
+  R->>P: Fetch policy + user snapshot
+  R->>P: Retrieve candidates (graph/embeddings/trending)
+  R->>P: Fetch item/user-item snapshots for pruned set
+  R->>R: Score + rank + constraints
+  R-->>C: Response (request_id, model_id, experiments)
+  R->>S: Async log (request + served list + events)
+```
+
+## Components
+
+### 1) Recommendation Service
+A single service with clear internal modules and strict per-stage deadlines.
+
+**Responsibilities**
+- Candidate retrieval (multiple sources) with quotas and time budgets.
+- Multi-stage scoring/ranking with batched inference.
+- Policy and safety enforcement as part of eligibility and final filtering.
+- Experiment assignment and rollout selection (shadow/canary/ramp).
+- Async logging of request + served list + metadata.
+
+**Serving-time design**
+- Parallel retrieval with deadlines; always return the best safe result within the hard timeout.
+- Multi-stage ranking to reduce expensive work:
+  - Stage 0: eligibility + cheap features (prune aggressively)
+  - Stage 1: lightweight model (CPU)
+  - Stage 2: heavier model re-rank (optional per surface/traffic tier)
+- Deterministic output is tied to `model_id`, `feature_set_id`, and `ranker_config_version`.
+
+**Major simplification (merged components)**
+- Candidate generation, scoring/ranking, policy/constraints, and experimentation run in one deployable unit so rollouts and incident response stay straightforward.
+
+### 2) Postgres (Primary State Store)
+A regional Postgres cluster (primary + read replicas) storing the low-latency state required on the critical path.
+
+**What it stores**
+- **Policy state**: blocks/mutes, sensitive content rules, regional compliance flags (strongly enforced).
+- **Feature snapshots**: denormalized, versioned views for `user`, `item`, and `user_item`.
+- **Retrieval support** (as appropriate for the product): follow edges, recent interactions, and embedding lookup/indexing (e.g., `pgvector`) for candidate recall.
+- **Model/config metadata**: model records, rollout configs, feature set versions, and experiment definitions.
+
+**Operational shape**
+- Partition large tables by time and/or entity hash where needed.
+- Read replicas serve most read traffic; the service uses connection pooling and bounded query sizes.
+- Online queries are designed around “fetch few big rows” (user snapshot) plus “fetch pruned item set” rather than per-candidate fan-out.
+
+**Major simplification (reduced datastores)**
+- A single primary database handles policy, feature snapshots, and metadata to keep the serving surface area small.
+
+### 3) Event Stream
+A durable, partitioned stream (e.g., Kafka/PubSub) used as the ingestion buffer.
+
+**Topics (minimal)**
+- `rec_requests_v1`: one event per response (served list + versions + degradations).
+- `rec_interactions_v1`: client interactions (impression/click/dwell/etc.).
+- `rec_candidates_debug_v1` (optional): sampled debug payloads.
+
+**Semantics**
+- At-least-once delivery; consumers are idempotent via `event_id` and stable keys.
+- The Recommendation Service never blocks user responses on stream acks; it uses a bounded async buffer with backpressure metrics.
+
+**Major simplification (single ingestion backbone)**
+- One stream supports both analytics-grade logging and nearline feature refresh, avoiding separate “logging” and “feature streaming” stacks.
+
+### 4) Data Jobs (Nearline + Batch)
+A small set of jobs (same runtime/tooling) that cover the learning loop end-to-end.
+
+**Responsibilities**
+- Validate/enforce schemas; quarantine invalid events.
+- Write immutable raw logs to object storage (append-only).
+- Maintain derived aggregates and refresh feature snapshots back into Postgres on a schedule (minutes–hours depending on feature).
+- Build training datasets (joins of served items + subsequent outcomes).
+- Train/evaluate models; publish model artifacts and update model/config metadata for rollout.
+- Run data quality checks, drift detection, and training-time leakage checks.
+
+**Major simplification (merged pipeline)**
+- Stream processing, offline dataset building, training, evaluation, and publishing are treated as one coherent “data jobs” surface with shared contracts and storage.
+
+### 5) Object Storage (System of Record)
+Immutable storage for:
+- Raw logs (partitioned by time, region, and schema version).
+- Curated datasets and labels.
+- Model artifacts (binaries, feature definitions bundle, metadata).
+
+This enables deterministic replay for training and audits without coupling serving to a lakehouse runtime.
+
+## Data Model (Minimal Contracts)
+
+### Core identifiers
+- `request_id`: unique per response; joins served list to interactions.
+- `event_id`: unique per client event; enables idempotency.
+- `model_id`: immutable model artifact identifier.
+- `feature_set_id`: versioned feature definition bundle identifier.
+- `ranker_config_version`: versioned business/ranking config identifier.
+
+### Request Log (one per response)
+Fields:
+- `request_id`, `ts_ms`, `user_id`, `surface`, `cursor`, `limit`, `region`
+- `model_id`, `feature_set_id`, `ranker_config_version`
+- `experiment_assignments`: `{id, variant}[]`
+- `degradations`: `{stage, reason, duration_ms}[]`
+- `served_items`: `{item_id, position, score, reason_codes[]}[]`
+
+### Interaction Event (client-side)
+Fields:
+- `event_id`, `ts_ms`, `user_id`, `request_id`
+- `event_type`, `item_id`, `position`
+- Optional: `dwell_ms`, `viewport_ms`, `action_metadata`
+
+## API Design
+
+### 1) Get Recommendations
+`POST /v1/recommendations:get`
+
+Request:
+```json
+{
+  "user_id": "u123",
+  "surface": "home",
+  "limit": 30,
+  "cursor": "opaque",
+  "client_context": {
+    "locale": "en-US",
+    "region": "us-east",
+    "device_class": "mobile",
+    "app_version": "9.2.1"
+  },
+  "request_id": "optional-uuid"
+}
+```
+
+Response:
+```json
+{
+  "request_id": "uuid",
+  "items": [
+    { "item_id": "i123", "rank": 1, "score": 0.913, "reason_codes": ["follow", "fresh"] }
+  ],
+  "next_cursor": "opaque",
+  "model_id": "ranker_v17",
+  "experiments": [{ "id": "exp_42", "variant": "B" }],
+  "degraded": false
+}
+```
+
+### 2) Log Interaction Event
+`POST /v1/recommendations/events`
+
+Response:
+- `202` accepted
+- `409` duplicate `event_id`
+
+### 3) Admin: Deploy Model
+`POST /v1/models/{model_id}/deploy`
+
+Request:
+```json
+{ "mode": "canary", "traffic_pct": 1, "region": "us-east" }
+```
+
+Guardrails:
+- Pre-deploy checks (schema compatibility, offline eval thresholds).
+- Automated rollback driven by monitored guardrail metrics and SLOs.
+
+## Consistency, Correctness, and Privacy
+
+### Serving-time safety consistency
+- Policy state (blocks/mutes/sensitive rules) is always consulted during eligibility and final enforcement.
+- Users are routed to a **home region** for policy writes; policy reads are served locally with fast replication to meet “seconds-level” cross-region propagation.
+
+### Feature/model versioning and replay
+- Every response is logged with versions (`model_id`, `feature_set_id`, `ranker_config_version`).
+- Raw logs and datasets are immutable in object storage, enabling deterministic rebuilds.
+
+### GDPR/CCPA
+- PII minimization in logs; separate storage/controls for sensitive attributes.
+- DSAR deletion:
+  - Delete/expire user policy and feature snapshots in Postgres quickly.
+  - Apply tombstones/deletion manifests to object storage datasets and exclude deleted users from future training builds.
+
+## Scaling & Performance
+
+### Online latency controls
+- Strict stage deadlines; bounded parallelism; circuit breakers on database queries and model evaluation.
+- Multi-stage ranking reduces expensive feature reads and compute for large candidate sets.
+- Use read replicas and prepared statements; cap candidate set sizes per source and per stage.
+
+### Event ingestion bursts
+- The event stream absorbs peaks; clients use retry/backoff with idempotent `event_id`.
+- Consumers scale by partitions; aggregates are written as idempotent upserts.
+
+### Multi-region availability
+- Stateless Recommendation Service deployments per region.
+- Regional Postgres clusters; asynchronous replication for non-critical tables, prioritized replication for policy state.
+- Object storage is replicated for durability and global training access.
+
+## Failure Modes & Mitigations (Critical Set)
+
+1) **Postgres read pressure / partial outage**
+- Use read replicas and per-query deadlines; degrade to cached/trending candidates while still enforcing policy.
+- Record degradations in request logs for audit and analysis.
+
+2) **Event stream lag**
+- Serving continues; logging buffer sheds non-critical debug events first.
+- Data Jobs backfill from retained stream or raw object storage logs.
+
+3) **Bad model/config rollout**
+- Canary and automated rollback on guardrail metrics and SLO breaches.
+- Kill switch to a lightweight ranker profile with strict safety enforcement.
+
+4) **Training data corruption / schema drift**
+- Schema validation on ingest; quarantine invalid events.
+- Block model promotion unless data quality checks pass; rebuild datasets from immutable raw logs.
+
+## Operations
+
+### SLIs/SLOs
+- Serving: latency (P50/P95/P99), error/timeout rate, stage timings, degradation rate.
+- Quality guardrails: CTR/dwell proxies, hides/blocks per impression, diversity/freshness metrics.
+- Pipelines: ingest accept rate, consumer lag, feature refresh lag, training job success.
+
+### Deployment practices
+- Service: blue/green or rolling with SLO-based abort.
+- Models/config: shadow → canary → ramp, driven by config in Postgres and validated by online monitoring.
+
+## Simplification Notes
+
+- **Merged**: Candidate generation + ranking + policy + experimentation into the `Recommendation Service` to make rollouts, debugging, and on-call ownership straightforward.
+- **Merged**: Stream processing, dataset building, training, evaluation, and publishing into a single `Data Jobs` surface to reduce orchestration and lineage complexity.
+- **Removed**: Separate online feature store; feature snapshots live in `Postgres` with versioned schemas and refresh jobs, keeping one serving-time state system.
+- **Removed**: Separate lakehouse/warehouse layer as a required serving dependency; `Object Storage` holds immutable logs/datasets and is consumed by jobs only.
+- **Removed**: Standalone model registry/deployment controller; model artifacts are stored in `Object Storage` with rollout metadata in `Postgres` and standard CI/CD hooks.
+- **Remaining complexity**: Multi-region active-active serving and strong serving-time safety enforcement are necessary for the stated latency and availability targets.
+- **Remaining complexity**: At-least-once ingestion with idempotent processing is necessary to hit event durability targets at peak throughput.
+- **Remaining complexity**: Versioned artifacts (`model_id`, `feature_set_id`, `ranker_config_version`) are necessary for auditability and reproducible training.

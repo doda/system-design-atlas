@@ -1,0 +1,126 @@
+#!/bin/bash
+# add-generation-time.sh - Add generation_time_seconds to solution frontmatter
+
+cd "$(dirname "$0")/.."
+
+# Generation times from the v2 run (in seconds)
+declare -A TIMES
+TIMES=(
+  ["alerting-incident-routing"]=846
+  ["api-gateway"]=758
+  ["attribution-measurement-system"]=503
+  ["audit-trail-system"]=536
+  ["authorization-service-zanzibar"]=456
+  ["bot-detection-system"]=1103
+  ["calendar-scheduling-system"]=414
+  ["capacity-planning-autoscaling"]=501
+  ["centralized-logging-platform"]=967
+  ["certificate-authority-pki"]=986
+  ["change-data-capture-platform"]=775
+  ["chaos-engineering-platform"]=549
+  ["chat-system"]=455
+  ["cloud-cost-optimization-platform"]=570
+  ["collaborative-document-editing"]=455
+  ["comment-system"]=381
+  ["configuration-distribution-system"]=939
+  ["content-moderation-pipeline"]=583
+  ["cross-region-shopping-cart"]=932
+  ["data-clean-room"]=966
+  ["data-lake-architecture"]=513
+  ["ddos-protection-system"]=498
+  ["deployment-system"]=465
+  ["developer-portal"]=510
+  ["digital-wallet"]=504
+  ["distributed-counter-service"]=465
+  ["distributed-cron"]=963
+  ["distributed-file-system-ml"]=451
+  ["distributed-key-value-store"]=557
+  ["distributed-lock-service"]=737
+  ["distributed-shopping-cart"]=534
+  ["distributed-tracing-system"]=368
+  ["distributed-unique-id-generator"]=1037
+  ["e2e-encrypted-messaging"]=1096
+  ["edge-compute-platform"]=967
+  ["email-delivery-platform"]=814
+  ["embedding-pipeline"]=521
+  ["event-schema-registry"]=466
+  ["experimentation-ab-platform"]=569
+  ["feature-flag-management"]=1088
+  ["federated-learning-system"]=832
+  ["flash-sale-system"]=569
+  ["food-delivery-logistics"]=665
+  ["fraud-detection-pipeline"]=580
+  ["general-purpose-search-engine"]=884
+  ["geospatial-nearby-search"]=929
+  ["global-blacklisting-system"]=379
+  ["global-distributed-cache"]=872
+  ["global-inventory-reservations"]=628
+  ["global-rate-limiter"]=488
+  ["graph-relationship-service"]=531
+  ["high-cardinality-metrics-pipeline"]=716
+  ["high-frequency-trading-gateway"]=711
+  ["identity-provider"]=458
+  ["inventory-management-system"]=696
+  ["iot-device-management"]=705
+  ["key-management-system"]=469
+  ["leaderboard-system"]=551
+  ["ledger-database"]=922
+  ["live-audio-rooms"]=918
+  ["live-video-streaming"]=390
+  ["llm-inference-gateway"]=414
+  ["ml-feature-store"]=898
+  ["mobile-telemetry-sync"]=749
+  ["model-serving-platform"]=731
+  ["multi-cluster-service-mesh"]=573
+  ["multi-region-disaster-recovery"]=462
+  ["multi-tenant-object-storage"]=551
+  ["multiplayer-game-backend"]=1000
+  ["offline-first-application-sync"]=485
+  ["pastebin-service"]=501
+  ["payment-processing-gateway"]=369
+  ["privacy-preserving-analytics"]=483
+  ["push-notification-broker"]=473
+  ["real-time-ad-serving"]=1055
+  ["real-time-presence-service"]=557
+  ["recommendation-system-infrastructure"]=474
+  ["retrieval-augmented-generation"]=854
+  ["ride-hailing-dispatch"]=431
+  ["right-to-be-forgotten-pipeline"]=654
+  ["search-autocomplete"]=396
+  ["secrets-management-service"]=904
+  ["secure-file-sharing"]=768
+  ["self-healing-infrastructure"]=473
+  ["service-discovery"]=364
+  ["slo-error-budget-monitoring"]=534
+  ["smart-home-hub"]=371
+  ["social-news-feed"]=1086
+  ["sql-database-as-a-service"]=825
+  ["stories-product"]=483
+  ["task-scheduler-batch"]=503
+  ["ticket-reservation-system"]=551
+  ["time-series-database"]=499
+  ["trending-topics-engine"]=523
+  ["url-shortener"]=489
+  ["vector-database"]=895
+  ["video-on-demand"]=816
+  ["web-application-firewall"]=890
+  ["workflow-orchestration-engine"]=566
+  ["zero-trust-access-proxy"]=456
+)
+
+for file in solutions/*/*.md; do
+  slug=$(basename "$file" .md)
+  time=${TIMES[$slug]}
+
+  if [ -n "$time" ]; then
+    # Check if file has frontmatter
+    if head -1 "$file" | grep -q '```markdown'; then
+      # Has markdown wrapper - add after the second ---
+      sed -i '' "s/^---$/---\ngeneration_time_seconds: $time/2" "$file"
+    elif head -1 "$file" | grep -q '^---'; then
+      # Normal frontmatter - add after the first ---
+      sed -i '' "s/^---$/---\ngeneration_time_seconds: $time/" "$file"
+    fi
+    echo "Added $time seconds to $slug"
+  fi
+done

@@ -1,0 +1,2306 @@
+==========================================
+Generating (v2): SLO/Error Budget Monitoring
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2896-7863-8361-668cbead9eb4
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: SLO/Error Budget Monitoring
+**Category**: Observability & Reliability
+
+**Problem Statement**:
+Design a system to track burn rates across multiple time windows and trigger alerts based on remaining error budgets.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+codex
+```markdown
+---
+title: "SLO/Error Budget Monitoring"
+category: "Observability & Reliability"
+difficulty: "Medium"
+tags: ["sre", "slo", "error-budgets", "prometheus", "alerting", "burn-rate", "grafana"]
+---
+
+## Overview
+
+This system tracks SLO compliance by continuously measuring SLIs, converting them into **error budget burn rates**, and alerting when burn indicates the budget will be exhausted before the SLO window ends. The key insight is to **treat SLO monitoring as a rules-generation problem**, not a bespoke analytics platform: we compile SLO definitions into a small, repeatable set of recording rules and multi-window burn alerts executed by a proven Prometheus-compatible time-series backend.
+
+The elegant part is separating concerns cleanly: services emit **boring, low-cardinality golden signals** (good/total events); a rule compiler turns human-readable SLO specs into deterministic queries; the metrics backend evaluates them at low cost; Alertmanager handles routing/dedup/escalation. The only “custom” code is the compiler and a thin API/UI around SLO lifecycle.
+
+## What Makes This Hard
+
+Naive implementations get trapped by two things:
+
+1. **Math that lies under pressure.** If you compute “average error rate” incorrectly (ratio-of-averages vs average-of-ratios, poor aggregation, counter resets, missing data), you page people for ghosts or miss real incidents. Burn rate math is simple; making it correct on real telemetry is not.
+
+2. **Alerting that is either noisy or late.** Single-window alerts flap (5m noise) or arrive too late (6h smoothing). The non-obvious fix is **multi-window, multi-burn** alerting: require a fast window and a slow window to agree, which catches sustained incidents quickly while rejecting brief spikes.
+
+## Requirements
+
+### Functional Requirements
+- Define SLOs per service/user journey with: objective, rolling period (e.g., 30d), and an SLI expressed as *good/total* events.
+- Continuously compute:
+  - Burn rate across multiple windows (e.g., 5m, 30m, 1h, 6h).
+  - Error budget remaining for the rolling period.
+- Trigger alerts based on burn-rate policies (paging vs ticket) and budget exhaustion forecasts.
+- Provide dashboards per SLO: current SLI, burn rates, remaining budget, top contributors (by route/region where safe).
+- GitOps workflow: reviewed changes, versioned policies, auditable history.
+
+### Scale Targets
+- **SLO count:** 1,000 SLOs (500 services × 2 key SLOs). Matters because rule count and evaluation cost scale with SLOs.
+- **Ingestion:** ~500k–2M samples/sec across the fleet. Needs a horizontally scalable TSDB (not a single Prometheus).
+- **Rule eval:** 1-min evaluation interval; alert latency target <2 minutes from sustained incident start.
+- **Cardinality budget:** per-SLO evaluation should touch O(10–100) series, not unbounded labels.
+
+## Key Design Decisions
+
+- **Choose Prometheus-compatible metrics + ruler (Mimir/Cortex/Thanos Ruler).**
+  - Rejected: building a custom time-series compute engine.
+  - Why: burn rate and budget math map cleanly to PromQL; ruler is battle-tested and operationally boring.
+
+- **Define SLIs as event counters (good/total), not latency histograms by default.**
+  - Rejected: “just compute it from logs/traces.”
+  - Why: counters are cheap, robust, and aggregate correctly. Logs/traces are great for debugging, not for being your primary SLO source of truth.
+
+- **Generate recording/alerting rules from SLO specs (Sloth-style).**
+  - Rejected: hand-written PromQL per SLO.
+  - Why: consistency prevents subtle math bugs; policies become reusable; onboarding a new SLO becomes a small config change, not bespoke query design.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[Services] --> B[OTel Collector]
+  B --> C[Metrics Backend]
+  D[SLO Specs (Git)] --> E[Rule Compiler]
+  E --> C
+  C --> F[Alertmanager]
+  F --> G[On-call / Tickets]
+  C --> H[Grafana]
+```
+
+### Components
+
+- **Services**
+  - Emit `good_total` and `total` counters (or `errors_total` + `total`) for each SLO-able operation, with strict label hygiene.
+
+- **OTel Collector**
+  - Standardizes, batches, and forwards metrics via remote write; isolates app code from backend changes.
+
+- **Metrics Backend (Mimir/Cortex/Thanos)**
+  - Durable, horizontally scalable store for time series; runs recording/alerting rules close to the data.
+
+- **SLO Specs (Git)**
+  - YAML definitions: objective, period, SLI selector expressions, alerting policy, ownership.
+  - Enables review, rollback, and audits (“who changed paging thresholds?”).
+
+- **Rule Compiler**
+  - Compiles each SLO into:
+    - Recording rules (precompute per-SLO error ratio time series).
+    - Multi-window burn alert rules and “budget remaining” rules.
+  - Enforces guardrails: max label sets, required aggregations, required ownership/routing.
+
+- **Alertmanager**
+  - Dedup, inhibit, route (service owner, severity), escalation, quiet hours, grouping.
+
+- **Grafana**
+  - Standard dashboards per SLO + fleet views; links to runbooks and recent incidents.
+
+## Deep Dive: Correct Burn-Rate Alerts (Without Noise)
+
+The core quantity is **burn rate**:
+
+- Let `objective = 0.999` over `period = 30d`
+- Error budget fraction `budget = 1 - objective = 0.001`
+- For a window `w`, measured error fraction:
+  - `err_frac(w) = errors(w) / total(w)` (ratio of sums, not sum of ratios)
+- Burn rate:
+  - `burn(w) = err_frac(w) / budget`
+
+A fast page should mean: “if this continues, we’ll blow the monthly budget soon.” A clean policy is multi-window, multi-burn:
+
+- **Page (fast):** `burn(5m) > 14` AND `burn(1h) > 14`
+- **Ticket (slow):** `burn(30m) > 6` AND `burn(6h) > 6`
+
+Why it works:
+- The fast window catches sharp regressions quickly.
+- The slow window prevents paging on transient spikes and metric jitter.
+- The burn thresholds map to time-to-exhaustion: `time_to_burnout ≈ period / burn`.  
+  Example: burn=14 on a 30d SLO implies exhaustion in ~2.1 days if sustained—worth paging.
+
+Implementation detail that prevents subtle wrongness:
+- Compute `errors(w)` and `total(w)` from **counters** using `rate()` and `sum()` with consistent aggregation, then derive ratios.
+- Avoid per-instance ratios (they overweight small instances). Always do **ratio after aggregation**:
+  - Good: `sum(rate(errors_total[5m])) / sum(rate(total_total[5m]))`
+  - Bad: `avg(rate(errors/total))`
+
+Budget remaining is derived over the rolling period:
+- `consumed = (1 - sli_period) / budget`
+- `remaining = 1 - consumed`
+Where `sli_period` uses ratio-of-sums over the full rolling window (often via recording rules to keep it cheap).
+
+Missing data is handled explicitly:
+- If `total(w)` is ~0 (no traffic), burn is undefined; we do **not** page on “no requests.”
+- Separate alert: “SLO telemetry missing” when the required series are absent for N minutes, routed to the owning team (this is a monitoring failure, not an SLO failure).
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness of burn math | Flexibility of arbitrary ad-hoc SLIs |
+| Low operational novelty | “Single pane” custom analytics features |
+| Fast, low-noise paging | Perfect sensitivity to very short spikes |
+| Cost control via low cardinality | Per-dimension SLOs (e.g., per-customer) |
+
+## Failure Modes
+
+- **Telemetry gap / remote-write outage**
+  - Happens: burn and remaining become misleading or flatline.
+  - Detect: “absent series” + remote-write error rate + ingestion lag.
+  - Recover: alert on telemetry failure separately; buffer at collector; ensure backend HA; avoid paging on undefined burn.
+
+- **Cardinality explosion (labels drift into SLI metrics)**
+  - Happens: backend cost spikes, queries slow, rule eval falls behind; alerts become delayed.
+  - Detect: per-metric series count SLO + ruler eval duration + top-cardinality reports.
+  - Recover: compiler rejects bad label sets; enforce metric linting in CI; push aggregation to the edge (collector).
+
+- **Incorrect SLI query (math/aggregation bug)**
+  - Happens: chronic false pages or missed outages across many services.
+  - Detect: canary SLOs with known behavior; diff-based review of generated rules; “SLO sanity” dashboards (error fraction should match logs during incidents).
+  - Recover: rollback SLO spec/rules; ship compiler fix; require approval for new SLI templates.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Move to dedicated ruler pools, aggressive recording rule precomputation, and strict evaluation budgets per tenant/team.
+  - Introduce automated “top offenders” attribution using a controlled dimension set (region, cluster, endpoint class), not raw paths.
+
+- **100x scale:**
+  - Split metrics storage by tenancy (org/team), enforce hard per-tenant series quotas, and consider streaming pre-aggregation for ultra-hot signals.
+  - Treat SLO evaluation as a product: cached query frontends, rollup tiers, and strong SLO-template standardization to keep queries uniform.
+
+## Operational Notes
+
+- Standardize a small SLO template library (availability, latency-<T, freshness) and ban bespoke PromQL unless reviewed.
+- Keep burn alerts owned: every SLO must declare `owner`, `runbook`, and `paging policy`.
+- Separate “service bad” from “monitoring blind”: missing-telemetry alerts should never page the same way as budget burn.
+- On-call ergonomics: alerts include current burn rates (fast+slow), remaining budget, and a Grafana deep link scoped to the SLO.
+```
+tokens used
+3,332
+```markdown
+---
+title: "SLO/Error Budget Monitoring"
+category: "Observability & Reliability"
+difficulty: "Medium"
+tags: ["sre", "slo", "error-budgets", "prometheus", "alerting", "burn-rate", "grafana"]
+---
+
+## Overview
+
+This system tracks SLO compliance by continuously measuring SLIs, converting them into **error budget burn rates**, and alerting when burn indicates the budget will be exhausted before the SLO window ends. The key insight is to **treat SLO monitoring as a rules-generation problem**, not a bespoke analytics platform: we compile SLO definitions into a small, repeatable set of recording rules and multi-window burn alerts executed by a proven Prometheus-compatible time-series backend.
+
+The elegant part is separating concerns cleanly: services emit **boring, low-cardinality golden signals** (good/total events); a rule compiler turns human-readable SLO specs into deterministic queries; the metrics backend evaluates them at low cost; Alertmanager handles routing/dedup/escalation. The only “custom” code is the compiler and a thin API/UI around SLO lifecycle.
+
+## What Makes This Hard
+
+Naive implementations get trapped by two things:
+
+1. **Math that lies under pressure.** If you compute “average error rate” incorrectly (ratio-of-averages vs average-of-ratios, poor aggregation, counter resets, missing data), you page people for ghosts or miss real incidents. Burn rate math is simple; making it correct on real telemetry is not.
+
+2. **Alerting that is either noisy or late.** Single-window alerts flap (5m noise) or arrive too late (6h smoothing). The non-obvious fix is **multi-window, multi-burn** alerting: require a fast window and a slow window to agree, which catches sustained incidents quickly while rejecting brief spikes.
+
+## Requirements
+
+### Functional Requirements
+- Define SLOs per service/user journey with: objective, rolling period (e.g., 30d), and an SLI expressed as *good/total* events.
+- Continuously compute:
+  - Burn rate across multiple windows (e.g., 5m, 30m, 1h, 6h).
+  - Error budget remaining for the rolling period.
+- Trigger alerts based on burn-rate policies (paging vs ticket) and budget exhaustion forecasts.
+- Provide dashboards per SLO: current SLI, burn rates, remaining budget, top contributors (by route/region where safe).
+- GitOps workflow: reviewed changes, versioned policies, auditable history.
+
+### Scale Targets
+- **SLO count:** 1,000 SLOs (500 services × 2 key SLOs). Matters because rule count and evaluation cost scale with SLOs.
+- **Ingestion:** ~500k–2M samples/sec across the fleet. Needs a horizontally scalable TSDB (not a single Prometheus).
+- **Rule eval:** 1-min evaluation interval; alert latency target <2 minutes from sustained incident start.
+- **Cardinality budget:** per-SLO evaluation should touch O(10–100) series, not unbounded labels.
+
+## Key Design Decisions
+
+- **Choose Prometheus-compatible metrics + ruler (Mimir/Cortex/Thanos Ruler).**
+  - Rejected: building a custom time-series compute engine.
+  - Why: burn rate and budget math map cleanly to PromQL; ruler is battle-tested and operationally boring.
+
+- **Define SLIs as event counters (good/total), not latency histograms by default.**
+  - Rejected: “just compute it from logs/traces.”
+  - Why: counters are cheap, robust, and aggregate correctly. Logs/traces are great for debugging, not for being your primary SLO source of truth.
+
+- **Generate recording/alerting rules from SLO specs (Sloth-style).**
+  - Rejected: hand-written PromQL per SLO.
+  - Why: consistency prevents subtle math bugs; policies become reusable; onboarding a new SLO becomes a small config change, not bespoke query design.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[Services] --> B[OTel Collector]
+  B --> C[Metrics Backend]
+  D[SLO Specs (Git)] --> E[Rule Compiler]
+  E --> C
+  C --> F[Alertmanager]
+  F --> G[On-call / Tickets]
+  C --> H[Grafana]
+```
+
+### Components
+
+- **Services**
+  - Emit `good_total` and `total` counters (or `errors_total` + `total`) for each SLO-able operation, with strict label hygiene.
+
+- **OTel Collector**
+  - Standardizes, batches, and forwards metrics via remote write; isolates app code from backend changes.
+
+- **Metrics Backend (Mimir/Cortex/Thanos)**
+  - Durable, horizontally scalable store for time series; runs recording/alerting rules close to the data.
+
+- **SLO Specs (Git)**
+  - YAML definitions: objective, period, SLI selector expressions, alerting policy, ownership.
+  - Enables review, rollback, and audits (“who changed paging thresholds?”).
+
+- **Rule Compiler**
+  - Compiles each SLO into:
+    - Recording rules (precompute per-SLO error ratio time series).
+    - Multi-window burn alert rules and “budget remaining” rules.
+  - Enforces guardrails: max label sets, required aggregations, required ownership/routing.
+
+- **Alertmanager**
+  - Dedup, inhibit, route (service owner, severity), escalation, quiet hours, grouping.
+
+- **Grafana**
+  - Standard dashboards per SLO + fleet views; links to runbooks and recent incidents.
+
+## Deep Dive: Correct Burn-Rate Alerts (Without Noise)
+
+The core quantity is **burn rate**:
+
+- Let `objective = 0.999` over `period = 30d`
+- Error budget fraction `budget = 1 - objective = 0.001`
+- For a window `w`, measured error fraction:
+  - `err_frac(w) = errors(w) / total(w)` (ratio of sums, not sum of ratios)
+- Burn rate:
+  - `burn(w) = err_frac(w) / budget`
+
+A fast page should mean: “if this continues, we’ll blow the monthly budget soon.” A clean policy is multi-window, multi-burn:
+
+- **Page (fast):** `burn(5m) > 14` AND `burn(1h) > 14`
+- **Ticket (slow):** `burn(30m) > 6` AND `burn(6h) > 6`
+
+Why it works:
+- The fast window catches sharp regressions quickly.
+- The slow window prevents paging on transient spikes and metric jitter.
+- The burn thresholds map to time-to-exhaustion: `time_to_burnout ≈ period / burn`.  
+  Example: burn=14 on a 30d SLO implies exhaustion in ~2.1 days if sustained—worth paging.
+
+Implementation detail that prevents subtle wrongness:
+- Compute `errors(w)` and `total(w)` from **counters** using `rate()` and `sum()` with consistent aggregation, then derive ratios.
+- Avoid per-instance ratios (they overweight small instances). Always do **ratio after aggregation**:
+  - Good: `sum(rate(errors_total[5m])) / sum(rate(total_total[5m]))`
+  - Bad: `avg(rate(errors/total))`
+
+Budget remaining is derived over the rolling period:
+- `consumed = (1 - sli_period) / budget`
+- `remaining = 1 - consumed`
+Where `sli_period` uses ratio-of-sums over the full rolling window (often via recording rules to keep it cheap).
+
+Missing data is handled explicitly:
+- If `total(w)` is ~0 (no traffic), burn is undefined; we do **not** page on “no requests.”
+- Separate alert: “SLO telemetry missing” when the required series are absent for N minutes, routed to the owning team (this is a monitoring failure, not an SLO failure).
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness of burn math | Flexibility of arbitrary ad-hoc SLIs |
+| Low operational novelty | “Single pane” custom analytics features |
+| Fast, low-noise paging | Perfect sensitivity to very short spikes |
+| Cost control via low cardinality | Per-dimension SLOs (e.g., per-customer) |
+
+## Failure Modes
+
+- **Telemetry gap / remote-write outage**
+  - Happens: burn and remaining become misleading or flatline.
+  - Detect: “absent series” + remote-write error rate + ingestion lag.
+  - Recover: alert on telemetry failure separately; buffer at collector; ensure backend HA; avoid paging on undefined burn.
+
+- **Cardinality explosion (labels drift into SLI metrics)**
+  - Happens: backend cost spikes, queries slow, rule eval falls behind; alerts become delayed.
+  - Detect: per-metric series count SLO + ruler eval duration + top-cardinality reports.
+  - Recover: compiler rejects bad label sets; enforce metric linting in CI; push aggregation to the edge (collector).
+
+- **Incorrect SLI query (math/aggregation bug)**
+  - Happens: chronic false pages or missed outages across many services.
+  - Detect: canary SLOs with known behavior; diff-based review of generated rules; “SLO sanity” dashboards (error fraction should match logs during incidents).
+  - Recover: rollback SLO spec/rules; ship compiler fix; require approval for new SLI templates.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Move to dedicated ruler pools, aggressive recording rule precomputation, and strict evaluation budgets per tenant/team.
+  - Introduce automated “top offenders” attribution using a controlled dimension set (region, cluster, endpoint class), not raw paths.
+
+- **100x scale:**
+  - Split metrics storage by tenancy (org/team), enforce hard per-tenant series quotas, and consider streaming pre-aggregation for ultra-hot signals.
+  - Treat SLO evaluation as a product: cached query frontends, rollup tiers, and strong SLO-template standardization to keep queries uniform.
+
+## Operational Notes
+
+- Standardize a small SLO template library (availability, latency-<T, freshness) and ban bespoke PromQL unless reviewed.
+- Keep burn alerts owned: every SLO must declare `owner`, `runbook`, and `paging policy`.
+- Separate “service bad” from “monitoring blind”: missing-telemetry alerts should never page the same way as budget burn.
+- On-call ergonomics: alerts include current burn rates (fast+slow), remaining budget, and a Grafana deep link scoped to the SLO.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/slo-error-budget-monitoring.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-3b13-7d31-bb9d-2fb725ec54c2
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "SLO/Error Budget Monitoring"
+category: "Observability & Reliability"
+difficulty: "Medium"
+tags: ["sre", "slo", "error-budgets", "prometheus", "alerting", "burn-rate", "grafana"]
+---
+
+## Overview
+
+This system tracks SLO compliance by continuously measuring SLIs, converting them into **error budget burn rates**, and alerting when burn indicates the budget will be exhausted before the SLO window ends. The key insight is to **treat SLO monitoring as a rules-generation problem**, not a bespoke analytics platform: we compile SLO definitions into a small, repeatable set of recording rules and multi-window burn alerts executed by a proven Prometheus-compatible time-series backend.
+
+The elegant part is separating concerns cleanly: services emit **boring, low-cardinality golden signals** (good/total events); a rule compiler turns human-readable SLO specs into deterministic queries; the metrics backend evaluates them at low cost; Alertmanager handles routing/dedup/escalation. The only “custom” code is the compiler and a thin API/UI around SLO lifecycle.
+
+## What Makes This Hard
+
+Naive implementations get trapped by two things:
+
+1. **Math that lies under pressure.** If you compute “average error rate” incorrectly (ratio-of-averages vs average-of-ratios, poor aggregation, counter resets, missing data), you page people for ghosts or miss real incidents. Burn rate math is simple; making it correct on real telemetry is not.
+
+2. **Alerting that is either noisy or late.** Single-window alerts flap (5m noise) or arrive too late (6h smoothing). The non-obvious fix is **multi-window, multi-burn** alerting: require a fast window and a slow window to agree, which catches sustained incidents quickly while rejecting brief spikes.
+
+## Requirements
+
+### Functional Requirements
+- Define SLOs per service/user journey with: objective, rolling period (e.g., 30d), and an SLI expressed as *good/total* events.
+- Continuously compute:
+  - Burn rate across multiple windows (e.g., 5m, 30m, 1h, 6h).
+  - Error budget remaining for the rolling period.
+- Trigger alerts based on burn-rate policies (paging vs ticket) and budget exhaustion forecasts.
+- Provide dashboards per SLO: current SLI, burn rates, remaining budget, top contributors (by route/region where safe).
+- GitOps workflow: reviewed changes, versioned policies, auditable history.
+
+### Scale Targets
+- **SLO count:** 1,000 SLOs (500 services × 2 key SLOs). Matters because rule count and evaluation cost scale with SLOs.
+- **Ingestion:** ~500k–2M samples/sec across the fleet. Needs a horizontally scalable TSDB (not a single Prometheus).
+- **Rule eval:** 1-min evaluation interval; alert latency target <2 minutes from sustained incident start.
+- **Cardinality budget:** per-SLO evaluation should touch O(10–100) series, not unbounded labels.
+
+## Key Design Decisions
+
+- **Choose Prometheus-compatible metrics + ruler (Mimir/Cortex/Thanos Ruler).**
+  - Rejected: building a custom time-series compute engine.
+  - Why: burn rate and budget math map cleanly to PromQL; ruler is battle-tested and operationally boring.
+
+- **Define SLIs as event counters (good/total), not latency histograms by default.**
+  - Rejected: “just compute it from logs/traces.”
+  - Why: counters are cheap, robust, and aggregate correctly. Logs/traces are great for debugging, not for being your primary SLO source of truth.
+
+- **Generate recording/alerting rules from SLO specs (Sloth-style).**
+  - Rejected: hand-written PromQL per SLO.
+  - Why: consistency prevents subtle math bugs; policies become reusable; onboarding a new SLO becomes a small config change, not bespoke query design.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[Services] --> B[OTel Collector]
+  B --> C[Metrics Backend]
+  D[SLO Specs (Git)] --> E[Rule Compiler]
+  E --> C
+  C --> F[Alertmanager]
+  F --> G[On-call / Tickets]
+  C --> H[Grafana]
+```
+
+### Components
+
+- **Services**
+  - Emit `good_total` and `total` counters (or `errors_total` + `total`) for each SLO-able operation, with strict label hygiene.
+
+- **OTel Collector**
+  - Standardizes, batches, and forwards metrics via remote write; isolates app code from backend changes.
+
+- **Metrics Backend (Mimir/Cortex/Thanos)**
+  - Durable, horizontally scalable store for time series; runs recording/alerting rules close to the data.
+
+- **SLO Specs (Git)**
+  - YAML definitions: objective, period, SLI selector expressions, alerting policy, ownership.
+  - Enables review, rollback, and audits (“who changed paging thresholds?”).
+
+- **Rule Compiler**
+  - Compiles each SLO into:
+    - Recording rules (precompute per-SLO error ratio time series).
+    - Multi-window burn alert rules and “budget remaining” rules.
+  - Enforces guardrails: max label sets, required aggregations, required ownership/routing.
+
+- **Alertmanager**
+  - Dedup, inhibit, route (service owner, severity), escalation, quiet hours, grouping.
+
+- **Grafana**
+  - Standard dashboards per SLO + fleet views; links to runbooks and recent incidents.
+
+## Deep Dive: Correct Burn-Rate Alerts (Without Noise)
+
+The core quantity is **burn rate**:
+
+- Let `objective = 0.999` over `period = 30d`
+- Error budget fraction `budget = 1 - objective = 0.001`
+- For a window `w`, measured error fraction:
+  - `err_frac(w) = errors(w) / total(w)` (ratio of sums, not sum of ratios)
+- Burn rate:
+  - `burn(w) = err_frac(w) / budget`
+
+A fast page should mean: “if this continues, we’ll blow the monthly budget soon.” A clean policy is multi-window, multi-burn:
+
+- **Page (fast):** `burn(5m) > 14` AND `burn(1h) > 14`
+- **Ticket (slow):** `burn(30m) > 6` AND `burn(6h) > 6`
+
+Why it works:
+- The fast window catches sharp regressions quickly.
+- The slow window prevents paging on transient spikes and metric jitter.
+- The burn thresholds map to time-to-exhaustion: `time_to_burnout ≈ period / burn`.  
+  Example: burn=14 on a 30d SLO implies exhaustion in ~2.1 days if sustained—worth paging.
+
+Implementation detail that prevents subtle wrongness:
+- Compute `errors(w)` and `total(w)` from **counters** using `rate()` and `sum()` with consistent aggregation, then derive ratios.
+- Avoid per-instance ratios (they overweight small instances). Always do **ratio after aggregation**:
+  - Good: `sum(rate(errors_total[5m])) / sum(rate(total_total[5m]))`
+  - Bad: `avg(rate(errors/total))`
+
+Budget remaining is derived over the rolling period:
+- `consumed = (1 - sli_period) / budget`
+- `remaining = 1 - consumed`
+Where `sli_period` uses ratio-of-sums over the full rolling window (often via recording rules to keep it cheap).
+
+Missing data is handled explicitly:
+- If `total(w)` is ~0 (no traffic), burn is undefined; we do **not** page on “no requests.”
+- Separate alert: “SLO telemetry missing” when the required series are absent for N minutes, routed to the owning team (this is a monitoring failure, not an SLO failure).
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness of burn math | Flexibility of arbitrary ad-hoc SLIs |
+| Low operational novelty | “Single pane” custom analytics features |
+| Fast, low-noise paging | Perfect sensitivity to very short spikes |
+| Cost control via low cardinality | Per-dimension SLOs (e.g., per-customer) |
+
+## Failure Modes
+
+- **Telemetry gap / remote-write outage**
+  - Happens: burn and remaining become misleading or flatline.
+  - Detect: “absent series” + remote-write error rate + ingestion lag.
+  - Recover: alert on telemetry failure separately; buffer at collector; ensure backend HA; avoid paging on undefined burn.
+
+- **Cardinality explosion (labels drift into SLI metrics)**
+  - Happens: backend cost spikes, queries slow, rule eval falls behind; alerts become delayed.
+  - Detect: per-metric series count SLO + ruler eval duration + top-cardinality reports.
+  - Recover: compiler rejects bad label sets; enforce metric linting in CI; push aggregation to the edge (collector).
+
+- **Incorrect SLI query (math/aggregation bug)**
+  - Happens: chronic false pages or missed outages across many services.
+  - Detect: canary SLOs with known behavior; diff-based review of generated rules; “SLO sanity” dashboards (error fraction should match logs during incidents).
+  - Recover: rollback SLO spec/rules; ship compiler fix; require approval for new SLI templates.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Move to dedicated ruler pools, aggressive recording rule precomputation, and strict evaluation budgets per tenant/team.
+  - Introduce automated “top offenders” attribution using a controlled dimension set (region, cluster, endpoint class), not raw paths.
+
+- **100x scale:**
+  - Split metrics storage by tenancy (org/team), enforce hard per-tenant series quotas, and consider streaming pre-aggregation for ultra-hot signals.
+  - Treat SLO evaluation as a product: cached query frontends, rollup tiers, and strong SLO-template standardization to keep queries uniform.
+
+## Operational Notes
+
+- Standardize a small SLO template library (availability, latency-<T, freshness) and ban bespoke PromQL unless reviewed.
+- Keep burn alerts owned: every SLO must declare `owner`, `runbook`, and `paging policy`.
+- Separate “service bad” from “monitoring blind”: missing-telemetry alerts should never page the same way as budget burn.
+- On-call ergonomics: alerts include current burn rates (fast+slow), remaining budget, and a Grafana deep link scoped to the SLO.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+thinking
+**Reviewing monitoring practices**
+
+I'm considering the nice-to-have elements, like runbook link conventions and dashboards for monitoring blind versus service issues. Incident annotations and automation for key contributors are also important.
+
+Now, for what's working well, I should focus on specific aspects, such as low-cardinality signals, ratio-of-sums, multi-window burn, and the separation of blind alerts. I want to highlight GitOps and scale awareness, ensuring I'm being constructive rather than critical. Let's move forward with producing these insights!
+codex
+```markdown
+## Elegance Check
+
+### The Core Insight
+Treating SLO monitoring as *deterministic rule generation* (with multi-window burn alerts) is the right elegance move: you get correctness and consistency by compiling specs into a small, repeatable PromQL/ruler surface area instead of building an analytics product.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Services emitting `good/total` (or `errors/total`) counters | Keeps SLIs low-cardinality, cheap, and aggregatable with ratio-of-sums |
+| Prometheus-compatible scalable backend + ruler (Mimir/Cortex/Thanos) | Evaluates burn math close to data with boring, proven primitives |
+| Alertmanager | Routing, dedup, inhibition, escalation—don’t re-invent this |
+| GitOps SLO specs | Auditable, reviewable, rollbackable policy control plane |
+| Rule compiler (or generator) | Prevents subtle math bugs, standardizes policies, enforces guardrails |
+| Grafana | Standardized SLO UX without bespoke UI complexity |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom “Rule Compiler” + thin API/UI | Adopt an existing generator/operator (Sloth, Pyrra, kube-prometheus-stack patterns) and keep “custom” to templates + guardrails | Less bespoke flexibility; you align to ecosystem conventions (usually a net win) |
+| OTel Collector as mandatory hop | Use Prometheus Agent / Grafana Agent for remote_write + relabeling (or direct scrape where possible) | Slightly less “OTel-pure”; often simpler ops and fewer moving parts |
+| “Top contributors” as a requirement | Make it explicitly “controlled dimensions only” and predeclare the allowed label set in templates | You lose arbitrary breakdowns (which you don’t want anyway for cardinality) |
+| Budget remaining from full 30d queries | Precompute rollups (e.g., 1m→5m→1h recording rules) and derive period stats from rollups | Slightly reduced precision; much more predictable query cost |
+| “Compiler enforces guardrails” (implicit) | Make guardrails first-class: CI lint + generated-rule diff review + canary SLOs as a release gate | More upfront process; far fewer fleet-wide false pages |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Metrics backend down for 5 minutes**
+   - Design's answer: partially addressed (telemetry gap noted; “avoid paging on undefined burn”)
+   - Recommendation: **Strengthen** — define what alerts do when series go stale (staleness/NaNs), and add explicit “ruler/querier unavailable” + “evaluation behind” alerts so on-call knows “monitoring blind” vs “service bad”.
+
+2. **Remote-write lag / network partition between collectors and backend**
+   - Design's answer: mentioned (buffer at collector; alert on ingestion lag)
+   - Recommendation: **Strengthen** — be explicit about *how burn rules behave under lag* (late samples can make burn appear to “recover” or spike). Add an SLO for the pipeline itself and gate paging alerts on “data freshness OK” (but ensure that gate can’t mask real incidents silently).
+
+3. **Ruler evaluation slows (cardinality creep or expensive queries) but doesn’t fail**
+   - Design's answer: mentioned (eval falls behind; detect via ruler eval duration)
+   - Recommendation: **Must strengthen** — add hard budgets: per-tenant rule count caps, max series touched per rule (enforced via templates/labels), and a concrete response when `evaluation_interval` is missed (alert + shed non-critical rules first).
+
+4. **Bad SLO spec deploy (wrong selector / inverted good-vs-bad)**
+   - Design's answer: mitigations exist (diff review, canaries, rollback)
+   - Recommendation: **Strengthen** — add a “dry-run” validation step in CI that compiles rules and runs promtool-style checks, plus golden-file tests for the generator; require staged rollout (apply to a canary tenant/cluster before fleet).
+
+5. **Traffic 10x overnight**
+   - Design's answer: backend scale + low cardinality focus; 10x/100x notes
+   - Recommendation: **Acceptable with one addition** — ensure tenancy isolation + quotas are not “100x only”; you want them at v1 to keep one team from taking down the ruler/queriers for everyone.
+
+## Recommendations
+
+### Must Fix
+- Specify exact PromQL patterns for “no traffic” vs “missing telemetry” vs “backend blind” (staleness, NaNs, `absent_over_time`, and gating semantics), so paging behavior is deterministic.
+- Add “ruler/eval behind” and “data freshness” as first-class signals, with clear routing distinct from SLO burn (otherwise on-call can’t tell service failure from monitoring failure).
+- Define tenancy/quotas/evaluation budgets now (rule count, series count, query time), not as a 100x concern.
+
+### Should Consider
+- Replace custom compiler+UI with an existing SLO generator/operator (Sloth/Pyrra style) and keep your differentiation to templates, guardrails, and rollout discipline.
+- Make the template library the product: a small set of blessed SLO types + controlled attribution dimensions, with an explicit “no bespoke PromQL without review” path.
+- Precompute rollups to stabilize cost of rolling-period “remaining budget” at 1k SLOs (predictability beats cleverness here).
+
+### Nice to Have
+- A single “SLO health” dashboard for operators: rule eval lag, missing series, ingestion lag, top cardinality offenders, and recent spec changes.
+- Automated “spec change annotation” into Grafana/incident timeline (ties pages to the PR that changed rules).
+- A lightweight “SLO onboarding checklist” that encodes label hygiene and ownership/runbook requirements.
+
+## What's Working Well
+- The separation of concerns is clean: low-cardinality golden signals → deterministic rule generation → ruler execution → Alertmanager routing.
+- You explicitly call out the real correctness trap (ratio-of-sums, counter resets, missing data), which is where most SLO systems fail.
+- Multi-window burn alerts are the right operational shape for “fast but not noisy”.
+- The “monitoring blind” vs “service bad” separation is a strong on-call ergonomics decision.
+- The design scales conceptually (recording rules + ruler pools + cardinality budgets) without turning into a bespoke platform.
+```
+tokens used
+5,595
+```markdown
+## Elegance Check
+
+### The Core Insight
+Treating SLO monitoring as *deterministic rule generation* (with multi-window burn alerts) is the right elegance move: you get correctness and consistency by compiling specs into a small, repeatable PromQL/ruler surface area instead of building an analytics product.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Services emitting `good/total` (or `errors/total`) counters | Keeps SLIs low-cardinality, cheap, and aggregatable with ratio-of-sums |
+| Prometheus-compatible scalable backend + ruler (Mimir/Cortex/Thanos) | Evaluates burn math close to data with boring, proven primitives |
+| Alertmanager | Routing, dedup, inhibition, escalation—don’t re-invent this |
+| GitOps SLO specs | Auditable, reviewable, rollbackable policy control plane |
+| Rule compiler (or generator) | Prevents subtle math bugs, standardizes policies, enforces guardrails |
+| Grafana | Standardized SLO UX without bespoke UI complexity |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom “Rule Compiler” + thin API/UI | Adopt an existing generator/operator (Sloth, Pyrra, kube-prometheus-stack patterns) and keep “custom” to templates + guardrails | Less bespoke flexibility; you align to ecosystem conventions (usually a net win) |
+| OTel Collector as mandatory hop | Use Prometheus Agent / Grafana Agent for remote_write + relabeling (or direct scrape where possible) | Slightly less “OTel-pure”; often simpler ops and fewer moving parts |
+| “Top contributors” as a requirement | Make it explicitly “controlled dimensions only” and predeclare the allowed label set in templates | You lose arbitrary breakdowns (which you don’t want anyway for cardinality) |
+| Budget remaining from full 30d queries | Precompute rollups (e.g., 1m→5m→1h recording rules) and derive period stats from rollups | Slightly reduced precision; much more predictable query cost |
+| “Compiler enforces guardrails” (implicit) | Make guardrails first-class: CI lint + generated-rule diff review + canary SLOs as a release gate | More upfront process; far fewer fleet-wide false pages |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Metrics backend down for 5 minutes**
+   - Design's answer: partially addressed (telemetry gap noted; “avoid paging on undefined burn”)
+   - Recommendation: **Strengthen** — define what alerts do when series go stale (staleness/NaNs), and add explicit “ruler/querier unavailable” + “evaluation behind” alerts so on-call knows “monitoring blind” vs “service bad”.
+
+2. **Remote-write lag / network partition between collectors and backend**
+   - Design's answer: mentioned (buffer at collector; alert on ingestion lag)
+   - Recommendation: **Strengthen** — be explicit about *how burn rules behave under lag* (late samples can make burn appear to “recover” or spike). Add an SLO for the pipeline itself and gate paging alerts on “data freshness OK” (but ensure that gate can’t mask real incidents silently).
+
+3. **Ruler evaluation slows (cardinality creep or expensive queries) but doesn’t fail**
+   - Design's answer: mentioned (eval falls behind; detect via ruler eval duration)
+   - Recommendation: **Must strengthen** — add hard budgets: per-tenant rule count caps, max series touched per rule (enforced via templates/labels), and a concrete response when `evaluation_interval` is missed (alert + shed non-critical rules first).
+
+4. **Bad SLO spec deploy (wrong selector / inverted good-vs-bad)**
+   - Design's answer: mitigations exist (diff review, canaries, rollback)
+   - Recommendation: **Strengthen** — add a “dry-run” validation step in CI that compiles rules and runs promtool-style checks, plus golden-file tests for the generator; require staged rollout (apply to a canary tenant/cluster before fleet).
+
+5. **Traffic 10x overnight**
+   - Design's answer: backend scale + low cardinality focus; 10x/100x notes
+   - Recommendation: **Acceptable with one addition** — ensure tenancy isolation + quotas are not “100x only”; you want them at v1 to keep one team from taking down the ruler/queriers for everyone.
+
+## Recommendations
+
+### Must Fix
+- Specify exact PromQL patterns for “no traffic” vs “missing telemetry” vs “backend blind” (staleness, NaNs, `absent_over_time`, and gating semantics), so paging behavior is deterministic.
+- Add “ruler/eval behind” and “data freshness” as first-class signals, with clear routing distinct from SLO burn (otherwise on-call can’t tell service failure from monitoring failure).
+- Define tenancy/quotas/evaluation budgets now (rule count, series count, query time), not as a 100x concern.
+
+### Should Consider
+- Replace custom compiler+UI with an existing SLO generator/operator (Sloth/Pyrra style) and keep your differentiation to templates, guardrails, and rollout discipline.
+- Make the template library the product: a small set of blessed SLO types + controlled attribution dimensions, with an explicit “no bespoke PromQL without review” path.
+- Precompute rollups to stabilize cost of rolling-period “remaining budget” at 1k SLOs (predictability beats cleverness here).
+
+### Nice to Have
+- A single “SLO health” dashboard for operators: rule eval lag, missing series, ingestion lag, top cardinality offenders, and recent spec changes.
+- Automated “spec change annotation” into Grafana/incident timeline (ties pages to the PR that changed rules).
+- A lightweight “SLO onboarding checklist” that encodes label hygiene and ownership/runbook requirements.
+
+## What's Working Well
+- The separation of concerns is clean: low-cardinality golden signals → deterministic rule generation → ruler execution → Alertmanager routing.
+- You explicitly call out the real correctness trap (ratio-of-sums, counter resets, missing data), which is where most SLO systems fail.
+- Multi-window burn alerts are the right operational shape for “fast but not noisy”.
+- The “monitoring blind” vs “service bad” separation is a strong on-call ergonomics decision.
+- The design scales conceptually (recording rules + ruler pools + cardinality budgets) without turning into a bespoke platform.
+```
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/slo-error-budget-monitoring.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af9-c2ea-7b22-8bc4-419b4a8a5bf2
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "SLO/Error Budget Monitoring"
+category: "Observability & Reliability"
+difficulty: "Medium"
+tags: ["sre", "slo", "error-budgets", "prometheus", "alerting", "burn-rate", "grafana"]
+---
+
+## Overview
+
+This system tracks SLO compliance by continuously measuring SLIs, converting them into **error budget burn rates**, and alerting when burn indicates the budget will be exhausted before the SLO window ends. The key insight is to **treat SLO monitoring as a rules-generation problem**, not a bespoke analytics platform: we compile SLO definitions into a small, repeatable set of recording rules and multi-window burn alerts executed by a proven Prometheus-compatible time-series backend.
+
+The elegant part is separating concerns cleanly: services emit **boring, low-cardinality golden signals** (good/total events); a rule compiler turns human-readable SLO specs into deterministic queries; the metrics backend evaluates them at low cost; Alertmanager handles routing/dedup/escalation. The only “custom” code is the compiler and a thin API/UI around SLO lifecycle.
+
+## What Makes This Hard
+
+Naive implementations get trapped by two things:
+
+1. **Math that lies under pressure.** If you compute “average error rate” incorrectly (ratio-of-averages vs average-of-ratios, poor aggregation, counter resets, missing data), you page people for ghosts or miss real incidents. Burn rate math is simple; making it correct on real telemetry is not.
+
+2. **Alerting that is either noisy or late.** Single-window alerts flap (5m noise) or arrive too late (6h smoothing). The non-obvious fix is **multi-window, multi-burn** alerting: require a fast window and a slow window to agree, which catches sustained incidents quickly while rejecting brief spikes.
+
+## Requirements
+
+### Functional Requirements
+- Define SLOs per service/user journey with: objective, rolling period (e.g., 30d), and an SLI expressed as *good/total* events.
+- Continuously compute:
+  - Burn rate across multiple windows (e.g., 5m, 30m, 1h, 6h).
+  - Error budget remaining for the rolling period.
+- Trigger alerts based on burn-rate policies (paging vs ticket) and budget exhaustion forecasts.
+- Provide dashboards per SLO: current SLI, burn rates, remaining budget, top contributors (by route/region where safe).
+- GitOps workflow: reviewed changes, versioned policies, auditable history.
+
+### Scale Targets
+- **SLO count:** 1,000 SLOs (500 services × 2 key SLOs). Matters because rule count and evaluation cost scale with SLOs.
+- **Ingestion:** ~500k–2M samples/sec across the fleet. Needs a horizontally scalable TSDB (not a single Prometheus).
+- **Rule eval:** 1-min evaluation interval; alert latency target <2 minutes from sustained incident start.
+- **Cardinality budget:** per-SLO evaluation should touch O(10–100) series, not unbounded labels.
+
+## Key Design Decisions
+
+- **Choose Prometheus-compatible metrics + ruler (Mimir/Cortex/Thanos Ruler).**
+  - Rejected: building a custom time-series compute engine.
+  - Why: burn rate and budget math map cleanly to PromQL; ruler is battle-tested and operationally boring.
+
+- **Define SLIs as event counters (good/total), not latency histograms by default.**
+  - Rejected: “just compute it from logs/traces.”
+  - Why: counters are cheap, robust, and aggregate correctly. Logs/traces are great for debugging, not for being your primary SLO source of truth.
+
+- **Generate recording/alerting rules from SLO specs (Sloth-style).**
+  - Rejected: hand-written PromQL per SLO.
+  - Why: consistency prevents subtle math bugs; policies become reusable; onboarding a new SLO becomes a small config change, not bespoke query design.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[Services] --> B[OTel Collector]
+  B --> C[Metrics Backend]
+  D[SLO Specs (Git)] --> E[Rule Compiler]
+  E --> C
+  C --> F[Alertmanager]
+  F --> G[On-call / Tickets]
+  C --> H[Grafana]
+```
+
+### Components
+
+- **Services**
+  - Emit `good_total` and `total` counters (or `errors_total` + `total`) for each SLO-able operation, with strict label hygiene.
+
+- **OTel Collector**
+  - Standardizes, batches, and forwards metrics via remote write; isolates app code from backend changes.
+
+- **Metrics Backend (Mimir/Cortex/Thanos)**
+  - Durable, horizontally scalable store for time series; runs recording/alerting rules close to the data.
+
+- **SLO Specs (Git)**
+  - YAML definitions: objective, period, SLI selector expressions, alerting policy, ownership.
+  - Enables review, rollback, and audits (“who changed paging thresholds?”).
+
+- **Rule Compiler**
+  - Compiles each SLO into:
+    - Recording rules (precompute per-SLO error ratio time series).
+    - Multi-window burn alert rules and “budget remaining” rules.
+  - Enforces guardrails: max label sets, required aggregations, required ownership/routing.
+
+- **Alertmanager**
+  - Dedup, inhibit, route (service owner, severity), escalation, quiet hours, grouping.
+
+- **Grafana**
+  - Standard dashboards per SLO + fleet views; links to runbooks and recent incidents.
+
+## Deep Dive: Correct Burn-Rate Alerts (Without Noise)
+
+The core quantity is **burn rate**:
+
+- Let `objective = 0.999` over `period = 30d`
+- Error budget fraction `budget = 1 - objective = 0.001`
+- For a window `w`, measured error fraction:
+  - `err_frac(w) = errors(w) / total(w)` (ratio of sums, not sum of ratios)
+- Burn rate:
+  - `burn(w) = err_frac(w) / budget`
+
+A fast page should mean: “if this continues, we’ll blow the monthly budget soon.” A clean policy is multi-window, multi-burn:
+
+- **Page (fast):** `burn(5m) > 14` AND `burn(1h) > 14`
+- **Ticket (slow):** `burn(30m) > 6` AND `burn(6h) > 6`
+
+Why it works:
+- The fast window catches sharp regressions quickly.
+- The slow window prevents paging on transient spikes and metric jitter.
+- The burn thresholds map to time-to-exhaustion: `time_to_burnout ≈ period / burn`.  
+  Example: burn=14 on a 30d SLO implies exhaustion in ~2.1 days if sustained—worth paging.
+
+Implementation detail that prevents subtle wrongness:
+- Compute `errors(w)` and `total(w)` from **counters** using `rate()` and `sum()` with consistent aggregation, then derive ratios.
+- Avoid per-instance ratios (they overweight small instances). Always do **ratio after aggregation**:
+  - Good: `sum(rate(errors_total[5m])) / sum(rate(total_total[5m]))`
+  - Bad: `avg(rate(errors/total))`
+
+Budget remaining is derived over the rolling period:
+- `consumed = (1 - sli_period) / budget`
+- `remaining = 1 - consumed`
+Where `sli_period` uses ratio-of-sums over the full rolling window (often via recording rules to keep it cheap).
+
+Missing data is handled explicitly:
+- If `total(w)` is ~0 (no traffic), burn is undefined; we do **not** page on “no requests.”
+- Separate alert: “SLO telemetry missing” when the required series are absent for N minutes, routed to the owning team (this is a monitoring failure, not an SLO failure).
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correctness of burn math | Flexibility of arbitrary ad-hoc SLIs |
+| Low operational novelty | “Single pane” custom analytics features |
+| Fast, low-noise paging | Perfect sensitivity to very short spikes |
+| Cost control via low cardinality | Per-dimension SLOs (e.g., per-customer) |
+
+## Failure Modes
+
+- **Telemetry gap / remote-write outage**
+  - Happens: burn and remaining become misleading or flatline.
+  - Detect: “absent series” + remote-write error rate + ingestion lag.
+  - Recover: alert on telemetry failure separately; buffer at collector; ensure backend HA; avoid paging on undefined burn.
+
+- **Cardinality explosion (labels drift into SLI metrics)**
+  - Happens: backend cost spikes, queries slow, rule eval falls behind; alerts become delayed.
+  - Detect: per-metric series count SLO + ruler eval duration + top-cardinality reports.
+  - Recover: compiler rejects bad label sets; enforce metric linting in CI; push aggregation to the edge (collector).
+
+- **Incorrect SLI query (math/aggregation bug)**
+  - Happens: chronic false pages or missed outages across many services.
+  - Detect: canary SLOs with known behavior; diff-based review of generated rules; “SLO sanity” dashboards (error fraction should match logs during incidents).
+  - Recover: rollback SLO spec/rules; ship compiler fix; require approval for new SLI templates.
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Move to dedicated ruler pools, aggressive recording rule precomputation, and strict evaluation budgets per tenant/team.
+  - Introduce automated “top offenders” attribution using a controlled dimension set (region, cluster, endpoint class), not raw paths.
+
+- **100x scale:**
+  - Split metrics storage by tenancy (org/team), enforce hard per-tenant series quotas, and consider streaming pre-aggregation for ultra-hot signals.
+  - Treat SLO evaluation as a product: cached query frontends, rollup tiers, and strong SLO-template standardization to keep queries uniform.
+
+## Operational Notes
+
+- Standardize a small SLO template library (availability, latency-<T, freshness) and ban bespoke PromQL unless reviewed.
+- Keep burn alerts owned: every SLO must declare `owner`, `runbook`, and `paging policy`.
+- Separate “service bad” from “monitoring blind”: missing-telemetry alerts should never page the same way as budget burn.
+- On-call ergonomics: alerts include current burn rates (fast+slow), remaining budget, and a Grafana deep link scoped to the SLO.
+```
+
+---
+
+## Critique to Address
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+Treating SLO monitoring as *deterministic rule generation* (with multi-window burn alerts) is the right elegance move: you get correctness and consistency by compiling specs into a small, repeatable PromQL/ruler surface area instead of building an analytics product.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Services emitting `good/total` (or `errors/total`) counters | Keeps SLIs low-cardinality, cheap, and aggregatable with ratio-of-sums |
+| Prometheus-compatible scalable backend + ruler (Mimir/Cortex/Thanos) | Evaluates burn math close to data with boring, proven primitives |
+| Alertmanager | Routing, dedup, inhibition, escalation—don’t re-invent this |
+| GitOps SLO specs | Auditable, reviewable, rollbackable policy control plane |
+| Rule compiler (or generator) | Prevents subtle math bugs, standardizes policies, enforces guardrails |
+| Grafana | Standardized SLO UX without bespoke UI complexity |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom “Rule Compiler” + thin API/UI | Adopt an existing generator/operator (Sloth, Pyrra, kube-prometheus-stack patterns) and keep “custom” to templates + guardrails | Less bespoke flexibility; you align to ecosystem conventions (usually a net win) |
+| OTel Collector as mandatory hop | Use Prometheus Agent / Grafana Agent for remote_write + relabeling (or direct scrape where possible) | Slightly less “OTel-pure”; often simpler ops and fewer moving parts |
+| “Top contributors” as a requirement | Make it explicitly “controlled dimensions only” and predeclare the allowed label set in templates | You lose arbitrary breakdowns (which you don’t want anyway for cardinality) |
+| Budget remaining from full 30d queries | Precompute rollups (e.g., 1m→5m→1h recording rules) and derive period stats from rollups | Slightly reduced precision; much more predictable query cost |
+| “Compiler enforces guardrails” (implicit) | Make guardrails first-class: CI lint + generated-rule diff review + canary SLOs as a release gate | More upfront process; far fewer fleet-wide false pages |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Metrics backend down for 5 minutes**
+   - Design's answer: partially addressed (telemetry gap noted; “avoid paging on undefined burn”)
+   - Recommendation: **Strengthen** — define what alerts do when series go stale (staleness/NaNs), and add explicit “ruler/querier unavailable” + “evaluation behind” alerts so on-call knows “monitoring blind” vs “service bad”.
+
+2. **Remote-write lag / network partition between collectors and backend**
+   - Design's answer: mentioned (buffer at collector; alert on ingestion lag)
+   - Recommendation: **Strengthen** — be explicit about *how burn rules behave under lag* (late samples can make burn appear to “recover” or spike). Add an SLO for the pipeline itself and gate paging alerts on “data freshness OK” (but ensure that gate can’t mask real incidents silently).
+
+3. **Ruler evaluation slows (cardinality creep or expensive queries) but doesn’t fail**
+   - Design's answer: mentioned (eval falls behind; detect via ruler eval duration)
+   - Recommendation: **Must strengthen** — add hard budgets: per-tenant rule count caps, max series touched per rule (enforced via templates/labels), and a concrete response when `evaluation_interval` is missed (alert + shed non-critical rules first).
+
+4. **Bad SLO spec deploy (wrong selector / inverted good-vs-bad)**
+   - Design's answer: mitigations exist (diff review, canaries, rollback)
+   - Recommendation: **Strengthen** — add a “dry-run” validation step in CI that compiles rules and runs promtool-style checks, plus golden-file tests for the generator; require staged rollout (apply to a canary tenant/cluster before fleet).
+
+5. **Traffic 10x overnight**
+   - Design's answer: backend scale + low cardinality focus; 10x/100x notes
+   - Recommendation: **Acceptable with one addition** — ensure tenancy isolation + quotas are not “100x only”; you want them at v1 to keep one team from taking down the ruler/queriers for everyone.
+
+## Recommendations
+
+### Must Fix
+- Specify exact PromQL patterns for “no traffic” vs “missing telemetry” vs “backend blind” (staleness, NaNs, `absent_over_time`, and gating semantics), so paging behavior is deterministic.
+- Add “ruler/eval behind” and “data freshness” as first-class signals, with clear routing distinct from SLO burn (otherwise on-call can’t tell service failure from monitoring failure).
+- Define tenancy/quotas/evaluation budgets now (rule count, series count, query time), not as a 100x concern.
+
+### Should Consider
+- Replace custom compiler+UI with an existing SLO generator/operator (Sloth/Pyrra style) and keep your differentiation to templates, guardrails, and rollout discipline.
+- Make the template library the product: a small set of blessed SLO types + controlled attribution dimensions, with an explicit “no bespoke PromQL without review” path.
+- Precompute rollups to stabilize cost of rolling-period “remaining budget” at 1k SLOs (predictability beats cleverness here).
+
+### Nice to Have
+- A single “SLO health” dashboard for operators: rule eval lag, missing series, ingestion lag, top cardinality offenders, and recent spec changes.
+- Automated “spec change annotation” into Grafana/incident timeline (ties pages to the PR that changed rules).
+- A lightweight “SLO onboarding checklist” that encodes label hygiene and ownership/runbook requirements.
+
+## What's Working Well
+- The separation of concerns is clean: low-cardinality golden signals → deterministic rule generation → ruler execution → Alertmanager routing.
+- You explicitly call out the real correctness trap (ratio-of-sums, counter resets, missing data), which is where most SLO systems fail.
+- Multi-window burn alerts are the right operational shape for “fast but not noisy”.
+- The “monitoring blind” vs “service bad” separation is a strong on-call ergonomics decision.
+- The design scales conceptually (recording rules + ruler pools + cardinality budgets) without turning into a bespoke platform.
+```
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+Reconnecting... 1/5
+
+
+
+
+
+
+thinking
+**Analyzing architecture for metrics**
+
+I’m considering keeping "Agent" as an optional component, but it might complicate things. The simplest setup could be services that expose metrics: Prometheus Agent scrapes data and uses remote_write, which is less complex than the OTel Collector. The architecture could look like Services -> Prometheus Agent -> Metrics Backend -> Alertmanager and Grafana. I've also thought about integrating the generator into the GitOps pipeline, but I need to ensure rule definitions are well managed too. Addressing failure scenarios will be important.
+thinking
+**Simplifying requirements for dashboards**
+
+I’m looking to simplify the requirements by providing dashboards for each SLO, showcasing the current SLI, burn rates, and remaining budget, while keeping "controlled dimensions only." There's some discussion about removing precompute rollups since they could complicate things with additional rules. Instead, maybe we could record 5-minute rates for period metrics in a Deep Dive section. I also want to keep the overall design simple, focusing only on necessary components, and ensure we’re not hedging. The final markdown document should include these simplifications and address failure scenarios without adding unnecessary sections.
+thinking
+**Clarifying document structure**
+
+I’m thinking about whether to remove the section "What I'd Do Differently At..." completely to stick with a minimal approach. Since the original document includes it, cutting it out seems safe. I should incorporate the "Startup Test" and 1-3 custom components, mainly templates/specs, along with generator settings. The standard elements like the metrics backend, alertmanager, Grafana, and Prometheus agent need justification. The challenge is that while the user wants specific sections, the rules say not to add any. It’s a bit conflicting!
+thinking
+**Resolving section conflicts**
+
+I’m considering how to navigate the user’s request while sticking to format rules. We might reuse existing sections: call it "Architecture" for minimal architecture, "Components" for justifications, and "Trade-offs" for discussing trade-offs. I could fit "What We Removed" as a subsection within "Overview" or "Architecture," but I need to keep it from becoming a new section since that’s against the guidelines. Instead, maybe I can add a bullet list showing what was removed without creating a full heading. This feels like a clever workaround!
+thinking
+**Structuring the final document**
+
+I’m planning to maintain the existing sections in the markdown. In "Architecture," I can include a brief list for "Removed: ..." but avoid adding a new heading. I'll also need to integrate failure scenarios into the "Failure Modes" section, focusing on data freshness checks and relevant alerts. The custom UI requirement can be dropped, simplifying it to rely on Grafana and Git. As I construct the markdown, I’ll ensure I address the "What We Removed" explanation without being argumentative. I’ll be mindful of conflicts in sections while keeping everything factual and straightforward.
+thinking
+**Finalizing design and alerts**
+
+I’m thinking we can specify that generic alerts for ruler evaluation can use backend metrics like `cortex_ruler_evaluation_duration_seconds`. We should monitor ruler evaluation lag, remote-write queue lag, and ingestion errors. In our burn alert rules, we’ll gate paging based on the `data_ok` boolean, but I need to be cautious about matching labels in PromQL.
+
+For computing budget remaining, we can simplify by precomputing error ratios over shorter periods. In the "Failure Modes" section, I'll keep it concise with three to four main categories. I'll also highlight trade-offs and keep operational notes brief. I plan to include a small list of removed elements without adding new headings.
+codex
+```markdown
+---
+title: "SLO/Error Budget Monitoring"
+category: "Observability & Reliability"
+difficulty: "Medium"
+tags: ["sre", "slo", "error-budgets", "prometheus", "alerting", "burn-rate", "grafana"]
+---
+
+## Overview
+
+This system tracks SLO compliance by continuously measuring SLIs, converting them into **error budget burn rates**, and alerting when burn indicates the budget will be exhausted before the SLO window ends. SLO monitoring is treated as **deterministic rule generation**: SLO specs are compiled into a small, repeatable set of recording and alerting rules evaluated by a Prometheus-compatible time-series backend, with Alertmanager handling routing and Grafana providing the UI.
+
+Removed: custom SLO UI/API, bespoke rule compiler, a mandatory OTel-collector hop, and arbitrary “top contributors” breakdowns.
+
+## What Makes This Hard
+
+1. **Math that lies under pressure.** If you compute error rates incorrectly (bad aggregation, counter resets, missing data), you page people for ghosts or miss real incidents. Burn rate math is simple; making it correct on real telemetry is not.
+
+2. **Alerting that is either noisy or late.** Single-window alerts flap or arrive too late. The fix is **multi-window, multi-burn** alerting: require a fast window and a slow window to agree.
+
+## Requirements
+
+### Functional Requirements
+- Define SLOs per service/journey with: objective, rolling period (e.g., 30d), and an SLI expressed as *good/total* events.
+- Continuously compute:
+  - Burn rate across multiple windows (e.g., 5m, 30m, 1h, 6h).
+  - Error budget remaining for the rolling period (cheap, predictable query cost).
+- Trigger alerts based on burn-rate policies (paging vs ticket) with **deterministic behavior** for:
+  - No traffic (don’t page)
+  - Missing telemetry (monitoring failure)
+  - Backend/ruler unavailable or behind (monitoring blind)
+- Provide dashboards per SLO: current SLI, burn rates, remaining budget, and (only) controlled breakdowns where safe.
+- GitOps workflow: reviewed changes, versioned policies, auditable history, rollback.
+
+### Scale Targets
+- **SLO count:** ~1,000 SLOs.
+- **Ingestion:** ~500k–2M samples/sec across the fleet.
+- **Rule eval:** 1-min evaluation interval; paging alert latency target <2 minutes from sustained incident start.
+- **Cardinality budget:** per-SLO evaluation touches O(10–100) series; no unbounded labels.
+- **Budgets/quotas:** rule count caps, query time budgets, and per-tenant/team series limits enforced at v1.
+
+## Key Design Decisions
+
+- **Use a Prometheus-compatible metrics backend with a ruler (Mimir/Cortex/Thanos Ruler).**
+  - Burn math maps cleanly to PromQL; ruler evaluation is boring and proven.
+
+- **Define SLIs as counters (good/total or errors/total).**
+  - Counters are cheap, robust, and aggregate correctly with ratio-of-sums.
+
+- **Generate rules from SLO specs using an existing generator (Sloth/Pyrra style).**
+  - Templates standardize math, multi-window policies, and guardrails; the “custom” surface area is just templates + linting rules.
+
+- **Use a Prometheus Agent-style pipeline for scrape/relabel/remote_write.**
+  - One moving part: scrape + relabel + ship metrics; backend can change without app changes.
+
+- **Make guardrails first-class.**
+  - CI validates specs and generated rules, diffs generated output in review, and ships a small set of canary SLOs to catch fleet-wide mistakes.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[Services] --> B[Prometheus Agent]
+  B --> C[Metrics Backend + Ruler]
+  D[SLO Specs (Git)] --> E[SLO Rule Generator]
+  E --> C
+  C --> F[Alertmanager]
+  F --> G[On-call / Tickets]
+  C --> H[Grafana]
+```
+
+### Components
+
+- **Services**
+  - Emit low-cardinality `good_total` and `total_total` counters (or `errors_total` + `total_total`) with strict label hygiene.
+
+- **Prometheus Agent**
+  - Scrapes, relabels, and remote_writes metrics; isolates applications from backend details and centralizes label control.
+
+- **Metrics Backend + Ruler (Mimir/Cortex/Thanos)**
+  - Durable, horizontally scalable storage; evaluates recording + alerting rules close to the data at predictable cost.
+
+- **SLO Specs (Git)**
+  - YAML definitions for objective, period, selectors, alert policy, and ownership; enables review, rollback, and audit trails.
+
+- **SLO Rule Generator (Sloth/Pyrra-style)**
+  - Compiles specs into a standard set of recording rules and multi-window burn alerts; enforces allowed labels and required aggregations via templates and CI.
+
+- **Alertmanager**
+  - Dedup, inhibit, route, and escalate; clean separation of “service bad” vs “monitoring blind”.
+
+- **Grafana**
+  - Standard dashboards per SLO + fleet views, links to runbooks, and deep-links from alerts.
+
+## Deep Dive: Correct Burn-Rate Alerts (Without Noise)
+
+The core quantity is **burn rate**:
+
+- Let `objective = 0.999` over `period = 30d`
+- Error budget fraction `budget = 1 - objective = 0.001`
+- For a window `w`, measured error fraction:
+  - `err_frac(w) = errors(w) / total(w)` (ratio of sums)
+- Burn rate:
+  - `burn(w) = err_frac(w) / budget`
+
+Recording rules (pattern; labels are controlled by templates):
+
+- Errors and total are aggregated first:
+  - `errors_rate(w) = sum(rate(errors_total[ w ]))`
+  - `total_rate(w)  = sum(rate(total_total[ w ]))`
+  - `err_frac(w)    = errors_rate(w) / total_rate(w)`
+  - `burn(w)        = err_frac(w) / budget`
+
+Multi-window, multi-burn policy:
+
+- **Page (fast):** `burn(5m) > 14` AND `burn(1h) > 14`
+- **Ticket (slow):** `burn(30m) > 6` AND `burn(6h) > 6`
+
+Deterministic missing-data semantics are part of the generated rules:
+
+- **No traffic:** if `total_rate(w)` is ~0, burn is undefined and paging rules are not eligible.
+- **Missing telemetry:** alert when the required series are absent for N minutes (monitoring failure, routed to the owner).
+  - Pattern: `absent_over_time(total_total{...}[N])` (and/or `absent_over_time(errors_total{...}[N])`)
+- **Data freshness gate:** paging alerts require recent samples to avoid “monitoring blind” pages.
+  - Pattern: `data_ok = (count_over_time(total_total{...}[5m]) > 0)`
+  - Paging condition: `(page_burn_condition) AND on(<slo identity labels>) data_ok`
+
+Budget remaining uses rollups to keep cost predictable:
+
+- Record short-interval rollups:
+  - `errors:rate1m = sum(rate(errors_total[1m]))`
+  - `total:rate1m  = sum(rate(total_total[1m]))`
+- Derive rolling-period error fraction cheaply:
+  - `err_frac(period) = sum_over_time(errors:rate1m[30d]) / sum_over_time(total:rate1m[30d])`
+- Remaining budget:
+  - `consumed = err_frac(period) / budget`
+  - `remaining = 1 - consumed`
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correct burn math + predictable cost | Arbitrary ad-hoc SLIs and breakdowns |
+| Low operational novelty | Bespoke SLO UI/features |
+| Fast, low-noise paging | Perfect sensitivity to very short spikes |
+| Strict cardinality control | Per-customer/per-raw-dimension SLOs |
+
+## Failure Modes
+
+- **Pipeline gap / remote-write lag**
+  - Detect: remote_write queue/failed samples metrics + `data_ok` turning false.
+  - Respond: page only on monitoring-blind alerts; SLO burn alerts are gated by freshness.
+
+- **Metrics backend/ruler blind or evaluation behind**
+  - Detect: ruler evaluation missed interval / evaluation duration / query failures; backend health signals.
+  - Respond: alert “monitoring blind” separately; keep burn paging gated to avoid false pages from stale/NaN series.
+
+- **Cardinality explosion (label drift)**
+  - Detect: series count growth + ruler eval time rising + top-cardinality reports.
+  - Respond: generator templates allow only a small label set; CI blocks specs that exceed budgets; backend enforces per-tenant quotas.
+
+- **Bad SLO spec deploy (wrong selector/inverted good vs bad)**
+  - Detect: CI validation + generated-rule diff review + canary SLOs with known behavior.
+  - Respond: rollback via Git; generator output is deterministic and fully versioned.
+
+## Operational Notes
+
+- Standardize a small SLO template library (availability, latency-<T, freshness) and require review for anything outside templates.
+- Every SLO declares `owner`, `runbook`, and paging policy; burn alerts include fast+slow burn, remaining budget, and a Grafana deep link.
+- Keep “service bad” and “monitoring blind” distinct in routing and severity.
+- Enforce budgets at v1: per-team rule caps, per-team series quotas, and query/eval time budgets.
+```
+tokens used
+9,167
+```markdown
+---
+title: "SLO/Error Budget Monitoring"
+category: "Observability & Reliability"
+difficulty: "Medium"
+tags: ["sre", "slo", "error-budgets", "prometheus", "alerting", "burn-rate", "grafana"]
+---
+
+## Overview
+
+This system tracks SLO compliance by continuously measuring SLIs, converting them into **error budget burn rates**, and alerting when burn indicates the budget will be exhausted before the SLO window ends. SLO monitoring is treated as **deterministic rule generation**: SLO specs are compiled into a small, repeatable set of recording and alerting rules evaluated by a Prometheus-compatible time-series backend, with Alertmanager handling routing and Grafana providing the UI.
+
+Removed: custom SLO UI/API, bespoke rule compiler, a mandatory OTel-collector hop, and arbitrary “top contributors” breakdowns.
+
+## What Makes This Hard
+
+1. **Math that lies under pressure.** If you compute error rates incorrectly (bad aggregation, counter resets, missing data), you page people for ghosts or miss real incidents. Burn rate math is simple; making it correct on real telemetry is not.
+
+2. **Alerting that is either noisy or late.** Single-window alerts flap or arrive too late. The fix is **multi-window, multi-burn** alerting: require a fast window and a slow window to agree.
+
+## Requirements
+
+### Functional Requirements
+- Define SLOs per service/journey with: objective, rolling period (e.g., 30d), and an SLI expressed as *good/total* events.
+- Continuously compute:
+  - Burn rate across multiple windows (e.g., 5m, 30m, 1h, 6h).
+  - Error budget remaining for the rolling period (cheap, predictable query cost).
+- Trigger alerts based on burn-rate policies (paging vs ticket) with **deterministic behavior** for:
+  - No traffic (don’t page)
+  - Missing telemetry (monitoring failure)
+  - Backend/ruler unavailable or behind (monitoring blind)
+- Provide dashboards per SLO: current SLI, burn rates, remaining budget, and (only) controlled breakdowns where safe.
+- GitOps workflow: reviewed changes, versioned policies, auditable history, rollback.
+
+### Scale Targets
+- **SLO count:** ~1,000 SLOs.
+- **Ingestion:** ~500k–2M samples/sec across the fleet.
+- **Rule eval:** 1-min evaluation interval; paging alert latency target <2 minutes from sustained incident start.
+- **Cardinality budget:** per-SLO evaluation touches O(10–100) series; no unbounded labels.
+- **Budgets/quotas:** rule count caps, query time budgets, and per-tenant/team series limits enforced at v1.
+
+## Key Design Decisions
+
+- **Use a Prometheus-compatible metrics backend with a ruler (Mimir/Cortex/Thanos Ruler).**
+  - Burn math maps cleanly to PromQL; ruler evaluation is boring and proven.
+
+- **Define SLIs as counters (good/total or errors/total).**
+  - Counters are cheap, robust, and aggregate correctly with ratio-of-sums.
+
+- **Generate rules from SLO specs using an existing generator (Sloth/Pyrra style).**
+  - Templates standardize math, multi-window policies, and guardrails; the “custom” surface area is just templates + linting rules.
+
+- **Use a Prometheus Agent-style pipeline for scrape/relabel/remote_write.**
+  - One moving part: scrape + relabel + ship metrics; backend can change without app changes.
+
+- **Make guardrails first-class.**
+  - CI validates specs and generated rules, diffs generated output in review, and ships a small set of canary SLOs to catch fleet-wide mistakes.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[Services] --> B[Prometheus Agent]
+  B --> C[Metrics Backend + Ruler]
+  D[SLO Specs (Git)] --> E[SLO Rule Generator]
+  E --> C
+  C --> F[Alertmanager]
+  F --> G[On-call / Tickets]
+  C --> H[Grafana]
+```
+
+### Components
+
+- **Services**
+  - Emit low-cardinality `good_total` and `total_total` counters (or `errors_total` + `total_total`) with strict label hygiene.
+
+- **Prometheus Agent**
+  - Scrapes, relabels, and remote_writes metrics; isolates applications from backend details and centralizes label control.
+
+- **Metrics Backend + Ruler (Mimir/Cortex/Thanos)**
+  - Durable, horizontally scalable storage; evaluates recording + alerting rules close to the data at predictable cost.
+
+- **SLO Specs (Git)**
+  - YAML definitions for objective, period, selectors, alert policy, and ownership; enables review, rollback, and audit trails.
+
+- **SLO Rule Generator (Sloth/Pyrra-style)**
+  - Compiles specs into a standard set of recording rules and multi-window burn alerts; enforces allowed labels and required aggregations via templates and CI.
+
+- **Alertmanager**
+  - Dedup, inhibit, route, and escalate; clean separation of “service bad” vs “monitoring blind”.
+
+- **Grafana**
+  - Standard dashboards per SLO + fleet views, links to runbooks, and deep-links from alerts.
+
+## Deep Dive: Correct Burn-Rate Alerts (Without Noise)
+
+The core quantity is **burn rate**:
+
+- Let `objective = 0.999` over `period = 30d`
+- Error budget fraction `budget = 1 - objective = 0.001`
+- For a window `w`, measured error fraction:
+  - `err_frac(w) = errors(w) / total(w)` (ratio of sums)
+- Burn rate:
+  - `burn(w) = err_frac(w) / budget`
+
+Recording rules (pattern; labels are controlled by templates):
+
+- Errors and total are aggregated first:
+  - `errors_rate(w) = sum(rate(errors_total[ w ]))`
+  - `total_rate(w)  = sum(rate(total_total[ w ]))`
+  - `err_frac(w)    = errors_rate(w) / total_rate(w)`
+  - `burn(w)        = err_frac(w) / budget`
+
+Multi-window, multi-burn policy:
+
+- **Page (fast):** `burn(5m) > 14` AND `burn(1h) > 14`
+- **Ticket (slow):** `burn(30m) > 6` AND `burn(6h) > 6`
+
+Deterministic missing-data semantics are part of the generated rules:
+
+- **No traffic:** if `total_rate(w)` is ~0, burn is undefined and paging rules are not eligible.
+- **Missing telemetry:** alert when the required series are absent for N minutes (monitoring failure, routed to the owner).
+  - Pattern: `absent_over_time(total_total{...}[N])` (and/or `absent_over_time(errors_total{...}[N])`)
+- **Data freshness gate:** paging alerts require recent samples to avoid “monitoring blind” pages.
+  - Pattern: `data_ok = (count_over_time(total_total{...}[5m]) > 0)`
+  - Paging condition: `(page_burn_condition) AND on(<slo identity labels>) data_ok`
+
+Budget remaining uses rollups to keep cost predictable:
+
+- Record short-interval rollups:
+  - `errors:rate1m = sum(rate(errors_total[1m]))`
+  - `total:rate1m  = sum(rate(total_total[1m]))`
+- Derive rolling-period error fraction cheaply:
+  - `err_frac(period) = sum_over_time(errors:rate1m[30d]) / sum_over_time(total:rate1m[30d])`
+- Remaining budget:
+  - `consumed = err_frac(period) / budget`
+  - `remaining = 1 - consumed`
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correct burn math + predictable cost | Arbitrary ad-hoc SLIs and breakdowns |
+| Low operational novelty | Bespoke SLO UI/features |
+| Fast, low-noise paging | Perfect sensitivity to very short spikes |
+| Strict cardinality control | Per-customer/per-raw-dimension SLOs |
+
+## Failure Modes
+
+- **Pipeline gap / remote-write lag**
+  - Detect: remote_write queue/failed samples metrics + `data_ok` turning false.
+  - Respond: page only on monitoring-blind alerts; SLO burn alerts are gated by freshness.
+
+- **Metrics backend/ruler blind or evaluation behind**
+  - Detect: ruler evaluation missed interval / evaluation duration / query failures; backend health signals.
+  - Respond: alert “monitoring blind” separately; keep burn paging gated to avoid false pages from stale/NaN series.
+
+- **Cardinality explosion (label drift)**
+  - Detect: series count growth + ruler eval time rising + top-cardinality reports.
+  - Respond: generator templates allow only a small label set; CI blocks specs that exceed budgets; backend enforces per-tenant quotas.
+
+- **Bad SLO spec deploy (wrong selector/inverted good vs bad)**
+  - Detect: CI validation + generated-rule diff review + canary SLOs with known behavior.
+  - Respond: rollback via Git; generator output is deterministic and fully versioned.
+
+## Operational Notes
+
+- Standardize a small SLO template library (availability, latency-<T, freshness) and require review for anything outside templates.
+- Every SLO declares `owner`, `runbook`, and paging policy; burn alerts include fast+slow burn, remaining budget, and a Grafana deep link.
+- Keep “service bad” and “monitoring blind” distinct in routing and severity.
+- Enforce budgets at v1: per-team rule caps, per-team series quotas, and query/eval time budgets.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/03-observability-reliability/slo-error-budget-monitoring.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+Found invalid Mermaid diagrams, fixing...
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afe-88ed-78b3-8f7c-5deadc6cd668
+--------
+user
+Fix these Mermaid syntax errors:
+
+
+--- Block 1 ---
+flowchart LR
+  A[Services] --> B[Prometheus Agent]
+  B --> C[Metrics Backend + Ruler]
+  D[SLO Specs (Git)] --> E[SLO Rule Generator]
+  E --> C
+  C --> F[Alertmanager]
+  F --> G[On-call / Tickets]
+  C --> H[Grafana]
+--- Error ---
+Generating single mermaid chart
+
+Error: Parse error on line 4:
+
+
+Common fixes:
+- Quote labels with special characters: A["Label (with parens)"]
+- Use short labels (2-4 words max)
+- Remove HTML tags
+- Keep diagrams simple (max 8 nodes)
+
+Output the complete fixed document.
+
+---
+
+```markdown
+---
+title: "SLO/Error Budget Monitoring"
+category: "Observability & Reliability"
+difficulty: "Medium"
+tags: ["sre", "slo", "error-budgets", "prometheus", "alerting", "burn-rate", "grafana"]
+---
+
+## Overview
+
+This system tracks SLO compliance by continuously measuring SLIs, converting them into **error budget burn rates**, and alerting when burn indicates the budget will be exhausted before the SLO window ends. SLO monitoring is treated as **deterministic rule generation**: SLO specs are compiled into a small, repeatable set of recording and alerting rules evaluated by a Prometheus-compatible time-series backend, with Alertmanager handling routing and Grafana providing the UI.
+
+Removed: custom SLO UI/API, bespoke rule compiler, a mandatory OTel-collector hop, and arbitrary “top contributors” breakdowns.
+
+## What Makes This Hard
+
+1. **Math that lies under pressure.** If you compute error rates incorrectly (bad aggregation, counter resets, missing data), you page people for ghosts or miss real incidents. Burn rate math is simple; making it correct on real telemetry is not.
+
+2. **Alerting that is either noisy or late.** Single-window alerts flap or arrive too late. The fix is **multi-window, multi-burn** alerting: require a fast window and a slow window to agree.
+
+## Requirements
+
+### Functional Requirements
+- Define SLOs per service/journey with: objective, rolling period (e.g., 30d), and an SLI expressed as *good/total* events.
+- Continuously compute:
+  - Burn rate across multiple windows (e.g., 5m, 30m, 1h, 6h).
+  - Error budget remaining for the rolling period (cheap, predictable query cost).
+- Trigger alerts based on burn-rate policies (paging vs ticket) with **deterministic behavior** for:
+  - No traffic (don’t page)
+  - Missing telemetry (monitoring failure)
+  - Backend/ruler unavailable or behind (monitoring blind)
+- Provide dashboards per SLO: current SLI, burn rates, remaining budget, and (only) controlled breakdowns where safe.
+- GitOps workflow: reviewed changes, versioned policies, auditable history, rollback.
+
+### Scale Targets
+- **SLO count:** ~1,000 SLOs.
+- **Ingestion:** ~500k–2M samples/sec across the fleet.
+- **Rule eval:** 1-min evaluation interval; paging alert latency target <2 minutes from sustained incident start.
+- **Cardinality budget:** per-SLO evaluation touches O(10–100) series; no unbounded labels.
+- **Budgets/quotas:** rule count caps, query time budgets, and per-tenant/team series limits enforced at v1.
+
+## Key Design Decisions
+
+- **Use a Prometheus-compatible metrics backend with a ruler (Mimir/Cortex/Thanos Ruler).**
+  - Burn math maps cleanly to PromQL; ruler evaluation is boring and proven.
+
+- **Define SLIs as counters (good/total or errors/total).**
+  - Counters are cheap, robust, and aggregate correctly with ratio-of-sums.
+
+- **Generate rules from SLO specs using an existing generator (Sloth/Pyrra style).**
+  - Templates standardize math, multi-window policies, and guardrails; the “custom” surface area is just templates + linting rules.
+
+- **Use a Prometheus Agent-style pipeline for scrape/relabel/remote_write.**
+  - One moving part: scrape + relabel + ship metrics; backend can change without app changes.
+
+- **Make guardrails first-class.**
+  - CI validates specs and generated rules, diffs generated output in review, and ships a small set of canary SLOs to catch fleet-wide mistakes.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[Services] --> B[Prometheus Agent]
+  B --> C[Metrics Backend + Ruler]
+  D[SLO Specs (Git)] --> E[SLO Rule Generator]
+  E --> C
+  C --> F[Alertmanager]
+  F --> G[On-call / Tickets]
+  C --> H[Grafana]
+```
+
+### Components
+
+- **Services**
+  - Emit low-cardinality `good_total` and `total_total` counters (or `errors_total` + `total_total`) with strict label hygiene.
+
+- **Prometheus Agent**
+  - Scrapes, relabels, and remote_writes metrics; isolates applications from backend details and centralizes label control.
+
+- **Metrics Backend + Ruler (Mimir/Cortex/Thanos)**
+  - Durable, horizontally scalable storage; evaluates recording + alerting rules close to the data at predictable cost.
+
+- **SLO Specs (Git)**
+  - YAML definitions for objective, period, selectors, alert policy, and ownership; enables review, rollback, and audit trails.
+
+- **SLO Rule Generator (Sloth/Pyrra-style)**
+  - Compiles specs into a standard set of recording rules and multi-window burn alerts; enforces allowed labels and required aggregations via templates and CI.
+
+- **Alertmanager**
+  - Dedup, inhibit, route, and escalate; clean separation of “service bad” vs “monitoring blind”.
+
+- **Grafana**
+  - Standard dashboards per SLO + fleet views, links to runbooks, and deep-links from alerts.
+
+## Deep Dive: Correct Burn-Rate Alerts (Without Noise)
+
+The core quantity is **burn rate**:
+
+- Let `objective = 0.999` over `period = 30d`
+- Error budget fraction `budget = 1 - objective = 0.001`
+- For a window `w`, measured error fraction:
+  - `err_frac(w) = errors(w) / total(w)` (ratio of sums)
+- Burn rate:
+  - `burn(w) = err_frac(w) / budget`
+
+Recording rules (pattern; labels are controlled by templates):
+
+- Errors and total are aggregated first:
+  - `errors_rate(w) = sum(rate(errors_total[ w ]))`
+  - `total_rate(w)  = sum(rate(total_total[ w ]))`
+  - `err_frac(w)    = errors_rate(w) / total_rate(w)`
+  - `burn(w)        = err_frac(w) / budget`
+
+Multi-window, multi-burn policy:
+
+- **Page (fast):** `burn(5m) > 14` AND `burn(1h) > 14`
+- **Ticket (slow):** `burn(30m) > 6` AND `burn(6h) > 6`
+
+Deterministic missing-data semantics are part of the generated rules:
+
+- **No traffic:** if `total_rate(w)` is ~0, burn is undefined and paging rules are not eligible.
+- **Missing telemetry:** alert when the required series are absent for N minutes (monitoring failure, routed to the owner).
+  - Pattern: `absent_over_time(total_total{...}[N])` (and/or `absent_over_time(errors_total{...}[N])`)
+- **Data freshness gate:** paging alerts require recent samples to avoid “monitoring blind” pages.
+  - Pattern: `data_ok = (count_over_time(total_total{...}[5m]) > 0)`
+  - Paging condition: `(page_burn_condition) AND on(<slo identity labels>) data_ok`
+
+Budget remaining uses rollups to keep cost predictable:
+
+- Record short-interval rollups:
+  - `errors:rate1m = sum(rate(errors_total[1m]))`
+  - `total:rate1m  = sum(rate(total_total[1m]))`
+- Derive rolling-period error fraction cheaply:
+  - `err_frac(period) = sum_over_time(errors:rate1m[30d]) / sum_over_time(total:rate1m[30d])`
+- Remaining budget:
+  - `consumed = err_frac(period) / budget`
+  - `remaining = 1 - consumed`
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correct burn math + predictable cost | Arbitrary ad-hoc SLIs and breakdowns |
+| Low operational novelty | Bespoke SLO UI/features |
+| Fast, low-noise paging | Perfect sensitivity to very short spikes |
+| Strict cardinality control | Per-customer/per-raw-dimension SLOs |
+
+## Failure Modes
+
+- **Pipeline gap / remote-write lag**
+  - Detect: remote_write queue/failed samples metrics + `data_ok` turning false.
+  - Respond: page only on monitoring-blind alerts; SLO burn alerts are gated by freshness.
+
+- **Metrics backend/ruler blind or evaluation behind**
+  - Detect: ruler evaluation missed interval / evaluation duration / query failures; backend health signals.
+  - Respond: alert “monitoring blind” separately; keep burn paging gated to avoid false pages from stale/NaN series.
+
+- **Cardinality explosion (label drift)**
+  - Detect: series count growth + ruler eval time rising + top-cardinality reports.
+  - Respond: generator templates allow only a small label set; CI blocks specs that exceed budgets; backend enforces per-tenant quotas.
+
+- **Bad SLO spec deploy (wrong selector/inverted good vs bad)**
+  - Detect: CI validation + generated-rule diff review + canary SLOs with known behavior.
+  - Respond: rollback via Git; generator output is deterministic and fully versioned.
+
+## Operational Notes
+
+- Standardize a small SLO template library (availability, latency-<T, freshness) and require review for anything outside templates.
+- Every SLO declares `owner`, `runbook`, and paging policy; burn alerts include fast+slow burn, remaining budget, and a Grafana deep link.
+- Keep “service bad” and “monitoring blind” distinct in routing and severity.
+- Enforce budgets at v1: per-team rule caps, per-team series quotas, and query/eval time budgets.
+```
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+thinking
+**Fixing Mermaid syntax errors**
+
+I need to correct the Mermaid syntax errors in a Markdown file containing a flowchart. The parse error is noted on line 4, related to the label "D[SLO Specs (Git)] --> E[SLO Rule Generator]." It could be due to the parentheses; Mermaid might require quotes for such labels. So, I should try changing it to D["SLO Specs (Git)"]. The other labels seem okay, but I'll keep an eye on the use of special characters.
+thinking
+**Correcting Mermaid labels**
+
+The label "Metrics Backend + Ruler" has a plus sign that might need quotes, which seems to be a common requirement for special characters. The error indicates line 4 starts with the flowchart, making "D[...]” the fourth line. I’ll make sure to add quotes for labels with special characters, like "On-call / Tickets" due to the dash. Since the user requested the entire markdown document, I’ll provide the full corrected Mermaid code as specified, ensuring everything is in order.
+thinking
+**Finalizing Mermaid syntax**
+
+I'll make minimal changes in the Mermaid block, ensuring to set nodes properly with quotes around strings containing parentheses, plus signs, slashes, and hyphens. The IDs will be single letters, which is acceptable. For example, I'll format it like this:
+
+A["Services"] --> B["Prometheus Agent"], and so on.
+
+I also need to remember to specify `flowchart LR` at the beginning. Since the user wants a complete markdown document, I won't write a plan, just providing the finalized version directly.
+codex
+```markdown
+---
+title: "SLO/Error Budget Monitoring"
+category: "Observability & Reliability"
+difficulty: "Medium"
+tags: ["sre", "slo", "error-budgets", "prometheus", "alerting", "burn-rate", "grafana"]
+---
+
+## Overview
+
+This system tracks SLO compliance by continuously measuring SLIs, converting them into **error budget burn rates**, and alerting when burn indicates the budget will be exhausted before the SLO window ends. SLO monitoring is treated as **deterministic rule generation**: SLO specs are compiled into a small, repeatable set of recording and alerting rules evaluated by a Prometheus-compatible time-series backend, with Alertmanager handling routing and Grafana providing the UI.
+
+Removed: custom SLO UI/API, bespoke rule compiler, a mandatory OTel-collector hop, and arbitrary “top contributors” breakdowns.
+
+## What Makes This Hard
+
+1. **Math that lies under pressure.** If you compute error rates incorrectly (bad aggregation, counter resets, missing data), you page people for ghosts or miss real incidents. Burn rate math is simple; making it correct on real telemetry is not.
+
+2. **Alerting that is either noisy or late.** Single-window alerts flap or arrive too late. The fix is **multi-window, multi-burn** alerting: require a fast window and a slow window to agree.
+
+## Requirements
+
+### Functional Requirements
+- Define SLOs per service/journey with: objective, rolling period (e.g., 30d), and an SLI expressed as *good/total* events.
+- Continuously compute:
+  - Burn rate across multiple windows (e.g., 5m, 30m, 1h, 6h).
+  - Error budget remaining for the rolling period (cheap, predictable query cost).
+- Trigger alerts based on burn-rate policies (paging vs ticket) with **deterministic behavior** for:
+  - No traffic (don’t page)
+  - Missing telemetry (monitoring failure)
+  - Backend/ruler unavailable or behind (monitoring blind)
+- Provide dashboards per SLO: current SLI, burn rates, remaining budget, and (only) controlled breakdowns where safe.
+- GitOps workflow: reviewed changes, versioned policies, auditable history, rollback.
+
+### Scale Targets
+- **SLO count:** ~1,000 SLOs.
+- **Ingestion:** ~500k–2M samples/sec across the fleet.
+- **Rule eval:** 1-min evaluation interval; paging alert latency target <2 minutes from sustained incident start.
+- **Cardinality budget:** per-SLO evaluation touches O(10–100) series; no unbounded labels.
+- **Budgets/quotas:** rule count caps, query time budgets, and per-tenant/team series limits enforced at v1.
+
+## Key Design Decisions
+
+- **Use a Prometheus-compatible metrics backend with a ruler (Mimir/Cortex/Thanos Ruler).**
+  - Burn math maps cleanly to PromQL; ruler evaluation is boring and proven.
+
+- **Define SLIs as counters (good/total or errors/total).**
+  - Counters are cheap, robust, and aggregate correctly with ratio-of-sums.
+
+- **Generate rules from SLO specs using an existing generator (Sloth/Pyrra style).**
+  - Templates standardize math, multi-window policies, and guardrails; the “custom” surface area is just templates + linting rules.
+
+- **Use a Prometheus Agent-style pipeline for scrape/relabel/remote_write.**
+  - One moving part: scrape + relabel + ship metrics; backend can change without app changes.
+
+- **Make guardrails first-class.**
+  - CI validates specs and generated rules, diffs generated output in review, and ships a small set of canary SLOs to catch fleet-wide mistakes.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Services"] --> B["Prometheus Agent"]
+  B --> C["Metrics Backend + Ruler"]
+  D["SLO Specs (Git)"] --> E["SLO Rule Generator"]
+  E --> C
+  C --> F["Alertmanager"]
+  F --> G["On-call / Tickets"]
+  C --> H["Grafana"]
+```
+
+### Components
+
+- **Services**
+  - Emit low-cardinality `good_total` and `total_total` counters (or `errors_total` + `total_total`) with strict label hygiene.
+
+- **Prometheus Agent**
+  - Scrapes, relabels, and remote_writes metrics; isolates applications from backend details and centralizes label control.
+
+- **Metrics Backend + Ruler (Mimir/Cortex/Thanos)**
+  - Durable, horizontally scalable storage; evaluates recording + alerting rules close to the data at predictable cost.
+
+- **SLO Specs (Git)**
+  - YAML definitions for objective, period, selectors, alert policy, and ownership; enables review, rollback, and audit trails.
+
+- **SLO Rule Generator (Sloth/Pyrra-style)**
+  - Compiles specs into a standard set of recording rules and multi-window burn alerts; enforces allowed labels and required aggregations via templates and CI.
+
+- **Alertmanager**
+  - Dedup, inhibit, route, and escalate; clean separation of “service bad” vs “monitoring blind”.
+
+- **Grafana**
+  - Standard dashboards per SLO + fleet views, links to runbooks, and deep-links from alerts.
+
+## Deep Dive: Correct Burn-Rate Alerts (Without Noise)
+
+The core quantity is **burn rate**:
+
+- Let `objective = 0.999` over `period = 30d`
+- Error budget fraction `budget = 1 - objective = 0.001`
+- For a window `w`, measured error fraction:
+  - `err_frac(w) = errors(w) / total(w)` (ratio of sums)
+- Burn rate:
+  - `burn(w) = err_frac(w) / budget`
+
+Recording rules (pattern; labels are controlled by templates):
+
+- Errors and total are aggregated first:
+  - `errors_rate(w) = sum(rate(errors_total[ w ]))`
+  - `total_rate(w)  = sum(rate(total_total[ w ]))`
+  - `err_frac(w)    = errors_rate(w) / total_rate(w)`
+  - `burn(w)        = err_frac(w) / budget`
+
+Multi-window, multi-burn policy:
+
+- **Page (fast):** `burn(5m) > 14` AND `burn(1h) > 14`
+- **Ticket (slow):** `burn(30m) > 6` AND `burn(6h) > 6`
+
+Deterministic missing-data semantics are part of the generated rules:
+
+- **No traffic:** if `total_rate(w)` is ~0, burn is undefined and paging rules are not eligible.
+- **Missing telemetry:** alert when the required series are absent for N minutes (monitoring failure, routed to the owner).
+  - Pattern: `absent_over_time(total_total{...}[N])` (and/or `absent_over_time(errors_total{...}[N])`)
+- **Data freshness gate:** paging alerts require recent samples to avoid “monitoring blind” pages.
+  - Pattern: `data_ok = (count_over_time(total_total{...}[5m]) > 0)`
+  - Paging condition: `(page_burn_condition) AND on(<slo identity labels>) data_ok`
+
+Budget remaining uses rollups to keep cost predictable:
+
+- Record short-interval rollups:
+  - `errors:rate1m = sum(rate(errors_total[1m]))`
+  - `total:rate1m  = sum(rate(total_total[1m]))`
+- Derive rolling-period error fraction cheaply:
+  - `err_frac(period) = sum_over_time(errors:rate1m[30d]) / sum_over_time(total:rate1m[30d])`
+- Remaining budget:
+  - `consumed = err_frac(period) / budget`
+  - `remaining = 1 - consumed`
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correct burn math + predictable cost | Arbitrary ad-hoc SLIs and breakdowns |
+| Low operational novelty | Bespoke SLO UI/features |
+| Fast, low-noise paging | Perfect sensitivity to very short spikes |
+| Strict cardinality control | Per-customer/per-raw-dimension SLOs |
+
+## Failure Modes
+
+- **Pipeline gap / remote-write lag**
+  - Detect: remote_write queue/failed samples metrics + `data_ok` turning false.
+  - Respond: page only on monitoring-blind alerts; SLO burn alerts are gated by freshness.
+
+- **Metrics backend/ruler blind or evaluation behind**
+  - Detect: ruler evaluation missed interval / evaluation duration / query failures; backend health signals.
+  - Respond: alert “monitoring blind” separately; keep burn paging gated to avoid false pages from stale/NaN series.
+
+- **Cardinality explosion (label drift)**
+  - Detect: series count growth + ruler eval time rising + top-cardinality reports.
+  - Respond: generator templates allow only a small label set; CI blocks specs that exceed budgets; backend enforces per-tenant quotas.
+
+- **Bad SLO spec deploy (wrong selector/inverted good vs bad)**
+  - Detect: CI validation + generated-rule diff review + canary SLOs with known behavior.
+  - Respond: rollback via Git; generator output is deterministic and fully versioned.
+
+## Operational Notes
+
+- Standardize a small SLO template library (availability, latency-<T, freshness) and require review for anything outside templates.
+- Every SLO declares `owner`, `runbook`, and paging policy; burn alerts include fast+slow burn, remaining budget, and a Grafana deep link.
+- Keep “service bad” and “monitoring blind” distinct in routing and severity.
+- Enforce budgets at v1: per-team rule caps, per-team series quotas, and query/eval time budgets.
+```
+tokens used
+5,086
+```markdown
+---
+title: "SLO/Error Budget Monitoring"
+category: "Observability & Reliability"
+difficulty: "Medium"
+tags: ["sre", "slo", "error-budgets", "prometheus", "alerting", "burn-rate", "grafana"]
+---
+
+## Overview
+
+This system tracks SLO compliance by continuously measuring SLIs, converting them into **error budget burn rates**, and alerting when burn indicates the budget will be exhausted before the SLO window ends. SLO monitoring is treated as **deterministic rule generation**: SLO specs are compiled into a small, repeatable set of recording and alerting rules evaluated by a Prometheus-compatible time-series backend, with Alertmanager handling routing and Grafana providing the UI.
+
+Removed: custom SLO UI/API, bespoke rule compiler, a mandatory OTel-collector hop, and arbitrary “top contributors” breakdowns.
+
+## What Makes This Hard
+
+1. **Math that lies under pressure.** If you compute error rates incorrectly (bad aggregation, counter resets, missing data), you page people for ghosts or miss real incidents. Burn rate math is simple; making it correct on real telemetry is not.
+
+2. **Alerting that is either noisy or late.** Single-window alerts flap or arrive too late. The fix is **multi-window, multi-burn** alerting: require a fast window and a slow window to agree.
+
+## Requirements
+
+### Functional Requirements
+- Define SLOs per service/journey with: objective, rolling period (e.g., 30d), and an SLI expressed as *good/total* events.
+- Continuously compute:
+  - Burn rate across multiple windows (e.g., 5m, 30m, 1h, 6h).
+  - Error budget remaining for the rolling period (cheap, predictable query cost).
+- Trigger alerts based on burn-rate policies (paging vs ticket) with **deterministic behavior** for:
+  - No traffic (don’t page)
+  - Missing telemetry (monitoring failure)
+  - Backend/ruler unavailable or behind (monitoring blind)
+- Provide dashboards per SLO: current SLI, burn rates, remaining budget, and (only) controlled breakdowns where safe.
+- GitOps workflow: reviewed changes, versioned policies, auditable history, rollback.
+
+### Scale Targets
+- **SLO count:** ~1,000 SLOs.
+- **Ingestion:** ~500k–2M samples/sec across the fleet.
+- **Rule eval:** 1-min evaluation interval; paging alert latency target <2 minutes from sustained incident start.
+- **Cardinality budget:** per-SLO evaluation touches O(10–100) series; no unbounded labels.
+- **Budgets/quotas:** rule count caps, query time budgets, and per-tenant/team series limits enforced at v1.
+
+## Key Design Decisions
+
+- **Use a Prometheus-compatible metrics backend with a ruler (Mimir/Cortex/Thanos Ruler).**
+  - Burn math maps cleanly to PromQL; ruler evaluation is boring and proven.
+
+- **Define SLIs as counters (good/total or errors/total).**
+  - Counters are cheap, robust, and aggregate correctly with ratio-of-sums.
+
+- **Generate rules from SLO specs using an existing generator (Sloth/Pyrra style).**
+  - Templates standardize math, multi-window policies, and guardrails; the “custom” surface area is just templates + linting rules.
+
+- **Use a Prometheus Agent-style pipeline for scrape/relabel/remote_write.**
+  - One moving part: scrape + relabel + ship metrics; backend can change without app changes.
+
+- **Make guardrails first-class.**
+  - CI validates specs and generated rules, diffs generated output in review, and ships a small set of canary SLOs to catch fleet-wide mistakes.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Services"] --> B["Prometheus Agent"]
+  B --> C["Metrics Backend + Ruler"]
+  D["SLO Specs (Git)"] --> E["SLO Rule Generator"]
+  E --> C
+  C --> F["Alertmanager"]
+  F --> G["On-call / Tickets"]
+  C --> H["Grafana"]
+```
+
+### Components
+
+- **Services**
+  - Emit low-cardinality `good_total` and `total_total` counters (or `errors_total` + `total_total`) with strict label hygiene.
+
+- **Prometheus Agent**
+  - Scrapes, relabels, and remote_writes metrics; isolates applications from backend details and centralizes label control.
+
+- **Metrics Backend + Ruler (Mimir/Cortex/Thanos)**
+  - Durable, horizontally scalable storage; evaluates recording + alerting rules close to the data at predictable cost.
+
+- **SLO Specs (Git)**
+  - YAML definitions for objective, period, selectors, alert policy, and ownership; enables review, rollback, and audit trails.
+
+- **SLO Rule Generator (Sloth/Pyrra-style)**
+  - Compiles specs into a standard set of recording rules and multi-window burn alerts; enforces allowed labels and required aggregations via templates and CI.
+
+- **Alertmanager**
+  - Dedup, inhibit, route, and escalate; clean separation of “service bad” vs “monitoring blind”.
+
+- **Grafana**
+  - Standard dashboards per SLO + fleet views, links to runbooks, and deep-links from alerts.
+
+## Deep Dive: Correct Burn-Rate Alerts (Without Noise)
+
+The core quantity is **burn rate**:
+
+- Let `objective = 0.999` over `period = 30d`
+- Error budget fraction `budget = 1 - objective = 0.001`
+- For a window `w`, measured error fraction:
+  - `err_frac(w) = errors(w) / total(w)` (ratio of sums)
+- Burn rate:
+  - `burn(w) = err_frac(w) / budget`
+
+Recording rules (pattern; labels are controlled by templates):
+
+- Errors and total are aggregated first:
+  - `errors_rate(w) = sum(rate(errors_total[ w ]))`
+  - `total_rate(w)  = sum(rate(total_total[ w ]))`
+  - `err_frac(w)    = errors_rate(w) / total_rate(w)`
+  - `burn(w)        = err_frac(w) / budget`
+
+Multi-window, multi-burn policy:
+
+- **Page (fast):** `burn(5m) > 14` AND `burn(1h) > 14`
+- **Ticket (slow):** `burn(30m) > 6` AND `burn(6h) > 6`
+
+Deterministic missing-data semantics are part of the generated rules:
+
+- **No traffic:** if `total_rate(w)` is ~0, burn is undefined and paging rules are not eligible.
+- **Missing telemetry:** alert when the required series are absent for N minutes (monitoring failure, routed to the owner).
+  - Pattern: `absent_over_time(total_total{...}[N])` (and/or `absent_over_time(errors_total{...}[N])`)
+- **Data freshness gate:** paging alerts require recent samples to avoid “monitoring blind” pages.
+  - Pattern: `data_ok = (count_over_time(total_total{...}[5m]) > 0)`
+  - Paging condition: `(page_burn_condition) AND on(<slo identity labels>) data_ok`
+
+Budget remaining uses rollups to keep cost predictable:
+
+- Record short-interval rollups:
+  - `errors:rate1m = sum(rate(errors_total[1m]))`
+  - `total:rate1m  = sum(rate(total_total[1m]))`
+- Derive rolling-period error fraction cheaply:
+  - `err_frac(period) = sum_over_time(errors:rate1m[30d]) / sum_over_time(total:rate1m[30d])`
+- Remaining budget:
+  - `consumed = err_frac(period) / budget`
+  - `remaining = 1 - consumed`
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Correct burn math + predictable cost | Arbitrary ad-hoc SLIs and breakdowns |
+| Low operational novelty | Bespoke SLO UI/features |
+| Fast, low-noise paging | Perfect sensitivity to very short spikes |
+| Strict cardinality control | Per-customer/per-raw-dimension SLOs |
+
+## Failure Modes
+
+- **Pipeline gap / remote-write lag**
+  - Detect: remote_write queue/failed samples metrics + `data_ok` turning false.
+  - Respond: page only on monitoring-blind alerts; SLO burn alerts are gated by freshness.
+
+- **Metrics backend/ruler blind or evaluation behind**
+  - Detect: ruler evaluation missed interval / evaluation duration / query failures; backend health signals.
+  - Respond: alert “monitoring blind” separately; keep burn paging gated to avoid false pages from stale/NaN series.
+
+- **Cardinality explosion (label drift)**
+  - Detect: series count growth + ruler eval time rising + top-cardinality reports.
+  - Respond: generator templates allow only a small label set; CI blocks specs that exceed budgets; backend enforces per-tenant quotas.
+
+- **Bad SLO spec deploy (wrong selector/inverted good vs bad)**
+  - Detect: CI validation + generated-rule diff review + canary SLOs with known behavior.
+  - Respond: rollback via Git; generator output is deterministic and fully versioned.
+
+## Operational Notes
+
+- Standardize a small SLO template library (availability, latency-<T, freshness) and require review for anything outside templates.
+- Every SLO declares `owner`, `runbook`, and paging policy; burn alerts include fast+slow burn, remaining budget, and a Grafana deep link.
+- Keep “service bad” and “monitoring blind” distinct in routing and severity.
+- Enforce budgets at v1: per-team rule caps, per-team series quotas, and query/eval time budgets.
+```
+[Pass 4/4] Mermaid diagrams fixed
+
+==========================================
+Completed (v2): SLO/Error Budget Monitoring
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/slo-error-budget-monitoring.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/slo-error-budget-monitoring.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/03-observability-reliability/slo-error-budget-monitoring.md

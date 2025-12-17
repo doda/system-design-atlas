@@ -1,0 +1,358 @@
+---
+title: "Task Scheduler (Batch)"
+category: "Foundational Infrastructure"
+difficulty: "Hard"
+tags: ["scheduler", "distributed-systems", "multi-tenant", "kafka", "leases", "outbox"]
+---
+
+## Overview
+
+A distributed batch task scheduler accepts large volumes of jobs, runs them at (or after) a specified time, enforces priorities and retries, and prevents any single tenant from monopolizing capacity. The system provides:
+
+- **Durable enqueue** (no job loss after an acknowledged submit)
+- **At-least-once execution** with **leases** and bounded duplicates
+- **Delayed scheduling** (`runAt`) and retry backoff
+- **Multi-tenant isolation** (rate limits, max queued, max running, fairness)
+- **Operational control** (pause/resume, cancel, audit, replay/DLQ tooling)
+
+The metadata database is authoritative for job state. Notifications are used to reduce polling and improve freshness, but correctness never depends on notifications being delivered exactly once.
+
+---
+
+## Requirements
+
+### Functional Requirements
+
+- Submit jobs with `tenantId`, `queueId`, `priority`, payload, optional `runAt`.
+- Deterministic ordering **within a queue**:
+  - Higher priority first (P0 before P1…).
+  - Within the same priority: earlier `runAt` first.
+  - Tie-breaker: `jobId` (ULID) ascending.
+- Dispatch ready jobs to workers using **leases**, heartbeats, and lease timeouts.
+- Retry failures with configurable policy (max attempts, exponential backoff, jitter) and DLQ routing.
+- Cancel jobs (best-effort if already running) and pause/resume queues.
+- Status tracking and attempt history for audit/debug.
+- Multi-tenant isolation:
+  - Admission rate limits (enqueue/cancel/status).
+  - Max queued / max running per tenant and per queue.
+  - Fair scheduling across tenants (no starvation).
+- Admin controls: tenant/queue configuration, requeue/DLQ replay, observability, audit logs.
+
+### Non-Functional Requirements (Targets)
+
+- Enqueue API: P50 20ms, P99 150ms (regional)
+- Due-to-dispatch (`runAt <= now`): P50 250ms, P99 2s (normal), P99 10s (degraded)
+- Status reads: P99 200ms (with cache) / 500ms (DB-only)
+- Availability: APIs 99.99% (multi-AZ), dispatch 99.9% (graceful degradation)
+- Durability: RPO ≈ 0 after acknowledged enqueue; RTO 30–60 minutes for regional failover
+
+---
+
+## Simplified Architecture
+
+```mermaid
+flowchart TB
+  subgraph Client["Clients"]
+    C1["CLI / SDK"]
+    C2["Admin Console"]
+    W["Worker Agents"]
+  end
+
+  subgraph Edge["Edge"]
+    GW["API Gateway\nAuthN/Z, WAF, rate limits"]
+  end
+
+  subgraph App["Scheduler Service (Single Deployable)"]
+    API["Job + Admin APIs"]
+    DISP["Worker Dispatch APIs\npoll/heartbeat/complete"]
+    BG["Background Loops\n(delay promotion, lease reaper, archival)"]
+    PUB["Outbox Publisher\n(DB -> notifications)"]
+  end
+
+  subgraph Store["Storage"]
+    DB[("Postgres (multi-AZ)\nJobs, Attempts, Tenants, Queues,\nStats, Outbox, Audit")]
+    OBJ[("Object Storage\nLarge payloads, exports/archives")]
+  end
+
+  subgraph Obs["Observability"]
+    OBS[("Metrics / Logs / Traces")]
+  end
+
+  C1 --> GW --> API
+  C2 --> GW --> API
+  W --> DISP
+
+  API --> DB
+  DISP --> DB
+  BG --> DB
+  PUB --> DB
+
+  API --> OBJ
+  BG --> OBJ
+
+  App --> OBS
+```
+
+**Core idea**: one service owns the API, dispatch, and all background work. Postgres provides strong consistency for state transitions. The outbox drives low-latency wakeups while remaining optional for correctness.
+
+---
+
+## Components
+
+### Scheduler Service
+
+A stateless service (scaled horizontally) containing four modules:
+
+1. **Job + Admin API**
+   - Authenticate/authorize requests, enforce tenant/queue policies.
+   - Idempotent enqueue with stored request hash.
+   - Status/read/list/cancel endpoints.
+   - Pause/resume queues and edit limits/weights.
+
+2. **Dispatch API (Worker-Facing)**
+   - `poll` assigns jobs via transactional leasing.
+   - `heartbeat` extends leases.
+   - `complete` finalizes attempts and schedules retries/DLQ.
+
+3. **Background Loops**
+   - **Delay promotion**: moves due `SCHEDULED` jobs to `READY` and creates outbox notifications.
+   - **Lease reaper**: transitions expired `RUNNING` leases back to `SCHEDULED` with backoff (or marks timed out).
+   - **Retention/archival**: exports old attempts/jobs to object storage and prunes DB partitions.
+
+4. **Outbox Publisher**
+   - Reads undelivered outbox rows and publishes “job ready” notifications.
+   - Delivery targets:
+     - Primary: Postgres `LISTEN/NOTIFY` channel(s) to wake dispatchers.
+     - Optional: a streaming bus (e.g., Kafka) for very large fanout / cross-service integrations.
+
+### Postgres (Metadata + Control)
+
+Authoritative store for:
+- Job state machine and leases
+- Attempts history
+- Tenant/queue configuration
+- Isolation counters (queued/running)
+- Outbox and audit records
+
+Runs multi-AZ with synchronous replication and PITR for durability.
+
+### Object Storage
+
+- Stores large payloads referenced by jobs (`payload_ref` + checksum).
+- Stores periodic exports/archives (attempt history, job timelines) for 30–90 day retention.
+
+### API Gateway
+
+- Tenant-scoped auth, WAF, and admission rate limiting.
+- Provides a clean place for burst protection without adding an extra quota service.
+
+---
+
+## Data Model
+
+### Job State Machine
+
+- `SCHEDULED` → `READY` → `RUNNING` → `SUCCEEDED`
+- `RUNNING` → `SCHEDULED` (retry after failure/backoff or lease timeout)
+- Any state → `CANCELED` (best-effort if already running)
+- `RUNNING/READY/SCHEDULED` → `DLQ` when attempts exhausted or non-retryable
+
+**Cancel semantics**
+- If not leased: cancel is authoritative (job will not run).
+- If leased/running: set `cancel_requested=true`. Completion is accepted only if it matches the active lease and the job is not canceled.
+
+### Tables (Illustrative)
+
+**`tenants`**
+- `tenant_id` (PK)
+- `status` (ACTIVE/SUSPENDED)
+- `limits` (jsonb: submit_qps, max_running, max_queued, etc.)
+- `weight` (int default 1)
+- `created_at`, `updated_at`
+
+**`queues`**
+- `tenant_id` (PK part), `queue_id` (PK part)
+- `weight` (int default 1)
+- `paused` (bool)
+- `max_running` (int nullable override)
+- `created_at`, `updated_at`
+
+**`tenant_stats`**
+- `tenant_id` (PK)
+- `running` (int)
+- `queued` (int)
+- `updated_at`
+
+**`queue_stats`**
+- `tenant_id` (PK part), `queue_id` (PK part)
+- `running` (int)
+- `queued` (int)
+- `updated_at`
+
+**`jobs`**
+- `tenant_id` (PK part), `job_id` (PK part, ULID)
+- `idempotency_key` (unique with tenant_id)
+- `queue_id`, `priority`
+- `state` (SCHEDULED/READY/RUNNING/SUCCEEDED/CANCELED/DLQ)
+- `run_at` (timestamp) — initial schedule time
+- `next_run_at` (timestamp) — retry/delay target (authoritative “due” timestamp)
+- `payload_ref` + `payload_sha256`
+- `attempt` (int), `max_attempts` (int), `backoff_policy` (jsonb)
+- `cancel_requested` (bool)
+- `active_lease_id` (uuid), `lease_expires_at` (timestamp), `leased_by` (worker_id)
+- `last_error` (text)
+- `created_at`, `updated_at`
+
+**`attempts`**
+- `tenant_id` (PK part), `job_id` (PK part), `attempt_no` (PK part)
+- `lease_id`, `worker_id`
+- `started_at`, `heartbeat_at`, `finished_at`
+- `result` (SUCCEEDED/FAILED/TIMED_OUT/CANCELED)
+- `error_code`, `error_message`, `runtime_ms`
+
+**`outbox`**
+- `event_id` (PK)
+- `event_type` (JOB_READY, JOB_DLQ, etc.)
+- `aggregate_key` (tenantId/jobId)
+- `payload` (jsonb small: ids + routing)
+- `created_at`, `delivered_at` (nullable)
+
+**`audit_log`**
+- `event_id` (PK), `tenant_id`, `actor`, `action`, `resource`, `metadata`, `created_at`
+
+### Indexing / Partitioning
+
+- Partition `jobs` and `attempts` by `tenantShard = hash(tenant_id) % N` (logical) and optionally by time (daily partitions) for retention.
+- Hot indexes:
+  - `jobs(tenantShard, state, priority, next_run_at, job_id)`
+  - `jobs(tenant_id, idempotency_key)` unique
+  - `jobs(tenant_id, queue_id, state, priority, next_run_at, job_id)` for strict per-queue ordering
+
+---
+
+## Core Flows
+
+### Enqueue
+
+1. Client calls `POST /v1/tenants/{t}/jobs` with `Idempotency-Key`.
+2. Transaction:
+   - Validate tenant/queue, enforce `max_queued` via `tenant_stats/queue_stats`.
+   - Insert `jobs` row with `state=SCHEDULED` and `next_run_at = runAt (or now)`.
+   - If `next_run_at <= now`: set `state=READY` and insert `outbox` event `JOB_READY`.
+   - Increment queued counters.
+3. Return `202 Accepted` with `jobId` and state.
+
+Large payloads are stored in object storage; the DB stores a pointer and checksum.
+
+### Delay Promotion (Background)
+
+Continuously:
+- Claim a shard (advisory lock or “lease row” pattern).
+- In bounded batches:
+  - `UPDATE jobs SET state=READY WHERE state=SCHEDULED AND next_run_at <= now() ...`
+  - Insert one `JOB_READY` outbox row per promoted job.
+
+This avoids global scans by partitioning work by shard and limiting batch size.
+
+### Worker Poll (Lease Assignment)
+
+1. Worker calls `POST /v1/worker:poll` with `workerId`, `capabilities`, `maxJobs`.
+2. For each assignment (loop inside the service):
+   - Transaction:
+     - Pick an eligible tenant/queue under caps (see “Fair Scheduling”).
+     - Select the earliest eligible job for that queue:
+       - `ORDER BY priority, next_run_at, job_id`
+     - Atomically transition `READY -> RUNNING`, set `lease_id`, `lease_expires_at`, `leased_by`, insert `attempts` row.
+     - Update running/queued counters.
+3. Return assignments.
+
+### Heartbeat / Complete
+
+- `heartbeat`: extends `lease_expires_at` (and updates `attempts.heartbeat_at`).
+- `complete`: idempotently finalizes the attempt and transitions job:
+  - Success → `SUCCEEDED`
+  - Failure with retries left → compute backoff, set `next_run_at`, set `state=SCHEDULED`
+  - Exhausted / non-retryable → `DLQ` and outbox `JOB_DLQ`
+
+### Lease Reaper (Background)
+
+Periodically:
+- Find `RUNNING` jobs with `lease_expires_at < now()` and transition to retry or DLQ based on policy.
+- Insert outbox `JOB_READY` when transitioning back to `READY` (or when the next run becomes due immediately).
+
+---
+
+## Scheduling, Isolation, and Fairness
+
+### Ordering
+
+Within a queue, dispatch always selects the “head” job by:
+`priority ASC, next_run_at ASC, job_id ASC`.
+
+### Isolation Controls
+
+- **Admission rate limits** at the gateway (enqueue/cancel/status).
+- **Max queued / max running** enforced transactionally via `tenant_stats` and `queue_stats`.
+- Queue pause/resume enforced by `queues.paused`.
+
+### Fair Scheduling (No Starvation)
+
+Dispatch uses a two-level selection:
+
+1. **Tenant selection**
+   - Eligible tenants are those with `tenant_stats.running < tenant_limits.max_running` and at least one due job.
+   - Selection uses weighted round-robin (default weight 1), with `last_served_at` tracked in Postgres to keep behavior consistent across dispatcher instances.
+
+2. **Queue selection within tenant**
+   - Eligible queues are those not paused and under `max_running`.
+   - Selection uses queue weights and `last_served_at`.
+
+After selecting a tenant+queue, the job selection is strictly ordered within that queue.
+
+---
+
+## Reliability, Failure Handling, and Recovery
+
+- **Durability after enqueue**: job row and counters commit in Postgres before returning success.
+- **At-least-once execution**: leases and timeouts guarantee reclamation after worker or service failure.
+- **Outbox-driven freshness**: outbox publisher wakes dispatchers quickly; missed notifications are corrected by worker polling and background scans.
+- **Regional recovery**: restore Postgres from multi-AZ / promote standby; restart stateless scheduler instances; resume background loops; workers retry with jitter.
+
+Key failure behaviors:
+- Scheduler crash mid-assignment: transaction rollback prevents partial leases; leased jobs recover on expiry.
+- Worker crash: lease expiry triggers re-dispatch.
+- Notification disruption: dispatch remains correct via DB truth; latency degrades until notifications recover.
+
+---
+
+## Operations
+
+### Monitoring
+
+- API: QPS, P99 latency, 4xx/5xx, rate-limit counts
+- Scheduling: due jobs backlog (`READY` count), promotion lag, outbox age
+- Dispatch: due-to-dispatch SLO, active leases, lease expirations, retry/DLQ rates
+- DB: txn latency, lock waits, connection pool saturation, deadlocks
+
+### Retention
+
+- Keep hot `jobs` and `attempts` in Postgres for 7–14 days.
+- Export older timelines/attempts to object storage daily; prune old partitions.
+- Keep audit logs in Postgres for quick access and export to object storage for long-term retention.
+
+---
+
+## Simplification Notes
+
+- Removed and why acceptable:
+  - Kafka-ready bus: replaced by Postgres outbox + `LISTEN/NOTIFY` and DB-based correctness; notifications are an accelerator, not a source of truth.
+  - Redis quota/counter store: replaced by transactional `tenant_stats`/`queue_stats` in Postgres for strong consistency and fewer moving parts.
+  - Separate Timer/Outbox/Dispatcher services: implemented as modules in one stateless Scheduler Service, reducing deploy and on-call surface area.
+
+- Merged and why:
+  - Control plane + data plane combined into a single deployable service, keeping the system easy to operate while still allowing independent horizontal scaling via separate process pools/replicas.
+
+- Complexity that remains and why necessary:
+  - Leases, retries/backoff, and a durable state machine: required for correctness under failures with at-least-once execution.
+  - Fair scheduling with caps and weights: required to prevent tenant starvation and enforce isolation.
+  - Outbox: required to make “state changed” notifications reliable without coupling correctness to notification delivery.

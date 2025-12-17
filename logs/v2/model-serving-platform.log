@@ -1,0 +1,2473 @@
+==========================================
+Generating (v2): Model Serving Platform
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2b96-7423-80e5-6ed597ec9a49
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Model Serving Platform
+**Category**: AI/ML Infrastructure
+
+**Problem Statement**:
+Design a system to host thousands of ML models, managing GPU scheduling, shadow deployments, and cold-start latency.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+thinking
+**Designing GPU Scheduling Solutions**
+
+The user wants a markdown document that doesn't involve repo changes and no tools. I’ll focus on essential design aspects like GPU scheduling for multi-tenancy and cold starts. Using Kubernetes with NVIDIA GPU operator could work alongside KServe or Triton. I need to tackle the significant pieces like model registry and caching, ensuring a strong separation between the control and data planes. Shadow deployment strategies with traffic mirroring and addressing cold starts with efficient model loading are crucial. Consistency and versioning are also important for reliability.
+thinking
+**Defining Requirements and Scaling Targets**
+
+I need to provide clear numerical requirements for the project, like handling 10k models, 1k QPS, and ensuring 99th percentile latency. A mermaid diagram with up to eight nodes will illustrate this. I should consider failure modes like GPU exhaustion and bad model problems. Operational notes on SLO tiers, autoscaling, and observability are also important. I’ll explicitly choose technologies like K8s, KServe, and Triton. Shadow deployments should duplicate requests to a shadow cluster without affecting responses, and GPU scheduling will use Kueue with NVIDIA MIG.
+thinking
+**Exploring Cold Starts in GPU Scheduling**
+
+I’m diving into the challenges of cold starts without overwhelming GPUs. I’ll describe concepts like model packaging and content-addressed artifacts, alongside strategies like node-local model caching and maintaining a warm pool for efficient admissions. There’s also the importance of multi-tenancy isolation—using namespaces and network policies, along with signed model artifacts. For security, I might consider running containers with gVisor or Kata. I'll focus on Kubernetes RBAC for robust isolation and offer thoughts on adjustments needed at 10x and 100x scale. Finally, I'll produce the document.
+codex
+```markdown
+---
+title: "Model Serving Platform"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["model-serving", "gpus", "scheduling", "rollouts", "multi-tenancy", "latency"]
+---
+
+## Overview
+
+This system hosts **thousands of ML models** behind a single, stable API while keeping GPU utilization high and rollouts safe. The key insight is to **separate “serving identity” (a model + version) from “GPU residency” (what’s currently loaded on a node)**. Most platforms bind these together, then pay for it in cold starts, noisy neighbors, and rollouts that are either risky or slow.
+
+The design uses a **small control plane** (metadata, rollout orchestration, quota) and a **boring, reliable data plane** (Envoy → model routers → Triton-based workers). GPUs are treated as a scarce cluster resource with explicit **SLO tiers** and **admission control**, not as an autoscaling afterthought.
+
+The result: safe shadow deployments, predictable scheduling under contention, and cold starts that don’t trigger a “load storm” that takes down the fleet.
+
+## What Makes This Hard
+
+Naive implementations get trapped by three coupled problems:
+
+1. **Cold starts are nonlinear.** Loading weights, building CUDA kernels, and warming caches creates bursty GPU/CPU/IO demand. Under load, the platform thrashes: requests queue up, more replicas spawn, and everything gets slower.
+2. **GPU scheduling is multi-dimensional.** It’s not just “a GPU”; it’s memory, compute, model size, batch shape, and interference. Bin-packing without guardrails produces noisy neighbors and tail-latency spikes.
+3. **Shadow deployments are easy to route but hard to trust.** You need deterministic sampling, feature parity, and output comparison at scale without polluting prod latency or exposing sensitive payloads.
+
+## Requirements
+
+### Functional Requirements
+- Host **10k+ models** with versioning, provenance, and controlled rollout.
+- Support **real-time inference** (sync) and **batch/async inference** (queued).
+- Provide **shadow deployments** (full request mirroring, zero user impact) and **canary** (partial user impact with rollback).
+- Enforce **multi-tenant quotas** (GPU, CPU, memory, QPS) and isolation boundaries.
+- Collect **model-level telemetry** (latency, GPU memory, OOMs, error rates) and produce rollback signals.
+
+### Scale Targets
+- **Models:** 10,000 total; **500 active/day**; **50 hot concurrently** (typical long-tail).
+- **Traffic:** 20k RPS peak platform-wide; hot models 2k RPS each; long-tail ≤1 RPS.
+- **Latency SLOs:** p95 < 150ms for “hot tier”; p95 < 400ms for “warm tier”; “cold tier” allows first-hit up to 2–5s.
+- **Rollouts:** up to 200 deployments/day; shadow for 30 minutes with statistical confidence gates.
+- **GPU fleet:** 200–2,000 GPUs with mixed SKUs; target **>70% utilization** on hot tier while meeting p95.
+
+Why these numbers matter: long-tail + strict tail latency creates the classic conflict—keeping everything warm is too expensive, but loading on demand melts the fleet without orchestration.
+
+## Key Design Decisions
+
+- **We chose:** Triton Inference Server as the primary runtime, managed by Kubernetes + KServe APIs.
+  - **Rejected:** a custom per-framework server fleet.
+  - **Why:** Triton gives proven batching, multiple backends, and stable operational semantics; KServe gives a standard CRD surface and rollout hooks.
+
+- **We chose:** Explicit SLO tiers with admission control (Hot/Warm/Cold) plus a warm-pool of “empty” GPU workers.
+  - **Rejected:** pure HPA/autoscaling based on latency.
+  - **Why:** scaling reacts too late for model load time; admission control prevents load storms and preserves tail latency for paid tiers.
+
+- **We chose:** Deterministic shadowing at the edge (request hash sampling) + async diff pipeline.
+  - **Rejected:** in-worker mirroring and synchronous comparisons.
+  - **Why:** edge mirroring is uniform and observable; async diffs keep prod latency clean and avoids coupling to model runtime behavior.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Clients] --> G[Edge Gateway]
+  G --> R[Model Router]
+  R --> W[GPU Workers]
+  W --> S[(Object Store)]
+  R --> M[(Metadata DB)]
+  G --> Q[Shadow Sink]
+  Q --> L[(Log Store)]
+  P[Rollout Controller] --> R
+  P --> M
+```
+
+### Components
+
+- **Edge Gateway (Envoy):** AuthN/Z, request normalization, deterministic sampling for shadow/canary, and routing headers. Earns its place because rollout safety and shadowing must be consistent across all models.
+- **Model Router:** Low-latency lookup from (model, version, tenant, tier) → worker pool, with backpressure and queueing policy. This is where SLO tiers become enforceable behavior.
+- **GPU Workers (Triton):** Long-lived processes that dynamically load/unload models. They expose uniform gRPC/HTTP inference and export GPU telemetry.
+- **Object Store (S3/GCS/MinIO):** Source of truth for model artifacts (weights, tokenizer, config), stored content-addressed for deduplication and integrity.
+- **Metadata DB (Postgres):** Model registry metadata, rollout state machines, quotas, audit trail. Postgres is the right “boring” choice for correctness and operability.
+- **Rollout Controller:** Orchestrates canary/shadow, promotes versions, triggers warmups, and enforces policy gates (error/latency/diff drift).
+- **Shadow Sink + Log Store:** Accepts mirrored requests (payloads or hashed features), stores outputs and metadata for offline diffing and dashboards.
+
+## Deep Dive: Cold Starts Without Melting the Fleet
+
+The hard part is not “loading a model”; it’s preventing **synchronized loading** across replicas and nodes while traffic is already waiting. The platform solves this with three mechanisms that work together:
+
+1. **Content-addressed artifacts + node-local cache**
+   - Every model version resolves to immutable artifact digests (e.g., `sha256:...`).
+   - GPU nodes run a small **model-cache daemon** that downloads artifacts to local NVMe and exposes “present/not present” to the scheduler.
+   - This turns “load model” from “hit S3 under duress” into “read local disk” for steady-state and makes prefetch predictable.
+
+2. **Warm pool of GPU workers + two-phase activation**
+   - Keep a small number of **idle Triton workers** per GPU SKU (hot spare capacity).
+   - When a model needs to serve, the router requests activation:
+     1) **Prefetch** artifacts to node cache (IO phase).
+     2) **Load + warm** in Triton (GPU/CPU phase) with concurrency limits per node.
+   - Only after warmup does the router shift traffic. This prevents user traffic from being the warmup driver.
+
+3. **Admission control with per-tier guarantees**
+   - The router enforces a maximum number of concurrent model activations per cluster and per node (e.g., “2 loads/GPU node at once”).
+   - Cold-tier requests queue (with explicit timeouts) rather than triggering replica explosion.
+   - Hot-tier capacity is protected via reserved GPU slices (MIG partitions or dedicated node pools), so cold starts cannot steal the GPUs needed for tail latency.
+
+Non-obvious edge case: **cold-start storms from retries.** The gateway tags retries with an idempotency key; the router deduplicates activations per (model, version) and returns queued promises instead of initiating multiple loads. This single change eliminates a common “thundering herd” failure mode.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Tail latency for hot traffic | Always-warm for long tail |
+| High GPU utilization with guardrails | Maximum simplicity (more policy) |
+| Safe rollouts with trustworthy shadowing | Some extra infra for diffing/logging |
+
+## Failure Modes
+
+- **GPU OOM / bad model version**
+  - **What happens:** Triton worker crashes or ejects model; p95 spikes; errors rise.
+  - **Detect:** GPU memory telemetry + error-rate SLO burn + crashloop alerts per model version.
+  - **Recover:** Automatic rollback to last-good version; quarantine the artifact digest; block promotion until manual override.
+
+- **Cold-start load storm**
+  - **What happens:** Many models activated concurrently; S3 and CPU saturate; hot traffic degrades.
+  - **Detect:** Spike in activation queue depth, node cache misses, and artifact download bandwidth.
+  - **Recover:** Admission controller clamps activations; router de-prioritizes cold tier; rollout controller pauses new deploys; prefetch runs at controlled rate.
+
+- **Metadata/registry outage (Postgres)**
+  - **What happens:** New deployments and policy changes stall; routing must continue.
+  - **Detect:** DB health + elevated router cache misses.
+  - **Recover:** Router runs on cached routing tables with TTL; deploy pipeline halts safely; failover Postgres (managed HA or Patroni).
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Split fleets by tier (hot/warm/cold) with dedicated GPU pools and stricter quotas.
+  - Add artifact prefetch forecasting from access logs to keep warm tier efficient.
+
+- **100x scale:**
+  - Introduce a dedicated **global scheduler** for GPU placement (beyond Kubernetes primitives) that optimizes for model co-location and interference.
+  - Move shadow diffing to privacy-preserving feature representations (token hashes / embeddings) to control log volume and sensitivity.
+
+## Operational Notes
+
+- On-call cares about three dashboards: **activation queue depth**, **GPU memory headroom**, and **per-model error/latency burn**. These predict incidents earlier than aggregate RPS.
+- Treat “model load” as a first-class SLO with budgets; cap concurrent loads per node to protect hot traffic.
+- Enforce tenant quotas at the router (QPS + concurrency) and at the cluster (GPU slices/node pools) so abuse can’t bypass a single layer.
+- Rollouts are policy-driven: promote only when shadow diff drift + error rate + tail latency gates pass for a fixed window.
+```
+tokens used
+3,904
+```markdown
+---
+title: "Model Serving Platform"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["model-serving", "gpus", "scheduling", "rollouts", "multi-tenancy", "latency"]
+---
+
+## Overview
+
+This system hosts **thousands of ML models** behind a single, stable API while keeping GPU utilization high and rollouts safe. The key insight is to **separate “serving identity” (a model + version) from “GPU residency” (what’s currently loaded on a node)**. Most platforms bind these together, then pay for it in cold starts, noisy neighbors, and rollouts that are either risky or slow.
+
+The design uses a **small control plane** (metadata, rollout orchestration, quota) and a **boring, reliable data plane** (Envoy → model routers → Triton-based workers). GPUs are treated as a scarce cluster resource with explicit **SLO tiers** and **admission control**, not as an autoscaling afterthought.
+
+The result: safe shadow deployments, predictable scheduling under contention, and cold starts that don’t trigger a “load storm” that takes down the fleet.
+
+## What Makes This Hard
+
+Naive implementations get trapped by three coupled problems:
+
+1. **Cold starts are nonlinear.** Loading weights, building CUDA kernels, and warming caches creates bursty GPU/CPU/IO demand. Under load, the platform thrashes: requests queue up, more replicas spawn, and everything gets slower.
+2. **GPU scheduling is multi-dimensional.** It’s not just “a GPU”; it’s memory, compute, model size, batch shape, and interference. Bin-packing without guardrails produces noisy neighbors and tail-latency spikes.
+3. **Shadow deployments are easy to route but hard to trust.** You need deterministic sampling, feature parity, and output comparison at scale without polluting prod latency or exposing sensitive payloads.
+
+## Requirements
+
+### Functional Requirements
+- Host **10k+ models** with versioning, provenance, and controlled rollout.
+- Support **real-time inference** (sync) and **batch/async inference** (queued).
+- Provide **shadow deployments** (full request mirroring, zero user impact) and **canary** (partial user impact with rollback).
+- Enforce **multi-tenant quotas** (GPU, CPU, memory, QPS) and isolation boundaries.
+- Collect **model-level telemetry** (latency, GPU memory, OOMs, error rates) and produce rollback signals.
+
+### Scale Targets
+- **Models:** 10,000 total; **500 active/day**; **50 hot concurrently** (typical long-tail).
+- **Traffic:** 20k RPS peak platform-wide; hot models 2k RPS each; long-tail ≤1 RPS.
+- **Latency SLOs:** p95 < 150ms for “hot tier”; p95 < 400ms for “warm tier”; “cold tier” allows first-hit up to 2–5s.
+- **Rollouts:** up to 200 deployments/day; shadow for 30 minutes with statistical confidence gates.
+- **GPU fleet:** 200–2,000 GPUs with mixed SKUs; target **>70% utilization** on hot tier while meeting p95.
+
+Why these numbers matter: long-tail + strict tail latency creates the classic conflict—keeping everything warm is too expensive, but loading on demand melts the fleet without orchestration.
+
+## Key Design Decisions
+
+- **We chose:** Triton Inference Server as the primary runtime, managed by Kubernetes + KServe APIs.
+  - **Rejected:** a custom per-framework server fleet.
+  - **Why:** Triton gives proven batching, multiple backends, and stable operational semantics; KServe gives a standard CRD surface and rollout hooks.
+
+- **We chose:** Explicit SLO tiers with admission control (Hot/Warm/Cold) plus a warm-pool of “empty” GPU workers.
+  - **Rejected:** pure HPA/autoscaling based on latency.
+  - **Why:** scaling reacts too late for model load time; admission control prevents load storms and preserves tail latency for paid tiers.
+
+- **We chose:** Deterministic shadowing at the edge (request hash sampling) + async diff pipeline.
+  - **Rejected:** in-worker mirroring and synchronous comparisons.
+  - **Why:** edge mirroring is uniform and observable; async diffs keep prod latency clean and avoids coupling to model runtime behavior.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Clients] --> G[Edge Gateway]
+  G --> R[Model Router]
+  R --> W[GPU Workers]
+  W --> S[(Object Store)]
+  R --> M[(Metadata DB)]
+  G --> Q[Shadow Sink]
+  Q --> L[(Log Store)]
+  P[Rollout Controller] --> R
+  P --> M
+```
+
+### Components
+
+- **Edge Gateway (Envoy):** AuthN/Z, request normalization, deterministic sampling for shadow/canary, and routing headers. Earns its place because rollout safety and shadowing must be consistent across all models.
+- **Model Router:** Low-latency lookup from (model, version, tenant, tier) → worker pool, with backpressure and queueing policy. This is where SLO tiers become enforceable behavior.
+- **GPU Workers (Triton):** Long-lived processes that dynamically load/unload models. They expose uniform gRPC/HTTP inference and export GPU telemetry.
+- **Object Store (S3/GCS/MinIO):** Source of truth for model artifacts (weights, tokenizer, config), stored content-addressed for deduplication and integrity.
+- **Metadata DB (Postgres):** Model registry metadata, rollout state machines, quotas, audit trail. Postgres is the right “boring” choice for correctness and operability.
+- **Rollout Controller:** Orchestrates canary/shadow, promotes versions, triggers warmups, and enforces policy gates (error/latency/diff drift).
+- **Shadow Sink + Log Store:** Accepts mirrored requests (payloads or hashed features), stores outputs and metadata for offline diffing and dashboards.
+
+## Deep Dive: Cold Starts Without Melting the Fleet
+
+The hard part is not “loading a model”; it’s preventing **synchronized loading** across replicas and nodes while traffic is already waiting. The platform solves this with three mechanisms that work together:
+
+1. **Content-addressed artifacts + node-local cache**
+   - Every model version resolves to immutable artifact digests (e.g., `sha256:...`).
+   - GPU nodes run a small **model-cache daemon** that downloads artifacts to local NVMe and exposes “present/not present” to the scheduler.
+   - This turns “load model” from “hit S3 under duress” into “read local disk” for steady-state and makes prefetch predictable.
+
+2. **Warm pool of GPU workers + two-phase activation**
+   - Keep a small number of **idle Triton workers** per GPU SKU (hot spare capacity).
+   - When a model needs to serve, the router requests activation:
+     1) **Prefetch** artifacts to node cache (IO phase).
+     2) **Load + warm** in Triton (GPU/CPU phase) with concurrency limits per node.
+   - Only after warmup does the router shift traffic. This prevents user traffic from being the warmup driver.
+
+3. **Admission control with per-tier guarantees**
+   - The router enforces a maximum number of concurrent model activations per cluster and per node (e.g., “2 loads/GPU node at once”).
+   - Cold-tier requests queue (with explicit timeouts) rather than triggering replica explosion.
+   - Hot-tier capacity is protected via reserved GPU slices (MIG partitions or dedicated node pools), so cold starts cannot steal the GPUs needed for tail latency.
+
+Non-obvious edge case: **cold-start storms from retries.** The gateway tags retries with an idempotency key; the router deduplicates activations per (model, version) and returns queued promises instead of initiating multiple loads. This single change eliminates a common “thundering herd” failure mode.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Tail latency for hot traffic | Always-warm for long tail |
+| High GPU utilization with guardrails | Maximum simplicity (more policy) |
+| Safe rollouts with trustworthy shadowing | Some extra infra for diffing/logging |
+
+## Failure Modes
+
+- **GPU OOM / bad model version**
+  - **What happens:** Triton worker crashes or ejects model; p95 spikes; errors rise.
+  - **Detect:** GPU memory telemetry + error-rate SLO burn + crashloop alerts per model version.
+  - **Recover:** Automatic rollback to last-good version; quarantine the artifact digest; block promotion until manual override.
+
+- **Cold-start load storm**
+  - **What happens:** Many models activated concurrently; S3 and CPU saturate; hot traffic degrades.
+  - **Detect:** Spike in activation queue depth, node cache misses, and artifact download bandwidth.
+  - **Recover:** Admission controller clamps activations; router de-prioritizes cold tier; rollout controller pauses new deploys; prefetch runs at controlled rate.
+
+- **Metadata/registry outage (Postgres)**
+  - **What happens:** New deployments and policy changes stall; routing must continue.
+  - **Detect:** DB health + elevated router cache misses.
+  - **Recover:** Router runs on cached routing tables with TTL; deploy pipeline halts safely; failover Postgres (managed HA or Patroni).
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Split fleets by tier (hot/warm/cold) with dedicated GPU pools and stricter quotas.
+  - Add artifact prefetch forecasting from access logs to keep warm tier efficient.
+
+- **100x scale:**
+  - Introduce a dedicated **global scheduler** for GPU placement (beyond Kubernetes primitives) that optimizes for model co-location and interference.
+  - Move shadow diffing to privacy-preserving feature representations (token hashes / embeddings) to control log volume and sensitivity.
+
+## Operational Notes
+
+- On-call cares about three dashboards: **activation queue depth**, **GPU memory headroom**, and **per-model error/latency burn**. These predict incidents earlier than aggregate RPS.
+- Treat “model load” as a first-class SLO with budgets; cap concurrent loads per node to protect hot traffic.
+- Enforce tenant quotas at the router (QPS + concurrency) and at the cluster (GPU slices/node pools) so abuse can’t bypass a single layer.
+- Rollouts are policy-driven: promote only when shadow diff drift + error rate + tail latency gates pass for a fixed window.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/model-serving-platform.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afa-312f-7e32-94b9-d339b60d7765
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Model Serving Platform"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["model-serving", "gpus", "scheduling", "rollouts", "multi-tenancy", "latency"]
+---
+
+## Overview
+
+This system hosts **thousands of ML models** behind a single, stable API while keeping GPU utilization high and rollouts safe. The key insight is to **separate “serving identity” (a model + version) from “GPU residency” (what’s currently loaded on a node)**. Most platforms bind these together, then pay for it in cold starts, noisy neighbors, and rollouts that are either risky or slow.
+
+The design uses a **small control plane** (metadata, rollout orchestration, quota) and a **boring, reliable data plane** (Envoy → model routers → Triton-based workers). GPUs are treated as a scarce cluster resource with explicit **SLO tiers** and **admission control**, not as an autoscaling afterthought.
+
+The result: safe shadow deployments, predictable scheduling under contention, and cold starts that don’t trigger a “load storm” that takes down the fleet.
+
+## What Makes This Hard
+
+Naive implementations get trapped by three coupled problems:
+
+1. **Cold starts are nonlinear.** Loading weights, building CUDA kernels, and warming caches creates bursty GPU/CPU/IO demand. Under load, the platform thrashes: requests queue up, more replicas spawn, and everything gets slower.
+2. **GPU scheduling is multi-dimensional.** It’s not just “a GPU”; it’s memory, compute, model size, batch shape, and interference. Bin-packing without guardrails produces noisy neighbors and tail-latency spikes.
+3. **Shadow deployments are easy to route but hard to trust.** You need deterministic sampling, feature parity, and output comparison at scale without polluting prod latency or exposing sensitive payloads.
+
+## Requirements
+
+### Functional Requirements
+- Host **10k+ models** with versioning, provenance, and controlled rollout.
+- Support **real-time inference** (sync) and **batch/async inference** (queued).
+- Provide **shadow deployments** (full request mirroring, zero user impact) and **canary** (partial user impact with rollback).
+- Enforce **multi-tenant quotas** (GPU, CPU, memory, QPS) and isolation boundaries.
+- Collect **model-level telemetry** (latency, GPU memory, OOMs, error rates) and produce rollback signals.
+
+### Scale Targets
+- **Models:** 10,000 total; **500 active/day**; **50 hot concurrently** (typical long-tail).
+- **Traffic:** 20k RPS peak platform-wide; hot models 2k RPS each; long-tail ≤1 RPS.
+- **Latency SLOs:** p95 < 150ms for “hot tier”; p95 < 400ms for “warm tier”; “cold tier” allows first-hit up to 2–5s.
+- **Rollouts:** up to 200 deployments/day; shadow for 30 minutes with statistical confidence gates.
+- **GPU fleet:** 200–2,000 GPUs with mixed SKUs; target **>70% utilization** on hot tier while meeting p95.
+
+Why these numbers matter: long-tail + strict tail latency creates the classic conflict—keeping everything warm is too expensive, but loading on demand melts the fleet without orchestration.
+
+## Key Design Decisions
+
+- **We chose:** Triton Inference Server as the primary runtime, managed by Kubernetes + KServe APIs.
+  - **Rejected:** a custom per-framework server fleet.
+  - **Why:** Triton gives proven batching, multiple backends, and stable operational semantics; KServe gives a standard CRD surface and rollout hooks.
+
+- **We chose:** Explicit SLO tiers with admission control (Hot/Warm/Cold) plus a warm-pool of “empty” GPU workers.
+  - **Rejected:** pure HPA/autoscaling based on latency.
+  - **Why:** scaling reacts too late for model load time; admission control prevents load storms and preserves tail latency for paid tiers.
+
+- **We chose:** Deterministic shadowing at the edge (request hash sampling) + async diff pipeline.
+  - **Rejected:** in-worker mirroring and synchronous comparisons.
+  - **Why:** edge mirroring is uniform and observable; async diffs keep prod latency clean and avoids coupling to model runtime behavior.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Clients] --> G[Edge Gateway]
+  G --> R[Model Router]
+  R --> W[GPU Workers]
+  W --> S[(Object Store)]
+  R --> M[(Metadata DB)]
+  G --> Q[Shadow Sink]
+  Q --> L[(Log Store)]
+  P[Rollout Controller] --> R
+  P --> M
+```
+
+### Components
+
+- **Edge Gateway (Envoy):** AuthN/Z, request normalization, deterministic sampling for shadow/canary, and routing headers. Earns its place because rollout safety and shadowing must be consistent across all models.
+- **Model Router:** Low-latency lookup from (model, version, tenant, tier) → worker pool, with backpressure and queueing policy. This is where SLO tiers become enforceable behavior.
+- **GPU Workers (Triton):** Long-lived processes that dynamically load/unload models. They expose uniform gRPC/HTTP inference and export GPU telemetry.
+- **Object Store (S3/GCS/MinIO):** Source of truth for model artifacts (weights, tokenizer, config), stored content-addressed for deduplication and integrity.
+- **Metadata DB (Postgres):** Model registry metadata, rollout state machines, quotas, audit trail. Postgres is the right “boring” choice for correctness and operability.
+- **Rollout Controller:** Orchestrates canary/shadow, promotes versions, triggers warmups, and enforces policy gates (error/latency/diff drift).
+- **Shadow Sink + Log Store:** Accepts mirrored requests (payloads or hashed features), stores outputs and metadata for offline diffing and dashboards.
+
+## Deep Dive: Cold Starts Without Melting the Fleet
+
+The hard part is not “loading a model”; it’s preventing **synchronized loading** across replicas and nodes while traffic is already waiting. The platform solves this with three mechanisms that work together:
+
+1. **Content-addressed artifacts + node-local cache**
+   - Every model version resolves to immutable artifact digests (e.g., `sha256:...`).
+   - GPU nodes run a small **model-cache daemon** that downloads artifacts to local NVMe and exposes “present/not present” to the scheduler.
+   - This turns “load model” from “hit S3 under duress” into “read local disk” for steady-state and makes prefetch predictable.
+
+2. **Warm pool of GPU workers + two-phase activation**
+   - Keep a small number of **idle Triton workers** per GPU SKU (hot spare capacity).
+   - When a model needs to serve, the router requests activation:
+     1) **Prefetch** artifacts to node cache (IO phase).
+     2) **Load + warm** in Triton (GPU/CPU phase) with concurrency limits per node.
+   - Only after warmup does the router shift traffic. This prevents user traffic from being the warmup driver.
+
+3. **Admission control with per-tier guarantees**
+   - The router enforces a maximum number of concurrent model activations per cluster and per node (e.g., “2 loads/GPU node at once”).
+   - Cold-tier requests queue (with explicit timeouts) rather than triggering replica explosion.
+   - Hot-tier capacity is protected via reserved GPU slices (MIG partitions or dedicated node pools), so cold starts cannot steal the GPUs needed for tail latency.
+
+Non-obvious edge case: **cold-start storms from retries.** The gateway tags retries with an idempotency key; the router deduplicates activations per (model, version) and returns queued promises instead of initiating multiple loads. This single change eliminates a common “thundering herd” failure mode.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Tail latency for hot traffic | Always-warm for long tail |
+| High GPU utilization with guardrails | Maximum simplicity (more policy) |
+| Safe rollouts with trustworthy shadowing | Some extra infra for diffing/logging |
+
+## Failure Modes
+
+- **GPU OOM / bad model version**
+  - **What happens:** Triton worker crashes or ejects model; p95 spikes; errors rise.
+  - **Detect:** GPU memory telemetry + error-rate SLO burn + crashloop alerts per model version.
+  - **Recover:** Automatic rollback to last-good version; quarantine the artifact digest; block promotion until manual override.
+
+- **Cold-start load storm**
+  - **What happens:** Many models activated concurrently; S3 and CPU saturate; hot traffic degrades.
+  - **Detect:** Spike in activation queue depth, node cache misses, and artifact download bandwidth.
+  - **Recover:** Admission controller clamps activations; router de-prioritizes cold tier; rollout controller pauses new deploys; prefetch runs at controlled rate.
+
+- **Metadata/registry outage (Postgres)**
+  - **What happens:** New deployments and policy changes stall; routing must continue.
+  - **Detect:** DB health + elevated router cache misses.
+  - **Recover:** Router runs on cached routing tables with TTL; deploy pipeline halts safely; failover Postgres (managed HA or Patroni).
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Split fleets by tier (hot/warm/cold) with dedicated GPU pools and stricter quotas.
+  - Add artifact prefetch forecasting from access logs to keep warm tier efficient.
+
+- **100x scale:**
+  - Introduce a dedicated **global scheduler** for GPU placement (beyond Kubernetes primitives) that optimizes for model co-location and interference.
+  - Move shadow diffing to privacy-preserving feature representations (token hashes / embeddings) to control log volume and sensitivity.
+
+## Operational Notes
+
+- On-call cares about three dashboards: **activation queue depth**, **GPU memory headroom**, and **per-model error/latency burn**. These predict incidents earlier than aggregate RPS.
+- Treat “model load” as a first-class SLO with budgets; cap concurrent loads per node to protect hot traffic.
+- Enforce tenant quotas at the router (QPS + concurrency) and at the cluster (GPU slices/node pools) so abuse can’t bypass a single layer.
+- Rollouts are policy-driven: promote only when shadow diff drift + error rate + tail latency gates pass for a fixed window.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+codex
+## Elegance Check
+
+### The Core Insight
+Decoupling **serving identity** (model+version) from **GPU residency** (what’s loaded) and making “model activation” a first-class, rate-limited workflow (prefetch → load/warm → cutover) is the non-obvious move that prevents load storms and keeps tail latency sane.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Edge Gateway (Envoy) | One consistent place for auth + deterministic sampling + rollout headers across all models/tenants. |
+| Model Router | Turns tiers/quotas/backpressure into enforceable behavior at request time (not just “desired state”). |
+| GPU Workers (Triton) | Proven batching/runtime semantics; avoids per-framework snowflakes. |
+| Object Store | Immutable artifacts + dedupe + integrity; clean separation of build vs serve. |
+| Metadata DB (Postgres) | Correct rollout state, auditability, and quota truth; “boring” and operable. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom “router cache with TTL” + bespoke invalidation | Postgres `LISTEN/NOTIFY` for rollout/routing changes; router keeps local in-memory snapshot | Requires careful reconnect/replay; still need cold-start fallback behavior. |
+| Separate “model-cache daemon” service + bespoke API | DaemonSet that exposes cache status via node labels/annotations + gRPC health, or reuse K8s Device Plugin/NVIDIA operator patterns | Less custom protocol, but labels are eventually consistent; need guardrails for stale metadata. |
+| Custom activation orchestration in router/controller | Temporal (or Argo Workflows) for activation steps and retries; router just awaits readiness | Adds dependency, but removes a lot of tricky retry/idempotency logic from hot path. |
+| Shadow sink + log store as a custom pipeline | Kafka/SQS + compacted topics + consumer diff workers | Adds messaging infra, but simplifies backpressure, replay, and “log store is slow” failure modes. |
+| “Global scheduler at 100x” as future work | Start earlier with K8s scheduler plugin / Kueue / Volcano for GPU placement constraints | Less bespoke, but may not model interference perfectly; still valuable before building a new scheduler. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres down for 5 minutes**
+   - Design's answer: cached routing tables with TTL; deploy pipeline halts
+   - Recommendation: Strengthen (define *which* ops must continue: quota enforcement, rollback decisions, artifact quarantine; consider “last-known-good” snapshot with explicit staleness budget and alerting)
+
+2. **Object store throttling / partial outage**
+   - Design's answer: node-local cache + admission control
+   - Recommendation: Strengthen (cache corruption/eviction policy, checksum verification on NVMe, exponential backoff + global prefetch rate limits; define behavior when cache misses persist: fail cold tier fast vs queue)
+
+3. **Network partition: router ↔ subset of GPU workers**
+   - Design's answer: not addressed
+   - Recommendation: Must fix (router should treat workers as ephemeral: circuit-break, fast health-based eviction, avoid “blackhole” routing; define in-flight request retry policy to avoid duplicate inference)
+
+4. **One component is slow (shadow sink/diff pipeline lagging)**
+   - Design's answer: async diffs keep prod latency clean
+   - Recommendation: Strengthen (explicit backpressure + sampling downgrade rules; “diff lag” should gate promotions and be visible as a rollout SLO)
+
+5. **Bad config/rollout policy pushes wrong headers or tier mapping**
+   - Design's answer: not addressed
+   - Recommendation: Must fix (config versioning + canary the control-plane configs; safe defaults in gateway/router when headers are malformed; “break glass” global rollback switch)
+
+## Recommendations
+
+### Must Fix
+- Define **partition/blackhole semantics** between router and workers (health, retries, idempotency, and fast fail vs queue per tier).
+- Make **staleness explicit** for routing/quotas when Postgres is unavailable (what is allowed to drift, for how long, and how you alert).
+- Add a clear **backpressure contract** for shadow/diff/logging (what drops first, and how that affects rollout gates).
+
+### Should Consider
+- Collapse custom orchestration into a **workflow engine** (Temporal/Argo) so activation retries, dedupe, and timeouts aren’t reinvented in the request path.
+- Use **Kafka/SQS** (or Redis Streams at smaller scale) for shadow/diff to get replay, consumer scaling, and simpler failure handling.
+- Make multi-tenancy isolation more concrete: **per-tenant concurrency limits + fair queuing** at router; define “noisy neighbor” handling within the same tier.
+
+### Nice to Have
+- Formalize a **“model load SLO”** (p95 activation time, queue depth budgets) alongside inference SLOs.
+- Add **prewarm forecasting** as a first-class feature earlier (access-log driven) to reduce cold-tier pain without scaling complexity.
+- Document “3am ops” runbooks: quarantine digest, drain a node pool, disable shadowing, clamp activations.
+
+## What's Working Well
+- The activation workflow (prefetch → warm → cutover) plus admission control is a strong, elegant answer to load storms.
+- Using Triton + KServe keeps the data plane “boring” and focuses custom effort where it matters (routing/tiering/rollout safety).
+- Deterministic edge sampling + async diffing is the right latency/privacy posture, and the retry-storm dedupe callout shows good production instincts.
+tokens used
+4,873
+## Elegance Check
+
+### The Core Insight
+Decoupling **serving identity** (model+version) from **GPU residency** (what’s loaded) and making “model activation” a first-class, rate-limited workflow (prefetch → load/warm → cutover) is the non-obvious move that prevents load storms and keeps tail latency sane.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Edge Gateway (Envoy) | One consistent place for auth + deterministic sampling + rollout headers across all models/tenants. |
+| Model Router | Turns tiers/quotas/backpressure into enforceable behavior at request time (not just “desired state”). |
+| GPU Workers (Triton) | Proven batching/runtime semantics; avoids per-framework snowflakes. |
+| Object Store | Immutable artifacts + dedupe + integrity; clean separation of build vs serve. |
+| Metadata DB (Postgres) | Correct rollout state, auditability, and quota truth; “boring” and operable. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom “router cache with TTL” + bespoke invalidation | Postgres `LISTEN/NOTIFY` for rollout/routing changes; router keeps local in-memory snapshot | Requires careful reconnect/replay; still need cold-start fallback behavior. |
+| Separate “model-cache daemon” service + bespoke API | DaemonSet that exposes cache status via node labels/annotations + gRPC health, or reuse K8s Device Plugin/NVIDIA operator patterns | Less custom protocol, but labels are eventually consistent; need guardrails for stale metadata. |
+| Custom activation orchestration in router/controller | Temporal (or Argo Workflows) for activation steps and retries; router just awaits readiness | Adds dependency, but removes a lot of tricky retry/idempotency logic from hot path. |
+| Shadow sink + log store as a custom pipeline | Kafka/SQS + compacted topics + consumer diff workers | Adds messaging infra, but simplifies backpressure, replay, and “log store is slow” failure modes. |
+| “Global scheduler at 100x” as future work | Start earlier with K8s scheduler plugin / Kueue / Volcano for GPU placement constraints | Less bespoke, but may not model interference perfectly; still valuable before building a new scheduler. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres down for 5 minutes**
+   - Design's answer: cached routing tables with TTL; deploy pipeline halts
+   - Recommendation: Strengthen (define *which* ops must continue: quota enforcement, rollback decisions, artifact quarantine; consider “last-known-good” snapshot with explicit staleness budget and alerting)
+
+2. **Object store throttling / partial outage**
+   - Design's answer: node-local cache + admission control
+   - Recommendation: Strengthen (cache corruption/eviction policy, checksum verification on NVMe, exponential backoff + global prefetch rate limits; define behavior when cache misses persist: fail cold tier fast vs queue)
+
+3. **Network partition: router ↔ subset of GPU workers**
+   - Design's answer: not addressed
+   - Recommendation: Must fix (router should treat workers as ephemeral: circuit-break, fast health-based eviction, avoid “blackhole” routing; define in-flight request retry policy to avoid duplicate inference)
+
+4. **One component is slow (shadow sink/diff pipeline lagging)**
+   - Design's answer: async diffs keep prod latency clean
+   - Recommendation: Strengthen (explicit backpressure + sampling downgrade rules; “diff lag” should gate promotions and be visible as a rollout SLO)
+
+5. **Bad config/rollout policy pushes wrong headers or tier mapping**
+   - Design's answer: not addressed
+   - Recommendation: Must fix (config versioning + canary the control-plane configs; safe defaults in gateway/router when headers are malformed; “break glass” global rollback switch)
+
+## Recommendations
+
+### Must Fix
+- Define **partition/blackhole semantics** between router and workers (health, retries, idempotency, and fast fail vs queue per tier).
+- Make **staleness explicit** for routing/quotas when Postgres is unavailable (what is allowed to drift, for how long, and how you alert).
+- Add a clear **backpressure contract** for shadow/diff/logging (what drops first, and how that affects rollout gates).
+
+### Should Consider
+- Collapse custom orchestration into a **workflow engine** (Temporal/Argo) so activation retries, dedupe, and timeouts aren’t reinvented in the request path.
+- Use **Kafka/SQS** (or Redis Streams at smaller scale) for shadow/diff to get replay, consumer scaling, and simpler failure handling.
+- Make multi-tenancy isolation more concrete: **per-tenant concurrency limits + fair queuing** at router; define “noisy neighbor” handling within the same tier.
+
+### Nice to Have
+- Formalize a **“model load SLO”** (p95 activation time, queue depth budgets) alongside inference SLOs.
+- Add **prewarm forecasting** as a first-class feature earlier (access-log driven) to reduce cold-tier pain without scaling complexity.
+- Document “3am ops” runbooks: quarantine digest, drain a node pool, disable shadowing, clamp activations.
+
+## What's Working Well
+- The activation workflow (prefetch → warm → cutover) plus admission control is a strong, elegant answer to load storms.
+- Using Triton + KServe keeps the data plane “boring” and focuses custom effort where it matters (routing/tiering/rollout safety).
+- Deterministic edge sampling + async diffing is the right latency/privacy posture, and the retry-storm dedupe callout shows good production instincts.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/model-serving-platform.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afd-3d42-7ed1-a625-a5d989ed7287
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Model Serving Platform"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["model-serving", "gpus", "scheduling", "rollouts", "multi-tenancy", "latency"]
+---
+
+## Overview
+
+This system hosts **thousands of ML models** behind a single, stable API while keeping GPU utilization high and rollouts safe. The key insight is to **separate “serving identity” (a model + version) from “GPU residency” (what’s currently loaded on a node)**. Most platforms bind these together, then pay for it in cold starts, noisy neighbors, and rollouts that are either risky or slow.
+
+The design uses a **small control plane** (metadata, rollout orchestration, quota) and a **boring, reliable data plane** (Envoy → model routers → Triton-based workers). GPUs are treated as a scarce cluster resource with explicit **SLO tiers** and **admission control**, not as an autoscaling afterthought.
+
+The result: safe shadow deployments, predictable scheduling under contention, and cold starts that don’t trigger a “load storm” that takes down the fleet.
+
+## What Makes This Hard
+
+Naive implementations get trapped by three coupled problems:
+
+1. **Cold starts are nonlinear.** Loading weights, building CUDA kernels, and warming caches creates bursty GPU/CPU/IO demand. Under load, the platform thrashes: requests queue up, more replicas spawn, and everything gets slower.
+2. **GPU scheduling is multi-dimensional.** It’s not just “a GPU”; it’s memory, compute, model size, batch shape, and interference. Bin-packing without guardrails produces noisy neighbors and tail-latency spikes.
+3. **Shadow deployments are easy to route but hard to trust.** You need deterministic sampling, feature parity, and output comparison at scale without polluting prod latency or exposing sensitive payloads.
+
+## Requirements
+
+### Functional Requirements
+- Host **10k+ models** with versioning, provenance, and controlled rollout.
+- Support **real-time inference** (sync) and **batch/async inference** (queued).
+- Provide **shadow deployments** (full request mirroring, zero user impact) and **canary** (partial user impact with rollback).
+- Enforce **multi-tenant quotas** (GPU, CPU, memory, QPS) and isolation boundaries.
+- Collect **model-level telemetry** (latency, GPU memory, OOMs, error rates) and produce rollback signals.
+
+### Scale Targets
+- **Models:** 10,000 total; **500 active/day**; **50 hot concurrently** (typical long-tail).
+- **Traffic:** 20k RPS peak platform-wide; hot models 2k RPS each; long-tail ≤1 RPS.
+- **Latency SLOs:** p95 < 150ms for “hot tier”; p95 < 400ms for “warm tier”; “cold tier” allows first-hit up to 2–5s.
+- **Rollouts:** up to 200 deployments/day; shadow for 30 minutes with statistical confidence gates.
+- **GPU fleet:** 200–2,000 GPUs with mixed SKUs; target **>70% utilization** on hot tier while meeting p95.
+
+Why these numbers matter: long-tail + strict tail latency creates the classic conflict—keeping everything warm is too expensive, but loading on demand melts the fleet without orchestration.
+
+## Key Design Decisions
+
+- **We chose:** Triton Inference Server as the primary runtime, managed by Kubernetes + KServe APIs.
+  - **Rejected:** a custom per-framework server fleet.
+  - **Why:** Triton gives proven batching, multiple backends, and stable operational semantics; KServe gives a standard CRD surface and rollout hooks.
+
+- **We chose:** Explicit SLO tiers with admission control (Hot/Warm/Cold) plus a warm-pool of “empty” GPU workers.
+  - **Rejected:** pure HPA/autoscaling based on latency.
+  - **Why:** scaling reacts too late for model load time; admission control prevents load storms and preserves tail latency for paid tiers.
+
+- **We chose:** Deterministic shadowing at the edge (request hash sampling) + async diff pipeline.
+  - **Rejected:** in-worker mirroring and synchronous comparisons.
+  - **Why:** edge mirroring is uniform and observable; async diffs keep prod latency clean and avoids coupling to model runtime behavior.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Clients] --> G[Edge Gateway]
+  G --> R[Model Router]
+  R --> W[GPU Workers]
+  W --> S[(Object Store)]
+  R --> M[(Metadata DB)]
+  G --> Q[Shadow Sink]
+  Q --> L[(Log Store)]
+  P[Rollout Controller] --> R
+  P --> M
+```
+
+### Components
+
+- **Edge Gateway (Envoy):** AuthN/Z, request normalization, deterministic sampling for shadow/canary, and routing headers. Earns its place because rollout safety and shadowing must be consistent across all models.
+- **Model Router:** Low-latency lookup from (model, version, tenant, tier) → worker pool, with backpressure and queueing policy. This is where SLO tiers become enforceable behavior.
+- **GPU Workers (Triton):** Long-lived processes that dynamically load/unload models. They expose uniform gRPC/HTTP inference and export GPU telemetry.
+- **Object Store (S3/GCS/MinIO):** Source of truth for model artifacts (weights, tokenizer, config), stored content-addressed for deduplication and integrity.
+- **Metadata DB (Postgres):** Model registry metadata, rollout state machines, quotas, audit trail. Postgres is the right “boring” choice for correctness and operability.
+- **Rollout Controller:** Orchestrates canary/shadow, promotes versions, triggers warmups, and enforces policy gates (error/latency/diff drift).
+- **Shadow Sink + Log Store:** Accepts mirrored requests (payloads or hashed features), stores outputs and metadata for offline diffing and dashboards.
+
+## Deep Dive: Cold Starts Without Melting the Fleet
+
+The hard part is not “loading a model”; it’s preventing **synchronized loading** across replicas and nodes while traffic is already waiting. The platform solves this with three mechanisms that work together:
+
+1. **Content-addressed artifacts + node-local cache**
+   - Every model version resolves to immutable artifact digests (e.g., `sha256:...`).
+   - GPU nodes run a small **model-cache daemon** that downloads artifacts to local NVMe and exposes “present/not present” to the scheduler.
+   - This turns “load model” from “hit S3 under duress” into “read local disk” for steady-state and makes prefetch predictable.
+
+2. **Warm pool of GPU workers + two-phase activation**
+   - Keep a small number of **idle Triton workers** per GPU SKU (hot spare capacity).
+   - When a model needs to serve, the router requests activation:
+     1) **Prefetch** artifacts to node cache (IO phase).
+     2) **Load + warm** in Triton (GPU/CPU phase) with concurrency limits per node.
+   - Only after warmup does the router shift traffic. This prevents user traffic from being the warmup driver.
+
+3. **Admission control with per-tier guarantees**
+   - The router enforces a maximum number of concurrent model activations per cluster and per node (e.g., “2 loads/GPU node at once”).
+   - Cold-tier requests queue (with explicit timeouts) rather than triggering replica explosion.
+   - Hot-tier capacity is protected via reserved GPU slices (MIG partitions or dedicated node pools), so cold starts cannot steal the GPUs needed for tail latency.
+
+Non-obvious edge case: **cold-start storms from retries.** The gateway tags retries with an idempotency key; the router deduplicates activations per (model, version) and returns queued promises instead of initiating multiple loads. This single change eliminates a common “thundering herd” failure mode.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Tail latency for hot traffic | Always-warm for long tail |
+| High GPU utilization with guardrails | Maximum simplicity (more policy) |
+| Safe rollouts with trustworthy shadowing | Some extra infra for diffing/logging |
+
+## Failure Modes
+
+- **GPU OOM / bad model version**
+  - **What happens:** Triton worker crashes or ejects model; p95 spikes; errors rise.
+  - **Detect:** GPU memory telemetry + error-rate SLO burn + crashloop alerts per model version.
+  - **Recover:** Automatic rollback to last-good version; quarantine the artifact digest; block promotion until manual override.
+
+- **Cold-start load storm**
+  - **What happens:** Many models activated concurrently; S3 and CPU saturate; hot traffic degrades.
+  - **Detect:** Spike in activation queue depth, node cache misses, and artifact download bandwidth.
+  - **Recover:** Admission controller clamps activations; router de-prioritizes cold tier; rollout controller pauses new deploys; prefetch runs at controlled rate.
+
+- **Metadata/registry outage (Postgres)**
+  - **What happens:** New deployments and policy changes stall; routing must continue.
+  - **Detect:** DB health + elevated router cache misses.
+  - **Recover:** Router runs on cached routing tables with TTL; deploy pipeline halts safely; failover Postgres (managed HA or Patroni).
+
+## What I'd Do Differently At...
+
+- **10x scale:**
+  - Split fleets by tier (hot/warm/cold) with dedicated GPU pools and stricter quotas.
+  - Add artifact prefetch forecasting from access logs to keep warm tier efficient.
+
+- **100x scale:**
+  - Introduce a dedicated **global scheduler** for GPU placement (beyond Kubernetes primitives) that optimizes for model co-location and interference.
+  - Move shadow diffing to privacy-preserving feature representations (token hashes / embeddings) to control log volume and sensitivity.
+
+## Operational Notes
+
+- On-call cares about three dashboards: **activation queue depth**, **GPU memory headroom**, and **per-model error/latency burn**. These predict incidents earlier than aggregate RPS.
+- Treat “model load” as a first-class SLO with budgets; cap concurrent loads per node to protect hot traffic.
+- Enforce tenant quotas at the router (QPS + concurrency) and at the cluster (GPU slices/node pools) so abuse can’t bypass a single layer.
+- Rollouts are policy-driven: promote only when shadow diff drift + error rate + tail latency gates pass for a fixed window.
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Decoupling **serving identity** (model+version) from **GPU residency** (what’s loaded) and making “model activation” a first-class, rate-limited workflow (prefetch → load/warm → cutover) is the non-obvious move that prevents load storms and keeps tail latency sane.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|---------------------|
+| Edge Gateway (Envoy) | One consistent place for auth + deterministic sampling + rollout headers across all models/tenants. |
+| Model Router | Turns tiers/quotas/backpressure into enforceable behavior at request time (not just “desired state”). |
+| GPU Workers (Triton) | Proven batching/runtime semantics; avoids per-framework snowflakes. |
+| Object Store | Immutable artifacts + dedupe + integrity; clean separation of build vs serve. |
+| Metadata DB (Postgres) | Correct rollout state, auditability, and quota truth; “boring” and operable. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom “router cache with TTL” + bespoke invalidation | Postgres `LISTEN/NOTIFY` for rollout/routing changes; router keeps local in-memory snapshot | Requires careful reconnect/replay; still need cold-start fallback behavior. |
+| Separate “model-cache daemon” service + bespoke API | DaemonSet that exposes cache status via node labels/annotations + gRPC health, or reuse K8s Device Plugin/NVIDIA operator patterns | Less custom protocol, but labels are eventually consistent; need guardrails for stale metadata. |
+| Custom activation orchestration in router/controller | Temporal (or Argo Workflows) for activation steps and retries; router just awaits readiness | Adds dependency, but removes a lot of tricky retry/idempotency logic from hot path. |
+| Shadow sink + log store as a custom pipeline | Kafka/SQS + compacted topics + consumer diff workers | Adds messaging infra, but simplifies backpressure, replay, and “log store is slow” failure modes. |
+| “Global scheduler at 100x” as future work | Start earlier with K8s scheduler plugin / Kueue / Volcano for GPU placement constraints | Less bespoke, but may not model interference perfectly; still valuable before building a new scheduler. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Postgres down for 5 minutes**
+   - Design's answer: cached routing tables with TTL; deploy pipeline halts
+   - Recommendation: Strengthen (define *which* ops must continue: quota enforcement, rollback decisions, artifact quarantine; consider “last-known-good” snapshot with explicit staleness budget and alerting)
+
+2. **Object store throttling / partial outage**
+   - Design's answer: node-local cache + admission control
+   - Recommendation: Strengthen (cache corruption/eviction policy, checksum verification on NVMe, exponential backoff + global prefetch rate limits; define behavior when cache misses persist: fail cold tier fast vs queue)
+
+3. **Network partition: router ↔ subset of GPU workers**
+   - Design's answer: not addressed
+   - Recommendation: Must fix (router should treat workers as ephemeral: circuit-break, fast health-based eviction, avoid “blackhole” routing; define in-flight request retry policy to avoid duplicate inference)
+
+4. **One component is slow (shadow sink/diff pipeline lagging)**
+   - Design's answer: async diffs keep prod latency clean
+   - Recommendation: Strengthen (explicit backpressure + sampling downgrade rules; “diff lag” should gate promotions and be visible as a rollout SLO)
+
+5. **Bad config/rollout policy pushes wrong headers or tier mapping**
+   - Design's answer: not addressed
+   - Recommendation: Must fix (config versioning + canary the control-plane configs; safe defaults in gateway/router when headers are malformed; “break glass” global rollback switch)
+
+## Recommendations
+
+### Must Fix
+- Define **partition/blackhole semantics** between router and workers (health, retries, idempotency, and fast fail vs queue per tier).
+- Make **staleness explicit** for routing/quotas when Postgres is unavailable (what is allowed to drift, for how long, and how you alert).
+- Add a clear **backpressure contract** for shadow/diff/logging (what drops first, and how that affects rollout gates).
+
+### Should Consider
+- Collapse custom orchestration into a **workflow engine** (Temporal/Argo) so activation retries, dedupe, and timeouts aren’t reinvented in the request path.
+- Use **Kafka/SQS** (or Redis Streams at smaller scale) for shadow/diff to get replay, consumer scaling, and simpler failure handling.
+- Make multi-tenancy isolation more concrete: **per-tenant concurrency limits + fair queuing** at router; define “noisy neighbor” handling within the same tier.
+
+### Nice to Have
+- Formalize a **“model load SLO”** (p95 activation time, queue depth budgets) alongside inference SLOs.
+- Add **prewarm forecasting** as a first-class feature earlier (access-log driven) to reduce cold-tier pain without scaling complexity.
+- Document “3am ops” runbooks: quarantine digest, drain a node pool, disable shadowing, clamp activations.
+
+## What's Working Well
+- The activation workflow (prefetch → warm → cutover) plus admission control is a strong, elegant answer to load storms.
+- Using Triton + KServe keeps the data plane “boring” and focuses custom effort where it matters (routing/tiering/rollout safety).
+- Deterministic edge sampling + async diffing is the right latency/privacy posture, and the retry-storm dedupe callout shows good production instincts.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+thinking
+**Clarifying section additions**
+
+I'm trying to understand how "do not add sections" applies to the document. Maybe it means not to add more than necessary? It seems like I can repurpose existing headings instead. For example, I could summarize the architecture under "Overview" and trim "Requirements."  
+
+I think I can create a "What We Removed" subsection under "Key Design Decisions" or add a bullet list under "Architecture." Using bold labels might keep it aligned with the guideline of not adding new sections, while ensuring it's explicit. I also want to incorporate simplifications from critiques.
+thinking
+**Refining component usage**
+
+I’ve been thinking about how I can streamline the existing components. It seems that the DaemonSet isn't a new addition, but rather a simplified model-cache. I might consider removing the separate model-cache daemon entirely. Instead, I could have workers cache artifacts on a node-local disk without needing the router to check cache status.  
+
+Also, I wonder if I can drop the Shadow Sink while merging its functionality with the Log Store. Keeping the object store, metadata db, gateway, router, GPU workers, and log store might work, but I’m unsure about the shadow pipeline since it’s tied to shadow deployments and telemetry for rollback.
+thinking
+**Simplifying shadow deployment**
+
+I'm considering how to simplify the shadow setup by focusing on deterministic sampling and storing only metadata and outputs from the canary or shadow version. To avoid adding new components, I could eliminate full payload mirroring and instead route some traffic to the shadow version asynchronously. However, this needs to ensure zero user impact.  
+
+Now, regarding the rollout controller, merging it into the metadata db and router might streamline things. Perhaps tracking deployments by changing the DB and using LISTEN/NOTIFY could make the process efficient as the router reacts accordingly.
+thinking
+**Streamlining components and rollouts**
+
+I'm considering how to merge the rollout controller into the router and CI/CD processes. Implementing rollouts of about 200 per day seems acceptable. I’ll keep three custom components: the gateway (managed like API Gateway but with Envoy), the router, and the worker.  
+
+For failure scenarios, if Postgres goes down, we should rely on the last-known snapshot for the router and allow inference to continue with cached quotas in "stale" mode. I need to document this clearly while possibly removing mentions of KServe APIs to reduce complexity.
+thinking
+**Assessing component simplifications**
+
+I think I might keep K8s and Triton while potentially dropping KServe and simplifying the SLO tiers to just Hot and Cold. I know the SLO tiers are crucial for preventing overloads, but I wonder if simplifying to two tiers would be enough.  
+
+I could map the warm tier into hot with different quotas or treat warm as cold with faster timeouts. For admission control, I’ll keep it simple with a concurrency limit. I can also use Postgres as a queue for async processing, reducing the need for new components. Finally, I'll ensure the final markdown document is clear and adheres to the original structure while addressing simplifications.
+exec
+/bin/zsh -lc ls in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 61ms:
+challenges
+drafts
+drafts-v2
+frontend
+grades
+logs
+problems.yaml
+prompts
+reviewed
+scripts
+solutions
+solutions-v2
+
+thinking
+**Searching for files**
+
+I need to find a file for the "Model Serving Platform." I'll use the `rg` command, which should help me locate it quickly. It's great for searching, but I want to make sure I'm entering the command correctly. I wonder if there are any specific parameters I should consider to narrow down the search results. Okay, let's go ahead and execute that command and see what I can find!
+exec
+/bin/zsh -lc "rg -n \"title: \\\"Model Serving Platform\\\"\" -S ." in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 85ms:
+./grades/model-serving-platform.log:52:title: "Model Serving Platform"
+./drafts/model-serving-platform.md:2:title: "Model Serving Platform"
+./logs/model-serving-platform.log:259:title: "Model Serving Platform"
+./logs/model-serving-platform.log:607:title: "Model Serving Platform"
+./logs/model-serving-platform.log:1036:title: "Model Serving Platform"
+./logs/model-serving-platform.log:1403:title: "Model Serving Platform"
+./logs/model-serving-platform.log:2034:title: "Model Serving Platform"
+./logs/model-serving-platform.log:2757:title: "Model Serving Platform"
+./logs/model-serving-platform.log:3421:title: "Model Serving Platform"
+./logs/model-serving-platform.log:3761:title: "Model Serving Platform"
+./problems.yaml:405:    title: "Model Serving Platform"
+./solutions/07-ai-ml-infrastructure/model-serving-platform.md:2:title: "Model Serving Platform"
+./drafts-v2/model-serving-platform.md:3:title: "Model Serving Platform"
+./logs/v2/model-serving-platform.log:171:title: "Model Serving Platform"
+./logs/v2/model-serving-platform.log:319:title: "Model Serving Platform"
+./logs/v2/model-serving-platform.log:588:title: "Model Serving Platform"
+./logs/v2/model-serving-platform.log:986:title: "Model Serving Platform"
+./reviewed/model-serving-platform.md:2:title: "Model Serving Platform"
+
+thinking
+**Evaluating document updates**
+
+It seems like I need to determine whether to update `reviewed/model-serving-platform.md` or something from `solutions-v2...`. The user is asking for an output document, which could suggest they want to simplify the design currently in `drafts-v2`. I'll need to check the AGENTS instructions to clarify their expectations. I should also find out if AGENTS are present in the repository. Let's dive into that!
+exec
+/bin/zsh -lc 'find .. -name AGENTS.md -print' in /Users/dominikdabrowski/pr/system-design-atlas exited 124 in 10.01s:
+
+
+thinking
+I’m noticing that a command timed out, and I think it might be due to a large tree structure. Increasing the timeout sounds like a good plan to tackle this. I guess it’s just a matter of adjusting the settings to give the command more time to complete. That should help avoid these frustrating interruptions in the future. I'm curious if there are other settings I should consider while I'm at it!
+exec
+/bin/zsh -lc 'find /Users/dominikdabrowski/pr/system-design-atlas -name AGENTS.md -print' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 421ms:
+
+exec
+/bin/zsh -lc "sed -n '1,40p' solutions/07-ai-ml-infrastructure/model-serving-platform.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 44ms:
+---
+title: "Model Serving Platform"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["model-serving", "gpu-scheduling", "mlops", "kubernetes", "canary-shadow"]
+---
+
+## Overview
+
+This platform serves **thousands of heterogeneous ML models** (CPU, single-GPU, and multi-GPU LLMs) with strict tail-latency SLOs, predictable GPU cost, and safe rollout mechanisms (canary, blue/green, shadow). The design keeps the request path fast and resilient by separating:
+
+- A **control plane** that stores model/deployment intent and reconciles it onto Kubernetes.
+- A **data plane** that performs authentication, traffic policy enforcement, and low-latency routing from a **locally cached** view of control-plane state.
+
+Cold starts are handled explicitly with **warm minimums**, **node-local artifact caching**, and **load-budgeted rollouts** to prevent IO storms and tail-latency collapses during deployments.
+
+---
+
+## Requirements
+
+exec
+/bin/zsh -lc "sed -n '1,220p' drafts-v2/model-serving-platform.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 42ms:
+```markdown
+---
+title: "Model Serving Platform"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["model-serving", "gpus", "scheduling", "rollouts", "multi-tenancy", "latency"]
+---
+
+## Overview
+
+This system hosts **thousands of ML models** behind a single, stable API while keeping GPU utilization high and rollouts safe. The key insight is to **separate “serving identity” (a model + version) from “GPU residency” (what’s currently loaded on a node)**. Most platforms bind these together, then pay for it in cold starts, noisy neighbors, and rollouts that are either risky or slow.
+
+The design uses a **small control plane** (metadata, rollout orchestration, quota) and a **boring, reliable data plane** (Envoy → model routers → Triton-based workers). GPUs are treated as a scarce cluster resource with explicit **SLO tiers** and **admission control**, not as an autoscaling afterthought.
+
+The result: safe shadow deployments, predictable scheduling under contention, and cold starts that don’t trigger a “load storm” that takes down the fleet.
+
+## What Makes This Hard
+
+Naive implementations get trapped by three coupled problems:
+
+exec
+/bin/zsh -lc "sed -n '1,220p' reviewed/model-serving-platform.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 44ms:
+---
+title: "Model Serving Platform"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["model-serving", "gpu-scheduling", "mlops", "kubernetes", "canary-shadow"]
+---
+
+## Overview
+
+A model serving platform reliably hosts **thousands of heterogeneous ML models** (CPU classifiers, GPU embedding models, and multi-GPU LLMs) while meeting strict **tail-latency SLOs**, controlling **GPU cost**, and enabling **safe rollouts** (canary, blue/green, shadow). “Inference” is not a single workload: models vary dramatically in **memory footprint**, **load time**, **batching characteristics**, **hardware constraints** (GPU type/MIG), and **runtime dependencies**—so naive scheduling and autoscaling can waste GPUs or trigger cascading latency failures.
+
+This design separates the system into:
+
+- A **strongly consistent control plane**: model registry metadata, deployment intent, traffic policy, authZ, quotas, and rollout state.
+- A **high-performance data plane**: routing, load shedding, batching, and execution, operating from a cached view of control-plane state.
+
+Cold starts are treated as first-class: we reduce them via **prewarmed capacity**, **node-local artifact caches**, and **load-budgeted rollouts** (controlling concurrent loads per node/GPU) instead of hoping autoscaling hides them.
+
+---
+
+
+thinking
+**Updating design files**
+
+I need to update the relevant files to include the appropriate tags. It looks like I should focus on `drafts/model-serving-platform.md`, `drafts-v2/model-serving-platform.md`, and possibly `solutions/07...`. First, I'll check the top of `drafts/model-serving-platform.md` to see what's already there and what changes are needed. Making sure everything is correctly documented is important. Let’s ensure we’re on the right track!
+exec
+/bin/zsh -lc "sed -n '1,40p' drafts/model-serving-platform.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 44ms:
+---
+title: "Model Serving Platform"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["model-serving", "gpu-scheduling", "mlops", "kubernetes", "canary-shadow"]
+---
+
+## Overview
+
+A model serving platform must reliably host thousands of heterogeneous ML models (tiny CPU classifiers through multi‑GPU LLMs) while meeting strict tail-latency SLOs, controlling cost, and enabling safe rollout patterns (canary, blue/green, shadow). The hard part is that “inference” is not a single workload: models differ wildly in memory footprint, load time, batching behavior, hardware constraints (GPU type/MIG), and runtime dependencies—so naive scheduling and autoscaling either waste GPUs or cause cascading latency failures.
+
+The key insight is to split the system into a **strongly consistent control plane** (model metadata, deployment intent, traffic policy) and a **high-performance data plane** (routing, batching, execution) with explicit mechanisms for **GPU-aware scheduling**, **warm capacity**, and **artifact locality**. Cold starts are treated as a first-class product surface: we reduce them via prewarmed pools, node-level artifact caches, and “load-budgeted” rollout controllers rather than hoping autoscaling hides the problem.
+
+## Requirements
+
+### Functional Requirements
+- Register and version models (artifacts + metadata), with immutable versions and provenance.
+- Create and manage deployments (replicas, resource requirements, runtime, env, secrets).
+- Route inference traffic to endpoints with weighted splits (A/B, canary) and **shadow** duplication.
+- GPU-aware scheduling: place replicas on compatible accelerators (type, memory, MIG) with quotas and priorities.
+exec
+/bin/zsh -lc "sed -n '1,60p' solutions/07-ai-ml-infrastructure/model-serving-platform.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 51ms:
+---
+title: "Model Serving Platform"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["model-serving", "gpu-scheduling", "mlops", "kubernetes", "canary-shadow"]
+---
+
+## Overview
+
+This platform serves **thousands of heterogeneous ML models** (CPU, single-GPU, and multi-GPU LLMs) with strict tail-latency SLOs, predictable GPU cost, and safe rollout mechanisms (canary, blue/green, shadow). The design keeps the request path fast and resilient by separating:
+
+- A **control plane** that stores model/deployment intent and reconciles it onto Kubernetes.
+- A **data plane** that performs authentication, traffic policy enforcement, and low-latency routing from a **locally cached** view of control-plane state.
+
+Cold starts are handled explicitly with **warm minimums**, **node-local artifact caching**, and **load-budgeted rollouts** to prevent IO storms and tail-latency collapses during deployments.
+
+---
+
+## Requirements
+
+
+thinking
+**Searching for design solutions**
+
+I’m looking at the solutions file, and it seems complex with tags that differ. The original prompt design is in drafts-v2 within a code block, and there are logs too. It feels like the user probably wants a simplified design for a "reviewed" version of v2. I think there’s a directory called `solutions-v2` that's relevant, so I'll search for the file that matches the tags in the prompt.
+exec
+/bin/zsh -lc "rg -n \"tags: \\[\\\"model-serving\\\", \\\"gpus\\\"\" -S ." in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 97ms:
+./logs/v2/model-serving-platform.log:174:tags: ["model-serving", "gpus", "scheduling", "rollouts", "multi-tenancy", "latency"]
+./logs/v2/model-serving-platform.log:322:tags: ["model-serving", "gpus", "scheduling", "rollouts", "multi-tenancy", "latency"]
+./logs/v2/model-serving-platform.log:591:tags: ["model-serving", "gpus", "scheduling", "rollouts", "multi-tenancy", "latency"]
+./logs/v2/model-serving-platform.log:989:tags: ["model-serving", "gpus", "scheduling", "rollouts", "multi-tenancy", "latency"]
+./logs/v2/model-serving-platform.log:1335:tags: ["model-serving", "gpus", "scheduling", "rollouts", "multi-tenancy", "latency"]
+./logs/v2/real-time-ad-serving.log:320:tags: ["model-serving", "gpus", "scheduling", "rollouts", "multi-tenancy", "latency"]
+./drafts-v2/model-serving-platform.md:6:tags: ["model-serving", "gpus", "scheduling", "rollouts", "multi-tenancy", "latency"]
+
+thinking
+I’m noticing that only drafts-v2 has those tags. It seems logical to think there should be a corresponding solution in solutions-v2 with the same tags. I wonder what I’ll find if I search in solutions-v2. It’s interesting that sometimes different versions of things might need to align better. I’m curious to see if there's been a mismatch or if they’ve kept everything consistent. Let’s see what happens with this search!
+exec
+/bin/zsh -lc 'ls solutions-v2' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 44ms:
+01-foundational-infrastructure
+02-storage-data-platforms
+03-observability-reliability
+04-realtime-media
+05-social-discovery
+06-commerce-fintech
+07-ai-ml-infrastructure
+08-security-access-control
+09-iot-edge
+10-strategic-problems
+exec
+/bin/zsh -lc 'ls solutions-v2/07-ai-ml-infrastructure' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 53ms:
+embedding-pipeline.md
+llm-inference-gateway.md
+exec
+/bin/zsh -lc 'ls drafts-v2 | head' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 48ms:
+alerting-incident-routing.md
+api-gateway.md
+attribution-measurement-system.md
+audit-trail-system.md
+authorization-service-zanzibar.md
+calendar-scheduling-system.md
+capacity-planning-autoscaling.md
+centralized-logging-platform.md
+certificate-authority-pki.md
+change-data-capture-platform.md
+
+thinking
+**Inspecting solutions design**
+
+I realize there are many solutions available, and it seems like solutions-v2 might be a subset of those. It's possible that the v2 solutions are still incomplete. However, I think the user likely wants a simplified design for the specific issue at hand. So, I'll need to take a closer look at the document `solutions-v2/07-ai-ml-infrastructure/llm-inference-gateway.md` to ensure I'm following the expected format.
+exec
+/bin/zsh -lc "sed -n '1,80p' solutions-v2/07-ai-ml-infrastructure/llm-inference-gateway.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 50ms:
+```markdown
+---
+title: "LLM Inference Gateway"
+category: "AI/ML Infrastructure"
+difficulty: "Advanced"
+tags: ["llm", "gateway", "streaming", "caching", "quotas", "moderation", "observability"]
+---
+
+## Overview
+
+This system is a single gateway service that sits between clients and one or more LLM providers. It provides one stable API, streams tokens to clients, enforces hard spend caps, and blocks unsafe content. It treats tokens as the unit of admission control using a strict `reserve → stream → settle` lifecycle so streaming remains fast while budgets remain enforceable.
+
+State is split by what it needs to be:
+- Redis enforces fast, atomic admission control and idempotency.
+- Postgres stores durable configuration and the immutable billing/audit ledger.
+
+## Requirements
+
+### Functional Requirements
+- Normalize a single API surface (chat/completions + tool calls) over multiple providers.
+
+
+
+
+thinking
+**Simplifying architecture details**
+
+I want to clarify that I’m not creating a new section. Under Architecture, I should add a label "What We Removed." I’ll focus on honest trade-offs in the Trade-offs section while simplifying the design. I think mentioning KServe can be omitted, along with the warm tier, but I need to remember the need for high GPU utilization and safe rollouts. Key components would be K8s, Envoy, Router service, Triton workers, S3, Postgres, and Log store. I'll merge rollout controller into the router and handle local disk caching with workers.
+thinking
+**Exploring async inference implementation**
+
+I need to address the requirement for batch/async inference. I’m considering implementing this with a Postgres table used as a queue, managed by worker threads in the router. However, this might be seen as adding a new module. The user mentioned no new components can be added, but adding features to existing ones is acceptable. I’ll outline async inference by having the router write requests into Postgres, returning job IDs for GPU workers. This approach adds logic but still uses existing components, though it does introduce network complexity. I could consider simplifying the requirements, but it seems necessary to keep them. Additionally, incorporating “LISTEN/NOTIFY” from the critique means using Postgres to monitor changes, avoiding complex cache invalidation.
+thinking
+**Incorporating blackhole semantics**
+
+I need to add blackhole semantics to the router, implementing active health checks and circuit-breakers for workers. If there's a partition, I should fail fast instead of queuing forever for the hot tier, returning a 503 status quickly and relying on retries with idempotency. I also want to consider explicit staleness; the router can serve cached quotas based on the last-known routing snapshot if Postgres is down for up to X minutes. Beyond that, it should switch to safe mode by only allowing the hot tier on preloaded models. 
+
+For shadow systems, if the log store lags, I plan to degrade sampling to zero and block promotions, which helps handle failure scenarios. Config versioning is also key — I want to store configurations in Postgres and update the gateway/router with the config version in memory via NOTIFY, enabling rollback by writing the previous version. With a simplification budget, it looks like I can stick to two custom components while still retaining the Envoy config.
+thinking
+**Finalizing design for documentation**
+
+I’m considering the custom components for the design. It seems the router, which includes the rollout engine, might be the only custom component since I can use Envoy and Triton off the shelf for the GPU workers. That simplifies things. I need to output a simplified design in a document titled `solutions-v2/07-ai-ml-infrastructure/model-serving-platform.md`. I’ll format it in markdown, wrapping the content with ```. I should also check the end of the `llm-inference-gateway` file to ensure I'm following the documentation standards.
+exec
+/bin/zsh -lc 'tail -n 5 solutions-v2/07-ai-ml-infrastructure/llm-inference-gateway.md' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 55ms:
+- Separate **Provider Adapter** service (provider translation is a gateway module).
+- Dedicated **Event Log** pipeline/component (billing/audit is a single Postgres ledger write at settlement).
+- In-flight **request coalescing/fan-out** (keeps retry and streaming semantics simple and deterministic).
+- Scale-future split plans (single Redis is the default until it demonstrably cannot carry the workload).
+```
+
+thinking
+**Exploring solutions for documentation**
+
+I'm thinking about opening another solution-v2 document to find examples of the "What We Removed" section they include at the end. It seems like in the `llm-inference-gateway` there’s a "What We Removed" label under the Operational Notes. They actually added a bullet list near the end, so I’ll need to look there too. I wonder if this will help clarify things I'm working on.
+exec
+/bin/zsh -lc 'rg -n "What We Removed" -S solutions-v2/07-ai-ml-infrastructure/llm-inference-gateway.md' in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 87ms:
+166:## What We Removed
+
+
+
+
+
+thinking
+**Evaluating document structure**
+
+I think it’s best to keep all original headings but add minimal architecture details using bold labels within those sections. However, the user requested a rewrite with four specific elements, which doesn’t necessarily require new headings; I can incorporate them into paragraphs. The user wants a simplified design as the main focus and asks for "What We Removed" to be added to the end of Key Design Decisions in a bullet list. I’ll ensure there are no new section headings.
+thinking
+**Navigating section adjustments**
+
+I’m considering how to handle the "What We Removed" label in this assistant response. It seems I need to balance user expectations with the explicit format rules. If they expect a "## What We Removed" header, I might run into problems. While the repository includes that section, the user strictly emphasizes not adding sections. I could keep the original section list but append a minimal "## What We Removed" at the end, while renaming "## Architecture" to "## Minimal Architecture." This seems like a reasonable compromise.
+thinking
+**Revising design sections**
+
+I’m thinking of incorporating "What We Removed" as the last subsection under "## Key Design Decisions" and label it as "### What We Removed." While that's technically a new subsection, it seems like a necessary addition. The original design includes "## Trade-offs," so I don’t need to worry about adding anything else. I can rename "## Architecture" to "## Minimal Architecture," which feels like a modification rather than an addition. I might consider cutting "What I'd Do Differently At..." for simplicity, especially since the user didn’t request it. I’ll go ahead and remove it.
+thinking
+**Simplifying architecture design**
+
+I'm planning to cut the detailed failure modes and operational notes but still want to address failure scenarios more concisely. I’ll keep the focus on failure modes without going into too much detail. I'll also incorporate the "startup test," which only applies to a few services, while making sure not to add components like a workflow engine or Kafka. In my simplified architecture, I'll outline:
+
+- Clients -> Edge Gateway (Envoy) -> Model Router (single service) -> GPU Workers (Triton)
+- GPU Workers -> Object store for artifacts
+- Model Router -> Postgres metadata DB
+- Edge Gateway / Router -> Log Store
+
+I won't include a Rollout Controller or Shadow Sink but will implement rollout safety with a DB-driven state in the router. The Model Router will be the only custom component, handling the rollout state machine and orchestration, ensuring less separation for a small team.
+thinking
+**Condensing requirements**
+
+In reviewing the requirements, I think I can condense the original while keeping the scale targets intact. The requirement specifies three tiers, so I’ll implement them simply using two classes: Reserved and Best-effort. I’ll maintain the Hot/Warm/Cold distinctions but treat Warm as a limited policy in the router. 
+
+For the deep dive into cold start, I’ll streamline the mechanisms to two: a node-local cache and an activation workflow managed by a single semaphore with limits. I’ll note potential failure scenarios to address in the Failure Modes section. The changes suggested include using Postgres LISTEN/NOTIFY, avoiding a custom cache daemon, and simplifying the shadow logging, ensuring we maintain best-effort sampling during any lag. 
+
+I’ll create a new document for this simplified design with the original structure while removing unnecessary sections. The front matter, including title and tags, will stay precisely as prompted. Finally, I’ll wrap the file in a code block and ensure to include the appropriate mermaid diagram. I might consider updating `problems.yaml`, but I’ll focus on creating the new file first.
+file update
+A /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/07-ai-ml-infrastructure/model-serving-platform.md
+```markdown
+---
+title: "Model Serving Platform"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["model-serving", "gpus", "scheduling", "rollouts", "multi-tenancy", "latency"]
+---
+
+## Overview
+
+This platform serves **thousands of ML models** behind one stable API while keeping GPUs busy and rollouts safe. The only trick is treating **model activation** (fetch → load/warm → serve) as a rate-limited workflow, separate from the client-facing model identity (model + version).
+
+## What Makes This Hard
+
+1. **Cold starts aren’t linear.** Load/warm burns GPU/CPU/IO and can collapse the fleet if many models activate together.
+2. **GPUs are a shared bottleneck.** Without strict backpressure, “scale up” becomes “load storm + tail latency.”
+3. **Safe rollouts need consistent routing.** Canary/shadow must be deterministic and must not add latency to primary traffic.
+
+## Requirements
+
+### Functional Requirements
+- Host **10k+ models** with versioning, provenance, and controlled rollout.
+- Support **real-time inference** (sync) and **batch/async inference** (queued).
+- Provide **shadow deployments** (zero user impact) and **canary** (partial user impact with rollback).
+- Enforce **multi-tenant quotas** (GPU, CPU, memory, QPS) and isolation boundaries.
+- Collect **model-level telemetry** (latency, GPU memory, OOMs, error rates) and produce rollback signals.
+
+### Scale Targets
+- **Models:** 10,000 total; **500 active/day**; **50 hot concurrently**.
+- **Traffic:** 20k RPS peak platform-wide; hot models 2k RPS each; long-tail ≤1 RPS.
+- **Latency SLOs:** p95 < 150ms (“hot”); p95 < 400ms (“warm”); “cold” first-hit 2–5s.
+- **Rollouts:** up to 200 deployments/day; shadow for 30 minutes with confidence gates.
+- **GPU fleet:** 200–2,000 GPUs with mixed SKUs; target **>70% utilization** on hot tier.
+
+## Key Design Decisions
+
+- **We chose:** One data-plane routing service (“Model Router”) that also owns activation + rollouts.
+  - **Why:** removes a separate rollout controller and keeps “what is safe to do right now” next to admission control.
+
+- **We chose:** Postgres as the only control-plane store, and `LISTEN/NOTIFY` to push routing/rollout updates to routers.
+  - **Why:** routers never hit the DB on the request path, but changes propagate immediately without bespoke invalidation.
+
+- **We chose:** Shadow execution is best-effort and never blocks the primary response.
+  - **Why:** shadow is for rollout confidence; production latency is non-negotiable.
+
+- **What We Removed (and merged into existing pieces):**
+  - A separate rollout controller (rollout state + gates live in Postgres; routers reconcile and shift traffic).
+  - A separate shadow sink service (routers send shadow outputs directly to the log store asynchronously).
+  - A dedicated model-cache daemon (GPU workers keep a local disk cache keyed by artifact digest).
+  - Any queue/messaging system (async inference uses a Postgres jobs table).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Clients] --> G[Edge Gateway]
+  G --> R[Model Router]
+  R --> W[GPU Workers]
+  W --> S[(Object Store)]
+  R --> M[(Metadata DB)]
+  R --> L[(Log Store)]
+```
+
+### Components
+
+- **Edge Gateway (Envoy):** AuthN/Z, request normalization, deterministic sampling headers for canary/shadow, and per-tenant rate limits.
+  - **Justification:** one consistent place to enforce identity, quotas, and sampling semantics across all models.
+
+- **Model Router:** Resolves (model, version, tenant, tier) → worker, enforces quotas and tier policies, deduplicates activations, runs rollout/shadow safely.
+  - **Justification:** the single custom component; it turns policies into real request-time behavior and prevents load storms.
+
+- **GPU Workers (Triton):** Long-lived inference runtime that loads/unloads models and exports GPU telemetry.
+  - **Justification:** proven runtime and batching; “boring” execution layer.
+
+- **Object Store (S3/GCS/MinIO):** Immutable, content-addressed model artifacts.
+  - **Justification:** cheap durability and clean separation between build and serve.
+
+- **Metadata DB (Postgres):** Model registry, rollout state, quotas, audit log, async inference jobs.
+  - **Justification:** correctness and operability; one durable source of truth.
+
+- **Log Store:** Shadow results, rollout metrics, and debugging breadcrumbs (tenant-configurable payload logging).
+  - **Justification:** shadow trust comes from durable, queryable comparisons outside the request path.
+
+## Deep Dive: Cold Starts Without Melting the Fleet
+
+**Activation is a bounded workflow** owned by the router:
+
+1. **Resolve artifacts by digest**
+   - Every version points to an immutable digest.
+   - Workers keep a node-local disk cache keyed by digest; cache fills on demand.
+
+2. **Two-phase activation**
+   - **Fetch:** pull artifacts (if cache miss) with global and per-node concurrency limits.
+   - **Load + warm:** load into Triton and run a small warmup, also concurrency-limited per node.
+   - Routers only cut traffic after the worker reports ready for that digest.
+
+3. **Deduplicate and rate-limit**
+   - One activation per (model, version, tier) cluster-wide; everyone else queues behind it.
+   - Cold-tier queues; hot-tier either hits warm capacity or fails fast.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Low-latency hot path | Some router complexity (it owns rollouts/activation) |
+| Few services to operate | Less modularity between “control” and “routing” |
+| No extra messaging infra | Async inference throughput is bounded by Postgres |
+| Shadow safety | Shadow fidelity is best-effort under load |
+
+## Failure Modes
+
+- **Postgres down for 5 minutes**
+  - **What happens:** no new deploys/rollout changes; inference must keep working.
+  - **Recover:** routers serve from last-known snapshot; enforce cached quotas; after a staleness budget, freeze rollouts/activations and fail cold tier fast.
+
+- **Object store throttling / partial outage**
+  - **What happens:** cache misses stall activations; retries can amplify the problem.
+  - **Recover:** routers cap fetch concurrency, backoff globally, and stop promoting new versions; cold tier fails fast once queue time exceeds its budget.
+
+- **Network partition: router ↔ subset of GPU workers**
+  - **What happens:** blackhole routing and duplicate inference on retries.
+  - **Recover:** routers health-probe workers, circuit-break quickly, and retry only when the request has an idempotency key; hot tier fails fast instead of queueing.
+
+- **Shadow/logging lag**
+  - **What happens:** diff confidence disappears; log store becomes a backpressure source.
+  - **Recover:** shadow sampling auto-downgrades to 0 before impacting primary; promotions are gated on “diff freshness,” not just latency/error.
+
+- **Bad rollout/config pushes wrong headers/tier mapping**
+  - **What happens:** misrouting or quota bypass.
+  - **Recover:** configs are versioned in Postgres; routers/gateway reject unknown versions and fall back to a safe default; a single “break-glass” flag disables shadow/canary immediately.
+
+## Operational Notes
+
+- On-call watches: **activation queue depth**, **artifact fetch rate/latency**, **GPU memory headroom**, **per-model error/latency burn**, and **shadow diff freshness**.
+- The only hard rule: cap concurrent activations per node and per cluster; everything else is negotiable.
+```
+apply_patch(auto_approved=true) exited 0 in 54ms:
+Success. Updated the following files:
+A solutions-v2/07-ai-ml-infrastructure/model-serving-platform.md
+file update:
+diff --git a/solutions-v2/07-ai-ml-infrastructure/model-serving-platform.md b/solutions-v2/07-ai-ml-infrastructure/model-serving-platform.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..1d749cbacb70a2e9f4841e39f923b1463afb179b
+--- /dev/null
++++ b/solutions-v2/07-ai-ml-infrastructure/model-serving-platform.md
+@@ -0,0 +1,136 @@
++```markdown
++---
++title: "Model Serving Platform"
++category: "AI/ML Infrastructure"
++difficulty: "Hard"
++tags: ["model-serving", "gpus", "scheduling", "rollouts", "multi-tenancy", "latency"]
++---
++
++## Overview
++
++This platform serves **thousands of ML models** behind one stable API while keeping GPUs busy and rollouts safe. The only trick is treating **model activation** (fetch → load/warm → serve) as a rate-limited workflow, separate from the client-facing model identity (model + version).
++
++## What Makes This Hard
++
++1. **Cold starts aren’t linear.** Load/warm burns GPU/CPU/IO and can collapse the fleet if many models activate together.
++2. **GPUs are a shared bottleneck.** Without strict backpressure, “scale up” becomes “load storm + tail latency.”
++3. **Safe rollouts need consistent routing.** Canary/shadow must be deterministic and must not add latency to primary traffic.
++
++## Requirements
++
++### Functional Requirements
++- Host **10k+ models** with versioning, provenance, and controlled rollout.
++- Support **real-time inference** (sync) and **batch/async inference** (queued).
++- Provide **shadow deployments** (zero user impact) and **canary** (partial user impact with rollback).
++- Enforce **multi-tenant quotas** (GPU, CPU, memory, QPS) and isolation boundaries.
++- Collect **model-level telemetry** (latency, GPU memory, OOMs, error rates) and produce rollback signals.
++
++### Scale Targets
++- **Models:** 10,000 total; **500 active/day**; **50 hot concurrently**.
++- **Traffic:** 20k RPS peak platform-wide; hot models 2k RPS each; long-tail ≤1 RPS.
++- **Latency SLOs:** p95 < 150ms (“hot”); p95 < 400ms (“warm”); “cold” first-hit 2–5s.
++- **Rollouts:** up to 200 deployments/day; shadow for 30 minutes with confidence gates.
++- **GPU fleet:** 200–2,000 GPUs with mixed SKUs; target **>70% utilization** on hot tier.
++
++## Key Design Decisions
++
++- **We chose:** One data-plane routing service (“Model Router”) that also owns activation + rollouts.
++  - **Why:** removes a separate rollout controller and keeps “what is safe to do right now” next to admission control.
++
++- **We chose:** Postgres as the only control-plane store, and `LISTEN/NOTIFY` to push routing/rollout updates to routers.
++  - **Why:** routers never hit the DB on the request path, but changes propagate immediately without bespoke invalidation.
++
++- **We chose:** Shadow execution is best-effort and never blocks the primary response.
++  - **Why:** shadow is for rollout confidence; production latency is non-negotiable.
++
++- **What We Removed (and merged into existing pieces):**
++  - A separate rollout controller (rollout state + gates live in Postgres; routers reconcile and shift traffic).
++  - A separate shadow sink service (routers send shadow outputs directly to the log store asynchronously).
++  - A dedicated model-cache daemon (GPU workers keep a local disk cache keyed by artifact digest).
++  - Any queue/messaging system (async inference uses a Postgres jobs table).
++
++## Architecture
++
++```mermaid
++flowchart LR
++  C[Clients] --> G[Edge Gateway]
++  G --> R[Model Router]
++  R --> W[GPU Workers]
++  W --> S[(Object Store)]
++  R --> M[(Metadata DB)]
++  R --> L[(Log Store)]
++```
++
++### Components
++
++- **Edge Gateway (Envoy):** AuthN/Z, request normalization, deterministic sampling headers for canary/shadow, and per-tenant rate limits.
++  - **Justification:** one consistent place to enforce identity, quotas, and sampling semantics across all models.
++
++- **Model Router:** Resolves (model, version, tenant, tier) → worker, enforces quotas and tier policies, deduplicates activations, runs rollout/shadow safely.
++  - **Justification:** the single custom component; it turns policies into real request-time behavior and prevents load storms.
++
++- **GPU Workers (Triton):** Long-lived inference runtime that loads/unloads models and exports GPU telemetry.
++  - **Justification:** proven runtime and batching; “boring” execution layer.
++
++- **Object Store (S3/GCS/MinIO):** Immutable, content-addressed model artifacts.
++  - **Justification:** cheap durability and clean separation between build and serve.
++
++- **Metadata DB (Postgres):** Model registry, rollout state, quotas, audit log, async inference jobs.
++  - **Justification:** correctness and operability; one durable source of truth.
++
++- **Log Store:** Shadow results, rollout metrics, and debugging breadcrumbs (tenant-configurable payload logging).
++  - **Justification:** shadow trust comes from durable, queryable comparisons outside the request path.
++
++## Deep Dive: Cold Starts Without Melting the Fleet
++
++**Activation is a bounded workflow** owned by the router:
++
++1. **Resolve artifacts by digest**
++   - Every version points to an immutable digest.
++   - Workers keep a node-local disk cache keyed by digest; cache fills on demand.
++
++2. **Two-phase activation**
++   - **Fetch:** pull artifacts (if cache miss) with global and per-node concurrency limits.
++   - **Load + warm:** load into Triton and run a small warmup, also concurrency-limited per node.
++   - Routers only cut traffic after the worker reports ready for that digest.
++
++3. **Deduplicate and rate-limit**
++   - One activation per (model, version, tier) cluster-wide; everyone else queues behind it.
++   - Cold-tier queues; hot-tier either hits warm capacity or fails fast.
++
++## Trade-offs
++
++| Optimized For | Sacrificed |
++|--------------|------------|
++| Low-latency hot path | Some router complexity (it owns rollouts/activation) |
++| Few services to operate | Less modularity between “control” and “routing” |
++| No extra messaging infra | Async inference throughput is bounded by Postgres |
++| Shadow safety | Shadow fidelity is best-effort under load |
++
++## Failure Modes
++
++- **Postgres down for 5 minutes**
++  - **What happens:** no new deploys/rollout changes; inference must keep working.
++  - **Recover:** routers serve from last-known snapshot; enforce cached quotas; after a staleness budget, freeze rollouts/activations and fail cold tier fast.
++
++- **Object store throttling / partial outage**
++  - **What happens:** cache misses stall activations; retries can amplify the problem.
++  - **Recover:** routers cap fetch concurrency, backoff globally, and stop promoting new versions; cold tier fails fast once queue time exceeds its budget.
++
++- **Network partition: router ↔ subset of GPU workers**
++  - **What happens:** blackhole routing and duplicate inference on retries.
++  - **Recover:** routers health-probe workers, circuit-break quickly, and retry only when the request has an idempotency key; hot tier fails fast instead of queueing.
++
++- **Shadow/logging lag**
++  - **What happens:** diff confidence disappears; log store becomes a backpressure source.
++  - **Recover:** shadow sampling auto-downgrades to 0 before impacting primary; promotions are gated on “diff freshness,” not just latency/error.
++
++- **Bad rollout/config pushes wrong headers/tier mapping**
++  - **What happens:** misrouting or quota bypass.
++  - **Recover:** configs are versioned in Postgres; routers/gateway reject unknown versions and fall back to a safe default; a single “break-glass” flag disables shadow/canary immediately.
++
++## Operational Notes
++
++- On-call watches: **activation queue depth**, **artifact fetch rate/latency**, **GPU memory headroom**, **per-model error/latency burn**, and **shadow diff freshness**.
++- The only hard rule: cap concurrent activations per node and per cluster; everything else is negotiable.
++```
+
+file update:
+diff --git a/solutions-v2/07-ai-ml-infrastructure/model-serving-platform.md b/solutions-v2/07-ai-ml-infrastructure/model-serving-platform.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..1d749cbacb70a2e9f4841e39f923b1463afb179b
+--- /dev/null
++++ b/solutions-v2/07-ai-ml-infrastructure/model-serving-platform.md
+@@ -0,0 +1,136 @@
++```markdown
++---
++title: "Model Serving Platform"
++category: "AI/ML Infrastructure"
++difficulty: "Hard"
++tags: ["model-serving", "gpus", "scheduling", "rollouts", "multi-tenancy", "latency"]
++---
++
++## Overview
++
++This platform serves **thousands of ML models** behind one stable API while keeping GPUs busy and rollouts safe. The only trick is treating **model activation** (fetch → load/warm → serve) as a rate-limited workflow, separate from the client-facing model identity (model + version).
++
++## What Makes This Hard
++
++1. **Cold starts aren’t linear.** Load/warm burns GPU/CPU/IO and can collapse the fleet if many models activate together.
++2. **GPUs are a shared bottleneck.** Without strict backpressure, “scale up” becomes “load storm + tail latency.”
++3. **Safe rollouts need consistent routing.** Canary/shadow must be deterministic and must not add latency to primary traffic.
++
++## Requirements
++
++### Functional Requirements
++- Host **10k+ models** with versioning, provenance, and controlled rollout.
++- Support **real-time inference** (sync) and **batch/async inference** (queued).
++- Provide **shadow deployments** (zero user impact) and **canary** (partial user impact with rollback).
++- Enforce **multi-tenant quotas** (GPU, CPU, memory, QPS) and isolation boundaries.
++- Collect **model-level telemetry** (latency, GPU memory, OOMs, error rates) and produce rollback signals.
++
++### Scale Targets
++- **Models:** 10,000 total; **500 active/day**; **50 hot concurrently**.
++- **Traffic:** 20k RPS peak platform-wide; hot models 2k RPS each; long-tail ≤1 RPS.
++- **Latency SLOs:** p95 < 150ms (“hot”); p95 < 400ms (“warm”); “cold” first-hit 2–5s.
++- **Rollouts:** up to 200 deployments/day; shadow for 30 minutes with confidence gates.
++- **GPU fleet:** 200–2,000 GPUs with mixed SKUs; target **>70% utilization** on hot tier.
++
++## Key Design Decisions
++
++- **We chose:** One data-plane routing service (“Model Router”) that also owns activation + rollouts.
++  - **Why:** removes a separate rollout controller and keeps “what is safe to do right now” next to admission control.
++
++- **We chose:** Postgres as the only control-plane store, and `LISTEN/NOTIFY` to push routing/rollout updates to routers.
++  - **Why:** routers never hit the DB on the request path, but changes propagate immediately without bespoke invalidation.
++
++- **We chose:** Shadow execution is best-effort and never blocks the primary response.
++  - **Why:** shadow is for rollout confidence; production latency is non-negotiable.
++
++- **What We Removed (and merged into existing pieces):**
++  - A separate rollout controller (rollout state + gates live in Postgres; routers reconcile and shift traffic).
++  - A separate shadow sink service (routers send shadow outputs directly to the log store asynchronously).
++  - A dedicated model-cache daemon (GPU workers keep a local disk cache keyed by artifact digest).
++  - Any queue/messaging system (async inference uses a Postgres jobs table).
++
++## Architecture
++
++```mermaid
++flowchart LR
++  C[Clients] --> G[Edge Gateway]
++  G --> R[Model Router]
++  R --> W[GPU Workers]
++  W --> S[(Object Store)]
++  R --> M[(Metadata DB)]
++  R --> L[(Log Store)]
++```
++
++### Components
++
++- **Edge Gateway (Envoy):** AuthN/Z, request normalization, deterministic sampling headers for canary/shadow, and per-tenant rate limits.
++  - **Justification:** one consistent place to enforce identity, quotas, and sampling semantics across all models.
++
++- **Model Router:** Resolves (model, version, tenant, tier) → worker, enforces quotas and tier policies, deduplicates activations, runs rollout/shadow safely.
++  - **Justification:** the single custom component; it turns policies into real request-time behavior and prevents load storms.
++
++- **GPU Workers (Triton):** Long-lived inference runtime that loads/unloads models and exports GPU telemetry.
++  - **Justification:** proven runtime and batching; “boring” execution layer.
++
++- **Object Store (S3/GCS/MinIO):** Immutable, content-addressed model artifacts.
++  - **Justification:** cheap durability and clean separation between build and serve.
++
++- **Metadata DB (Postgres):** Model registry, rollout state, quotas, audit log, async inference jobs.
++  - **Justification:** correctness and operability; one durable source of truth.
++
++- **Log Store:** Shadow results, rollout metrics, and debugging breadcrumbs (tenant-configurable payload logging).
++  - **Justification:** shadow trust comes from durable, queryable comparisons outside the request path.
++
++## Deep Dive: Cold Starts Without Melting the Fleet
++
++**Activation is a bounded workflow** owned by the router:
++
++1. **Resolve artifacts by digest**
++   - Every version points to an immutable digest.
++   - Workers keep a node-local disk cache keyed by digest; cache fills on demand.
++
++2. **Two-phase activation**
++   - **Fetch:** pull artifacts (if cache miss) with global and per-node concurrency limits.
++   - **Load + warm:** load into Triton and run a small warmup, also concurrency-limited per node.
++   - Routers only cut traffic after the worker reports ready for that digest.
++
++3. **Deduplicate and rate-limit**
++   - One activation per (model, version, tier) cluster-wide; everyone else queues behind it.
++   - Cold-tier queues; hot-tier either hits warm capacity or fails fast.
++
++## Trade-offs
++
++| Optimized For | Sacrificed |
++|--------------|------------|
++| Low-latency hot path | Some router complexity (it owns rollouts/activation) |
++| Few services to operate | Less modularity between “control” and “routing” |
++| No extra messaging infra | Async inference throughput is bounded by Postgres |
++| Shadow safety | Shadow fidelity is best-effort under load |
++
++## Failure Modes
++
++- **Postgres down for 5 minutes**
++  - **What happens:** no new deploys/rollout changes; inference must keep working.
++  - **Recover:** routers serve from last-known snapshot; enforce cached quotas; after a staleness budget, freeze rollouts/activations and fail cold tier fast.
++
++- **Object store throttling / partial outage**
++  - **What happens:** cache misses stall activations; retries can amplify the problem.
++  - **Recover:** routers cap fetch concurrency, backoff globally, and stop promoting new versions; cold tier fails fast once queue time exceeds its budget.
++
++- **Network partition: router ↔ subset of GPU workers**
++  - **What happens:** blackhole routing and duplicate inference on retries.
++  - **Recover:** routers health-probe workers, circuit-break quickly, and retry only when the request has an idempotency key; hot tier fails fast instead of queueing.
++
++- **Shadow/logging lag**
++  - **What happens:** diff confidence disappears; log store becomes a backpressure source.
++  - **Recover:** shadow sampling auto-downgrades to 0 before impacting primary; promotions are gated on “diff freshness,” not just latency/error.
++
++- **Bad rollout/config pushes wrong headers/tier mapping**
++  - **What happens:** misrouting or quota bypass.
++  - **Recover:** configs are versioned in Postgres; routers/gateway reject unknown versions and fall back to a safe default; a single “break-glass” flag disables shadow/canary immediately.
++
++## Operational Notes
++
++- On-call watches: **activation queue depth**, **artifact fetch rate/latency**, **GPU memory headroom**, **per-model error/latency burn**, and **shadow diff freshness**.
++- The only hard rule: cap concurrent activations per node and per cluster; everything else is negotiable.
++```
+
+exec
+/bin/zsh -lc "sed -n '1,220p' solutions-v2/07-ai-ml-infrastructure/model-serving-platform.md" in /Users/dominikdabrowski/pr/system-design-atlas succeeded in 54ms:
+```markdown
+---
+title: "Model Serving Platform"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["model-serving", "gpus", "scheduling", "rollouts", "multi-tenancy", "latency"]
+---
+
+## Overview
+
+This platform serves **thousands of ML models** behind one stable API while keeping GPUs busy and rollouts safe. The only trick is treating **model activation** (fetch → load/warm → serve) as a rate-limited workflow, separate from the client-facing model identity (model + version).
+
+## What Makes This Hard
+
+1. **Cold starts aren’t linear.** Load/warm burns GPU/CPU/IO and can collapse the fleet if many models activate together.
+2. **GPUs are a shared bottleneck.** Without strict backpressure, “scale up” becomes “load storm + tail latency.”
+3. **Safe rollouts need consistent routing.** Canary/shadow must be deterministic and must not add latency to primary traffic.
+
+## Requirements
+
+
+
+
+
+
+thinking
+**Finalizing documentation output**
+
+I’m working on the requirements, focusing on the Postgres jobs table without going too far. I think I can include details about how the gateway enqueues to Postgres and how the router dispatches jobs—this might fit well under Components or Operational notes. Even though we didn’t touch on multi-dimensional scheduling, that’s okay. The user is asking for a complete markdown document, so I need to ensure I provide that as requested. I’ll make sure to reference the file properly.
+thinking
+**Preparing final markdown output**
+
+I’m getting ready to include the full document from the file, even though it will be long, as it's required. The user explicitly wants the complete content rather than a summary, so I’ll focus on providing that in a code block. I'll avoid any extra commentary and ensure that the title, difficulty, and tags remain unchanged. It looks like I’ll be outputting the simplified document exactly as it is, wrapping it with the correct markdown formatting.
+thinking
+**Formatting design output**
+
+In my response, it looks like the user wants the content of the design in markdown format, complete with a code block as stated earlier. I’m thinking I should include the triple backticks to show that it's markdown. I’ll output exactly what’s in the file, but without adding any extra elements. The user specifically asked for the final markdown document, so I’ll format it as a single code block with the necessary YAML front matter and sections, ensuring clarity.
+thinking
+**Delivering markdown document**
+
+The user wants the solution-v2 document output as a markdown file, and I think a code block is appropriate for that. I’ll use a single code block with the markdown content inside but without any inner fencing. This might differ from the file, but the user specifically asked for the output rather than the original file. I should ensure the title and tags remain unchanged while providing the complete document content, as requested.
+thinking
+**Outputting complete markdown document**
+
+I’ve decided to paste the markdown without the extra wrapper, since the user expects the final document formatted correctly. The prompt specifically states to "Output the complete, final markdown document," so including the code fence is necessary. I’ll output a single code block with the entire content while avoiding any extra commentary. Even though I could mention the file creation, I’ll focus on providing the document alone to follow the user’s requirement. Let’s go ahead with that!
+codex
+```markdown
+---
+title: "Model Serving Platform"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["model-serving", "gpus", "scheduling", "rollouts", "multi-tenancy", "latency"]
+---
+
+## Overview
+
+This platform serves **thousands of ML models** behind one stable API while keeping GPUs busy and rollouts safe. The only trick is treating **model activation** (fetch → load/warm → serve) as a rate-limited workflow, separate from the client-facing model identity (model + version).
+
+## What Makes This Hard
+
+1. **Cold starts aren’t linear.** Load/warm burns GPU/CPU/IO and can collapse the fleet if many models activate together.
+2. **GPUs are a shared bottleneck.** Without strict backpressure, “scale up” becomes “load storm + tail latency.”
+3. **Safe rollouts need consistent routing.** Canary/shadow must be deterministic and must not add latency to primary traffic.
+
+## Requirements
+
+### Functional Requirements
+- Host **10k+ models** with versioning, provenance, and controlled rollout.
+- Support **real-time inference** (sync) and **batch/async inference** (queued).
+- Provide **shadow deployments** (zero user impact) and **canary** (partial user impact with rollback).
+- Enforce **multi-tenant quotas** (GPU, CPU, memory, QPS) and isolation boundaries.
+- Collect **model-level telemetry** (latency, GPU memory, OOMs, error rates) and produce rollback signals.
+
+### Scale Targets
+- **Models:** 10,000 total; **500 active/day**; **50 hot concurrently**.
+- **Traffic:** 20k RPS peak platform-wide; hot models 2k RPS each; long-tail ≤1 RPS.
+- **Latency SLOs:** p95 < 150ms (“hot”); p95 < 400ms (“warm”); “cold” first-hit 2–5s.
+- **Rollouts:** up to 200 deployments/day; shadow for 30 minutes with confidence gates.
+- **GPU fleet:** 200–2,000 GPUs with mixed SKUs; target **>70% utilization** on hot tier.
+
+## Key Design Decisions
+
+- **We chose:** One data-plane routing service (“Model Router”) that also owns activation + rollouts.
+  - **Why:** removes a separate rollout controller and keeps “what is safe to do right now” next to admission control.
+
+- **We chose:** Postgres as the only control-plane store, and `LISTEN/NOTIFY` to push routing/rollout updates to routers.
+  - **Why:** routers never hit the DB on the request path, but changes propagate immediately without bespoke invalidation.
+
+- **We chose:** Shadow execution is best-effort and never blocks the primary response.
+  - **Why:** shadow is for rollout confidence; production latency is non-negotiable.
+
+- **What We Removed (and merged into existing pieces):**
+  - A separate rollout controller (rollout state + gates live in Postgres; routers reconcile and shift traffic).
+  - A separate shadow sink service (routers send shadow outputs directly to the log store asynchronously).
+  - A dedicated model-cache daemon (GPU workers keep a local disk cache keyed by artifact digest).
+  - Any queue/messaging system (async inference uses a Postgres jobs table).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Clients] --> G[Edge Gateway]
+  G --> R[Model Router]
+  R --> W[GPU Workers]
+  W --> S[(Object Store)]
+  R --> M[(Metadata DB)]
+  R --> L[(Log Store)]
+```
+
+### Components
+
+- **Edge Gateway (Envoy):** AuthN/Z, request normalization, deterministic sampling headers for canary/shadow, and per-tenant rate limits.
+  - **Justification:** one consistent place to enforce identity, quotas, and sampling semantics across all models.
+
+- **Model Router:** Resolves (model, version, tenant, tier) → worker, enforces quotas and tier policies, deduplicates activations, runs rollout/shadow safely.
+  - **Justification:** the single custom component; it turns policies into real request-time behavior and prevents load storms.
+
+- **GPU Workers (Triton):** Long-lived inference runtime that loads/unloads models and exports GPU telemetry.
+  - **Justification:** proven runtime and batching; “boring” execution layer.
+
+- **Object Store (S3/GCS/MinIO):** Immutable, content-addressed model artifacts.
+  - **Justification:** cheap durability and clean separation between build and serve.
+
+- **Metadata DB (Postgres):** Model registry, rollout state, quotas, audit log, async inference jobs.
+  - **Justification:** correctness and operability; one durable source of truth.
+
+- **Log Store:** Shadow results, rollout metrics, and debugging breadcrumbs (tenant-configurable payload logging).
+  - **Justification:** shadow trust comes from durable, queryable comparisons outside the request path.
+
+## Deep Dive: Cold Starts Without Melting the Fleet
+
+**Activation is a bounded workflow** owned by the router:
+
+1. **Resolve artifacts by digest**
+   - Every version points to an immutable digest.
+   - Workers keep a node-local disk cache keyed by digest; cache fills on demand.
+
+2. **Two-phase activation**
+   - **Fetch:** pull artifacts (if cache miss) with global and per-node concurrency limits.
+   - **Load + warm:** load into Triton and run a small warmup, also concurrency-limited per node.
+   - Routers only cut traffic after the worker reports ready for that digest.
+
+3. **Deduplicate and rate-limit**
+   - One activation per (model, version, tier) cluster-wide; everyone else queues behind it.
+   - Cold-tier queues; hot-tier either hits warm capacity or fails fast.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Low-latency hot path | Some router complexity (it owns rollouts/activation) |
+| Few services to operate | Less modularity between “control” and “routing” |
+| No extra messaging infra | Async inference throughput is bounded by Postgres |
+| Shadow safety | Shadow fidelity is best-effort under load |
+
+## Failure Modes
+
+- **Postgres down for 5 minutes**
+  - **What happens:** no new deploys/rollout changes; inference must keep working.
+  - **Recover:** routers serve from last-known snapshot; enforce cached quotas; after a staleness budget, freeze rollouts/activations and fail cold tier fast.
+
+- **Object store throttling / partial outage**
+  - **What happens:** cache misses stall activations; retries can amplify the problem.
+  - **Recover:** routers cap fetch concurrency, backoff globally, and stop promoting new versions; cold tier fails fast once queue time exceeds its budget.
+
+- **Network partition: router ↔ subset of GPU workers**
+  - **What happens:** blackhole routing and duplicate inference on retries.
+  - **Recover:** routers health-probe workers, circuit-break quickly, and retry only when the request has an idempotency key; hot tier fails fast instead of queueing.
+
+- **Shadow/logging lag**
+  - **What happens:** diff confidence disappears; log store becomes a backpressure source.
+  - **Recover:** shadow sampling auto-downgrades to 0 before impacting primary; promotions are gated on “diff freshness,” not just latency/error.
+
+- **Bad rollout/config pushes wrong headers/tier mapping**
+  - **What happens:** misrouting or quota bypass.
+  - **Recover:** configs are versioned in Postgres; routers/gateway reject unknown versions and fall back to a safe default; a single “break-glass” flag disables shadow/canary immediately.
+
+## Operational Notes
+
+- On-call watches: **activation queue depth**, **artifact fetch rate/latency**, **GPU memory headroom**, **per-model error/latency burn**, and **shadow diff freshness**.
+- The only hard rule: cap concurrent activations per node and per cluster; everything else is negotiable.
+```
+file update:
+diff --git a/solutions-v2/07-ai-ml-infrastructure/model-serving-platform.md b/solutions-v2/07-ai-ml-infrastructure/model-serving-platform.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..1d749cbacb70a2e9f4841e39f923b1463afb179b
+--- /dev/null
++++ b/solutions-v2/07-ai-ml-infrastructure/model-serving-platform.md
+@@ -0,0 +1,136 @@
++```markdown
++---
++title: "Model Serving Platform"
++category: "AI/ML Infrastructure"
++difficulty: "Hard"
++tags: ["model-serving", "gpus", "scheduling", "rollouts", "multi-tenancy", "latency"]
++---
++
++## Overview
++
++This platform serves **thousands of ML models** behind one stable API while keeping GPUs busy and rollouts safe. The only trick is treating **model activation** (fetch → load/warm → serve) as a rate-limited workflow, separate from the client-facing model identity (model + version).
++
++## What Makes This Hard
++
++1. **Cold starts aren’t linear.** Load/warm burns GPU/CPU/IO and can collapse the fleet if many models activate together.
++2. **GPUs are a shared bottleneck.** Without strict backpressure, “scale up” becomes “load storm + tail latency.”
++3. **Safe rollouts need consistent routing.** Canary/shadow must be deterministic and must not add latency to primary traffic.
++
++## Requirements
++
++### Functional Requirements
++- Host **10k+ models** with versioning, provenance, and controlled rollout.
++- Support **real-time inference** (sync) and **batch/async inference** (queued).
++- Provide **shadow deployments** (zero user impact) and **canary** (partial user impact with rollback).
++- Enforce **multi-tenant quotas** (GPU, CPU, memory, QPS) and isolation boundaries.
++- Collect **model-level telemetry** (latency, GPU memory, OOMs, error rates) and produce rollback signals.
++
++### Scale Targets
++- **Models:** 10,000 total; **500 active/day**; **50 hot concurrently**.
++- **Traffic:** 20k RPS peak platform-wide; hot models 2k RPS each; long-tail ≤1 RPS.
++- **Latency SLOs:** p95 < 150ms (“hot”); p95 < 400ms (“warm”); “cold” first-hit 2–5s.
++- **Rollouts:** up to 200 deployments/day; shadow for 30 minutes with confidence gates.
++- **GPU fleet:** 200–2,000 GPUs with mixed SKUs; target **>70% utilization** on hot tier.
++
++## Key Design Decisions
++
++- **We chose:** One data-plane routing service (“Model Router”) that also owns activation + rollouts.
++  - **Why:** removes a separate rollout controller and keeps “what is safe to do right now” next to admission control.
++
++- **We chose:** Postgres as the only control-plane store, and `LISTEN/NOTIFY` to push routing/rollout updates to routers.
++  - **Why:** routers never hit the DB on the request path, but changes propagate immediately without bespoke invalidation.
++
++- **We chose:** Shadow execution is best-effort and never blocks the primary response.
++  - **Why:** shadow is for rollout confidence; production latency is non-negotiable.
++
++- **What We Removed (and merged into existing pieces):**
++  - A separate rollout controller (rollout state + gates live in Postgres; routers reconcile and shift traffic).
++  - A separate shadow sink service (routers send shadow outputs directly to the log store asynchronously).
++  - A dedicated model-cache daemon (GPU workers keep a local disk cache keyed by artifact digest).
++  - Any queue/messaging system (async inference uses a Postgres jobs table).
++
++## Architecture
++
++```mermaid
++flowchart LR
++  C[Clients] --> G[Edge Gateway]
++  G --> R[Model Router]
++  R --> W[GPU Workers]
++  W --> S[(Object Store)]
++  R --> M[(Metadata DB)]
++  R --> L[(Log Store)]
++```
++
++### Components
++
++- **Edge Gateway (Envoy):** AuthN/Z, request normalization, deterministic sampling headers for canary/shadow, and per-tenant rate limits.
++  - **Justification:** one consistent place to enforce identity, quotas, and sampling semantics across all models.
++
++- **Model Router:** Resolves (model, version, tenant, tier) → worker, enforces quotas and tier policies, deduplicates activations, runs rollout/shadow safely.
++  - **Justification:** the single custom component; it turns policies into real request-time behavior and prevents load storms.
++
++- **GPU Workers (Triton):** Long-lived inference runtime that loads/unloads models and exports GPU telemetry.
++  - **Justification:** proven runtime and batching; “boring” execution layer.
++
++- **Object Store (S3/GCS/MinIO):** Immutable, content-addressed model artifacts.
++  - **Justification:** cheap durability and clean separation between build and serve.
++
++- **Metadata DB (Postgres):** Model registry, rollout state, quotas, audit log, async inference jobs.
++  - **Justification:** correctness and operability; one durable source of truth.
++
++- **Log Store:** Shadow results, rollout metrics, and debugging breadcrumbs (tenant-configurable payload logging).
++  - **Justification:** shadow trust comes from durable, queryable comparisons outside the request path.
++
++## Deep Dive: Cold Starts Without Melting the Fleet
++
++**Activation is a bounded workflow** owned by the router:
++
++1. **Resolve artifacts by digest**
++   - Every version points to an immutable digest.
++   - Workers keep a node-local disk cache keyed by digest; cache fills on demand.
++
++2. **Two-phase activation**
++   - **Fetch:** pull artifacts (if cache miss) with global and per-node concurrency limits.
++   - **Load + warm:** load into Triton and run a small warmup, also concurrency-limited per node.
++   - Routers only cut traffic after the worker reports ready for that digest.
++
++3. **Deduplicate and rate-limit**
++   - One activation per (model, version, tier) cluster-wide; everyone else queues behind it.
++   - Cold-tier queues; hot-tier either hits warm capacity or fails fast.
++
++## Trade-offs
++
++| Optimized For | Sacrificed |
++|--------------|------------|
++| Low-latency hot path | Some router complexity (it owns rollouts/activation) |
++| Few services to operate | Less modularity between “control” and “routing” |
++| No extra messaging infra | Async inference throughput is bounded by Postgres |
++| Shadow safety | Shadow fidelity is best-effort under load |
++
++## Failure Modes
++
++- **Postgres down for 5 minutes**
++  - **What happens:** no new deploys/rollout changes; inference must keep working.
++  - **Recover:** routers serve from last-known snapshot; enforce cached quotas; after a staleness budget, freeze rollouts/activations and fail cold tier fast.
++
++- **Object store throttling / partial outage**
++  - **What happens:** cache misses stall activations; retries can amplify the problem.
++  - **Recover:** routers cap fetch concurrency, backoff globally, and stop promoting new versions; cold tier fails fast once queue time exceeds its budget.
++
++- **Network partition: router ↔ subset of GPU workers**
++  - **What happens:** blackhole routing and duplicate inference on retries.
++  - **Recover:** routers health-probe workers, circuit-break quickly, and retry only when the request has an idempotency key; hot tier fails fast instead of queueing.
++
++- **Shadow/logging lag**
++  - **What happens:** diff confidence disappears; log store becomes a backpressure source.
++  - **Recover:** shadow sampling auto-downgrades to 0 before impacting primary; promotions are gated on “diff freshness,” not just latency/error.
++
++- **Bad rollout/config pushes wrong headers/tier mapping**
++  - **What happens:** misrouting or quota bypass.
++  - **Recover:** configs are versioned in Postgres; routers/gateway reject unknown versions and fall back to a safe default; a single “break-glass” flag disables shadow/canary immediately.
++
++## Operational Notes
++
++- On-call watches: **activation queue depth**, **artifact fetch rate/latency**, **GPU memory headroom**, **per-model error/latency burn**, and **shadow diff freshness**.
++- The only hard rule: cap concurrent activations per node and per cluster; everything else is negotiable.
++```
+
+tokens used
+33,656
+```markdown
+---
+title: "Model Serving Platform"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["model-serving", "gpus", "scheduling", "rollouts", "multi-tenancy", "latency"]
+---
+
+## Overview
+
+This platform serves **thousands of ML models** behind one stable API while keeping GPUs busy and rollouts safe. The only trick is treating **model activation** (fetch → load/warm → serve) as a rate-limited workflow, separate from the client-facing model identity (model + version).
+
+## What Makes This Hard
+
+1. **Cold starts aren’t linear.** Load/warm burns GPU/CPU/IO and can collapse the fleet if many models activate together.
+2. **GPUs are a shared bottleneck.** Without strict backpressure, “scale up” becomes “load storm + tail latency.”
+3. **Safe rollouts need consistent routing.** Canary/shadow must be deterministic and must not add latency to primary traffic.
+
+## Requirements
+
+### Functional Requirements
+- Host **10k+ models** with versioning, provenance, and controlled rollout.
+- Support **real-time inference** (sync) and **batch/async inference** (queued).
+- Provide **shadow deployments** (zero user impact) and **canary** (partial user impact with rollback).
+- Enforce **multi-tenant quotas** (GPU, CPU, memory, QPS) and isolation boundaries.
+- Collect **model-level telemetry** (latency, GPU memory, OOMs, error rates) and produce rollback signals.
+
+### Scale Targets
+- **Models:** 10,000 total; **500 active/day**; **50 hot concurrently**.
+- **Traffic:** 20k RPS peak platform-wide; hot models 2k RPS each; long-tail ≤1 RPS.
+- **Latency SLOs:** p95 < 150ms (“hot”); p95 < 400ms (“warm”); “cold” first-hit 2–5s.
+- **Rollouts:** up to 200 deployments/day; shadow for 30 minutes with confidence gates.
+- **GPU fleet:** 200–2,000 GPUs with mixed SKUs; target **>70% utilization** on hot tier.
+
+## Key Design Decisions
+
+- **We chose:** One data-plane routing service (“Model Router”) that also owns activation + rollouts.
+  - **Why:** removes a separate rollout controller and keeps “what is safe to do right now” next to admission control.
+
+- **We chose:** Postgres as the only control-plane store, and `LISTEN/NOTIFY` to push routing/rollout updates to routers.
+  - **Why:** routers never hit the DB on the request path, but changes propagate immediately without bespoke invalidation.
+
+- **We chose:** Shadow execution is best-effort and never blocks the primary response.
+  - **Why:** shadow is for rollout confidence; production latency is non-negotiable.
+
+- **What We Removed (and merged into existing pieces):**
+  - A separate rollout controller (rollout state + gates live in Postgres; routers reconcile and shift traffic).
+  - A separate shadow sink service (routers send shadow outputs directly to the log store asynchronously).
+  - A dedicated model-cache daemon (GPU workers keep a local disk cache keyed by artifact digest).
+  - Any queue/messaging system (async inference uses a Postgres jobs table).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Clients] --> G[Edge Gateway]
+  G --> R[Model Router]
+  R --> W[GPU Workers]
+  W --> S[(Object Store)]
+  R --> M[(Metadata DB)]
+  R --> L[(Log Store)]
+```
+
+### Components
+
+- **Edge Gateway (Envoy):** AuthN/Z, request normalization, deterministic sampling headers for canary/shadow, and per-tenant rate limits.
+  - **Justification:** one consistent place to enforce identity, quotas, and sampling semantics across all models.
+
+- **Model Router:** Resolves (model, version, tenant, tier) → worker, enforces quotas and tier policies, deduplicates activations, runs rollout/shadow safely.
+  - **Justification:** the single custom component; it turns policies into real request-time behavior and prevents load storms.
+
+- **GPU Workers (Triton):** Long-lived inference runtime that loads/unloads models and exports GPU telemetry.
+  - **Justification:** proven runtime and batching; “boring” execution layer.
+
+- **Object Store (S3/GCS/MinIO):** Immutable, content-addressed model artifacts.
+  - **Justification:** cheap durability and clean separation between build and serve.
+
+- **Metadata DB (Postgres):** Model registry, rollout state, quotas, audit log, async inference jobs.
+  - **Justification:** correctness and operability; one durable source of truth.
+
+- **Log Store:** Shadow results, rollout metrics, and debugging breadcrumbs (tenant-configurable payload logging).
+  - **Justification:** shadow trust comes from durable, queryable comparisons outside the request path.
+
+## Deep Dive: Cold Starts Without Melting the Fleet
+
+**Activation is a bounded workflow** owned by the router:
+
+1. **Resolve artifacts by digest**
+   - Every version points to an immutable digest.
+   - Workers keep a node-local disk cache keyed by digest; cache fills on demand.
+
+2. **Two-phase activation**
+   - **Fetch:** pull artifacts (if cache miss) with global and per-node concurrency limits.
+   - **Load + warm:** load into Triton and run a small warmup, also concurrency-limited per node.
+   - Routers only cut traffic after the worker reports ready for that digest.
+
+3. **Deduplicate and rate-limit**
+   - One activation per (model, version, tier) cluster-wide; everyone else queues behind it.
+   - Cold-tier queues; hot-tier either hits warm capacity or fails fast.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Low-latency hot path | Some router complexity (it owns rollouts/activation) |
+| Few services to operate | Less modularity between “control” and “routing” |
+| No extra messaging infra | Async inference throughput is bounded by Postgres |
+| Shadow safety | Shadow fidelity is best-effort under load |
+
+## Failure Modes
+
+- **Postgres down for 5 minutes**
+  - **What happens:** no new deploys/rollout changes; inference must keep working.
+  - **Recover:** routers serve from last-known snapshot; enforce cached quotas; after a staleness budget, freeze rollouts/activations and fail cold tier fast.
+
+- **Object store throttling / partial outage**
+  - **What happens:** cache misses stall activations; retries can amplify the problem.
+  - **Recover:** routers cap fetch concurrency, backoff globally, and stop promoting new versions; cold tier fails fast once queue time exceeds its budget.
+
+- **Network partition: router ↔ subset of GPU workers**
+  - **What happens:** blackhole routing and duplicate inference on retries.
+  - **Recover:** routers health-probe workers, circuit-break quickly, and retry only when the request has an idempotency key; hot tier fails fast instead of queueing.
+
+- **Shadow/logging lag**
+  - **What happens:** diff confidence disappears; log store becomes a backpressure source.
+  - **Recover:** shadow sampling auto-downgrades to 0 before impacting primary; promotions are gated on “diff freshness,” not just latency/error.
+
+- **Bad rollout/config pushes wrong headers/tier mapping**
+  - **What happens:** misrouting or quota bypass.
+  - **Recover:** configs are versioned in Postgres; routers/gateway reject unknown versions and fall back to a safe default; a single “break-glass” flag disables shadow/canary immediately.
+
+## Operational Notes
+
+- On-call watches: **activation queue depth**, **artifact fetch rate/latency**, **GPU memory headroom**, **per-model error/latency burn**, and **shadow diff freshness**.
+- The only hard rule: cap concurrent activations per node and per cluster; everything else is negotiable.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/07-ai-ml-infrastructure/model-serving-platform.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Model Serving Platform
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/model-serving-platform.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/model-serving-platform.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/07-ai-ml-infrastructure/model-serving-platform.md

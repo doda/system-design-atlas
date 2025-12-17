@@ -1,0 +1,174 @@
+---
+title: "Distributed Counter Service"
+category: "Social & Discovery"
+difficulty: "Hard"
+tags: ["counters", "eventual-consistency", "stream-processing"]
+---
+
+## Overview
+
+This service ingests very high-volume counter events (views) and strongly consistent user intent (like/unlike), then serves fast reads of per-object totals with bounded staleness. The system uses an append-only log for durable ingestion, a single stream processor that aggregates into sharded counters, and a compact materialized totals store for reads and batch fetches.
+
+## Requirements
+
+### Functional
+- High-throughput view increments for arbitrary objects.
+- Like/unlike with idempotency and strong per-`(user_id, object_id)` correctness.
+- Read current counts (views/likes) with bounded staleness; batch reads for feeds.
+- Near-real-time freshness (seconds) for hot objects.
+- Replay/backfill to recompute aggregates.
+- Time-window aggregation (hour/day buckets) per object for analytics/trending inputs.
+
+### Non-Functional (Targets)
+- Scale: 50B views/day (peak ~5M events/s), 2B likes/day (peak ~200K events/s).
+- Latency: view ingest ack after durable log write; reads typically served from cache or totals store.
+- Availability: reads 99.99%, writes 99.9–99.99%.
+- Consistency: counts eventual; like state strong within a region.
+- Durability: views configurable RPO for regional disaster; likes state no silent loss.
+
+## Simplified Architecture
+
+### High-Level Design
+
+```mermaid
+flowchart TB
+  C[Clients] --> E[Edge]
+  E --> A[Counters API]
+
+  A --> K[(Kafka)]
+  A --> D[(DynamoDB)]
+  A --> R[(Redis)]
+
+  K --> P[Counter Processor]
+  D --> P
+  P --> D
+  P --> R
+```
+
+### Components
+
+#### 1) Edge
+- Auth, rate limits, basic request validation, routing.
+- Abuse controls for view endpoints (token buckets per device/user/IP/app key).
+
+#### 2) Counters API (single service)
+- Write endpoints:
+  - Views: validates request, assigns `write_shard`, appends event to Kafka with `acks=all`.
+  - Likes: performs conditional update to `user_like_state` (strong), writes a durable outbox record in the same DynamoDB transaction.
+- Read endpoints:
+  - Counts: reads from Redis first, falls back to DynamoDB totals; returns `asOfMs`.
+  - Like state: reads strongly from `user_like_state`.
+- Batch reads:
+  - Uses Redis multi-get; on cache miss uses DynamoDB `BatchGet` on totals.
+
+#### 3) Kafka (durability boundary)
+- Topics (time-retained):
+  - `views_events`
+  - `likes_events` (populated from the like outbox)
+- Partitioning (prevents viral hot-partition collapse):
+  - Partition key: `(counter_type, object_id, write_shard)` where `write_shard = hash(request_id or random) % W`.
+
+#### 4) Counter Processor (single stream processor app)
+A single processing application handles both counter types end-to-end:
+- Publishes like changes from the DynamoDB outbox into `likes_events` (exactly-once per outbox record).
+- Consumes `views_events` and `likes_events`.
+- Aggregates in memory/state store by `(counter_type, object_id, bucket_start_ms, write_shard)` using micro-batches.
+- Periodically flushes:
+  - Shard rows (absolute values) for replay/debug and time buckets.
+  - Total rows (materialized totals + `asOfMs`) at a controlled cadence (e.g., 1–5s for hot keys).
+- Updates Redis totals (write-through) after totals flush.
+
+#### 5) DynamoDB (single database technology)
+Two tables keep the operational surface area small:
+
+- `user_like_state` (strong state)
+  - PK: `(user_id, object_id)`
+  - Attributes: `liked`, `updated_at_ms`, `last_idempotency_key`
+  - Conditional writes provide idempotent toggles.
+
+- `counters` (both shards and totals)
+  - PK: `counter_type#object_id#bucket_start_ms` (bucket optional; e.g., hourly/day)
+  - SK:
+    - `TOTAL` (materialized total)
+    - `SHARD#<n>` (per write shard)
+  - Attributes:
+    - For `TOTAL`: `total_value`, `as_of_ms`
+    - For `SHARD`: `shard_value`, `updated_at_ms`
+
+- `like_outbox` (durable change log for likes)
+  - PK: `object_id#changed_at_ms` (or ULID-based PK for write distribution)
+  - Attributes: `event_id`, `user_id`, `liked`, `previous_liked`, `idempotency_key`, `published_at_ms`
+  - Written in the same DynamoDB transaction as `user_like_state` updates; consumed by the Counter Processor and marked published.
+
+#### 6) Redis
+- Read cache for `TOTAL` rows (5–30s TTL, keyed by `counter_type#object_id[#bucket]`).
+- Optional view idempotency window: `SET NX` for `(object_id, idempotencyKey)` with short TTL (e.g., 10 minutes).
+
+## Data Flow
+
+### Views
+1. `POST /v1/counters/views/{objectId}:increment` → Counters API appends `ViewEvent` to Kafka (`acks=all`), returns `202`.
+2. Counter Processor consumes, aggregates into shard state, flushes shard + total, updates Redis.
+
+### Likes
+1. `PUT /v1/likes/{objectId}` → Counters API performs a conditional toggle on `user_like_state` and writes a `like_outbox` record in the same DynamoDB transaction; returns `200` with `applied`.
+2. Counter Processor publishes outbox records to `likes_events`, then aggregates like counts the same way as views.
+
+## Event Schemas (compact)
+
+**ViewEvent**
+```json
+{ "eventId":"evt_...", "counterType":"views", "objectId":"obj_...", "writeShard":17, "amount":1, "ingestedAtMs":1730000000123, "idempotencyKey":"optional" }
+```
+
+**LikeEvent**
+```json
+{ "eventId":"evt_...", "counterType":"likes", "objectId":"obj_...", "userId":"usr_...", "liked":true, "previousLiked":false, "changedAtMs":1730000000456, "idempotencyKey":"req_..." }
+```
+
+## API
+
+### Increment Views
+- `POST /v1/counters/views/{objectId}:increment`
+- Response: `202 Accepted` `{ "eventId": "...", "acceptedAtMs": ... }`
+- Idempotency: honored when `idempotencyKey` is provided (best-effort bounded window).
+
+### Like / Unlike (Strong + Idempotent)
+- `PUT /v1/likes/{objectId}` body `{ "userId":"...", "liked":true, "idempotencyKey":"..." }`
+- Response: `{ "liked": true, "applied": true }` (`applied=false` for idempotent no-op)
+
+### Read Like State (Strong)
+- `GET /v1/likes/{objectId}?userId=...`
+
+### Read Counts (Single)
+- `GET /v1/counters/{objectId}?types=views,likes`
+- Returns `{ value, asOfMs }` per type.
+
+### Read Counts (Batch)
+- `POST /v1/counters:batchGet` with `objectIds` and `types`
+- Partial failures returned per item.
+
+## Scaling & Performance
+
+- Shards `W`: start 32–64; increase for hot object classes.
+- Processor batching: aggregate per shard in-memory and flush on size/time (e.g., 50–250ms), totals flush every 1–5s for hot keys.
+- Reads: default to Redis; DynamoDB totals as durable fallback; batch reads use Redis MGET + DynamoDB BatchGet.
+
+## Consistency, Freshness, Replay
+
+- Counts: eventual consistency with explicit `asOfMs`; typical freshness ≤ 5s, degraded ≤ 60s under backlog.
+- Like state: strongly consistent in-region; UI decisions rely on state, totals may lag.
+- Replay/backfill: reprocess Kafka topics (and/or like outbox if needed) into new `counters` table versions, then cut reads over.
+
+## Operations (SLO-driven)
+
+- Key metrics: ingest P99/5xx, Kafka produce errors, consumer lag, processor flush latency, DynamoDB throttles, Redis hit rate, `asOfMs` staleness distribution.
+- Alerts: lag/staleness thresholds (warn at 30s, page at 120s), sustained write errors, DynamoDB throttle spikes.
+
+## Simplification Notes
+
+- Removed: `ShardDelta` topic and separate Totalizer by having the Counter Processor flush shard and total materializations directly at a controlled cadence.
+- Removed: standalone Query Service by serving reads from the Counters API (Redis + totals store) and keeping like state reads in the same service.
+- Merged: Ingest + Query responsibilities into one `Counters API` deployment unit.
+- Merged: Counter shard and total storage into a single `counters` table (one database technology) with `SHARD#n` and `TOTAL` rows.
+- Complexity that remains: Kafka (durable replayable log), sharded partitioning for hot objects, and a stream processor with micro-batching—these are required to sustain viral-key write rates while keeping reads fast and replay/backfill reliable.

@@ -1,0 +1,292 @@
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2a95-8bcc-7d80-85ef-d23bd95adf48
+--------
+user
+You are a senior systems architect reviewing a system design document.
+
+Grade this solution on three dimensions (1-10 scale):
+
+1. **Strength** (1-10): How technically sound, complete, and production-ready is the design?
+   - Does it address scalability, reliability, and failure modes?
+   - Are the trade-offs well-reasoned?
+   - Would this actually work at scale?
+
+2. **Interestingness** (1-10): How engaging and educational is the content?
+   - Does it teach useful concepts?
+   - Are there insights that aren't obvious?
+   - Would an engineer learn something valuable?
+
+3. **Novelty** (1-10): How unique or creative is the approach?
+   - Does it go beyond textbook solutions?
+   - Are there clever simplifications or unconventional choices?
+   - Does it challenge common assumptions?
+
+Also note any major issues or particularly strong aspects.
+
+Output ONLY valid JSON in this exact format:
+{
+  "slug": "stories-product",
+  "strength": <1-10>,
+  "interestingness": <1-10>,
+  "novelty": <1-10>,
+  "overall": <average of three scores, 1 decimal>,
+  "summary": "<2-3 sentence summary of the design>",
+  "strengths": ["<strength 1>", "<strength 2>"],
+  "weaknesses": ["<weakness 1>", "<weakness 2>"],
+  "verdict": "<one of: exceptional, strong, adequate, weak>"
+}
+
+---
+
+## Solution to Grade
+
+---
+title: "Stories Product"
+category: "Social & Discovery"
+difficulty: "Hard"
+tags: ["ephemeral-content", "privacy", "cdn", "media-pipeline", "event-streaming", "nosql"]
+---
+
+## Overview
+
+Stories are 24-hour media posts with three core needs:
+
+1. **Fast media playback** at global scale (CDN + object storage + adaptive streaming).
+2. **Correct privacy enforcement** based on relationship state (follow/friend/block/close friends/custom lists).
+3. **High-volume view tracking** with near real-time viewer lists, without slowing playback.
+
+The critical user path is: **load tray → open story → start playback**. View tracking is accepted quickly and processed asynchronously.
+
+## Goals & Non-Goals
+
+### Goals
+- Fast tray and story opens with correct privacy enforcement.
+- Reliable 24-hour expiry with minimal operational overhead.
+- Near-real-time viewer lists (seconds-level lag acceptable).
+- High availability for reads; graceful degradation under spikes.
+
+### Non-Goals (can be added later)
+- Full-fledged recommendation/discovery graph for public stories.
+- Advanced ML moderation (assume hooks/integration points).
+- Permanent archives/highlights (different retention/consistency).
+
+## Requirements
+
+### Functional Requirements
+- Create a story (photo/video), optionally caption/stickers/metadata, and publish it.
+- Stories expire automatically after 24 hours and are not viewable after expiration.
+- Delete a story early; it becomes unavailable for future fetches immediately (media revocation discussed in trade-offs).
+- Fetch a “story tray” of accounts with active stories, ordered by recency, with “unseen” indicators.
+- Fetch story metadata and playback URLs/manifests.
+- Track views; authors can fetch a viewer list per story (with timestamps), and basic counts.
+- Privacy per story: `PUBLIC`, `FOLLOWERS/Friends`, `CLOSE_FRIENDS`, `CUSTOM_ALLOW/DENY`, plus blocks.
+- Abuse/report hooks: report story; admin/moderation can disable distribution.
+
+### Non-Functional Requirements (Targets)
+- Tray fetch: P50 50ms, P99 200ms (server-side)
+- Story metadata fetch: P50 30ms, P99 120ms
+- View event ack: P50 20ms, P99 80ms (accepted → async persistence)
+- Playback start: P50 <300ms, P95 <800ms (CDN + player)
+- Availability: reads 99.99%, publish 99.9%
+- Strong consistency for authn/authz decisions; eventual consistency acceptable for viewer lists/counts (seconds-level)
+
+## Simplified Architecture
+
+A single **Stories API** owns the product surface area (stories, tray, views, moderation). It uses:
+- **Postgres** for story metadata and tray/index data.
+- **Redis** for short-lived caching and high-throughput view tracking (viewer lists + counts).
+- **Object storage + CDN** for media delivery.
+- **Background workers** for media processing and async view materialization.
+
+```mermaid
+flowchart TB
+  C[Client App] --> CDN[CDN]
+  C --> API[Stories API]
+
+  API --> PG[(Postgres)]
+  API --> R[(Redis)]
+  API --> SG[Social Graph]
+
+  API --> OBJ[(Object Storage)]
+  CDN --> OBJ
+
+  W[Background Workers] --> OBJ
+  W --> PG
+  W --> R
+```
+
+### Component Responsibilities
+
+#### Stories API (single service)
+- Story create/publish/delete, story fetch, tray fetch.
+- Privacy enforcement on tray and story open.
+- Playback authorization (signed cookies/URLs).
+- View ingest endpoint (fast accept, idempotent).
+- Moderation endpoints (report, disable), plus audit logging.
+
+#### Postgres (source of truth for stories)
+- Story metadata, state machine, and expiry timestamps.
+- Tray support tables (active authors index, last-seen state).
+- Audience list definitions and membership (custom allow/deny).
+- Moderation/audit tables with longer retention than story TTL.
+
+#### Redis (hot-path performance + view tracking)
+- Short-lived caches for tray and story metadata (including tombstones).
+- High-write viewer lists and counts per story with TTL aligned to story expiry.
+- Optional stream/queue for view events to smooth bursts and support retries.
+
+#### Social Graph (dependency)
+- Relationship checks: follow/friend, blocks, close friends.
+- Exposed as batch-friendly APIs for tray filtering and story-open checks.
+
+#### Media plane (CDN + object storage + workers)
+- Direct-to-object-storage uploads via pre-signed URLs.
+- Workers transcode videos (HLS/DASH), generate thumbnails, and write renditions/manifests.
+- CDN serves manifests/segments with signed access.
+
+## Key Workflows
+
+### 1) Create → Upload → Publish (async processing)
+1. Client calls `POST /v1/stories` to create a draft and receive pre-signed upload URL(s).
+2. Client uploads media directly to object storage.
+3. Client calls `POST /v1/stories/{id}/publish`.
+4. API records `PROCESSING` and enqueues a media job (Postgres job row or Redis stream).
+5. Worker produces renditions + manifest + thumbnails, then marks the story `READY`.
+
+### 2) Tray Fetch (privacy-aware, fast)
+1. API fetches followees from Social Graph.
+2. API reads an `active_authors` index from Postgres (latest story per author, expires_at).
+3. API applies privacy filters in batch:
+   - blocks always exclude
+   - `PUBLIC` always include
+   - `FOLLOWERS/Friends` include based on relationship
+   - `CLOSE_FRIENDS` include based on close-friends membership
+   - `CUSTOM_ALLOW/DENY` includes Postgres membership checks for the referenced list(s)
+4. API computes `has_unseen` using `last_seen_by_viewer_author`.
+5. Result is cached briefly in Redis (30–60s) per viewer.
+
+### 3) Open Story (authz + signed playback)
+1. Client calls `GET /v1/stories/{story_id}`.
+2. API reads story metadata from Postgres (or Redis cache), validates `status` and `expires_at`.
+3. API performs a strong authz decision using Social Graph + audience list membership (when present).
+4. API returns story metadata and playback access (prefer signed cookies scoped to the story media path; otherwise short-lived signed URLs).
+5. Client fetches manifest/segments from CDN.
+
+### 4) View Tracking (async + idempotent)
+1. Client calls `POST /v1/stories/{id}/views` (retriable).
+2. API validates auth + story existence + authorization, then accepts quickly.
+3. View is materialized into Redis:
+   - Viewer list: a per-story sorted set keyed by `story_id` (score = server timestamp, member = `viewer_id`) using `ZADD NX` for unique viewers.
+   - Count: derived from `ZCARD` (or maintained alongside).
+4. If a queue/stream is used, workers process view events and apply the same idempotent updates; the API can fallback to enqueue-only during spikes.
+
+### 5) Delete / Disable (immediate blocking)
+- `DELETE /v1/stories/{id}` sets `status=DELETED` in Postgres immediately.
+- Moderation disable sets `status=DISABLED` plus reason and audit entry.
+- API stops issuing new playback authorization for deleted/disabled/expired stories.
+- Media bytes are removed via lifecycle rules; optional best-effort CDN purge for fast takedown.
+
+## Data Model
+
+### Postgres (partitioned by day for easy TTL drops)
+
+**Table: `stories`**
+- `story_id` (PK), `author_id`, `created_at`, `expires_at`, `status`, `processing_state`
+- `privacy_type`, `allow_list_id`, `deny_list_id`
+- `manifest_key`, `thumb_key`, `caption`, `disabled_reason` (nullable)
+
+**Table: `stories_by_author`**
+- `(author_id, created_at, story_id)` with index to fetch an author’s current stories fast
+
+**Table: `active_authors`**
+- `author_id` (PK), `latest_story_id`, `latest_created_at`, `latest_expires_at`, `audience_hint`
+- Updated on publish/ready/delete/expire; drives tray reads
+
+**Table: `audience_list_members`**
+- `(list_id, member_id)` (PK), `added_at`
+- Used for `CUSTOM_ALLOW/DENY` membership checks
+
+**Table: `last_seen_by_viewer_author`**
+- `(viewer_id, author_id)` (PK), `last_seen_at` (or `last_seen_story_created_at`)
+- Used for unseen indicators; longer TTL (e.g., 30–90 days) to cap growth
+
+**Tables: `story_reports`, `moderation_actions`**
+- Retained beyond story TTL for audit/compliance
+
+### Redis (TTL aligned to story expiry)
+- `tray:{viewer_id}` → cached tray response (30–60s)
+- `story:{story_id}` → cached story metadata/tombstone (10–30s)
+- `viewers:{story_id}` → sorted set of unique viewers (member `viewer_id`, score `first_viewed_at`)
+- Optional `viewstream` → stream of view events for burst smoothing and worker retries
+
+## API Design
+
+**Auth**: OAuth/JWT bearer tokens.
+
+### Create & Publish
+- `POST /v1/stories`
+- `POST /v1/stories/{story_id}/publish`
+
+### Fetch Tray & Story
+- `GET /v1/users/{user_id}/story-tray?limit=50&cursor=...`
+- `GET /v1/stories/{story_id}`
+
+### View Tracking & Viewer List
+- `POST /v1/stories/{story_id}/views`
+  - Idempotency: unique viewers deduped by `(story_id, viewer_id)`
+- `GET /v1/stories/{story_id}/viewers?limit=50&cursor=...`
+  - Author-only (or admin/moderation); served from Redis viewer set
+  - Cursor can be `(score, viewer_id)` for stable pagination
+
+### Delete / Disable
+- `DELETE /v1/stories/{story_id}`
+- `POST /v1/stories/{story_id}/disable`
+
+## Consistency, Expiry, and Revocation
+
+- **Authz correctness**: enforced server-side on tray and story open; default-deny on errors.
+- **Deletion enforcement**: immediate for API reads and playback authorization; media revocation bounded by token TTL and CDN caching.
+- **Viewer lists/counts**: seconds-level eventual consistency (queue/worker lag), with idempotent updates to prevent double counting.
+- **Expiry**:
+  - Postgres partitions dropped after `expires_at + grace` (e.g., 26h).
+  - Redis keys and viewer sets use matching TTL.
+  - Object storage lifecycle rules delete media after TTL + grace.
+
+## Scaling & Performance
+
+- **Tray spikes**: `active_authors` table keeps tray reads to a small, indexed join; Redis caching absorbs app-open bursts.
+- **Privacy checks**: batch Social Graph calls and list membership checks for the small candidate set returned by `active_authors`.
+- **Viral stories**: Redis viewer sets handle high write rates and constant-time dedupe; worker/stream mode provides backpressure under extreme bursts.
+- **Playback startup**: CDN serves manifests/segments; signed cookies keep caching effective; short token TTL bounds revocation window.
+
+## Failure Modes & Mitigations
+
+- **Redis degraded**: tray/story caches bypassed; viewer lists may lag or temporarily fall back to enqueue-only; playback remains unaffected.
+- **Postgres elevated latency**: tray and story reads lean on cached story metadata and `active_authors`; publish may return `PROCESSING` and retry.
+- **Worker backlog**: stories remain `PROCESSING` longer; view lists lag; surfaced via queue depth and event age metrics.
+- **Privacy regressions**: policy tests for privacy matrix, audit logs for access decisions, rapid rollback via feature flags.
+
+## Operations
+
+- **Golden signals**: tray latency/error rate, story fetch latency, playback QoE, publish ready time, Redis memory/ops, worker lag, authz default-deny rate.
+- **Rate limits**: per-user/session limits on view ingest and story fetch to control abuse.
+- **Schema evolution**: additive changes; versioned events if using a stream.
+
+## Simplification Notes
+
+- **Removed**: separate Story/Tray/ViewIngest/AuthZ/Moderation services; folded into a single `Stories API` to reduce deployment and operational overhead.
+- **Removed**: dedicated viewer store and counter store; viewer lists and counts are served from Redis structures with TTL aligned to story expiry.
+- **Removed**: large, multi-topic event bus as a hard dependency in the critical path; an optional Redis-backed stream is used only for smoothing bursts and worker retries.
+- **Merged**: tray caching, story caching, and view tracking into one Redis cluster to keep the runtime footprint small.
+- **Remaining complexity**: CDN + object storage + media workers (required for fast global playback), Social Graph integration (required for privacy correctness), short-lived signed playback auth (required for access control and revocation).
+mcp startup: no servers
+ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Dec 17th, 2025 1:06 AM.
+Warning: no last agent message; wrote empty content to /Users/dominikdabrowski/pr/system-design-atlas/grades/stories-product.json

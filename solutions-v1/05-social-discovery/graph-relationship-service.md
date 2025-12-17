@@ -1,0 +1,383 @@
+---
+title: "Graph Relationship Service"
+category: "Social & Discovery"
+difficulty: "Hard"
+tags: ["social-graph", "caching", "distributed-storage"]
+---
+
+## Overview
+
+A Relationship Service powers core social features—follow, friend, block, mute—and answers “who is connected to whom?” at extremely high read volume with tight latency. The service focuses on **single-hop adjacency** (lists + direct edge checks), not arbitrary graph traversal.
+
+The design uses:
+- A **single Relationship API service** that owns business rules and all relationship writes/reads.
+- **Redis** for low-latency relationship checks and hot first-page list caching.
+- A **Postgres-compatible relational store** as the durable source of truth with transactional writes across the denormalized read paths.
+- An **append-only audit log** stored alongside relationship data and exported to analytics in batch.
+
+This keeps correctness straightforward (transactional updates for edges/lists/counts) while meeting latency targets by serving most reads from cache.
+
+---
+
+## Requirements
+
+### Functional Requirements
+
+- Directed edges:
+  - `follow` / `unfollow`
+  - `block` / `unblock`
+  - `mute` / `unmute`
+- Bi-directional edges:
+  - friend request, accept/decline, remove friend
+- Queries:
+  - Outgoing adjacency: who a user follows (cursor pagination, stable ordering)
+  - Incoming adjacency: a user’s followers (cursor pagination, stable ordering)
+  - Pending friend requests (incoming and outgoing)
+  - Direct checks: does A follow B? are A and B friends? is A blocked by B?
+  - Batch checks: (viewer, many targets) for feed/profile rendering
+  - Counts: followers/following/friends with bounded staleness
+- Safety/moderation:
+  - blocks prevent follow/friend actions and restrict visibility per product rules
+- Compliance:
+  - immutable audit log of edge mutations
+  - GDPR deletion (user removal)
+
+### Non-Functional Requirements (Targets)
+
+| Category | Target |
+|---|---|
+| Users | 50M DAU, 300M MAU |
+| Total edges | ~50B (follow + auxiliary) |
+| Growth | 50–200M new edges/day (net) |
+| Read QPS | 150k avg, 500k peak |
+| Write QPS | 10k avg, 50k peak (bursty) |
+| Relationship check latency | P50 5ms, P99 30ms (regional) |
+| List first page latency | P50 20ms, P99 120ms (regional) |
+| Availability | Reads 99.99%, Writes 99.9% |
+| Durability | RPO ≈ 0 for acknowledged writes (multi-AZ) |
+| Consistency | Read-your-writes for actor (best-effort, seconds), eventual for others; counts eventual (seconds–minutes) |
+
+### Constraints & Assumptions
+
+- Hot-path queries are **single-hop adjacency lookups** and **edge existence checks**.
+- Pagination must be stable and deterministic (by `created_at` then `other_user_id`).
+- Skew is expected; design must handle “celebrity partitions”.
+- Edge mutations must be idempotent (clients retry).
+- Deletes must be safe at scale.
+
+---
+
+## Simplified Architecture
+
+```mermaid
+graph TB
+  C[Client Apps] --> GW[API Gateway]
+  GW --> RS[Relationship API]
+
+  RS --> R[(Redis Cache)]
+  RS --> DB[(Postgres Store)]
+
+  DB --> AE[Analytics Export]
+```
+
+### High-Level Request Paths
+
+- **Reads (check/list/counts)**: Relationship API → Redis (hit) → return; on miss → Postgres → return + populate cache.
+- **Writes (follow/block/friend)**:
+  1. Validate rules (authz, block semantics, rate limits, idempotency).
+  2. Transactionally update relationship tables + counts + audit log in Postgres.
+  3. Update Redis for actor “read-your-writes” and short-TTL cache freshness.
+
+---
+
+## Components
+
+### API Gateway
+
+**Responsibilities**
+- AuthN/AuthZ, request validation, routing
+- Rate limiting (per-user/per-IP)
+- Request normalization and protection controls
+
+**Key decisions**
+- Mutation endpoints require `Idempotency-Key`.
+- Separate limits for mutations vs checks vs list pagination.
+
+### Relationship API
+
+A single service with clear modules (rules, reads, writes, caching).
+
+**Responsibilities**
+- Business rules: block semantics, friend workflow state machine
+- Read APIs (lists/checks/batch checks/counts)
+- Write APIs (follow/unfollow/block/mute/friend transitions)
+- Cache population and write-through for actor experience
+
+**Key decisions**
+- Actor experience is optimized via **write-through cache updates** for:
+  - direct check `(viewer,type,target)`
+  - the actor’s own outgoing lists/counts
+- Non-actor list views rely on **short TTL** caching and database truth.
+
+### Redis Cache
+
+**Responsibilities**
+- Serve hot reads at low latency:
+  - edge checks
+  - batch checks
+  - first page (and optionally first 2–3 pages) of lists for hot users
+  - counts
+
+**Caching policy (simple and predictable)**
+- Edge checks: cache both positive and negative results with TTL + jitter.
+- Lists: cache first page keyed by `(user_id, list_type, cursor=empty, limit)` with short TTL.
+- Counts: cache with short TTL; refresh on reads and on relevant writes.
+
+**Stampede control**
+- Singleflight per key in the service (request coalescing).
+- TTL jitter + bounded stale-while-revalidate for list/count keys.
+
+### Postgres Store (Durable Source of Truth)
+
+Use a Postgres-compatible system that supports multi-AZ, read replicas, and horizontal scaling (partitioning/sharding) while keeping SQL semantics for correctness.
+
+**Responsibilities**
+- Durable relationship state
+- Deterministic pagination queries
+- Transactional write bundles (edge + adjacency views + counts + audit)
+- Idempotency enforcement
+
+---
+
+## Data Model
+
+### Edge Types and States
+
+Model all relationships as typed edges with explicit state:
+
+- `FOLLOW`: directed, `{ACTIVE, REMOVED}`
+- `BLOCK`: directed, `{ACTIVE, REMOVED}`
+- `MUTE`: directed, `{ACTIVE, REMOVED}`
+- `FRIEND_REQUEST`: directed, `{PENDING, REMOVED}`
+- `FRIEND`: symmetric, represented as **two directed edges** (`A→B` and `B→A`) with `{ACTIVE, REMOVED}`
+
+### Tables
+
+#### 1) Canonical edges (authoritative for checks)
+
+`edges`
+- Primary key: `(src_user_id, edge_type, dst_user_id)`
+- Columns:
+  - `state` (`ACTIVE|PENDING|REMOVED`)
+  - `created_at`, `updated_at`
+  - `op_version` (monotonic per edge)
+
+**Queries**
+- Check: `SELECT state FROM edges WHERE src=? AND type=? AND dst=?`
+- Batch check: `SELECT ... WHERE src=? AND type=? AND dst IN (...)`
+
+#### 2) Adjacency lists (optimized for pagination)
+
+`edges_out`
+- Key: `(src_user_id, edge_type, created_at, dst_user_id)` (ordered by `created_at DESC, dst_user_id`)
+- Only stores rows for visible list states (typically `ACTIVE`, and `PENDING` for friend requests where applicable).
+
+`edges_in`
+- Key: `(dst_user_id, edge_type, created_at, src_user_id)` (ordered by `created_at DESC, src_user_id`)
+- Same “only listable states” rule.
+
+Both tables are written in the same transaction as `edges`, so list and check results converge quickly without repair workflows.
+
+#### 3) Derived counts (bounded staleness)
+
+`edge_counts`
+- Key: `user_id`
+- Columns: `followers_count`, `following_count`, `friends_count`, `updated_at`
+
+Counts are updated transactionally on state transitions (e.g., `REMOVED → ACTIVE` increments; `ACTIVE → REMOVED` decrements). Redis caching provides bounded staleness for reads.
+
+#### 4) Idempotency keys
+
+`idempotency_keys`
+- Key: `(actor_user_id, idempotency_key)`
+- Columns: `request_hash`, `response_body`, `status_code`, `created_at`, `expires_at`
+
+This allows safe retries without duplicating edge transitions and keeps write handling deterministic.
+
+#### 5) Immutable audit log (append-only)
+
+`edge_audit`
+- Key: `(event_id)` (ULID/UUID)
+- Columns:
+  - `occurred_at`
+  - `actor_user_id`, `src_user_id`, `dst_user_id`, `edge_type`
+  - `action` (FOLLOW/UNFOLLOW/BLOCK/…)
+  - `op_version`
+  - `request_id` / `idempotency_key` (for traceability)
+
+A scheduled export job copies new audit rows to the analytics system (batch or streaming, depending on the platform), without being on the request path.
+
+---
+
+## Pagination
+
+Use an opaque cursor encoding the last seen sort key:
+- Outgoing lists: `(created_at, dst_user_id)`
+- Incoming lists: `(created_at, src_user_id)`
+
+Query pattern:
+- `WHERE (created_at, other_user_id) < (:cursor_created_at, :cursor_other_id)`
+- `ORDER BY created_at DESC, other_user_id DESC LIMIT :limit`
+
+This produces stable, deterministic pagination.
+
+---
+
+## API
+
+### Conventions
+
+- REST + JSON externally.
+- Acting user (`source_user_id`) is derived from auth context.
+- Cursor pagination with `limit` and opaque `cursor`.
+- Idempotency via `Idempotency-Key` on all mutation endpoints.
+
+### Endpoints
+
+#### Follow / Unfollow
+
+- `POST /v1/relationships/follow`
+  - Request: `{ "target_user_id": "u456" }`
+  - Response: `{ "state": "ACTIVE", "created_at": "..." }`
+
+- `DELETE /v1/relationships/follow/{target_user_id}`
+  - Response: `{ "state": "REMOVED", "updated_at": "..." }`
+
+Rule checks:
+- If either direction has an active `BLOCK`, return `PRECONDITION_FAILED`.
+- Enforce per-user mutation rate limits and per-target anti-spam limits.
+
+#### Friend Requests / Friends
+
+- `POST /v1/relationships/friends/requests` `{ "target_user_id": "u456" }`
+- `POST /v1/relationships/friends/requests/{requester_user_id}/accept`
+
+Accept writes `FRIEND` edges in both directions and marks the request removed.
+
+#### Lists
+
+- `GET /v1/users/{user_id}/following?limit=50&cursor=...`
+- `GET /v1/users/{user_id}/followers?limit=50&cursor=...`
+- `GET /v1/users/{user_id}/friends?limit=50&cursor=...`
+- `GET /v1/users/{user_id}/friends/requests/incoming?limit=50&cursor=...`
+
+Response:
+```json
+{
+  "items": [{ "user_id": "u456", "created_at": "..." }],
+  "next_cursor": "opaque..."
+}
+```
+
+#### Checks (single + batch)
+
+- `GET /v1/relationships/check?target_user_id=u456&type=FOLLOW`
+- `POST /v1/relationships/check:batch` `{ "targets": ["u1","u2"], "type":"FOLLOW" }`
+
+Batch implementation:
+- Redis pipeline for cached targets
+- One SQL query for misses using `IN (...)` (with a hard cap like 500)
+
+#### Block / Mute
+
+- `POST /v1/relationships/block` `{ "target_user_id": "u456" }`
+- `DELETE /v1/relationships/block/{target_user_id}`
+- `POST /v1/relationships/mute` `{ "target_user_id": "u456" }`
+- `DELETE /v1/relationships/mute/{target_user_id}`
+
+---
+
+## Consistency Model
+
+- **Edge checks**: served from Redis when present; otherwise from `edges` (authoritative). Writes update the relevant check cache entry immediately for actor read-your-writes.
+- **Lists**: database is authoritative; Redis caches first pages with short TTL. Actor-facing outgoing lists can be refreshed on write to feel instant.
+- **Counts**: stored transactionally in `edge_counts` and cached in Redis with bounded staleness.
+
+---
+
+## Scaling & Performance
+
+### Read scaling
+
+- Serve the majority of check and batch-check traffic from Redis.
+- Cache only the first page (and optionally first few pages) of the hottest lists to avoid deep-pagination cache churn.
+- Use read replicas for Postgres to handle cache misses and deep pagination; keep writes on the primary.
+
+### Write scaling
+
+- Keep the write path single-round-trip to Postgres with a single transaction:
+  - update `edges`
+  - update `edges_out` + `edges_in`
+  - update `edge_counts`
+  - insert `edge_audit`
+  - upsert `idempotency_keys`
+
+### Hot users (“celebrity” problem)
+
+- Cache first page followers/following for hot profiles with short TTL and singleflight refresh.
+- Apply endpoint protection for deep pagination: smaller defaults, stricter rate limits, and load shedding when needed.
+- Partition/shard `edges_in` by `dst_user_id` to distribute follower list IO and indexing load.
+
+---
+
+## Failure Modes
+
+1) **Redis outage**
+- Reads fall back to Postgres with circuit breakers and adaptive rate limits.
+- Cache repopulates naturally; singleflight reduces stampedes.
+
+2) **Database replica lag**
+- Checks remain correct via primary-read for actor writes when necessary; list/count caches use short TTL.
+- For strict actor read-your-writes, route actor reads to primary for a brief window.
+
+3) **Partial failures on write**
+- Transactional writes keep `edges`, adjacency tables, counts, and audit consistent.
+- If Redis updates fail, TTL-based cache expiry restores correctness; actor can be routed to DB for immediate consistency.
+
+4) **Retry storms / duplicate requests**
+- `Idempotency-Key` table returns the original outcome and prevents duplicate transitions.
+- `op_version` ensures monotonic edge state changes.
+
+---
+
+## Operations
+
+### Observability
+
+Track:
+- Endpoint p50/p95/p99 latency and error rates
+- Redis hit ratio, hot keys, eviction rate
+- DB p99 query latency, replica lag, lock contention, connection pool saturation
+- Cache-miss amplification for batch checks and list endpoints
+
+### GDPR deletion
+
+- Immediately mark user deleted and block future actions.
+- Asynchronously purge:
+  - outgoing edges (`edges`, `edges_out`) by `src_user_id`
+  - incoming list rows (`edges_in`) by `dst_user_id`
+- Use bounded-rate deletion jobs to avoid overwhelming partitions and indexes.
+
+### Analytics and compliance
+
+- `edge_audit` is append-only and retained per policy.
+- Export job ships audit rows to the analytics platform on a schedule; this stays off the request path.
+
+---
+
+## Simplification Notes
+
+- Removed: event bus and worker fleet; audit logging and analytics are sourced from `edge_audit` in the primary store and exported out-of-band.
+- Removed: versioned list cache keys and asynchronous cache repair; transactional writes keep `edges` and adjacency tables aligned, and caches rely on short TTL + singleflight.
+- Merged: cache updates, counters maintenance, and idempotency handling into the Relationship API write transaction (with best-effort Redis write-through).
+- Complexity that remains: Redis caching (to meet latency and protect the database), denormalized adjacency tables (to serve both directions efficiently), and partitioning/sharding (to handle follower hotspots and 50B+ rows).

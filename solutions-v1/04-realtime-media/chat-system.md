@@ -1,0 +1,273 @@
+---
+title: "Chat System (1:1 & Group)"
+category: "Real-Time & Media"
+difficulty: "Hard"
+tags: ["messaging", "websocket", "kafka", "cassandra", "push-notifications"]
+---
+
+## Overview
+
+This design delivers a WhatsApp/Slack-like chat experience with low-latency realtime messaging, reliable offline sync, multi-device support, receipts, presence/typing, media sharing, and abuse controls.
+
+The core idea is a single **Chat Service** that handles HTTP APIs and WebSockets, backed by:
+- **Postgres** for durable state (messages, conversations, membership, receipts, devices, sync cursors)
+- **Redis** for ephemeral state (presence/typing, connection routing, rate limiting, pub/sub fanout)
+- **Object storage + CDN** for media
+
+Messages are acknowledged only after a durable commit. Delivery is at-least-once end-to-end; clients deduplicate.
+
+---
+
+## Requirements
+
+### Functional Requirements
+- 1:1 and group messaging; multi-device per user.
+- Realtime delivery to online devices (WebSocket); offline via sync; optional push notifications.
+- Delivery/read receipts; typing indicators; presence (online/last seen).
+- Group management (create/invite/kick/roles).
+- Media upload/download with secure access; thumbnailing; scanning hooks.
+- Abuse controls: rate limits, reporting hooks, audit logs.
+
+### Non-Functional Requirements (Targets)
+- **Latency SLOs** (per region): Send ACK P99 < 200 ms; online delivery P99 < 400 ms; sync fetch P99 < 1 s for 500 messages (excluding media).
+- **Availability**: messaging 99.99% monthly; presence/typing 99.9% monthly.
+- **Consistency**: total order within a conversation (`convSeq`); strong membership checks; best-effort presence/typing.
+- **Durability/DR**: no silent loss; RPO ≤ 1 minute; RTO ≤ 30 minutes.
+
+### Constraints & Assumptions
+- Multi-region deployment; clients connect to nearest region.
+- Encryption in transit and at rest.
+- Optional E2EE is an extension.
+
+---
+
+## Simplified Architecture
+
+```mermaid
+flowchart TB
+  C[Client] --> E[Edge LB + WAF]
+  E --> S["Chat Service (HTTP+WS)"]
+
+  S --> PG[(Postgres)]
+  S --> R[(Redis)]
+  S --> OBJ[(Object Storage)]
+  OBJ --> CDN[CDN]
+  CDN --> C
+
+  S --> P[Push Provider]
+```
+
+**Service shape**
+- The Chat Service is a modular monolith: HTTP APIs, WebSocket handling, message send/history, sync, group management, and background delivery workers in one deployable unit.
+- Scale is achieved by running many stateless Chat Service instances; Redis and Postgres provide shared state.
+
+---
+
+## Components
+
+### Chat Service (HTTP + WebSocket)
+**Responsibilities**
+- Authenticate requests and WS connections.
+- Send path: validate, authorize, assign `convSeq`, persist message, acknowledge.
+- Delivery: realtime notifications to online connections; push notification enqueue when appropriate.
+- Sync: incremental catch-up for devices; reconcile gaps after reconnect.
+- Groups: membership/roles; strongly consistent authorization for reads/writes.
+- Receipts: monotonic “read up to” per conversation; optional delivered receipts.
+- Abuse controls: rate limiting, spam heuristics hooks, reporting/audit events.
+
+**Delivery model**
+- **Small groups / 1:1**: fan-out-on-write into a per-user inbox table for fast sync and unread counts.
+- **Large groups/channels**: store once in the message table; use per-user cursors and watermark-based updates. Realtime pushes target users who are currently subscribed/active in that conversation on WebSocket.
+
+### Postgres (Durable Store)
+**Why it exists**
+- Strong consistency for membership checks and ordered messaging per conversation.
+- Transactional durability boundary for “commit then deliver.”
+
+**Key patterns**
+- Transaction for send:
+  1. Validate membership + rate limit (reads)
+  2. Allocate `convSeq` (single-row update on conversation)
+  3. Insert message (unique idempotency key)
+  4. Create delivery work (outbox/inbox rows)
+  5. Commit → ACK
+
+- Background workers use `SELECT ... FOR UPDATE SKIP LOCKED` to process delivery work reliably.
+
+### Redis (Ephemeral + Fanout)
+**Uses**
+- Presence/typing TTL keys.
+- Connection routing (which Chat Service instance owns a user/device connection).
+- Pub/sub to deliver notifications to the correct instance.
+- Rate limiting counters.
+
+**Degradation**
+- If Redis is impaired, messaging remains correct; presence/typing and realtime routing degrade and clients rely on sync.
+
+### Media (Object Storage + CDN)
+**Flow**
+- Chat Service issues pre-signed upload URLs with constraints.
+- Client uploads directly to object storage.
+- Messages reference `mediaId`.
+- Downloads use short-lived signed URLs or a tokenized proxy endpoint.
+- Optional scanning/thumbnail generation runs asynchronously; metadata stored in Postgres.
+
+### Push Notifications (Optional)
+- Store device tokens in Postgres.
+- Background workers send minimal notifications (conversation + watermark) via APNs/FCM.
+- Full content remains in sync/messages APIs.
+
+---
+
+## Data Model (Illustrative)
+
+### Conversations and membership
+- `conversations(conversation_id, type, created_at, home_region, next_seq, large_group)`
+- `conversation_members(conversation_id, user_id, role, joined_at, left_at, membership_version)`
+
+### Messages (ordered by `convSeq`)
+- `messages(conversation_id, conv_seq, message_id, sender_id, sent_at, kind, payload, media_refs, edit_of, deleted_at)`
+- Partitioning: start with time-based partitions or hash partitions; index `(conversation_id, conv_seq)`.
+
+### Idempotency / dedup
+- `message_dedup(sender_id, conversation_id, client_msg_id, message_id, conv_seq, sent_at)` with TTL/cleanup policy.
+- Unique constraint on `(sender_id, conversation_id, client_msg_id)`.
+
+### Sync and unread
+- `user_conversation_state(user_id, conversation_id, last_read_seq, last_delivered_seq, updated_at, muted)`
+- **Inbox for small groups**
+  - `user_inbox(user_id, conversation_id, conv_seq, message_id, sent_at)` (append-only; query by cursor)
+
+### Delivery work (outbox)
+- `delivery_tasks(task_id, user_id, device_id nullable, conversation_id, conv_seq, kind, payload, run_after, status, attempts, created_at)`
+- Workers publish realtime events via Redis pub/sub and mark tasks done.
+
+### Presence/typing (Redis)
+- `presence:user:{userId}` → `{instanceId, lastHeartbeat}` (TTL)
+- `typing:{conversationId}:{userId}` → boolean (short TTL)
+
+---
+
+## Data Flows
+
+### Send + ACK + Realtime delivery (small group)
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as Client
+  participant S as Chat Service (WS/HTTP)
+  participant PG as Postgres
+  participant R as Redis
+
+  C->>S: SendMessage(clientMsgId, convId, body)
+  S->>PG: Txn: authorize + convSeq + insert message + enqueue deliveries
+  PG-->>S: Commit OK (messageId, convSeq)
+  S-->>C: ACK(messageId, convSeq)
+
+  S->>PG: Worker claims delivery_tasks
+  S->>R: Publish to recipient instance(s)
+  R-->>S: Recipient instance receives event
+  S-->>C: message.new / receipt events
+```
+
+### Large group/channel delivery
+- Message is written once to `messages`.
+- `user_conversation_state.last_delivered_seq` advances as devices sync.
+- Realtime pushes are watermark-based and targeted to currently subscribed/active viewers of the conversation; other online users catch up via sync.
+
+---
+
+## API
+
+All endpoints require authentication (Bearer token). Requests carry idempotency keys and request IDs.
+
+### Messaging
+- `POST /v1/conversations/{conversationId}/messages`
+  - Header: `Idempotency-Key: <uuid>`
+  - Body: `{ "clientMsgId":"uuid", "kind":"text", "body":"hi", "mediaIds":["..."] }`
+  - Response: `{ "messageId":"...", "convSeq":12345, "sentAt":"..." }`
+  - ACK after durable commit; delivery is asynchronous; clients dedupe.
+
+- `GET /v1/conversations/{conversationId}/messages?fromSeq=12000&limit=200`
+  - Returns ordered messages by `convSeq`.
+
+### Sync
+- `POST /v1/sync/inbox`
+  - Body: `{ "deviceId":"...", "cursor":"opaque", "limit":1000 }`
+  - Response: `{ "nextCursor":"opaque", "entries":[{"conversationId":"...","convSeq":12345,"messageId":"...","sentAt":"..."}] }`
+  - Entries come from `user_inbox` (small groups) and watermark/state updates (large groups).
+
+- `GET /v1/conversations/{conversationId}/state`
+  - Returns `lastReadSeq`, `lastDeliveredSeq`, `latestSeq`, `largeGroup`.
+
+### Receipts
+- `POST /v1/conversations/{conversationId}/read`
+  - Body: `{ "convSeq":12345, "deviceId":"..." }`
+  - Monotonic update; emits receipt event.
+
+### WebSocket
+- Connect: `wss://.../v1/ws?token=...`
+- Events: `message.new`, `conversation.updated`, `receipt.read`, `typing.*`, `presence.update`
+- Server may request resync when gaps are detected.
+
+### Groups
+- `POST /v1/groups`
+- `POST /v1/groups/{groupId}/members`
+- Membership is versioned (`membership_version`) and enforced on every write/read.
+
+### Media
+- `POST /v1/media/uploads` → pre-signed upload URL + `mediaId`
+- `GET /v1/media/{mediaId}/download` → short-lived signed URL (or proxied stream)
+
+---
+
+## Scaling & Performance
+
+### Chat Service
+- Horizontally scale stateless instances.
+- WebSocket routing uses Redis to map user/device → owning instance; events are delivered via pub/sub.
+- Apply backpressure: bounded per-connection queues; prioritize messages over typing/presence; coalesce low-value signals.
+
+### Postgres
+- Start with a primary + read replicas and partitioned `messages`.
+- Scale writes with:
+  - Partitioning and careful indexing on `(conversation_id, conv_seq)`.
+  - Batched inserts for `user_inbox` and `delivery_tasks`.
+  - Hot conversation mitigation: allocate `convSeq` in ranges per instance (optional evolution) to reduce row-lock contention.
+
+### Large groups/channels
+- Watermark-based delivery reduces write amplification.
+- Realtime pushes focus on active subscribers; full consistency is provided by sync/history reads.
+
+---
+
+## Failure Modes & DR
+
+- **Redis degraded**: presence/typing and realtime routing degrade; messages still commit; clients rely on sync.
+- **Worker lag**: messages are safe (committed); delivery tasks catch up; sync provides correctness.
+- **Duplicates**: idempotency keys + unique constraints; clients dedupe by `messageId`.
+- **Postgres issues**: fail fast on send, client retries with backoff; use PITR backups and streaming replication.
+- **Regional outage**: route clients to healthy region; conversations have a `home_region` for ordered writes; cross-region forwarding preserves `convSeq` semantics.
+
+**DR targets**
+- RPO ≤ 1 minute via WAL archiving/replication.
+- RTO ≤ 30 minutes via automated restore/failover runbooks and rehearsed restores.
+
+---
+
+## Operations
+
+- Metrics: send ACK latency, delivery lag, WS reconnect rate, per-connection queue depth, sync latency, duplicate rate, hot conversation rate, Postgres p99 and lock waits, Redis latency/evictions.
+- Progressive delivery: canary by region and user %; feature flags for large-group thresholds and push behavior.
+- Security: encryption, least-privilege IAM, signed media URLs, audit logs for admin/group actions.
+- Abuse: per-user/device/conversation rate limits (Redis), spam/report hooks, moderation pipeline integration.
+
+---
+
+## Simplification Notes
+
+- Removed: Kafka event log and consumer groups; acceptable because Postgres transactions + delivery task queue provide durable commit and reliable asynchronous delivery at this stage.
+- Removed: Cassandra/Scylla message store and separate inbox KV store; acceptable because a single Postgres schema supports ordered history, inbox indexing, and strong membership checks with one operational datastore.
+- Removed: standalone sequencer and outbox relay service; acceptable because `convSeq` allocation and delivery task creation happen atomically within the Postgres transaction.
+- Merged: API gateway, message service, inbox/sync service, fanout workers, and realtime router into the Chat Service; acceptable because these functions share the same data model and deployment cadence, and horizontal scaling is handled at the instance level.
+- Complexity that remains: multi-region ordering via `home_region`, watermark-based delivery for large groups, and Redis-backed realtime routing; necessary to preserve per-conversation ordering, bound large-group amplification, and keep realtime latency low.

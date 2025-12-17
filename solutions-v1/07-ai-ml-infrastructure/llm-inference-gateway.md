@@ -1,0 +1,287 @@
+---
+title: "LLM Inference Gateway"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["llm", "api-gateway", "caching", "streaming", "moderation", "quotas", "multi-region", "billing"]
+---
+
+## Overview
+
+An LLM Inference Gateway is the production front door for language model usage. It authenticates clients, enforces rate limits and spend quotas, applies safety controls, and proxies requests to one or more model backends while supporting low-latency token streaming.
+
+The core invariants are:
+
+1. **Quota correctness under concurrency**: retries, partial failures, and streaming cancellation must not double-charge or overshoot budgets.
+2. **Safety without breaking UX**: moderation must work for prompts and (optionally) streamed output while keeping time-to-first-token (TTFT) low.
+3. **Predictable latency and cost**: routing must handle heterogeneous providers with clear fallbacks and simple operational controls.
+
+This design keeps the hot path small and fast while still producing an auditable, durable usage trail suitable for billing and disputes.
+
+---
+
+## Requirements
+
+### Functional Requirements
+
+- Authenticate via API keys and/or OAuth; map to `org/project/user`.
+- Provide OpenAI-compatible `/v1/chat/completions` with **SSE streaming** and cancellation propagation.
+- Enforce **rate limits** (RPM/TPM) and **budgets** (daily/monthly USD and/or tokens) per org/project/user/model.
+- Apply **moderation** on prompts and optionally on generated output with outcomes: `block`, `redact`, `warn`, `allow`.
+- Support **exact-match caching** for deterministic requests (tenant-controlled).
+- Route across providers/models with health checks, simple circuit breaking, and controlled rollout.
+- Emit **audit and usage telemetry** (request IDs, policy version, quota decisions) for compliance and billing.
+
+### Non-Functional Requirements
+
+- Peak: 10,000 RPS; 10,000 concurrent SSE connections.
+- Gateway overhead (excluding model compute): non-streaming P50 ≤ 30ms/P99 ≤ 150ms; streaming TTFT overhead P50 ≤ 60ms/P99 ≤ 250ms.
+- API SLO: 99.99% monthly (multi-AZ).
+- Usage durability: **RPO ≤ 60s** for billing.
+- Retention: request metadata 30 days; audit logs 1 year; usage aggregates 13 months.
+
+### Constraints & Assumptions
+
+- Egress to external providers allowed; some tenants require **data residency** and region pinning.
+- Operable by a 6–10 engineer team with standard SRE tooling.
+- Prefer managed building blocks: managed Postgres and Redis.
+
+---
+
+## Simplified Architecture
+
+### High-Level
+
+A single stateless Gateway service handles the request lifecycle end-to-end (auth, policy, quota, moderation, routing, streaming, caching). Durable audit/usage records are written to Postgres, and Redis is used for low-latency counters/reservations and cache.
+
+```mermaid
+graph TB
+  C[Client] --> E[Edge LB/WAF]
+  E --> G[Gateway API]
+  G --> RD[(Redis)]
+  G --> PG[(Postgres)]
+  G --> MOD[Moderation API]
+  G --> P[LLM Providers]
+  G --> W[Async Worker]
+  W --> PG
+```
+
+**Why this works**
+- The hot path has only two in-region state dependencies: **Redis** (fast, atomic) and **Postgres** (durable, auditable).
+- The Gateway remains horizontally scalable and stateless, even for streaming.
+- Billing and analytics are produced from a single durable event source (Postgres), with asynchronous aggregation.
+
+---
+
+## Request Lifecycle (Streaming)
+
+Key invariant: **reserve before upstream work** and **finalize exactly once**.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as Client
+  participant G as Gateway
+  participant RD as Redis
+  participant MOD as Moderation
+  participant P as Provider
+  participant PG as Postgres
+
+  C->>G: POST /v1/chat/completions (stream=true)
+  G->>G: Authn/Authz + policy load (cached)
+  G->>MOD: Pre-moderate(prompt)
+  MOD-->>G: decision (allow/block/warn)
+
+  G->>RD: Reserve quota + rate check
+  RD-->>G: reservation_id or reject (402/429)
+
+  G->>P: Start upstream stream
+  loop Token stream
+    P-->>G: token chunk(s)
+    opt Output moderation enabled
+      G->>MOD: Post-moderate(window)
+      MOD-->>G: allow/redact/abort
+    end
+    G-->>C: SSE data: delta
+  end
+
+  G->>RD: Finalize(reservation_id, actual_usage, status) (idempotent)
+  G->>PG: Insert usage/audit record (idempotent)
+  G-->>C: SSE [DONE] or error
+```
+
+**Crash safety**
+- Reservations in Redis carry an expiry; a background sweeper marks expired reservations as `abandoned` and records a final status in Postgres for audit visibility.
+- Finalization is idempotent using unique keys (`request_id`, `reservation_id`), so retries and duplicate finalize attempts are safe.
+
+---
+
+## Components
+
+### Edge LB / WAF
+
+- TLS termination, WAF rules, basic connection limiting, and routing to the correct region endpoint.
+- Keeps the Gateway focused on application-level concerns.
+
+### Gateway API (Stateless, Streaming-Capable)
+
+**Responsibilities**
+- OpenAI-compatible API surface, SSE streaming proxy, and cancellation propagation.
+- Authentication and authorization; tenant policy evaluation with short TTL caching.
+- Quota reserve/finalize and rate limiting via Redis.
+- Prompt moderation and optional streamed-output moderation (sliding window).
+- Routing to the selected provider/model, with health checks and simple circuit breaking.
+- Exact-match caching for deterministic, tenant-approved requests.
+
+**Hot-path ordering**
+1. Auth/policy
+2. Prompt moderation (if enabled)
+3. Quota reserve + rate check
+4. Route + start upstream
+5. Stream tokens (+ optional output moderation)
+6. Finalize quota + write durable usage/audit record
+
+### Redis (Hot Path: Rate/Quota + Cache)
+
+- Atomic counters and reservations (Lua/scripts or Redis functions).
+- Exact-match response cache with single-flight locking to prevent stampedes.
+- Short TTLs for high-cardinality keys; policy TTL cache optional.
+
+### Postgres (System of Record)
+
+- Configuration: orgs/projects/keys/policies/quota configs/routing weights.
+- Durable, append-only usage and audit records (partitioned tables for scale).
+- Idempotency storage for `stream=false` retries (response references, status, TTL).
+
+### Moderation Backend (Pluggable)
+
+- A single API integration point for either:
+  - an external moderation provider, or
+  - a self-hosted moderation model in the same region.
+- Gateway enforces tenant policy on moderation outcomes and records decision metadata.
+
+### Async Worker (Aggregation + Maintenance)
+
+- Periodically aggregates `usage_events` into daily/monthly tables for dashboards and billing exports.
+- Sweeps expired reservations for audit completeness and operational visibility.
+- Runs in the same deployment as the Gateway (separate process) or as a small separate service.
+
+---
+
+## Data Model
+
+### Postgres Tables (Minimal Set)
+
+**Configuration**
+- `orgs(org_id pk, name, home_region, created_at)`
+- `projects(project_id pk, org_id fk, name, created_at)`
+- `api_keys(key_id pk, project_id fk, key_hash, status, scopes, created_at, last_used_at)`
+- `policies(policy_id pk, org_id fk, policy_version, moderation_mode, pii_rules, cache_policy, updated_at)`
+- `quota_configs(quota_id pk, scope_type, scope_id, period, max_usd, max_tokens, rpm, tpm, updated_at)`
+- `routing_policies(org_id, model, provider_weights_json, updated_at)`
+
+**Idempotency (non-streaming)**
+- `idempotency_keys(project_id, idem_key, request_hash, response_ref, status, expires_at)`
+
+**Audit + Usage (append-only, partitioned by day/month)**
+- `usage_events(event_id uuid pk, request_id uuid, org_id, project_id, user_id, reservation_id, model_requested, model_served, provider, policy_version, moderation_summary_json, tokens_in, tokens_out, usd, status, region, started_at, ended_at, created_at)`
+  - Unique constraint on `(project_id, request_id)` (or `(reservation_id)` depending on your request ID strategy).
+- `usage_daily(org_id, project_id, day, tokens_in, tokens_out, usd, requests, updated_at)`
+- `usage_monthly(org_id, project_id, month, tokens_in, tokens_out, usd, requests, updated_at)`
+
+### Redis Keys
+
+- `rl:req:{scope}:{minute}` → request counters
+- `rl:tok:{scope}:{minute}` → token counters
+- `quota:{scope}:{period}:{bucket}` → spend/token usage
+- `resv:{reservation_id}` → reservation record (scope, estimate, expiry, status)
+- `cache:resp:{hash}` → cached response blob + metadata
+- `lock:cache:{hash}` → single-flight lock
+
+---
+
+## API Design
+
+### Authentication
+
+- `Authorization: Bearer <api_key>` (and/or OAuth bearer token)
+- `Idempotency-Key: <uuid>` supported for `stream=false`
+
+### OpenAI-Compatible Endpoint
+
+`POST /v1/chat/completions`
+
+- Streaming: `Content-Type: text/event-stream`, `data: {...delta...}`, terminal `data: [DONE]`
+- Non-streaming: JSON response with `usage` and stable `request_id`
+
+### Errors
+
+- `400` invalid parameters
+- `401` invalid/missing credentials
+- `403` blocked by policy/moderation
+- `402` budget exceeded
+- `429` rate limited
+- `503` provider unavailable / circuit open
+- `504` upstream timeout
+
+Error body includes `request_id`, `code`, `message`, and `retry_after_ms` when relevant.
+
+---
+
+## Scaling, Latency, and Multi-Region
+
+### Performance
+
+- Keep the hot path to a small number of bounded operations:
+  - policy cache lookup (in-memory with TTL)
+  - Redis reserve/finalize (single round-trip each)
+  - moderation call(s) (prompt; optional output window)
+  - provider stream proxy
+
+### Streaming Efficiency
+
+- Backpressure-aware streaming; bounded per-connection buffers.
+- Prompt cancellation propagation upstream on client disconnect.
+- Optional token flush batching (small intervals) to reduce syscall overhead while preserving UX.
+
+### Multi-Region + Residency
+
+- Deploy a full stack per region (Gateway + Redis + Postgres in-region, multi-AZ).
+- Each org has a `home_region`; requests are routed to the org’s region to keep quota and audit state local and residency-compliant.
+- For global clients, a geo-aware edge routes to the correct region based on org identity (e.g., embedded in API key metadata resolved at the edge, or via region-specific base URLs).
+
+---
+
+## Operations
+
+### Observability
+
+- Gateway: RPS, concurrent streams, TTFT, stream duration, 4xx/5xx, upstream latency, cancellations
+- Redis: reserve/finalize latency, rejects by reason, script error rates, p99 latency
+- Moderation: decision latency, timeout rate, block/redact/warn rates
+- Postgres: insert latency for `usage_events`, partition health, replication lag (if used)
+- Worker: aggregation lag, sweep counts, export job status
+
+### Deployment
+
+- Canary rollout with automatic rollback on SLO burn.
+- Versioned policies; include `policy_version` in usage/audit records and cache keys.
+- Expand/contract migrations for Postgres; partitions managed automatically (daily/monthly).
+
+---
+
+## Security & Privacy
+
+- TLS everywhere; encryption at rest for Redis/Postgres.
+- API keys stored as hashes; support rotation and scoped permissions.
+- Minimal retention by default: store request metadata and policy decisions; store prompts/responses only when explicitly enabled and redacted.
+- Strong tenant isolation: cache keys include `org_id` + `policy_version`; per-tenant cache controls and TTLs.
+- Immutable audit trail in `usage_events` for “who/what/why” on quota and moderation decisions.
+
+---
+
+## Simplification Notes
+
+- Removed: separate auth, quota, moderation, router, and cache services; handled as modules within the `Gateway API` to reduce network hops and operational surface area.
+- Removed: external event bus and OLAP store; durable usage/audit records are staged in `Postgres` (`usage_events`) with an `Async Worker` for aggregation and exports, meeting the billing RPO with fewer moving parts.
+- Merged: telemetry, finance staging, and audit logging into a single append-only Postgres event stream to simplify reconciliation and reprocessing.
+- Complexity retained: `Redis` reservations for low-latency quota correctness, optional output moderation for streaming safety, and per-region stacks for residency and high availability.

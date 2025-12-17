@@ -1,0 +1,250 @@
+---
+title: "SLO/Error Budget Monitoring"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["sre", "slo", "alerting"]
+---
+
+## Overview
+
+This system manages SLO definitions and turns existing metrics into reliable, low-noise alerting using **error budgets** and **multi-window burn rates**. It builds on a Prometheus-compatible metrics backend for all time-series computation and uses Alertmanager-style alert routing for paging/ticketing.
+
+The core loop is:
+1. Define an SLO (objective, period, SLI query templates, guardrails).
+2. Compile that definition into a small set of PromQL recording/alerting rules.
+3. Let the metrics backend evaluate the rules every step (e.g., 60s).
+4. Route notifications only when the SLO is meaningfully at risk (burn-rate alerts with data-quality gating).
+
+## Glossary
+
+- **SLO (Service Level Objective)**: Reliability target over a period (e.g., 99.9% over 30 days).
+- **SLI (Service Level Indicator)**: How reliability is measured (e.g., fraction of requests that are not 5xx).
+- **Error budget**: Allowed unreliability over the period (`1 - objective`).
+- **Burn rate**: Budget consumption speed relative to steady state (`error_ratio / allowed_error_fraction`).
+- **Multi-window alert**: Alert fires only if a short and long window both breach thresholds.
+
+## Requirements
+
+### Functional Requirements
+- CRUD SLOs: objective, period, evaluation step, and SLI definition:
+  - Availability (bad/total)
+  - Latency (good/total using histogram buckets)
+  - Correctness (valid/total)
+  - Custom (advanced good/total or bad/total)
+- Compute per SLO:
+  - Burn rate across rolling windows
+  - Error budget remaining over the SLO period
+  - Time-to-exhaustion estimate (ETA) at current burn
+- Trigger alerts:
+  - Multi-window burn-rate (page vs ticket)
+  - Remaining-budget and/or exhaustion-ETA rules
+  - Deduplication, routing, escalation
+- Multi-tenant isolation (org/project), RBAC, and audit logs for config changes.
+- Drill-down from alert → underlying SLI queries and safe breakdowns (region/cluster/endpoint where bounded).
+- Integrate with existing telemetry stacks:
+  - Prometheus-compatible query API (Prometheus/Mimir/Thanos)
+  - OpenTelemetry metrics via Prometheus bridge or backend support
+  - Vendor APIs via a pluggable adapter model
+
+### Non-Functional Requirements (Target)
+- Tenants: 100–1,000 orgs; SLOs: 10,000–100,000 total
+- Evaluation step: 60s default (30–120s configurable)
+- Fast-burn paging detection: P50 < 60s, P99 < 180s from telemetry availability
+- Control plane strong consistency for config/audit; computed status bounded by ingest delay + rule interval
+- Single region, multi-AZ active/active; multi-region DR later
+
+## Simplified Architecture
+
+```mermaid
+flowchart TB
+  Client["Grafana + GitOps"] --> SLOMgr["SLO Manager API"]
+  SLOMgr --> PG["Postgres (config/audit)"]
+  SLOMgr --> TSDB["Metrics TSDB (PromQL + Rules)"]
+  TSDB --> AM["Alertmanager"]
+  AM --> Notify["PD/Slack/Email"]
+  SLOMgr --> AM
+  SLOMgr --> TSDB
+```
+
+### What This Architecture Provides
+- **All SLI math runs in the metrics backend** using recording/alerting rules (consistent semantics, predictable evaluation cadence).
+- **Alert lifecycle (dedupe, inhibition, retries, routing)** is handled by Alertmanager-style routing.
+- **One service** owns SLO configuration, validation, rule compilation, and status APIs.
+
+## Components
+
+### 1) SLO Manager (Single Service)
+**Responsibilities**
+- SLO CRUD, RBAC, audit logging, idempotency.
+- Query validation (lint + dry-run) against the target metrics adapter.
+- Compile SLOs into:
+  - Recording rules for derived SLO series (burn rate, error ratio, requests, budget remaining, ETA).
+  - Alerting rules for multi-window burn and budget/ETA thresholds.
+- Apply rule groups to the metrics backend’s rule API (or output YAML for GitOps).
+- Read APIs for current SLO status by querying derived series from the TSDB.
+- Optional: ingest alert state/history via Alertmanager webhook for “what happened” timelines.
+
+**Deployment**
+- Stateless replicas behind a load balancer.
+- Uses Postgres as the system of record; no separate cache/queue required.
+
+### 2) Postgres (Config + Audit)
+**Responsibilities**
+- Tenants/projects, SLOs, versions, alert policies, routing config references.
+- Audit logs for all config changes (who/what/when).
+- Idempotency-key storage for create/update endpoints.
+
+**Durability**
+- Multi-AZ managed Postgres with WAL + backups, RPO ~ 0, RTO < 1 hour.
+
+### 3) Metrics Backend (Prometheus-Compatible TSDB + Rule Evaluation)
+**Responsibilities**
+- Execute PromQL range queries and rule evaluation on a fixed interval.
+- Store derived SLO series and make them queryable for dashboards and APIs.
+
+**Assumptions**
+- Backend supports rule evaluation at scale (Prometheus, Mimir/Cortex ruler, Thanos rule, etc.).
+- Multi-tenancy is provided either by separate tenants/workspaces or by a tenant label + query enforcement.
+
+### 4) Alertmanager (Routing + Dedupe)
+**Responsibilities**
+- Receive firing alerts from the metrics backend.
+- Deduplicate by alert labels, group alerts, apply inhibition/silences, and route to receivers.
+- Handle provider retries/rate limits via receiver configuration.
+
+## SLI and Burn-Rate Model
+
+For an SLO with `objective` and `periodSeconds`:
+
+- `allowed_error_fraction = 1 - objective`
+- For each window `W`:
+  - `total(W)` and `bad(W)` are computed from the SLI definition
+  - `error_ratio(W) = bad(W) / total(W)` when `total(W) > 0`
+  - `burn_rate(W) = error_ratio(W) / allowed_error_fraction`
+
+Derived values over the SLO period window `P` (e.g., `30d`):
+- `budget_remaining = clamp(1 - burn_rate(P), 0, 1)`
+- `exhaustion_eta_seconds ≈ periodSeconds / burn_rate(short_window)` (guarded for burn ~ 0)
+
+### Data Quality Guardrails
+Each SLO version includes `min_requests` per window. Recording rules produce:
+- `slo_requests{window="W"}`
+- `slo_insufficient_data{window="W"}` = 1 when `slo_requests(W) < min_requests(W)`
+
+Alerting rules include `slo_insufficient_data{window="W"} == 0` so paging does not trigger on low traffic.
+
+Platform issues (query errors / rule evaluation failures) are handled via the backend’s own rule-evaluation health metrics and a separate “monitoring platform” alert policy.
+
+## Rule Compilation (PromQL)
+
+Each SLO defines queries with a `{{window}}` placeholder and a configured `ingestDelaySeconds`. The compiler applies:
+- Window substitution (`{{window}}` → `5m`, `1h`, …)
+- An evaluation offset (`offset ingestDelaySeconds`) so windows don’t include partial ingestion
+
+**Availability SLI example**
+- `totalQuery`: `sum(increase(http_requests_total{service="checkout"}[{{window}}] offset 2m))`
+- `badQuery`: `sum(increase(http_requests_total{service="checkout",code=~"5.."}[{{window}}] offset 2m))`
+
+**Latency SLI example (p99 ≤ 300ms)**
+- `totalQuery`: `sum(increase(http_request_duration_seconds_count{service="checkout"}[{{window}}] offset 2m))`
+- `goodQuery`: `sum(increase(http_request_duration_seconds_bucket{service="checkout",le="0.3"}[{{window}}] offset 2m))`
+
+The compiler generates (per SLO, per window):
+- `slo_requests{tenant="t",slo_id="...",window="5m"} = total(W)`
+- `slo_error_ratio{...} = bad(W) / total(W)`
+- `slo_burn_rate{...} = slo_error_ratio / (1 - objective)`
+- `slo_insufficient_data{...} = (slo_requests < min_requests)`
+
+And per SLO (period window):
+- `slo_budget_remaining{...} = clamp(1 - slo_burn_rate{window="30d"}, 0, 1)`
+
+## Alerting
+
+### Multi-Window Burn Alerts (Defaults)
+For a 30d SLO, define two rules:
+
+- **Fast burn (page)**: `5m` AND `1h`, higher thresholds, short `for`
+- **Slow burn (ticket)**: `30m` AND `6h`, lower thresholds, longer `for`
+
+Alert expressions use derived burn-rate series and data-quality gates:
+- `slo_burn_rate{window="5m"} > T_fast_short`
+- `slo_burn_rate{window="1h"} > T_fast_long`
+- `slo_insufficient_data{window="5m"} == 0`
+- `slo_insufficient_data{window="1h"} == 0`
+
+### Budget Remaining / ETA Alerts
+Optional policy rules:
+- Ticket when `slo_budget_remaining < X` (e.g., 0.2)
+- Page when `slo_exhaustion_eta_seconds < Y` (e.g., 6h)
+
+Routing is done via Alertmanager using stable labels:
+- `tenant`, `service`, `slo_id`, `severity`
+
+## API Design
+
+### Control Plane (REST)
+- `POST /v1/tenants/{tenantId}/slos` (Idempotency-Key required)
+- `PUT /v1/tenants/{tenantId}/slos/{sloId}` (creates new version, flips active)
+- `GET /v1/tenants/{tenantId}/slos/{sloId}`
+- `GET /v1/tenants/{tenantId}/slos/{sloId}/status?windows=5m,1h,6h,30d`
+- `POST /v1/tenants/{tenantId}/alert-policies`
+- `GET /v1/tenants/{tenantId}/audit?resourceType=slo&resourceId=...`
+
+### GitOps Support
+- `GET /v1/tenants/{tenantId}/rules` returns generated rule group YAML (recording + alerting) for review/commit.
+- `POST /v1/tenants/{tenantId}/sync` applies the currently active config to the backend rule API (or is driven by CI).
+
+### Error Envelope
+```json
+{ "error": { "code": "INVALID_QUERY", "message": "...", "details": {} } }
+```
+
+## Data Model (Postgres)
+
+- `tenants(tenant_id, name, created_at)`
+- `slo(slo_id, tenant_id, name, service, objective, period_seconds, enabled, created_at)`
+- `slo_version(slo_version_id, slo_id, version, sli_type, good_query, total_query, bad_query, min_requests_json, ingest_delay_seconds, labels_json, created_at)`
+- `alert_policy(policy_id, tenant_id, name, enabled, routing_json, created_at)`
+- `audit_log(id, tenant_id, actor, action, resource_type, resource_id, before_json, after_json, created_at)`
+- `idempotency_key(tenant_id, key, request_hash, response_json, created_at, expires_at)`
+- Optional: `alert_event(id, tenant_id, fingerprint, state, labels_json, starts_at, ends_at, received_at)`
+
+## Scaling & Performance
+
+### Primary Load Driver
+Rule evaluation and TSDB query cost dominate. This design controls that with:
+- A small, default window set for recording rules (alert windows + period window).
+- Strict label hygiene and query validation (required aggregation, bounded dimensions, timeouts).
+- Tenant-level quotas in the SLO Manager (max SLOs, max windows, max query cost).
+
+### Horizontal Scaling
+- **SLO Manager**: scale stateless replicas; Postgres connection pooling.
+- **Metrics backend**: scale ruler/query components per vendor guidance (Mimir/Cortex ruler sharding, Thanos rule sharding, etc.).
+- **Alertmanager**: HA pair with mesh; routing config generated by SLO Manager/GitOps.
+
+## Operations
+
+### Monitoring This System
+- SLO Manager: request latency, DB latency, rule-sync duration, rule-sync failures, adapter query latencies
+- Metrics backend: rule evaluation duration, rule evaluation failures, query latency/error rate
+- Alerting: notifications delivered/failed, alert group rate, silences/inhibitions effectiveness
+
+### Failure Modes
+- **Metrics backend degraded**: SLO alerts may delay; platform alerts fire on rule-evaluation failures/latency.
+- **SLO Manager down**: rule evaluation continues; CRUD/status APIs degrade; sync resumes when service returns.
+- **Bad SLO query**: rejected at validation or constrained by enforced limits; versioning supports rollback.
+
+### Security
+- OIDC/JWT for authentication; tenant-scoped RBAC authorization in SLO Manager.
+- Audit log for all config changes.
+- Encryption in transit; secrets referenced from a secrets manager in routing config.
+
+## Simplification Notes
+
+- Removed `API Gateway` by folding auth, RBAC, and idempotency into `SLO Manager`; one ingress point remains with standard OIDC middleware.
+- Removed `Evaluation Scheduler`, `Durable Work Queue`, and `SLI Evaluation Workers` by using the metrics backend’s rule engine to evaluate windows on a fixed interval and store derived series directly.
+- Removed `Derived Metrics Store` as a separate TSDB by writing derived SLO series into the existing Prometheus-compatible backend via recording rules.
+- Removed `Custom Alert Engine` and `Notification Service` by using Prometheus alerting rules plus Alertmanager for state transitions, dedupe, routing, retries, and provider integrations.
+- Removed `Redis (cache/locks)` by relying on Postgres for consistency and using in-process caching for read performance where needed.
+- Kept `Postgres` because strong consistency, auditing, and versioned configuration are required for correctness and governance.
+- Kept multi-window burn-rate alerting and data-quality gating because they are necessary to page reliably without flapping at both high and low traffic.

@@ -1,0 +1,254 @@
+---
+title: "Audit Trail System"
+category: "Security & Access Control"
+difficulty: "Hard"
+tags: ["audit-logging", "tamper-evidence", "compliance", "worm", "merkle-tree", "rfc3161"]
+---
+
+## Overview
+
+This audit trail system records security-relevant events and preserves them with long-term immutability and evidentiary integrity. It provides:
+
+- **Storage-enforced immutability (WORM)** for retention and legal hold.
+- **Cryptographic tamper-evidence** using per-tenant ordering and Merkle inclusion proofs.
+- **Independent anchoring** by periodically timestamping signed roots via an RFC 3161 Time Stamping Authority (TSA).
+
+The system is built as a single deployable service with a relational database for receipts/indexing and immutable object storage for the authoritative record.
+
+---
+
+## Requirements
+
+### Functional Requirements
+- Ingest audit events over HTTPS with strong authentication/authorization and tenant isolation.
+- Enforce immutable retention policies (1–7 years) and legal holds; prevent deletion/modification.
+- Search by tenant, actor, action, resource, time range, and correlation/request ID.
+- Provide cryptographic proofs (Merkle inclusion + signed manifests + TSA evidence).
+- Support compliance exports (e.g., daily signed bundles) and investigations.
+- Detect and alert on gaps, duplicates, and integrity violations.
+- Provide admin APIs for policy management, access control, key management, and reader permissions.
+- Support disaster recovery without weakening immutability guarantees.
+
+### Non-Functional Requirements (Concrete Targets)
+- Peak ingest: **10,000 events/s**, average **2,000 events/s**, avg event size **2 KB**, retention **5 years**.
+- Ingest latency:
+  - **Durable Accept**: ack after durable database commit (receipt issued).
+  - **Sealed Commit**: ack after WORM segment + signed manifest written.
+- Query latency target: P50 ~200 ms, P99 ~2 s for selective filters; proofs returned with results.
+- Availability targets:
+  - Durable Accept ingest: **99.99% monthly**
+  - Sealed Commit ingest: **99.9–99.95% monthly**
+  - Query: **99.9% monthly**
+- Producers may retry; ingestion must be idempotent and safe under at-least-once delivery.
+
+---
+
+## Simplified Architecture
+
+### High-Level Diagram
+
+```mermaid
+graph TD
+  P[Producers] --> S["Audit Service"]
+  S --> DB[(Postgres)]
+  S --> O["WORM Object Store"]
+  S --> K["KMS/HSM"]
+  S --> T["TSA (RFC3161)"]
+```
+
+### Key Design Choices
+- A single **Audit Service** handles ingest, query/proofs, sealing, anchoring, and admin APIs as one deployable unit; this keeps ordering, sealing, and proof generation tightly consistent.
+- **Postgres** provides receipts, policy state, and a searchable index of sealed events (non-authoritative).
+- **WORM object storage** stores the authoritative immutable segments and signed manifests.
+- **KMS/HSM** performs signing and encrypts data keys for at-rest encryption.
+- **TSA anchoring** is performed on a schedule (e.g., hourly + daily rollup) for independent “no later than” evidence.
+
+---
+
+## Core Flows
+
+### Write Path (Durable Accept)
+1. Producer sends a batch with `Idempotency-Key` and per-event `event_id`.
+2. Audit Service authenticates and authorizes the producer for the tenant, validates schema/size, and canonicalizes events for hashing.
+3. Audit Service writes the batch to Postgres as a **pending batch** and returns a **receipt** (`202 Accepted`).
+4. A background worker inside the Audit Service seals pending batches into immutable **segments**:
+   - Assigns per-tenant `ingest_seq`
+   - Builds chain hashes and Merkle roots
+   - Writes encrypted/compressed segment + signed manifest to WORM
+   - Updates Postgres with segment pointers and searchable fields for sealed events
+5. Anchoring job periodically timestamps a rollup root via the TSA and stores the token in WORM.
+
+### Write Path (Sealed Commit)
+- Same ingestion, but the request waits until the batch is sealed into WORM and indexed (`201 Created`).
+- This mode is intended for tenants/policies that require “accepted == immutable”.
+
+### Read/Proof Path
+1. Query filters run against Postgres (tenant-scoped).
+2. The Audit Service fetches the referenced manifest/segment from WORM.
+3. The Audit Service verifies:
+   - Manifest signature (KMS public key / key ID)
+   - Segment root and inclusion proof for returned events
+   - Anchor token presence (if the segment is within an anchored rollup window)
+4. Response includes events + proof bundles for independent verification.
+
+---
+
+## Component Design
+
+### 1) Audit Service (API + Worker)
+**Responsibilities**
+- Ingest API, query/proof API, export API, and admin/policy API.
+- Background sealing loop and anchoring job.
+- Idempotency and tenant-local ordering.
+
+**Ingest Semantics**
+- Durable Accept: receipt after Postgres commit of a pending batch.
+- Sealed Commit: receipt after WORM write + manifest signature + DB pointer update.
+
+**Idempotency**
+- Require:
+  - `Idempotency-Key` per batch
+  - `event_id` unique per tenant
+- Store `(tenant_id, idempotency_key) -> request_hash, receipt_id, status` for 24–72h.
+- Conflict if the same key is reused with a different body hash (`409 Conflict`).
+
+**Tenant Ordering**
+- Maintain `chain_heads` per tenant in Postgres.
+- Sealing uses per-tenant locking (e.g., `SELECT ... FOR UPDATE` or advisory locks) to serialize `ingest_seq` assignment.
+
+---
+
+### 2) Postgres (Receipts + Index)
+**Role**
+- Mutable control plane and searchable index; not the integrity source of truth.
+
+**Stores**
+- Pending batches for sealing (short retention).
+- Segment pointers and sealing progress.
+- Searchable fields for sealed events (time/actor/action/resource/request_id, plus pointers).
+- Policy and access-control configuration.
+
+**Scaling Approach**
+- Partition tables by time and tenant where needed.
+- Use btree indexes on common filters and BRIN on time-range scans.
+- Keep payloads out of Postgres; store only fields needed for search and retrieval pointers.
+
+---
+
+### 3) WORM Object Store (Immutable Segments + Manifests + Anchors)
+**Role**
+- Authoritative immutable record with retention and legal hold enforced by storage.
+
+**Immutability Controls**
+- AWS S3 Object Lock (Compliance mode), Azure Immutable Blob, or GCS Bucket Lock.
+- Separate roles for retention configuration and operational access; drift alerts.
+
+**Object Layout (Example)**
+- `segments/<tenant_id>/yyyy/mm/dd/hh/<segment_id>.bin`
+- `manifests/<tenant_id>/yyyy/mm/dd/hh/<segment_id>.json`
+- `anchors/yyyy/mm/dd/<anchor_id>.json` and TSA tokens
+
+---
+
+### 4) KMS/HSM (Encryption + Signing)
+- Envelope encryption for segments:
+  - Segment encrypted with a DEK (AES-256-GCM)
+  - DEK encrypted with KMS key (optionally per-tenant)
+- Manifests are signed with a KMS-backed signing key and include `signing_key_id`.
+
+---
+
+### 5) TSA Anchoring (RFC 3161)
+- On a schedule (e.g., hourly and daily):
+  - Compute a rollup root over recent segment roots (per tenant or global with tenant scoping embedded).
+  - Obtain an RFC 3161 timestamp token.
+  - Store the rollup record + token immutably in WORM.
+
+---
+
+## Cryptographic Model
+
+### Canonical Event Hash
+- Canonicalize event encoding (prefer Protobuf or strict JSON canonicalization).
+- `event_hash = SHA-256(canonical_event_bytes)`
+
+### Per-Tenant Chain Hash (Gap/Reorder Detection)
+- `chain_hash_i = SHA-256(chain_hash_{i-1} || event_hash || ingest_seq_i || received_ts_ms)`
+
+### Per-Segment Merkle Tree (Inclusion Proofs)
+- `leaf_i = SHA-256(event_hash || ingest_seq_i)`
+- `segment_root = MerkleRoot(leaf_1..leaf_n)`
+
+### Signed Manifest
+- Manifest includes `segment_root`, chain head/tail, object checksums, and metadata.
+- `manifest_sig = Sign(signing_key, SHA-256(manifest_bytes))`
+
+---
+
+## Data Model (Minimal)
+
+### Tables (Example)
+- `idempotency_receipts(tenant_id, idempotency_key, request_hash, receipt_id, status, created_at, expires_at)`
+- `pending_batches(batch_id PK, tenant_id, created_at, canonical_bytes_compressed, status)`
+- `chain_heads(tenant_id PK, last_ingest_seq, last_chain_hash, updated_at)`
+- `segments(segment_id PK, tenant_id, start_ts, end_ts, segment_uri, manifest_uri, segment_root, last_chain_hash, sealed_at)`
+- `event_index(tenant_id, event_id, received_ts, actor_id, action, resource_type, resource_id, request_id, segment_id, offset_hint)`
+
+### Segment + Manifest
+- Segment contains encrypted/compressed canonical records and enough Merkle material to generate paths.
+- Manifest binds segment integrity claims and signature, and optionally references an anchor record.
+
+---
+
+## APIs (Summary)
+
+### Ingest (Durable Accept)
+`POST /v1/audit/events`
+- Returns `202 Accepted` with `receipt_id`.
+
+### Receipt Status
+`GET /v1/audit/receipts/{receipt_id}?tenant_id=...`
+- `ACCEPTED | SEALED | FAILED` plus `segment_ids` when sealed.
+
+### Ingest (Sealed Commit)
+`POST /v1/audit/events:seal`
+- Returns `201 Created` only after sealing.
+
+### Query
+`GET /v1/audit/events?tenant_id=...&start_ts_ms=...&end_ts_ms=...&actor_id=...&action=...&cursor=...&limit=...`
+- Returns `events[]` with `proof` (manifest signature + Merkle path + anchor evidence when available).
+
+### Proof Retrieval
+`GET /v1/audit/proofs/{event_id}?tenant_id=...`
+
+### Offline Verification
+Provide a verifier CLI/library that validates:
+- manifest signature
+- Merkle inclusion
+- chain continuity (optional for the queried range)
+- TSA token timestamp and binding to rollup root
+
+---
+
+## Operations
+
+### SLIs/SLOs (Core)
+- Ingest: availability, P99 latency, error rate, `409` idempotency conflicts, `429` throttles.
+- Sealing: time-to-seal P50/P99, backlog size, failed seals.
+- Integrity: verification failures (target zero), signature verification failures, chain gaps.
+- Query: latency, index lag (sealed-to-searchable delay), export completion time.
+
+### Disaster Recovery
+- WORM objects replicated cross-region with immutable policies.
+- Postgres: multi-AZ primary + replica, PITR backups, tested restore runbook.
+- Rebuild capability: `event_index` can be re-derived from manifests/segments if needed.
+
+---
+
+## Simplification Notes
+
+- Removed: Dedicated log bus; acceptable because Postgres-backed pending batches provide durable buffering and replay for sealing, with fewer moving parts.
+- Removed: Separate indexer and external search cluster; acceptable because Postgres serves the searchable index for sealed events, while WORM remains the authoritative record.
+- Removed: Standalone anchor service; merged anchoring into the Audit Service as a scheduled job to keep the integrity chain in one operational boundary.
+- Merged: Ingest API, Query/Proof API, sealing processor, and admin APIs into one Audit Service to simplify deployment and keep ordering/sealing logic strongly consistent.
+- Remaining complexity: WORM storage, cryptographic proofs, and external TSA anchoring remain because they are the core mechanisms that provide immutability and independent evidentiary timestamps.

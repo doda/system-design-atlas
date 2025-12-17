@@ -1,0 +1,258 @@
+---
+title: "Food Delivery Logistics"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["marketplace", "dispatch", "routing", "real-time", "event-driven", "geospatial"]
+---
+
+## Overview
+
+Food delivery logistics coordinates a three-sided marketplace (customers, restaurants, couriers) in real time. The system must keep **order/payment state correct** while continuously making **fast dispatch and routing decisions** from volatile signals (courier movement, prep-time changes, demand spikes). The design below keeps a single canonical source of truth for transactions and uses lightweight asynchronous workers for optimization and realtime fanout.
+
+---
+
+## Requirements
+
+### Functional Requirements
+- Order lifecycle: quote, create, authorize/capture, cancel, refund, complete
+- Restaurant workflow: accept/reject, prep updates, ready-for-pickup
+- Courier workflow: online/offline, location updates, offers, accept/reject, pickup/deliver
+- Dispatch + optional batching (2–3 orders) with constraints
+- Routing + ETA updates using traffic and prep signals
+- Realtime tracking to customers/restaurants; fallback polling
+- Exceptions and re-dispatch (rejects, delays, cancellations, no-shows)
+- Auditability: immutable history for support and improvement
+
+### Non-Functional Requirements (Targets)
+- Global: 2,000 orders/sec peak; 300k location events/sec peak budget
+- P99: quote+place < 300ms (platform); dispatch decision < 1s (metro); tracking update < 2s
+- SLOs: checkout 99.99%; dispatch 99.95%; realtime 99.95%
+- Strong consistency for order/payment/assignment invariants; bounded staleness for location/ETA
+- Orders/payments RPO ~ 0; location telemetry may drop small % under overload
+
+### Constraints & Assumptions
+- Multi-region deployment; dispatch ownership is **regional (metro)**
+- External maps/traffic can be rate-limited; cache + graceful degradation required
+- PCI minimized via payment processor tokens; PII encrypted and access audited
+
+---
+
+## Simplified Architecture
+
+Each region runs the same stack. A single **Logistics Service** (modular monolith) owns all domain APIs and background workers. Postgres is the canonical store; Redis holds hot state and lightweight streams for asynchronous work.
+
+```mermaid
+flowchart TB
+  C[Client Apps] --> E[Edge LB/WAF]
+  E --> S["Logistics Service"]
+  S --> PG[(Postgres)]
+  S --> RD[(Redis)]
+  S --> MAPS[Maps/Traffic API]
+  S <--> PAY[Payment Provider]
+  S <--> PUSH[APNs/FCM]
+```
+
+### What’s inside `Logistics Service`
+- **HTTP APIs** for customer/restaurant/courier (idempotent state changes)
+- **Order state machine** + payment orchestration
+- **Location ingest** (validation + downsampling) writing latest location to Redis
+- **Dispatch worker** (assignment + batching) reading Redis hot state and writing offers/assignments to Postgres
+- **ETA/routing module** using maps API with caching
+- **Realtime gateway** (WebSockets) + Redis Pub/Sub for cross-instance fanout
+
+Major simplification: domain “services” become modules deployed together, which keeps correctness and optimization tightly integrated without distributed transactions.
+
+---
+
+## Core Workflows
+
+### Order Placement → Dispatch → Offer
+- Request is handled synchronously for correctness (payment + order creation).
+- Dispatch runs asynchronously but applies decisions via a single canonical transaction.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Client as Client
+  participant Svc as Logistics API
+  participant Pay as Payment
+  participant PG as Postgres
+  participant RD as Redis
+  participant W as Dispatch Worker
+  participant WS as Realtime (WS)
+
+  Client->>Svc: POST /v1/orders (Idempotency-Key)
+  Svc->>Pay: Authorize(token, amount)
+  Pay-->>Svc: auth_id
+  Svc->>PG: Tx: insert order + outbox row
+  PG-->>Svc: commit
+  Svc-->>Client: 201 {order_id, quoted_eta}
+
+  Svc->>RD: enqueue outbox pointer (stream)
+  RD-->>W: consume new order event
+  W->>RD: read nearby couriers + last locations
+  W->>Svc: ApplyAssignment(order_id, courier_id, expected_version)
+  Svc->>PG: Tx: insert offer, CAS assignment_version, append audit event
+  PG-->>Svc: commit
+  Svc->>RD: publish tracking update
+  RD-->>WS: fanout update
+  WS-->>Client: push status/ETA/location
+```
+
+### Canonical Order State Machine
+
+```mermaid
+stateDiagram-v2
+  [*] --> QUOTED
+  QUOTED --> PLACED: payment authorized
+  PLACED --> RESTAURANT_ACCEPTED
+  PLACED --> CANCELED: customer cancels
+  RESTAURANT_ACCEPTED --> PREPARING
+  PREPARING --> READY_FOR_PICKUP
+  READY_FOR_PICKUP --> PICKED_UP
+  PICKED_UP --> DELIVERED
+  RESTAURANT_ACCEPTED --> CANCELED: restaurant rejects/closes
+  PREPARING --> CANCELED: timeout/exception
+  READY_FOR_PICKUP --> CANCELED: courier failure/no pickup
+  DELIVERED --> [*]
+  CANCELED --> [*]
+```
+
+---
+
+## Components
+
+### Edge LB/WAF
+- TLS termination, basic rate limits, request logging, and regional routing (geo + account region)
+- Sticky sessions for WebSockets when needed
+
+### Logistics Service (Canonical + Realtime + Optimization)
+**Correctness (synchronous)**
+- Order lifecycle and invariants (state machine enforced in DB)
+- Payment authorize/capture/refund integrations
+- Idempotent endpoints (`Idempotency-Key` for create-like actions; natural idempotency for accept/reject)
+
+**Optimization (asynchronous)**
+- Dispatch and re-dispatch on events (new order, reject/expire, prep delay, courier drift)
+- Batching as an optimization with strict time budgets (degrades to single-order assignment)
+
+**Realtime**
+- WebSockets per order/courier channel with monotonically increasing `seq`
+- Polling fallback: `GET /tracking?since_seq=...`
+
+Major simplification: realtime fanout is part of the service; Redis Pub/Sub coordinates multiple instances.
+
+### Postgres (Canonical)
+Primary responsibilities:
+- Orders, payments, offers, deliveries, batches/stops (if batching enabled)
+- Immutable audit log for support and dispute resolution
+- Outbox table for reliable asynchronous processing
+
+Suggested minimal tables:
+- `orders`, `order_items`, `payments`
+- `offers` (lease-like TTL + status), `deliveries` (active delivery per order invariant)
+- `batches`, `batch_stops` (only if batching is enabled)
+- `order_events` (append-only audit: state changes, offers, assignments, exceptions)
+- `outbox_events` (events to drive workers and realtime fanout)
+
+Key invariants:
+- At most one active assignment per order (CAS via `assignment_version` + constraints)
+- Offer acceptance valid only if `(status=SENT, expires_at>now, version matches)`
+
+### Redis (Hot State + Lightweight Streams)
+- `courier:last_location:{courier_id}` (latest only; TTL-based staleness handling)
+- `cell:couriers:{cell}` membership sets (H3/S2 cell IDs), refreshed with TTL
+- `work:dispatch` / `work:eta` (Redis Streams) for asynchronous tasks
+- Pub/Sub channels for realtime fanout across instances
+
+Major simplification: a single Redis cluster supports hot state, streams, and pub/sub, avoiding separate queue and event-bus infrastructure.
+
+### Maps/Traffic API
+- Used for travel time estimation and sequencing
+- Redis caching of legs `(cellA, cellB, time_bucket)` with short TTL (60–180s)
+- Fallback to historical speeds + straight-line correction during throttling/outage
+
+---
+
+## Dispatch & Batching (Bounded, Regional)
+
+Per region, the dispatch worker maintains strict compute budgets to hit P99 targets.
+
+1. **Candidate lookup (fast)**: expand nearby cells, filter by capability and freshness, cap to ~50
+2. **Feasibility + cost**: estimate pickup/dropoff times (cached legs when possible)
+3. **Select + lease offer**: write offer with `expires_at` (20–30s) and apply assignment via CAS
+4. **Re-dispatch loop**: on reject/expire/no-response, try next candidate; batching disabled first under load
+
+---
+
+## API Design (External REST)
+
+- `POST /v1/orders` (Idempotency-Key)
+- `POST /v1/restaurants/{restaurant_id}/orders/{order_id}:accept|reject`
+- `POST /v1/couriers/{courier_id}/location` → `202 Accepted` (server may downsample/coalesce)
+- `POST /v1/couriers/{courier_id}/offers/{offer_id}:accept|reject` with `{version}`
+- `GET /v1/orders/{order_id}/tracking` (short cache + `seq`)
+
+Error handling:
+- Typed codes; idempotency for every state change
+- Conflicts expressed as `409` (stale version, state precondition failures)
+
+---
+
+## Scaling & Performance
+
+### Regional scaling model
+- Run one stack per region; all hot decisions stay local to minimize latency.
+- Scale `Logistics Service` horizontally (stateless HTTP + WS instances).
+- Scale dispatch/ETA workers independently (same binary, separate worker pools).
+
+### Handling 300k location events/sec
+- Accept location writes as “latest state” updates (coalesce per courier per 1–2s under load).
+- Use Redis pipelining/batching and simple validation to keep ingest CPU low.
+- Drop older queued updates in favor of newest for each courier during backpressure.
+
+### Data growth
+- Keep `order_events` append-only with partitioning by time/region.
+- Retain detailed location history only if needed and sampled (e.g., 1/N), with short retention.
+
+---
+
+## Consistency, Concurrency, Correctness
+
+- Strong consistency via Postgres transactions for orders, offers, payments, and assignments.
+- CAS with `assignment_version` prevents double assignment under concurrent dispatch.
+- Outbox ensures each committed state change is eventually processed by workers and realtime fanout.
+- Realtime is at-least-once; clients de-duplicate using `seq` and resync via `/tracking`.
+
+---
+
+## Failure Modes & Mitigations
+
+1. **Redis degraded**
+   - Dispatch falls back to smaller candidate radius and single-order assignment.
+   - Realtime degrades to polling; location ingest keeps accepting but may downsample more aggressively.
+
+2. **Maps provider outage/throttling**
+   - Use cached legs; fall back to historical speeds; tighten batching constraints.
+
+3. **Postgres pressure (locks/slow queries)**
+   - Keep critical transactions small and indexed; move heavy reads to replicas.
+   - Shed optional work (batching, frequent ETA recompute) before impacting checkout.
+
+---
+
+## Operations
+
+- SLO dashboards: checkout success/latency, dispatch decision latency, unassigned-age, offer accept/expire rates, tracking delivery latency
+- Infra dashboards: Postgres replication lag/slow queries, Redis latency/memory, WS connections, maps error rates, worker queue depth
+- Safe rollout: feature flags for scoring/batching; shadow evaluation for new heuristics
+
+---
+
+## Simplification Notes
+
+- Removed: Kafka event bus → replaced with `outbox_events` + Redis Streams/PubSub, keeping reliable internal async processing with fewer moving parts.
+- Removed: Separate Order/Restaurant/Courier/Dispatch/Routing/Realtime services → merged into one `Logistics Service` with modules to avoid cross-service coordination for core workflows.
+- Removed: Dedicated Location Ingest service → location ingest handled by the same service with aggressive coalescing and Redis hot-state writes.
+- Merged: “Realtime Gateway” into the main service → a single WebSocket layer with Redis Pub/Sub provides horizontal fanout.
+- Complexity kept: Postgres transactions + outbox (needed for correctness and recoverability), Redis hot state (needed for sub-second candidate lookup and realtime), and regional deployment (needed for latency and blast-radius control).

@@ -1,0 +1,358 @@
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2a94-b537-7db1-bcad-090dce999d53
+--------
+user
+You are a senior systems architect reviewing a system design document.
+
+Grade this solution on three dimensions (1-10 scale):
+
+1. **Strength** (1-10): How technically sound, complete, and production-ready is the design?
+   - Does it address scalability, reliability, and failure modes?
+   - Are the trade-offs well-reasoned?
+   - Would this actually work at scale?
+
+2. **Interestingness** (1-10): How engaging and educational is the content?
+   - Does it teach useful concepts?
+   - Are there insights that aren't obvious?
+   - Would an engineer learn something valuable?
+
+3. **Novelty** (1-10): How unique or creative is the approach?
+   - Does it go beyond textbook solutions?
+   - Are there clever simplifications or unconventional choices?
+   - Does it challenge common assumptions?
+
+Also note any major issues or particularly strong aspects.
+
+Output ONLY valid JSON in this exact format:
+{
+  "slug": "sql-database-as-a-service",
+  "strength": <1-10>,
+  "interestingness": <1-10>,
+  "novelty": <1-10>,
+  "overall": <average of three scores, 1 decimal>,
+  "summary": "<2-3 sentence summary of the design>",
+  "strengths": ["<strength 1>", "<strength 2>"],
+  "weaknesses": ["<weakness 1>", "<weakness 2>"],
+  "verdict": "<one of: exceptional, strong, adequate, weak>"
+}
+
+---
+
+## Solution to Grade
+
+---
+title: "SQL Database-as-a-Service (Sharded) — Control Plane"
+category: "Storage & Data Platforms"
+difficulty: "Hard"
+tags: ["control-plane", "sharding", "high-availability", "backups", "pitr", "workflows", "multi-tenant"]
+---
+
+## Overview
+
+This control plane provisions and operates sharded SQL clusters (e.g., Postgres) for many untrusted tenants. The core approach is **intent + reconciliation**:
+
+- The API persists **desired state** and creates an **operation** record in a strongly consistent metadata database.
+- A built-in **reconciler/worker** continuously executes operations as idempotent step machines.
+- The data plane (routers, HA, backups) runs close to the databases for fast failover and efficient backup/WAL shipping.
+- Every change is auditable, retry-safe, and debuggable under partial failures.
+
+Terminology:
+- **Shard**: a partition with one primary + replicas.
+- **WAL**: Postgres write-ahead log used for replication and PITR.
+- **PITR healthy until**: latest restore point guaranteed by continuous WAL archival without gaps.
+
+---
+
+## Requirements
+
+### Functional
+- Provision sharded clusters per tenant: shard count/strategy, sizing, AZ layout, networking, TLS.
+- Topology changes: add/remove shards, key-range moves/rehash, routing updates.
+- HA per shard: automatic promotion, replica management, safe primary routing.
+- Backups & PITR: scheduled backups, continuous WAL archiving, expose PITR health window.
+- Restores: restore to a new cluster from backup or to timestamp/LSN with validation and staged cutover.
+- Async mutations: all writes return `operation_id` with progress, logs, and audit history.
+- Tenant isolation: RBAC, quotas, rate limits, encryption keys, billing meters.
+- Observability: health, events, metrics, diagnostics.
+
+### Non-functional (targets)
+- 10k tenants, 50k clusters, ~200k shards, ~400k replicas.
+- Control plane API: 99.99% (multi-AZ); metadata strong consistency.
+- Shard availability: 99.95% (multi-AZ); typical failover < 60s.
+- Backup storage in object storage at PB scale; WAL ingest at high sustained throughput.
+
+---
+
+## Simplified Architecture
+
+```mermaid
+flowchart TB
+  Client["Console / CLI / SDK"] --> API["Control Plane Service"]
+  API --> Meta[(Metadata DB\nPostgres, multi-AZ)]
+  API --> K8s["Kubernetes API"]
+  K8s --> DP["Data Plane\nRouters + Shards"]
+  DP --> Obj[(Object Storage\nBackups + WAL)]
+  API --> Obj
+  API --> Obs["Metrics / Logs / Traces"]
+  DP --> Obs
+```
+
+### What this control plane owns
+- **One control-plane service**: REST API + background reconcilers in the same deployment unit.
+- **One metadata database (Postgres)**: source of truth for resources, operations, routing versions, and audit records.
+- **Kubernetes actuation**: create/update Kubernetes resources (StatefulSets/Services/Jobs) to implement desired state.
+- **Object storage**: immutable backup/WAL artifacts with manifests and checksums.
+
+---
+
+## Core Components
+
+### Control Plane Service (API + Reconcilers)
+**Responsibilities**
+- Authn/z (OIDC/JWT), RBAC, policy (residency/regions), quotas, rate limits.
+- Validate specs and record desired state.
+- Create and advance `operations` as durable step machines (at-least-once execution).
+- Expose operation progress, events, and audit history.
+- Generate and version routing configs; publish them in metadata for routers to consume.
+
+**Key design decisions**
+- **Async-only mutations**: `POST/PATCH/DELETE` return `operation_id`.
+- **Idempotency**: require `Idempotency-Key` on all mutations; store `request_hash`.
+- **Optimistic concurrency**: `resource_version` with `If-Match`.
+- **Work admission**: one mutating operation per cluster by default (enforced via DB locks/advisory locks).
+
+### Metadata DB (Postgres, multi-AZ)
+**Responsibilities**
+- Strongly consistent persistence for desired/observed state, operations, routing versions, and audit/event records.
+- Partition/TTL for high-volume append-only tables (events, WAL indices).
+
+**Operational shape**
+- Multi-AZ primary with synchronous replication/quorum.
+- Optional read replicas for heavy list/status reads.
+
+### Kubernetes Actuation
+**Responsibilities**
+- Provision per-shard stateful workloads, storage, services, network policies, certificates.
+- Run operational jobs (backup, restore, verification) as Kubernetes Jobs with explicit input/output artifacts.
+
+**Idempotency**
+- All K8s resources are named and versioned by `(cluster_id, shard_id, config_version)` to make retries safe.
+
+---
+
+## Data Plane (Per Cluster)
+
+```mermaid
+flowchart LR
+  App["Client/App"] --> Router["SQL Router"]
+  Router --> Shards["Shard Pods\nPrimary + Replicas"]
+  Patroni["HA Manager\n(Patroni)"] <--> Shards
+  Patroni --> Leases["K8s Leases API"]
+  Shards --> WAL["WAL Archive\n(WAL-G/pgBackRest)"]
+  WAL --> Obj["Object Storage"]
+```
+
+### Routing
+- Routers read the **active routing config version** from the metadata DB and refresh periodically (and/or long-poll).
+- Routing config is **append-only versioned** per cluster:
+  - write `pending` version
+  - activate after readiness gates pass
+  - never edit in place; roll forward with a new version
+
+### High availability
+- Patroni manages primary election and replica topology.
+- Leader election/fencing uses **Kubernetes Leases** (no separate consensus cluster).
+- Routers send writes only to the elected primary endpoint for each shard.
+
+### Backups & PITR
+- Each shard continuously archives WAL and produces backups using WAL-G/pgBackRest to object storage.
+- The control plane tracks:
+  - backup manifests/checksums
+  - WAL segment indices and continuity
+  - computed `pitr_healthy_until` per cluster/shard (aggregated per cluster)
+
+---
+
+## Data Model (Minimal)
+
+### Invariants
+- Strong metadata consistency: desired state, routing version, and operation transitions are authoritative in Postgres.
+- Default safety: one mutating operation per cluster at a time.
+- Routing is roll-forward only via versioned configs.
+
+### Tables (illustrative)
+- `tenants(tenant_id, kms_key_ref, quota_limits_json, ...)`
+- `clusters(cluster_id, tenant_id, desired_spec_json, observed_state_json, status, resource_version, ...)`
+- `shards(shard_id, cluster_id, key_range/hash_range, status, resource_version, ...)`
+- `nodes(node_id, shard_id, role, endpoint, health_status, replication_lag_ms, ...)`
+- `routing_configs(cluster_id, version, state, config_json, created_at, activated_at)`
+- `operations(operation_id, tenant_id, resource_type, resource_id, type, idempotency_key, request_hash, status, current_step, progress_pct, error_code, error_message, ...)`
+- `audit_events(event_id, tenant_id, actor, action, resource, result, created_at)` (append-only)
+- `backups(backup_id, cluster_id, type, object_manifest_uri, checksum, status, started_at, completed_at, expires_at)`
+- `wal_segments(segment_id, cluster_id, shard_id, timeline, start_lsn, end_lsn, object_uri, checksum, verified_at)` (partitioned)
+
+---
+
+## Key Flows
+
+### Create Cluster (Async)
+1. API validates request, writes `clusters.desired_spec_json`, creates `operations` row in one transaction.
+2. Reconcilers:
+   - create namespace/resources, storage classes, network policies
+   - create router deployment and per-shard StatefulSets
+   - wait for shard readiness gates (replicas caught up, health checks)
+   - write routing config `v1` as `pending`, then mark `active`
+   - mark cluster `ready` and operation `succeeded`
+
+Readiness gates before activating routing:
+- exactly one primary per shard (Patroni leader present)
+- replicas within lag thresholds (per spec)
+- router has loaded config version and is serving health checks
+
+### PITR Restore (to a New Cluster)
+1. API creates `restore` operation referencing source cluster + restore point.
+2. Reconcilers:
+   - pick base backup and WAL range within retention
+   - provision target cluster infra
+   - run restore Jobs to stream backup + WAL to shard pods
+   - verify manifest/checksums and restore point reached (timestamp/LSN)
+   - publish routing config for the new cluster and mark ready
+
+Cutover is explicit:
+- restores create a **new cluster endpoint**; switching traffic is a separate action (DNS/connection string update) with audit.
+
+---
+
+## API Design (Essentials)
+
+- All mutations return `202 { operation_id, ... }`.
+- `Idempotency-Key` required for mutations; conflict returns `409`.
+- Updates use `If-Match: <resource_version>`.
+
+Endpoints:
+- `POST /v1/clusters` → `{ cluster_id, operation_id }`
+- `GET /v1/clusters/{cluster_id}` (summary + backup health + routing version)
+- `GET /v1/clusters` (summaries, paginated)
+- `PATCH /v1/clusters/{cluster_id}` (safe spec changes)
+- `POST /v1/clusters/{cluster_id}/backups` → `{ backup_id, operation_id }`
+- `POST /v1/clusters/{cluster_id}/restores` → `{ target_cluster_id, operation_id }`
+- `GET /v1/operations/{operation_id}` (status/progress/errors)
+- `GET /v1/audit` / `GET /v1/clusters/{cluster_id}/audit` (append-only history)
+
+---
+
+## Scaling & Performance
+
+- **API**: stateless; scale horizontally behind an L7 load balancer.
+- **Reconcilers**: scale by sharding work queues on `(cluster_id hash)` with per-tenant concurrency caps and priority classes:
+  - `restore/failover` > `topology` > `backup` > `create/update`
+- **Metadata DB**:
+  - keep hot rows small; write append-only events instead of rewriting large JSON frequently
+  - partition/TTL `wal_segments` and `audit_events`
+  - use read replicas for list/status bursts
+
+---
+
+## Safety, Consistency, and Failure Handling
+
+- **Strong consistency**: operations, routing versions, desired specs, and admission locks.
+- **At-least-once execution**: every step is idempotent and keyed by `(operation_id, step_name, resource_version)`.
+- **Split-brain prevention**:
+  - Patroni + Kubernetes Leases for leader election/fencing
+  - routers only route writes to the current leader endpoint
+- **Safe mode**:
+  - if metadata DB integrity is suspect, stop starting new operations while keeping read-only APIs available
+
+---
+
+## Operations & Observability (Minimum)
+
+- Metrics:
+  - API latency/error rate; DB pool saturation
+  - operation queue depth, oldest pending age, failure counts by step
+  - backup success rate; WAL ingest lag; PITR continuity gaps
+  - shard failovers/hour; replication lag distribution
+- Alerts:
+  - oldest critical operation age > 5 minutes
+  - PITR unhealthy > 10 minutes for any cluster
+  - metadata DB write error rate > 0.1% or sustained lag
+  - unexpected failover spike
+- Runbooks:
+  - stuck operation triage (step replay/idempotency checks)
+  - PITR gap localization and recovery
+  - restore performance bottlenecks (object storage vs compute)
+  - split-brain containment verification
+
+---
+
+## Simplification Notes
+
+- Removed: separate workflow orchestrator service; operations run as DB-backed step machines in the control-plane service to keep durability and retries with fewer moving parts.
+- Removed: external event stream; operation status, audit, and events are served from append-only tables with polling/SSE as needed.
+- Removed: dedicated routing controller; routing configs are versioned in metadata and consumed directly by routers.
+- Removed: separate backup/PITR control service; backup/restore is executed by standard tools (WAL-G/pgBackRest) via Kubernetes Jobs, with the control plane tracking manifests and continuity.
+- Removed: separate consensus store for HA; Patroni uses Kubernetes Leases for leader election/fencing in a Kubernetes-native deployment.
+- Merged: API + workers into one deployable unit; simplified rollout, scaling, and on-call surface area.
+- Complexity retained: strong metadata consistency, versioned routing, and idempotent operations—these are necessary to keep provisioning, failover, and PITR safe under retries and partial failures at fleet scale.
+mcp startup: no servers
+
+
+
+thinking
+**Evaluating SQL Database Design**
+
+I need to provide a JSON output focused on the slug "sql-database-as-a-service," including scores and a summary. I’ll evaluate the design by identifying two strengths and weaknesses. The strengths include a solid control plane design highlighting the reconciler, and operational steps with good failure mode handling. However, weaknesses stem from potential single points of failure and limitations in security isolation. There are significant gaps in scaling and connection pooling that need addressing.
+thinking
+**Assessing K8s Shard Design**
+
+I’m looking at the design involving 200k shards and the associated Kubernetes resources. The need for multi-cluster K8s becomes clear, especially for managing stateful sets. I find the educational aspects like reconciliation and versioned routing moderately interesting. While there are simplifications in using DB-backed step machines, it feels fairly standard. I’m thinking of scoring strength at 8, interestingness at 7, and novelty at 6, averaging to 7.0. I’d label it as strong but leaning toward adequate due to that score.
+thinking
+**Finalizing Design Evaluation**
+
+I’m considering whether to adjust the strength score. Maybe 8 would work better than 9, given the gaps I've noticed. I could bump novelty up to 7 for its clever simplifications and versioned routing. That brings my overall average to 7.3, which feels strong enough. In summary, the strengths include reconciling intent, versioned routing, and durable operations, while weaknesses lie in K8s scaling and missing multi-region details. Now, I need to present everything in an exact JSON format.
+codex
+{
+  "slug": "sql-database-as-a-service",
+  "strength": 8,
+  "interestingness": 7,
+  "novelty": 7,
+  "overall": 7.3,
+  "summary": "A Kubernetes-native DBaaS control plane built around intent + reconciliation, with all mutations modeled as durable, idempotent operations in a strongly consistent metadata Postgres. The data plane uses Patroni (K8s Leases) for HA and WAL-G/pgBackRest to object storage for backups/PITR, with versioned, roll-forward routing configs consumed by routers and explicit restore-to-new-cluster cutover.",
+  "strengths": [
+    "Production-grade control-plane patterns: async ops, idempotency keys, optimistic concurrency, per-cluster admission/locking, and append-only versioned routing",
+    "Solid safety/ops story for HA and PITR: readiness gates before routing activation, manifest/checksum tracking, and explicit PITR health window computation"
+  ],
+  "weaknesses": [
+    "Scaling risks at stated fleet size: per-shard K8s objects (StatefulSets/Services/Leases/Jobs) and router polling/refresh against the metadata DB can become operationally and performance heavy without more hierarchy/caching/fanout control",
+    "Missing/under-specified hard parts: multi-region/DR and metadata DB failure strategy, stronger fencing guarantees under K8s API partitions, and concrete resharding/migration mechanisms (online key moves, transactional semantics, rollback)"
+  ],
+  "verdict": "strong"
+}
+tokens used
+4,328
+{
+  "slug": "sql-database-as-a-service",
+  "strength": 8,
+  "interestingness": 7,
+  "novelty": 7,
+  "overall": 7.3,
+  "summary": "A Kubernetes-native DBaaS control plane built around intent + reconciliation, with all mutations modeled as durable, idempotent operations in a strongly consistent metadata Postgres. The data plane uses Patroni (K8s Leases) for HA and WAL-G/pgBackRest to object storage for backups/PITR, with versioned, roll-forward routing configs consumed by routers and explicit restore-to-new-cluster cutover.",
+  "strengths": [
+    "Production-grade control-plane patterns: async ops, idempotency keys, optimistic concurrency, per-cluster admission/locking, and append-only versioned routing",
+    "Solid safety/ops story for HA and PITR: readiness gates before routing activation, manifest/checksum tracking, and explicit PITR health window computation"
+  ],
+  "weaknesses": [
+    "Scaling risks at stated fleet size: per-shard K8s objects (StatefulSets/Services/Leases/Jobs) and router polling/refresh against the metadata DB can become operationally and performance heavy without more hierarchy/caching/fanout control",
+    "Missing/under-specified hard parts: multi-region/DR and metadata DB failure strategy, stronger fencing guarantees under K8s API partitions, and concrete resharding/migration mechanisms (online key moves, transactional semantics, rollback)"
+  ],
+  "verdict": "strong"
+}
+Graded: sql-database-as-a-service

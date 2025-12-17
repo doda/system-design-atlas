@@ -1,0 +1,332 @@
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2a95-a078-7bc2-bad1-063e9cbc1371
+--------
+user
+You are a senior systems architect reviewing a system design document.
+
+Grade this solution on three dimensions (1-10 scale):
+
+1. **Strength** (1-10): How technically sound, complete, and production-ready is the design?
+   - Does it address scalability, reliability, and failure modes?
+   - Are the trade-offs well-reasoned?
+   - Would this actually work at scale?
+
+2. **Interestingness** (1-10): How engaging and educational is the content?
+   - Does it teach useful concepts?
+   - Are there insights that aren't obvious?
+   - Would an engineer learn something valuable?
+
+3. **Novelty** (1-10): How unique or creative is the approach?
+   - Does it go beyond textbook solutions?
+   - Are there clever simplifications or unconventional choices?
+   - Does it challenge common assumptions?
+
+Also note any major issues or particularly strong aspects.
+
+Output ONLY valid JSON in this exact format:
+{
+  "slug": "ml-feature-store",
+  "strength": <1-10>,
+  "interestingness": <1-10>,
+  "novelty": <1-10>,
+  "overall": <average of three scores, 1 decimal>,
+  "summary": "<2-3 sentence summary of the design>",
+  "strengths": ["<strength 1>", "<strength 2>"],
+  "weaknesses": ["<weakness 1>", "<weakness 2>"],
+  "verdict": "<one of: exceptional, strong, adequate, weak>"
+}
+
+---
+
+## Solution to Grade
+
+---
+title: "ML Feature Store"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["feature-store", "ml-platform", "data-engineering", "streaming", "lakehouse", "redis", "data-quality"]
+---
+
+## Overview
+
+A **feature store** defines, computes, validates, and serves ML features **consistently** across:
+
+- **Offline (training/batch)**: point-in-time correct datasets, reproducible snapshots, large joins/scans.
+- **Online (inference/real-time)**: low-latency feature retrieval with freshness semantics and graceful degradation.
+
+This design treats features as **versioned definitions** and feature values as **time-indexed facts**:
+- Offline is the **authoritative history** (append-only, time-travelable).
+- Online is a **latest-by-entity materialization** derived from offline + streaming inputs.
+
+---
+
+## Requirements
+
+### Functional
+- **Definitions & governance**
+  - Register feature views (entities, schema, owners, tags, TTL, freshness SLO, windows).
+  - Immutable versioning with lifecycle: `DRAFT → PUBLISHED → DEPRECATED`.
+  - RBAC, PII tagging, audit logs, dependency/impact listing.
+- **Compute**
+  - Batch compute and backfills from warehouse/lake sources.
+  - Streaming compute from an event log with bounded lateness + dedup.
+  - Deterministic transforms and consistent defaulting/missing semantics.
+- **Serving**
+  - Online `GetFeatures` by entity keys, partial results per feature.
+  - Offline training dataset build with **point-in-time correctness** and reproducibility.
+- **Quality**
+  - Schema/range/null/freshness/coverage checks with policy-driven actions (warn/block/quarantine).
+
+### Non-functional (targets)
+- Online: **10k reads/s peak**, **P50 ≤ 10ms**, **P99 ≤ 50ms**, **99.99%** (multi-AZ).
+- Ingestion: **1B rows/day avg**, tolerate **10× burst**; streaming lag **< 2 minutes** for real-time views.
+- Offline build: **~1TB join < 1 hour** on a right-sized Spark cluster.
+- Offline durability: **RPO ≈ 0** (object store + table snapshots + metadata PITR).
+- Online durability: rebuildable; **RPO ≤ freshness window** via replay and re-materialization.
+
+### Assumptions
+- Events include stable entity keys and event timestamps; bounded clock skew is enforced/normalized.
+- Single region, multi-AZ by default; optional DR via snapshot/backup replication.
+- Encryption in transit/at rest; audit logs retained **≥ 1 year**.
+
+---
+
+## Simplified Architecture
+
+### High-level design
+
+```mermaid
+flowchart TB
+  C["Clients (train/infer/notebooks)"] --> FS["Feature Store API"]
+
+  FS --> PG["Postgres (metadata)"]
+  FS --> R["Redis (online)"]
+  FS --> L["Lakehouse (offline)"]
+
+  S["Sources"] --> E["Event Log"]
+  E --> SJ["Spark (stream+batch)"]
+  SJ --> R
+  SJ --> L
+
+  FS --> SJ
+  PG --> SJ
+```
+
+### Core responsibilities
+- **Feature Store API**: registry + governance APIs, online serving, dataset build submission, version resolution, policy enforcement.
+- **Postgres**: single source of truth for definitions, policies, lineage pointers, audit logs, dataset artifacts.
+- **Lakehouse**: append-only offline feature history + dataset artifacts with time travel (Iceberg/Delta).
+- **Redis**: latest-by-entity online materialization for fast inference reads.
+- **Spark**: one compute stack for both streaming materialization and batch/backfill + training joins.
+- **Event Log**: existing event bus (Kafka/PubSub/Kinesis equivalent) used for near-real-time updates.
+
+---
+
+## Key Design Invariants
+
+- **Immutable published definitions**: every run and request resolves to a specific version/hash.
+- **Explicit time semantics**: each value carries `event_time` and `ingestion_time`.
+- **Offline history is authoritative**: online state is a derivation and is always rebuildable.
+- **Parity by construction**: the same transform spec and code artifacts drive streaming, batch, and training joins.
+
+---
+
+## Components
+
+### 1) Feature Store API (Registry + Serving)
+**Responsibilities**
+- Definition CRUD, publish workflow, version resolution (`prod` pins to versions).
+- Online `GetFeatures` with feature-level status and policy enforcement.
+- Dataset build submission and artifact metadata retrieval.
+- Minimal UI is optional; API is the source of truth.
+
+**Implementation notes**
+- In-process cache for resolved definition snapshots (ETag/hash + short TTL) to reduce Postgres load.
+- “Pinned-only mode” for inference: serving can operate with cached/pinned definitions during metadata outages.
+
+---
+
+### 2) Postgres (Metadata + Governance)
+**Responsibilities**
+- Definitions, versions, policies, tags, RBAC mappings, PII classification.
+- Audit log for publish, access, and dataset builds.
+- Lineage pointers (sources → transforms → feature views → datasets/models).
+
+**Availability**
+- Managed multi-AZ with PITR and read replicas for heavy catalog traffic.
+
+---
+
+### 3) Spark Compute (Streaming + Batch + Training Joins)
+**Responsibilities**
+- **Streaming jobs**: consume events, dedup + window/aggregate, write:
+  - online upserts to Redis
+  - offline append rows to the lakehouse
+- **Batch jobs**: incremental recompute, backfills, compaction/maintenance.
+- **Training joins**: standardized as-of join implementation for PIT correctness.
+
+**Operational model**
+- A small workflow scheduler (e.g., Airflow) triggers batch/backfill/training jobs and tracks retries/SLAs.
+
+---
+
+### 4) Lakehouse (Offline Store + Dataset Artifacts)
+**Responsibilities**
+- Append-only feature facts with time travel and snapshot isolation.
+- Training dataset artifacts written as tables/files with pinned snapshots and build metadata.
+
+**Storage layout**
+- Partition by `event_date`; optionally cluster/bucket by `entity_key_hash` for join efficiency.
+- Compaction to control small files and improve scan performance.
+
+---
+
+### 5) Redis (Online Store)
+**Responsibilities**
+- Latest-by-entity materialization for low-latency reads.
+
+**Data model (conceptual)**
+Key: `entity_type:entity_key`  
+Value:
+- `features[feature_ref] = {value, event_time, write_time, status}`
+- `view_versions[feature_view] = version`
+- `entity_write_time`
+
+---
+
+## Data Model
+
+### Postgres (minimal)
+- `feature_view_version`
+  - `id`, `name`, `version`, `status`, `entities (jsonb)`, `schema (jsonb)`
+  - `ttl_seconds`, `freshness_slo_seconds`, `allowed_lateness_seconds`
+  - `compute_spec (jsonb)`, `owner`, `tags (jsonb)`
+  - `pii (jsonb)`, `access_policy (jsonb)`
+  - `definition_hash`, `created_at`, `published_at`, `deprecated_at`
+- `feature_view_alias`
+  - `name`, `alias` (`prod|latest`), `version`, `updated_at`
+- `dataset_artifact`
+  - `id`, `uri`, `created_by`, `created_at`
+  - `label_source_ref`, `feature_refs (jsonb)`, `snapshot_refs (jsonb)`
+  - `code_hash`, `metrics (jsonb)`
+- `audit_log`
+  - `id`, `actor`, `action`, `resource`, `at`, `details (jsonb)`
+
+### Lakehouse (offline facts)
+- `offline_feature_values`
+  - `entity_type`, `entity_key`, `feature_view_name`, `feature_view_version`, `feature_name`
+  - `event_time`, `ingestion_time`, typed `value_*`, `source_ref`
+  - Partition: `event_date`
+
+---
+
+## Data Flow
+
+### Online inference read path
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as Inference Client
+  participant FS as Feature Store API
+  participant PG as Postgres
+  participant R as Redis
+
+  C->>FS: GetFeatures(keys, feature_refs, model)
+  FS->>PG: Resolve refs + policies (cached)
+  PG-->>FS: Versions + TTL + rules
+  FS->>R: MGET entity keys
+  R-->>FS: Values + event_time
+  FS-->>C: Values + per-feature status + request_id
+```
+
+### Streaming materialization
+```mermaid
+sequenceDiagram
+  autonumber
+  participant E as Event Log
+  participant SJ as Spark Streaming
+  participant R as Redis
+  participant L as Lakehouse
+
+  E->>SJ: Events (entity_key, event_time, payload)
+  SJ->>SJ: Transform + dedup + windows
+  SJ->>R: Upsert latest-by-entity
+  SJ->>L: Append offline feature facts
+```
+
+---
+
+## Correctness and Point-in-Time Training
+
+### As-of join rule (offline)
+For each label row `(entity_key, label_time)` and feature rows `(entity_key, event_time, ingestion_time)`:
+- Select rows where `event_time <= label_time`
+- Choose max `event_time`; tie-break by max `ingestion_time`
+- Enforce TTL: `label_time - event_time <= ttl`
+- Apply deterministic defaults and access policies when missing/expired/denied
+
+### Late/out-of-order handling
+- Streaming uses event-time processing with `allowed_lateness_seconds`.
+- Late events still append to offline history; online updates are bounded by freshness policy.
+
+---
+
+## API Design
+
+### Online serving
+- `POST /v1/features:get`
+  - Supports batch entity keys, partial per-feature results, strict response limits, and per-feature `status`.
+  - `asOfTime` is supported via offline dataset builds; online serves latest-by-entity.
+
+### Registry/governance
+- `POST /v1/registry/feature-views` (create draft)
+- `POST /v1/registry/feature-views/{name}/publish` (publish immutable version)
+- `GET /v1/registry/feature-views/{name}?version=...`
+- `POST /v1/registry/aliases/{name}/prod` (update prod pin)
+
+### Offline training datasets
+- `POST /v1/training-datasets`
+  - Inputs: label source ref + snapshot, feature refs (or alias resolved at submit), join keys, label time column, output location
+  - Output: dataset artifact URI + pinned definition hashes + build metrics
+
+---
+
+## Operations
+
+### SLOs and dashboards
+- Serving: availability, p50/p99, error rate, partial response rate, stale/missing/denied rates.
+- Freshness: per view watermark vs now; per view lag distribution.
+- Compute: streaming lag, batch duration, retries, backfill queue depth.
+- Quality: schema violations, null/range, coverage, drift metrics with thresholds.
+
+### Reliability
+- Multi-AZ Postgres + Redis; strict timeouts and circuit breakers in serving.
+- Graceful degradation: per-feature defaults + `STALE/MISSING/DENIED` statuses.
+- Rebuild procedure: re-materialize Redis from lakehouse snapshots and/or event log replay.
+
+### Security and compliance
+- OIDC/mTLS for service identity; RBAC enforced in the Feature Store API.
+- Encryption in transit/at rest; immutable audit log retention ≥ 1 year.
+- PII tagging at definition level; feature-level access policies enforced at serve and dataset build time.
+
+---
+
+## Simplification Notes
+
+- Removed: separate control-plane services; acceptable because registry, governance, and serving are cohesive and deploy together in the `Feature Store API`.
+- Removed: standalone data-quality service; acceptable because checks run inside Spark jobs and results/policies live in `Postgres` with consistent enforcement.
+- Removed: multiple compute stacks; acceptable because `Spark` covers streaming, batch, backfills, and training joins with one operational model.
+- Removed: multiple online store options; acceptable because `Redis` directly matches low-latency latest-by-entity reads for the stated SLOs.
+- Merged: training set builder into the same Spark job framework; acceptable because it shares transforms, version pinning, and scheduling.
+- Complexity that remains: event-time + late data handling (required for correctness), lakehouse time travel (required for reproducibility), multi-AZ online serving (required for 99.99%).
+mcp startup: no servers
+ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Dec 17th, 2025 1:06 AM.
+Warning: no last agent message; wrote empty content to /Users/dominikdabrowski/pr/system-design-atlas/grades/ml-feature-store.json

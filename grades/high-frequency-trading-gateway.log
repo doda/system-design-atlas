@@ -1,0 +1,385 @@
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2a95-9002-77f1-995a-4361516582b1
+--------
+user
+You are a senior systems architect reviewing a system design document.
+
+Grade this solution on three dimensions (1-10 scale):
+
+1. **Strength** (1-10): How technically sound, complete, and production-ready is the design?
+   - Does it address scalability, reliability, and failure modes?
+   - Are the trade-offs well-reasoned?
+   - Would this actually work at scale?
+
+2. **Interestingness** (1-10): How engaging and educational is the content?
+   - Does it teach useful concepts?
+   - Are there insights that aren't obvious?
+   - Would an engineer learn something valuable?
+
+3. **Novelty** (1-10): How unique or creative is the approach?
+   - Does it go beyond textbook solutions?
+   - Are there clever simplifications or unconventional choices?
+   - Does it challenge common assumptions?
+
+Also note any major issues or particularly strong aspects.
+
+Output ONLY valid JSON in this exact format:
+{
+  "slug": "high-frequency-trading-gateway",
+  "strength": <1-10>,
+  "interestingness": <1-10>,
+  "novelty": <1-10>,
+  "overall": <average of three scores, 1 decimal>,
+  "summary": "<2-3 sentence summary of the design>",
+  "strengths": ["<strength 1>", "<strength 2>"],
+  "weaknesses": ["<weakness 1>", "<weakness 2>"],
+  "verdict": "<one of: exceptional, strong, adequate, weak>"
+}
+
+---
+
+## Solution to Grade
+
+---
+title: "High-Frequency Trading Gateway"
+category: "Commerce & Fintech"
+difficulty: "Hard"
+tags: ["hft", "low-latency", "order-routing", "risk-management", "ptp", "audit"]
+---
+
+## Overview
+
+A high-frequency trading (HFT) order entry gateway sits on the critical path between trading clients and exchange matching engines. The goal is **predictable tail latency** while enforcing strict **pre-trade risk controls** (credit, positions, fat-finger limits) and producing an **auditable, tamper-evident trail** suitable for regulatory reconstruction.
+
+The design uses a deterministic, in-process fast path for parse → validate → risk → route, plus an asynchronous side path for audit, drop-copy, and observability that never blocks trading.
+
+---
+
+## Requirements
+
+### Functional Requirements
+
+- Accept order entry over low-latency protocols:
+  - FIX 4.2/4.4 over TCP.
+  - Optional binary framed protocol.
+- Per-session authentication, sequencing, and heartbeats.
+- Inline pre-trade risk checks per order:
+  - Credit/notional, quantity, price collars, max open orders, rate limits.
+  - Optional per-instrument and per-venue constraints.
+- Deterministic behavior:
+  - Strict per-session sequencing.
+  - Defined overload prioritization (e.g., cancels > replaces > new orders) without breaking correctness.
+- Route to one or more venues with venue-specific adapters (FIX/OUCH/binary).
+- Full order lifecycle: new, cancel, replace/modify, status/query.
+- Emit:
+  - Drop copy (near-real-time copy of order/exec flow).
+  - Immutable audit log of inbound/outbound messages and risk decisions.
+- Administrative controls:
+  - Limits and session provisioning.
+  - Kill-switch (per-account and global).
+  - Trading halts and venue disables.
+- Observability:
+  - Latency histograms, reject reasons, disconnects, queue depths, health endpoints.
+
+### Non-Functional Requirements (Targets)
+
+#### Scale (per colo)
+
+- Concurrent sessions: 1,000–5,000.
+- Burst: up to 500k msgs/sec for 1–10s.
+- Sustained: 100k msgs/sec.
+- Orders to venues: 25k–75k orders/sec.
+- Reference data: 50k–500k instruments.
+- Risk state: 10k–100k accounts (hot set much smaller).
+
+#### Latency (gateway internal: first byte in → first byte out to venue socket)
+
+- Binary protocol + kernel-bypass/busy-poll:
+  - P50 ≤ 10 µs, P99 ≤ 50 µs, P99.9 ≤ 150 µs at peak
+- FIX over TCP (tuned kernel, epoll + busy-poll):
+  - P50 ≤ 25 µs, P99 ≤ 150 µs, P99.9 ≤ 400 µs at peak
+
+#### Availability & Safety
+
+- 99.99% during trading hours (maintenance outside market hours).
+- Fail-closed behavior with explicit overload rejects; preserve cancel capability where possible.
+- No synchronous DB or remote RPC on the fast path.
+
+#### Consistency
+
+- Linearizable per-account risk state within a shard (single-writer).
+- Deterministic per-session sequencing.
+- Eventual consistency for dashboards and reporting.
+
+#### Durability & Auditability
+
+- Reconstructable audit trail for client/venue messages and risk decisions.
+- Regulatory-grade timestamps with clock-quality markers (PTP/PHC health).
+- RPO depends on definition of “accepted”; wire-level capture can provide RPO=0 for “observed on the wire”, while structured gateway logs are asynchronous.
+
+### Constraints & Assumptions
+
+- Colocated deployment; on-box jitter dominates.
+- Time sync via PTP (IEEE 1588) with NIC hardware timestamping (PHC).
+- On-prem/colo-friendly dependencies.
+
+---
+
+## Simplified Architecture
+
+Each colo runs multiple identical gateway instances behind an L4 VIP with session affinity. Each gateway instance is a single process with pinned shard engines for deterministic trading, plus dedicated threads for venue I/O and audit writing.
+
+```mermaid
+graph TD
+  C[Clients] --> VIP[L4 VIP]
+  VIP --> GW[Gateway Host]
+
+  GW --> EX[Venues]
+
+  GW --> PG[(Postgres Config)]
+  GW --> LOG[(Local Event Log)]
+  GW --> DC[Drop Copy Feed]
+  GW --> MET[Metrics Endpoint]
+```
+
+### What Runs on a Gateway Host
+
+**Trading fast path (per-shard, single-threaded, core-pinned)**
+- Session handling (FIX/binary), sequencing, validation.
+- Inline risk checks and state updates.
+- Routing decisions and handoff to venue adapters.
+- Bounded memory (fixed ring buffers, preallocated pools) and explicit overload policy.
+
+**Asynchronous side path (never blocks shards)**
+- Audit writer: consumes per-shard audit buffers and appends to a local event log.
+- Drop-copy publisher: streams a normalized view to downstream subscribers (compliance/monitoring).
+- Admin/config: loads versioned configuration from Postgres; applies updates at shard boundaries.
+- Observability: exposes counters/histograms and health endpoints.
+
+---
+
+## Deterministic Sharding Model
+
+Shards provide linearizable per-account risk state and predictable performance by avoiding cross-core contention.
+
+```mermaid
+flowchart LR
+  VIP[L4 Affinity] --> S[Session]
+  S --> H[Hash account_id]
+  H --> E0[Shard 0]
+  H --> E1[Shard 1]
+  H --> EN[Shard N]
+```
+
+- Each shard is a single-threaded event loop pinned to a core.
+- All mutable state for an account (limits consumption, open orders, idempotency) lives on exactly one shard.
+- Shards communicate only via one-way bounded queues for rare cases (e.g., global kill-switch broadcast).
+
+---
+
+## Core Components
+
+### 1) Trading Gateway (Sessions + Parser + Engine)
+
+**Responsibilities**
+- Accept client sessions, authenticate, maintain heartbeats.
+- Parse FIX/binary messages into normalized intents.
+- Enforce per-session sequencing and deterministic error handling.
+- Apply overload policy without breaking per-session correctness.
+
+**Key design choices**
+- Fixed-size ring buffers and object pools; avoid dynamic allocation on the hot path.
+- Strict per-session ordering; overload prioritization favors risk-reducing actions (cancel/replace) while preserving order within a session.
+
+### 2) Inline Risk (Per-Order, Per-Shard)
+
+**Responsibilities**
+- Deterministic per-order checks: notional, quantity, price collar, open orders, rate limits.
+- Maintain per-account consumption: open orders count, notional-at-risk, throttling counters.
+- Enforce instrument/venue allow/deny rules from config.
+
+**Consistency**
+- Linearizable per-account state within a shard: the same thread that decides “send” or “reject” updates consumption.
+
+**Configuration model**
+- Static limits and routing rules are versioned and applied at shard boundaries.
+- Dynamic consumption is purely in-memory and derived from order lifecycle events.
+
+### 3) Venue Adapters (Exchange Connectivity)
+
+**Responsibilities**
+- Maintain venue sessions (logon, heartbeats, sequence numbers).
+- Encode/decode venue-specific protocols (FIX/OUCH/binary).
+- Translate acks/rejects/fills into client execution reports.
+- Enforce venue constraints (rate limits, message formats, cancel semantics).
+
+**Throughput**
+- Multiple sessions per venue as needed to reduce head-of-line blocking.
+- Optional “cancel lane” via separate venue sessions/queues where the venue protocol supports it.
+
+### 4) Audit Log + Drop Copy
+
+**Audit goals**
+- Reconstructable record of:
+  - Client inbound messages (raw bytes and/or normalized form)
+  - Risk decisions (including reject reasons)
+  - Venue outbound messages
+  - Venue inbound responses
+  - Client outbound responses
+- Tamper-evident integrity: hash-chained segments with periodic signing.
+
+**Implementation**
+- Each shard writes compact audit events into a bounded SPSC buffer.
+- A dedicated audit writer thread appends to a local, segmented event log (preallocated segments; `fsync` policy is configurable and not on the fast path).
+- Drop copy is produced from the same audit stream (normalized events over TCP to authorized subscribers).
+
+**Backpressure**
+- If audit buffers approach saturation:
+  - Reject new orders with `BUSY_AUDIT_BACKPRESSURE`.
+  - Continue cancels/replaces where safe.
+  - Shed non-critical telemetry before audit.
+
+### 5) Control Plane (Embedded Admin + Postgres Config)
+
+**Responsibilities**
+- Store source-of-truth configuration in Postgres (accounts, sessions, limits, venue routes, venue enablement).
+- Admin API (mTLS + RBAC) to manage limits, sessions, kill-switch, venue disables, health and metrics.
+- Gateways load a signed, versioned snapshot at startup and refresh via polling or Postgres `LISTEN/NOTIFY` (control-plane only).
+
+**Safety**
+- Fail-closed if required config is missing, invalid, or stale beyond a bound.
+- Deterministic application: updates applied at shard boundaries with per-shard version tracking.
+
+### 6) Observability
+
+- `/metrics` for histograms/counters: parse/risk/route/venue enqueue latency, reject reasons, queue depths, session churn, venue health, clock quality.
+- `/health` for liveness/readiness with explicit gating on PTP health, config load, and venue connectivity.
+- PHC/PTP metadata included in audit events and exposed via metrics.
+
+---
+
+## Data Model
+
+### Postgres (Config + Admin Audit; Not on Fast Path)
+
+- `accounts(account_id PK, status, base_currency, created_at, updated_at)`
+- `sessions(session_id PK, account_id FK, protocol, api_key_id, source_ip_cidr, enabled, created_at, updated_at)`
+- `risk_limits(account_id PK, max_notional, max_order_qty, max_open_orders, max_orders_per_sec, price_collar_bps, instrument_scope, version, updated_at)`
+- `venue_routes(account_id, symbol_pattern, venue_id, priority, enabled, version, updated_at)`
+- `venues(venue_id PK, protocol, session_params_json, enabled, updated_at)`
+- `admin_audit(id PK, actor, action, target, before_json, after_json, ts)`
+
+### In-Memory (Per Shard; Bounded)
+
+- `SessionState`: seq tracking, auth state, heartbeat timers, idempotency window.
+- `AccountRiskState`: consumption counters, throttle counters, last applied config version.
+- `OrderState`: `ClOrdID`/internal id ↔ venue order id mapping, leaves/status bounded by max open orders.
+- `IdempotencyCache`: fixed-size cache of recent `correlation_id` → prior outcome.
+
+### Local Append-Only Event Log (Schema-on-Read)
+
+- Header: `ts_mono`, optional `ts_phc`, `clock_quality`, `gateway_id`, `shard_id`, `session_id`, `account_id`, `seq_in`, `seq_shard`, `correlation_id`, `event_type`
+- Payload: raw bytes and/or normalized fields
+
+---
+
+## APIs
+
+### Trading API (Low-Latency)
+
+**Protocols**
+- FIX 4.2/4.4 over TCP
+- Optional binary protocol
+
+**Core messages**
+- Session: logon/logout/heartbeat/test-request
+- Orders:
+  - `NewOrder(correlation_id, cl_ord_id, symbol, side, qty, price, tif, venue_hint?)`
+  - `Cancel(correlation_id, orig_cl_ord_id)`
+  - `Replace(correlation_id, orig_cl_ord_id, new_qty?, new_price?)`
+- Reports:
+  - `ExecReport(order_id, status, filled_qty, leaves_qty, avg_px, reason_code?)`
+
+**Deterministic error codes**
+- `INVALID_MESSAGE`, `INVALID_SYMBOL`, `SESSION_DISABLED`, `UNAUTHORIZED_IP`
+- `DUPLICATE_CORRELATION_ID`
+- `RISK_LIMIT_BREACH` (subcodes: NOTIONAL/QTY/PRICE_COLLAR/OPEN_ORDERS)
+- `THROTTLED`
+- `BUSY_AUDIT_BACKPRESSURE`, `BUSY_INTERNAL_QUEUE`
+
+**Idempotency**
+- Require unique `correlation_id` (or FIX `ClOrdID`) per session within a retention window.
+- On duplicates, return the prior outcome deterministically.
+
+**Ordering**
+- Strict per-session ordering; FIX resend semantics supported where applicable.
+
+### Admin API (mTLS + RBAC)
+
+- `PUT /v1/limits/{account_id}` (optimistic concurrency with `version`)
+- `POST /v1/sessions/{session_id}/disable`
+- `POST /v1/kill-switch` (global/account/venue)
+- `POST /v1/venues/{venue_id}/disable`
+- `GET /v1/health`
+- `GET /v1/metrics`
+- `GET /v1/latency` (rolling histograms and queue depths)
+
+---
+
+## Scaling
+
+### Capacity Planning (Example)
+
+For a 32-core host (no SMT), pinned:
+- 24–28 cores: shard engines (sessions + risk + routing)
+- 2–4 cores: venue adapter I/O (depending on venue count and protocol mix)
+- 1 core: audit writer
+- 1–2 cores: networking/admin/metrics
+
+At 100k msgs/sec sustained and 24 shards: ~4.2k msgs/sec per shard average. Bursts scale with constant-time parsing/risk checks and bounded allocations.
+
+### Horizontal Scaling
+
+- L4 session affinity keeps a TCP session on one gateway instance.
+- Hash by `account_id` to keep risk state consistent and local.
+- Multiple instances per colo for capacity and failover; clients reconnect and resync on instance failure.
+
+---
+
+## Failure Modes (Selected)
+
+- **Venue disconnect / desync**: deterministic reconnect; reject new orders for affected venue with clear reason; maintain cancel strategy per venue capability.
+- **Audit backpressure / disk issues**: reject new orders when audit buffers are high; continue cancels/replaces where safe; alert on dropped events and write latency.
+- **Config mismatch**: fail-closed for affected accounts; version checks per shard; admin audit trail for all changes.
+- **PTP degradation**: tag all events with clock quality; policy-based trading halt on sustained bad offsets.
+- **Host jitter regression**: canary rollout; auto-withdraw on sustained P99.9 breach; isolate CPUs, hugepages, NUMA pinning, warm-up routines.
+
+---
+
+## Operations
+
+- Blue/green or canary with strict latency SLO gating.
+- Startup safety checks: CPU pinning/NUMA, hugepages, clock sync, config signature/version, venue connectivity.
+- Monitoring: stage latencies, rejects, queue depths, venue session health, host performance, PTP offsets.
+
+---
+
+## Simplification Notes
+
+- Removed: separate config publisher; gateways load versioned config directly from Postgres (polling and optional `LISTEN/NOTIFY`), keeping control-plane dependency off the fast path.
+- Removed: external streaming infrastructure for drop copy; drop copy is emitted directly from the same normalized audit stream used to build the event log.
+- Merged: gateway, inline risk, control-plane agent, metrics exporter, and audit recorder into one deployable gateway binary per host; shard boundaries keep trading deterministic while side threads handle I/O.
+- Merged: “audit logger/recorder” and “append-only event log” into a single local append-only event log writer with hash-chained segments and periodic signing.
+- Kept: single-writer shards, bounded buffers, and explicit overload policies because they are required for microsecond tail latency and linearizable per-account risk state.
+- Kept: Postgres as the sole database because it provides auditable config and admin change history without introducing fast-path coupling.
+mcp startup: no servers
+ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Dec 17th, 2025 1:06 AM.
+Warning: no last agent message; wrote empty content to /Users/dominikdabrowski/pr/system-design-atlas/grades/high-frequency-trading-gateway.json

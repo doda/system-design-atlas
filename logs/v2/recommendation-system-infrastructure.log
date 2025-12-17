@@ -1,0 +1,1591 @@
+==========================================
+Generating (v2): Recommendation System Infrastructure
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2b54-7453-8ba0-48f97a3b4f66
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: Recommendation System Infrastructure
+**Category**: Social & Discovery
+
+**Problem Statement**:
+Design the pipeline for candidate generation, scoring, and ranking, including feedback loops for model retraining.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+thinking
+**Generating Markdown Documentation**
+
+I need to create a markdown document that’s both elegant and focused on key challenges like online/offline consistency, feedback loops, and data privacy. It should have a 6-8 node mermaid diagram and outline infrastructure for social discovery, including candidate generation and scoring methods.
+
+I’ll mention the tech stack, like Kafka and Postgres, and detail the hard parts like training-serving skew and feature correctness. It's crucial to explain failure modes too. I'll ensure crisp and clear writing without hedging!
+thinking
+**Crafting the Architecture**
+
+I’m putting together a mermaid diagram with eight nodes to represent the architecture: Client, API Gateway, Rec Service, ANN Retrieval, Feature Store, Cache, Event Bus, and Offline Training. I’ve combined the scoring and ranking into the Rec Service to fit the requirement.
+
+Next, I'll detail components focusing on the feedback loop, point-in-time features, and exploration logging. It's essential to set scale targets like 200M MAU and 300k QPS peak. I’ll also outline critical design decisions and create a trade-offs table. Let’s get started!
+codex
+```markdown
+---
+title: "Recommendation System Infrastructure"
+category: "Social & Discovery"
+difficulty: "Hard"
+tags: ["recommendations", "ranking", "ml-infra", "feature-store", "kafka", "serving"]
+---
+
+## Overview
+
+This system produces a personalized ranked feed by splitting the problem into two stages: **cheap, high-recall candidate generation** followed by **expensive, high-precision ranking**. The elegance is in treating “recommendations” as an OLTP service with strict latency/SLOs, while treating “learning” as a separate, asynchronous pipeline with strong data guarantees and clear contracts.
+
+The key insight: most teams fail not because their model is weak, but because their **data and feature semantics are inconsistent across online serving and offline training**. This design makes the feedback loop boring and reliable by anchoring everything on an immutable event log, a point-in-time correct feature pipeline, and a disciplined model lifecycle (registry + staged rollout + observability).
+
+## What Makes This Hard
+
+Naive implementations conflate “show content” with “learn from clicks” and end up with silent corruption:
+- **Training-serving skew**: the model trains on features computed one way, serves on another, then performance degrades with no obvious bug.
+- **Biased labels**: you only observe interactions for items you chose to show; the system trains itself into a popularity echo chamber.
+- **Freshness vs. cost**: the best features are often the freshest (recent follows, recent likes), but recomputing them at request time blows your latency budget.
+
+The trap: treating the pipeline as “ETL + model” instead of a product-critical distributed system with versioning, backfills, and hard correctness boundaries.
+
+## Requirements
+
+### Functional Requirements
+- Generate a ranked list of items per user from multiple sources (social graph, content similarity, popularity).
+- Enforce hard policy constraints (blocks, privacy, seen-content suppression, author mutes) deterministically.
+- Log every impression with enough context to enable point-in-time training and debugging.
+- Support continuous retraining and safe rollout (champion/challenger, gradual ramp, quick rollback).
+- Close the loop: ingest implicit feedback (click/dwell/like/hide/follow) and delayed feedback (unfollow, report).
+
+### Scale Targets
+- **Peak read QPS (feed requests):** 150k QPS (e.g., 15M DAU, 10 feed opens/day, 2-hour peak).
+- **Latency:** p95 150ms end-to-end; p99 300ms. Ranking must usually finish in <60ms to leave headroom for networking and cache misses.
+- **Candidate set sizes:** 2k–10k retrieved per request; rank top 100; return top 20–50.
+- **Event volume:** 5–20M events/min (impressions dominate). This matters because impression logs are the ground truth for unbiased learning and debugging.
+- **Model update cadence:** daily full retrain + hourly/near-real-time calibration updates (to react to drift without destabilizing the whole model).
+
+## Key Design Decisions
+
+- **Two-stage retrieval + ranking**
+  - Chose: ANN-based retrieval + lightweight ranking service.
+  - Rejected: single giant model scoring the entire corpus per request.
+  - Why: retrieval makes latency and cost predictable; ranking focuses compute on the only items that can matter.
+
+- **Immutable event log as the system of record**
+  - Chose: Kafka (or equivalent) for all user actions, impressions, and item updates.
+  - Rejected: “just write rows to a database and batch it later.”
+  - Why: the log gives replay, backfills, and deterministic training datasets; it turns pipeline bugs into fixable engineering problems instead of mystery model regressions.
+
+- **Feature store with point-in-time correctness**
+  - Chose: a single feature definition layer used by both offline and online (e.g., Feast-style contracts), with strict time-travel for training.
+  - Rejected: separate “offline features in Spark” and “online features in Redis” maintained independently.
+  - Why: prevents skew, enables reproducible training, and makes debugging model behavior tractable.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Feed API"] --> B["Rec Service"]
+  B --> C["Cache"]
+  B --> D["ANN Retrieval"]
+  B --> E["Feature Store"]
+  B --> F["Event Bus"]
+  F --> G["Offline Training"]
+  G --> H["Model Registry"]
+  H --> B
+```
+
+### Components
+
+- **Feed API**
+  - Owns request auth, privacy context, and response shaping. Keeps recommendation logic out of edge concerns.
+- **Rec Service**
+  - The latency-critical brain: merges retrieval sources, applies policy filters, fetches features, scores, ranks, and logs impressions.
+  - Runs with strict budgets (timeouts per dependency) and returns “good enough” rather than timing out.
+- **Cache**
+  - Stores short-lived per-user results (e.g., last feed page) and expensive precomputed artifacts (e.g., user embedding).
+  - Earns its place by turning dependency hiccups into slightly stale results instead of outages.
+- **ANN Retrieval**
+  - Serves top-K approximate nearest neighbors over item embeddings (plus optional per-user embedding).
+  - Keeps recall high while making the ranking stage feasible.
+- **Feature Store**
+  - Online: low-latency access to user/item features (Redis/Cassandra-style).
+  - Offline: point-in-time feature materialization for training (Parquet on object storage).
+- **Event Bus**
+  - The source of truth: impressions (with rank position), clicks, dwell, hides, follows, item publishes/edits, graph updates.
+  - Enables replayable training sets and audit/debug of “why was this shown?”
+- **Offline Training**
+  - Builds datasets, computes features, trains retrieval embeddings + ranking model, and validates with offline metrics and guardrails.
+- **Model Registry**
+  - Stores versioned models, schemas, feature contracts, and rollout state; supports canary + rollback.
+
+## Deep Dive: Feedback Loops Without Corrupting Learning
+
+The hardest part is getting a learning loop that improves the product instead of amplifying bias. The core rule: **impressions are the unit of truth**, not clicks. Every ranking response logs an impression record per item with: user_id, item_id, timestamp, rank position, retrieval source, model version, and key feature hashes. This makes the dataset self-describing and debuggable.
+
+Next, training data must be **point-in-time correct**. For each impression at time *t*, the offline pipeline joins features “as-of *t*” (user state, graph state, item state). Without this, you accidentally train on future information (data leakage) and ship a model that looks great offline and fails in production. Practically: store feature values with event-time, build offline feature tables with time travel, and enforce that training joins are constrained to `feature_time <= impression_time`.
+
+Finally, you need controlled exploration to avoid popularity traps. The Rec Service reserves a small slice of the ranked list (e.g., 1–2 positions) for exploration candidates drawn from long-tail sources (fresh content, under-exposed creators). These impressions are tagged with an exploration policy id so the trainer can:
+- avoid contaminating the main model with aggressively exploratory traffic, or
+- explicitly learn from it using debiasing (position features, propensity-aware training).
+This is the difference between “the model learns what we already show” and “the model learns what users actually prefer.”
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Low-latency serving with predictable cost | Perfect global optimal ranking |
+| Reproducible training and debuggability | More upfront logging/feature discipline |
+| Safe model iteration (canary/rollback) | Slightly slower experimentation velocity |
+| High recall via ANN retrieval | Exactness of nearest neighbors |
+
+## Failure Modes
+
+- **Event pipeline lag or outage**
+  - What happens: training freshness degrades; metrics drift; debugging becomes blind.
+  - Detect: consumer lag SLOs, missing impression rate, schema validation failures.
+  - Recover: buffer locally in Rec Service with backpressure limits; replay from Kafka; freeze training on known-good window.
+
+- **Feature store staleness / hot-key overload**
+  - What happens: rankings become generic; latency spikes; timeouts cascade.
+  - Detect: feature fetch p95/p99, timeout rate, “fallback feature” counters, hot-key dashboards.
+  - Recover: strict per-dependency timeouts; degrade gracefully to cached embeddings + simpler ranker; shard hot keys; precompute heavy aggregates.
+
+- **Bad model rollout**
+  - What happens: engagement drops; abuse signals rise; creator distribution skews.
+  - Detect: online guardrails (CTR, hides, reports, diversity), per-slice metrics, canary delta alarms.
+  - Recover: immediate rollback via Model Registry; freeze retraining; root-cause with impression-level replay.
+
+## What I'd Do Differently At...
+
+- **10x scale:** split ANN Retrieval by content type and recency tiers; add regional model replicas with local caches; push more features into streaming aggregates to reduce online fetch cost.
+- **100x scale:** re-architect embeddings/ANN into a dedicated distributed vector service with strict SLAs and autoscaling; move from “daily retrain” to continuous training for fast-moving segments; invest in stronger debiasing and counterfactual evaluation because exploration traffic becomes expensive and risky.
+
+## Operational Notes
+
+- The on-call’s first question is “is this a serving issue or a data issue?” Maintain separate SLOs for Rec Service latency/error, ANN latency/recall proxy, feature fetch success, and event logging completeness.
+- Treat feature definitions as an API: version them, validate schemas at ingestion, and block training/serving on incompatible changes.
+- Keep a “last known good” model and feature snapshot pinned; rollback must not depend on the data pipeline being healthy.
+- Always log: model version, feature schema version, retrieval sources, and timeouts taken—otherwise you can’t explain rankings when a VP asks “why did I see this?”
+```
+tokens used
+3,737
+```markdown
+---
+title: "Recommendation System Infrastructure"
+category: "Social & Discovery"
+difficulty: "Hard"
+tags: ["recommendations", "ranking", "ml-infra", "feature-store", "kafka", "serving"]
+---
+
+## Overview
+
+This system produces a personalized ranked feed by splitting the problem into two stages: **cheap, high-recall candidate generation** followed by **expensive, high-precision ranking**. The elegance is in treating “recommendations” as an OLTP service with strict latency/SLOs, while treating “learning” as a separate, asynchronous pipeline with strong data guarantees and clear contracts.
+
+The key insight: most teams fail not because their model is weak, but because their **data and feature semantics are inconsistent across online serving and offline training**. This design makes the feedback loop boring and reliable by anchoring everything on an immutable event log, a point-in-time correct feature pipeline, and a disciplined model lifecycle (registry + staged rollout + observability).
+
+## What Makes This Hard
+
+Naive implementations conflate “show content” with “learn from clicks” and end up with silent corruption:
+- **Training-serving skew**: the model trains on features computed one way, serves on another, then performance degrades with no obvious bug.
+- **Biased labels**: you only observe interactions for items you chose to show; the system trains itself into a popularity echo chamber.
+- **Freshness vs. cost**: the best features are often the freshest (recent follows, recent likes), but recomputing them at request time blows your latency budget.
+
+The trap: treating the pipeline as “ETL + model” instead of a product-critical distributed system with versioning, backfills, and hard correctness boundaries.
+
+## Requirements
+
+### Functional Requirements
+- Generate a ranked list of items per user from multiple sources (social graph, content similarity, popularity).
+- Enforce hard policy constraints (blocks, privacy, seen-content suppression, author mutes) deterministically.
+- Log every impression with enough context to enable point-in-time training and debugging.
+- Support continuous retraining and safe rollout (champion/challenger, gradual ramp, quick rollback).
+- Close the loop: ingest implicit feedback (click/dwell/like/hide/follow) and delayed feedback (unfollow, report).
+
+### Scale Targets
+- **Peak read QPS (feed requests):** 150k QPS (e.g., 15M DAU, 10 feed opens/day, 2-hour peak).
+- **Latency:** p95 150ms end-to-end; p99 300ms. Ranking must usually finish in <60ms to leave headroom for networking and cache misses.
+- **Candidate set sizes:** 2k–10k retrieved per request; rank top 100; return top 20–50.
+- **Event volume:** 5–20M events/min (impressions dominate). This matters because impression logs are the ground truth for unbiased learning and debugging.
+- **Model update cadence:** daily full retrain + hourly/near-real-time calibration updates (to react to drift without destabilizing the whole model).
+
+## Key Design Decisions
+
+- **Two-stage retrieval + ranking**
+  - Chose: ANN-based retrieval + lightweight ranking service.
+  - Rejected: single giant model scoring the entire corpus per request.
+  - Why: retrieval makes latency and cost predictable; ranking focuses compute on the only items that can matter.
+
+- **Immutable event log as the system of record**
+  - Chose: Kafka (or equivalent) for all user actions, impressions, and item updates.
+  - Rejected: “just write rows to a database and batch it later.”
+  - Why: the log gives replay, backfills, and deterministic training datasets; it turns pipeline bugs into fixable engineering problems instead of mystery model regressions.
+
+- **Feature store with point-in-time correctness**
+  - Chose: a single feature definition layer used by both offline and online (e.g., Feast-style contracts), with strict time-travel for training.
+  - Rejected: separate “offline features in Spark” and “online features in Redis” maintained independently.
+  - Why: prevents skew, enables reproducible training, and makes debugging model behavior tractable.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Feed API"] --> B["Rec Service"]
+  B --> C["Cache"]
+  B --> D["ANN Retrieval"]
+  B --> E["Feature Store"]
+  B --> F["Event Bus"]
+  F --> G["Offline Training"]
+  G --> H["Model Registry"]
+  H --> B
+```
+
+### Components
+
+- **Feed API**
+  - Owns request auth, privacy context, and response shaping. Keeps recommendation logic out of edge concerns.
+- **Rec Service**
+  - The latency-critical brain: merges retrieval sources, applies policy filters, fetches features, scores, ranks, and logs impressions.
+  - Runs with strict budgets (timeouts per dependency) and returns “good enough” rather than timing out.
+- **Cache**
+  - Stores short-lived per-user results (e.g., last feed page) and expensive precomputed artifacts (e.g., user embedding).
+  - Earns its place by turning dependency hiccups into slightly stale results instead of outages.
+- **ANN Retrieval**
+  - Serves top-K approximate nearest neighbors over item embeddings (plus optional per-user embedding).
+  - Keeps recall high while making the ranking stage feasible.
+- **Feature Store**
+  - Online: low-latency access to user/item features (Redis/Cassandra-style).
+  - Offline: point-in-time feature materialization for training (Parquet on object storage).
+- **Event Bus**
+  - The source of truth: impressions (with rank position), clicks, dwell, hides, follows, item publishes/edits, graph updates.
+  - Enables replayable training sets and audit/debug of “why was this shown?”
+- **Offline Training**
+  - Builds datasets, computes features, trains retrieval embeddings + ranking model, and validates with offline metrics and guardrails.
+- **Model Registry**
+  - Stores versioned models, schemas, feature contracts, and rollout state; supports canary + rollback.
+
+## Deep Dive: Feedback Loops Without Corrupting Learning
+
+The hardest part is getting a learning loop that improves the product instead of amplifying bias. The core rule: **impressions are the unit of truth**, not clicks. Every ranking response logs an impression record per item with: user_id, item_id, timestamp, rank position, retrieval source, model version, and key feature hashes. This makes the dataset self-describing and debuggable.
+
+Next, training data must be **point-in-time correct**. For each impression at time *t*, the offline pipeline joins features “as-of *t*” (user state, graph state, item state). Without this, you accidentally train on future information (data leakage) and ship a model that looks great offline and fails in production. Practically: store feature values with event-time, build offline feature tables with time travel, and enforce that training joins are constrained to `feature_time <= impression_time`.
+
+Finally, you need controlled exploration to avoid popularity traps. The Rec Service reserves a small slice of the ranked list (e.g., 1–2 positions) for exploration candidates drawn from long-tail sources (fresh content, under-exposed creators). These impressions are tagged with an exploration policy id so the trainer can:
+- avoid contaminating the main model with aggressively exploratory traffic, or
+- explicitly learn from it using debiasing (position features, propensity-aware training).
+This is the difference between “the model learns what we already show” and “the model learns what users actually prefer.”
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Low-latency serving with predictable cost | Perfect global optimal ranking |
+| Reproducible training and debuggability | More upfront logging/feature discipline |
+| Safe model iteration (canary/rollback) | Slightly slower experimentation velocity |
+| High recall via ANN retrieval | Exactness of nearest neighbors |
+
+## Failure Modes
+
+- **Event pipeline lag or outage**
+  - What happens: training freshness degrades; metrics drift; debugging becomes blind.
+  - Detect: consumer lag SLOs, missing impression rate, schema validation failures.
+  - Recover: buffer locally in Rec Service with backpressure limits; replay from Kafka; freeze training on known-good window.
+
+- **Feature store staleness / hot-key overload**
+  - What happens: rankings become generic; latency spikes; timeouts cascade.
+  - Detect: feature fetch p95/p99, timeout rate, “fallback feature” counters, hot-key dashboards.
+  - Recover: strict per-dependency timeouts; degrade gracefully to cached embeddings + simpler ranker; shard hot keys; precompute heavy aggregates.
+
+- **Bad model rollout**
+  - What happens: engagement drops; abuse signals rise; creator distribution skews.
+  - Detect: online guardrails (CTR, hides, reports, diversity), per-slice metrics, canary delta alarms.
+  - Recover: immediate rollback via Model Registry; freeze retraining; root-cause with impression-level replay.
+
+## What I'd Do Differently At...
+
+- **10x scale:** split ANN Retrieval by content type and recency tiers; add regional model replicas with local caches; push more features into streaming aggregates to reduce online fetch cost.
+- **100x scale:** re-architect embeddings/ANN into a dedicated distributed vector service with strict SLAs and autoscaling; move from “daily retrain” to continuous training for fast-moving segments; invest in stronger debiasing and counterfactual evaluation because exploration traffic becomes expensive and risky.
+
+## Operational Notes
+
+- The on-call’s first question is “is this a serving issue or a data issue?” Maintain separate SLOs for Rec Service latency/error, ANN latency/recall proxy, feature fetch success, and event logging completeness.
+- Treat feature definitions as an API: version them, validate schemas at ingestion, and block training/serving on incompatible changes.
+- Keep a “last known good” model and feature snapshot pinned; rollback must not depend on the data pipeline being healthy.
+- Always log: model version, feature schema version, retrieval sources, and timeouts taken—otherwise you can’t explain rankings when a VP asks “why did I see this?”
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/recommendation-system-infrastructure.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afb-63f4-79b3-a276-afef63c1c03e
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "Recommendation System Infrastructure"
+category: "Social & Discovery"
+difficulty: "Hard"
+tags: ["recommendations", "ranking", "ml-infra", "feature-store", "kafka", "serving"]
+---
+
+## Overview
+
+This system produces a personalized ranked feed by splitting the problem into two stages: **cheap, high-recall candidate generation** followed by **expensive, high-precision ranking**. The elegance is in treating “recommendations” as an OLTP service with strict latency/SLOs, while treating “learning” as a separate, asynchronous pipeline with strong data guarantees and clear contracts.
+
+The key insight: most teams fail not because their model is weak, but because their **data and feature semantics are inconsistent across online serving and offline training**. This design makes the feedback loop boring and reliable by anchoring everything on an immutable event log, a point-in-time correct feature pipeline, and a disciplined model lifecycle (registry + staged rollout + observability).
+
+## What Makes This Hard
+
+Naive implementations conflate “show content” with “learn from clicks” and end up with silent corruption:
+- **Training-serving skew**: the model trains on features computed one way, serves on another, then performance degrades with no obvious bug.
+- **Biased labels**: you only observe interactions for items you chose to show; the system trains itself into a popularity echo chamber.
+- **Freshness vs. cost**: the best features are often the freshest (recent follows, recent likes), but recomputing them at request time blows your latency budget.
+
+The trap: treating the pipeline as “ETL + model” instead of a product-critical distributed system with versioning, backfills, and hard correctness boundaries.
+
+## Requirements
+
+### Functional Requirements
+- Generate a ranked list of items per user from multiple sources (social graph, content similarity, popularity).
+- Enforce hard policy constraints (blocks, privacy, seen-content suppression, author mutes) deterministically.
+- Log every impression with enough context to enable point-in-time training and debugging.
+- Support continuous retraining and safe rollout (champion/challenger, gradual ramp, quick rollback).
+- Close the loop: ingest implicit feedback (click/dwell/like/hide/follow) and delayed feedback (unfollow, report).
+
+### Scale Targets
+- **Peak read QPS (feed requests):** 150k QPS (e.g., 15M DAU, 10 feed opens/day, 2-hour peak).
+- **Latency:** p95 150ms end-to-end; p99 300ms. Ranking must usually finish in <60ms to leave headroom for networking and cache misses.
+- **Candidate set sizes:** 2k–10k retrieved per request; rank top 100; return top 20–50.
+- **Event volume:** 5–20M events/min (impressions dominate). This matters because impression logs are the ground truth for unbiased learning and debugging.
+- **Model update cadence:** daily full retrain + hourly/near-real-time calibration updates (to react to drift without destabilizing the whole model).
+
+## Key Design Decisions
+
+- **Two-stage retrieval + ranking**
+  - Chose: ANN-based retrieval + lightweight ranking service.
+  - Rejected: single giant model scoring the entire corpus per request.
+  - Why: retrieval makes latency and cost predictable; ranking focuses compute on the only items that can matter.
+
+- **Immutable event log as the system of record**
+  - Chose: Kafka (or equivalent) for all user actions, impressions, and item updates.
+  - Rejected: “just write rows to a database and batch it later.”
+  - Why: the log gives replay, backfills, and deterministic training datasets; it turns pipeline bugs into fixable engineering problems instead of mystery model regressions.
+
+- **Feature store with point-in-time correctness**
+  - Chose: a single feature definition layer used by both offline and online (e.g., Feast-style contracts), with strict time-travel for training.
+  - Rejected: separate “offline features in Spark” and “online features in Redis” maintained independently.
+  - Why: prevents skew, enables reproducible training, and makes debugging model behavior tractable.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Feed API"] --> B["Rec Service"]
+  B --> C["Cache"]
+  B --> D["ANN Retrieval"]
+  B --> E["Feature Store"]
+  B --> F["Event Bus"]
+  F --> G["Offline Training"]
+  G --> H["Model Registry"]
+  H --> B
+```
+
+### Components
+
+- **Feed API**
+  - Owns request auth, privacy context, and response shaping. Keeps recommendation logic out of edge concerns.
+- **Rec Service**
+  - The latency-critical brain: merges retrieval sources, applies policy filters, fetches features, scores, ranks, and logs impressions.
+  - Runs with strict budgets (timeouts per dependency) and returns “good enough” rather than timing out.
+- **Cache**
+  - Stores short-lived per-user results (e.g., last feed page) and expensive precomputed artifacts (e.g., user embedding).
+  - Earns its place by turning dependency hiccups into slightly stale results instead of outages.
+- **ANN Retrieval**
+  - Serves top-K approximate nearest neighbors over item embeddings (plus optional per-user embedding).
+  - Keeps recall high while making the ranking stage feasible.
+- **Feature Store**
+  - Online: low-latency access to user/item features (Redis/Cassandra-style).
+  - Offline: point-in-time feature materialization for training (Parquet on object storage).
+- **Event Bus**
+  - The source of truth: impressions (with rank position), clicks, dwell, hides, follows, item publishes/edits, graph updates.
+  - Enables replayable training sets and audit/debug of “why was this shown?”
+- **Offline Training**
+  - Builds datasets, computes features, trains retrieval embeddings + ranking model, and validates with offline metrics and guardrails.
+- **Model Registry**
+  - Stores versioned models, schemas, feature contracts, and rollout state; supports canary + rollback.
+
+## Deep Dive: Feedback Loops Without Corrupting Learning
+
+The hardest part is getting a learning loop that improves the product instead of amplifying bias. The core rule: **impressions are the unit of truth**, not clicks. Every ranking response logs an impression record per item with: user_id, item_id, timestamp, rank position, retrieval source, model version, and key feature hashes. This makes the dataset self-describing and debuggable.
+
+Next, training data must be **point-in-time correct**. For each impression at time *t*, the offline pipeline joins features “as-of *t*” (user state, graph state, item state). Without this, you accidentally train on future information (data leakage) and ship a model that looks great offline and fails in production. Practically: store feature values with event-time, build offline feature tables with time travel, and enforce that training joins are constrained to `feature_time <= impression_time`.
+
+Finally, you need controlled exploration to avoid popularity traps. The Rec Service reserves a small slice of the ranked list (e.g., 1–2 positions) for exploration candidates drawn from long-tail sources (fresh content, under-exposed creators). These impressions are tagged with an exploration policy id so the trainer can:
+- avoid contaminating the main model with aggressively exploratory traffic, or
+- explicitly learn from it using debiasing (position features, propensity-aware training).
+This is the difference between “the model learns what we already show” and “the model learns what users actually prefer.”
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Low-latency serving with predictable cost | Perfect global optimal ranking |
+| Reproducible training and debuggability | More upfront logging/feature discipline |
+| Safe model iteration (canary/rollback) | Slightly slower experimentation velocity |
+| High recall via ANN retrieval | Exactness of nearest neighbors |
+
+## Failure Modes
+
+- **Event pipeline lag or outage**
+  - What happens: training freshness degrades; metrics drift; debugging becomes blind.
+  - Detect: consumer lag SLOs, missing impression rate, schema validation failures.
+  - Recover: buffer locally in Rec Service with backpressure limits; replay from Kafka; freeze training on known-good window.
+
+- **Feature store staleness / hot-key overload**
+  - What happens: rankings become generic; latency spikes; timeouts cascade.
+  - Detect: feature fetch p95/p99, timeout rate, “fallback feature” counters, hot-key dashboards.
+  - Recover: strict per-dependency timeouts; degrade gracefully to cached embeddings + simpler ranker; shard hot keys; precompute heavy aggregates.
+
+- **Bad model rollout**
+  - What happens: engagement drops; abuse signals rise; creator distribution skews.
+  - Detect: online guardrails (CTR, hides, reports, diversity), per-slice metrics, canary delta alarms.
+  - Recover: immediate rollback via Model Registry; freeze retraining; root-cause with impression-level replay.
+
+## What I'd Do Differently At...
+
+- **10x scale:** split ANN Retrieval by content type and recency tiers; add regional model replicas with local caches; push more features into streaming aggregates to reduce online fetch cost.
+- **100x scale:** re-architect embeddings/ANN into a dedicated distributed vector service with strict SLAs and autoscaling; move from “daily retrain” to continuous training for fast-moving segments; invest in stronger debiasing and counterfactual evaluation because exploration traffic becomes expensive and risky.
+
+## Operational Notes
+
+- The on-call’s first question is “is this a serving issue or a data issue?” Maintain separate SLOs for Rec Service latency/error, ANN latency/recall proxy, feature fetch success, and event logging completeness.
+- Treat feature definitions as an API: version them, validate schemas at ingestion, and block training/serving on incompatible changes.
+- Keep a “last known good” model and feature snapshot pinned; rollback must not depend on the data pipeline being healthy.
+- Always log: model version, feature schema version, retrieval sources, and timeouts taken—otherwise you can’t explain rankings when a VP asks “why did I see this?”
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+codex
+## Elegance Check
+
+### The Core Insight
+Treating “recommendations” as two systems with different correctness/latency needs—(1) an OLTP-ish low-latency serving path and (2) an asynchronous learning/data system with strong contracts—anchored by impression-as-ground-truth and point-in-time feature joins to prevent training/serving skew.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Rec Service | Owns latency budgets, merges sources, applies deterministic policy, and logs impressions with serving context. |
+| Immutable Event Log | Enables replay/backfills, deterministic dataset construction, and debugging “why shown” without relying on mutable DB rows. |
+| Point-in-time Feature Pipeline | Prevents leakage/skew; makes offline evaluation and incident RCA credible. |
+| ANN Retrieval | Makes high-recall candidate generation feasible under strict p95/p99 latency and cost. |
+| Model Registry + Rollout Controls | Makes rollback and staged deploy independent from pipeline health; turns model iteration into an operable release process. |
+| Cache | Converts dependency hiccups into staleness rather than outages; absorbs hot users/feeds. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom “Model Registry” concept | Use MLflow/SageMaker Model Registry/Vertex AI + a tiny internal “rollout config” service | Less bespoke flexibility; big reduction in operational surface area. |
+| “Feature store” split online/offline described abstractly | Start with Feast (or managed feature store) + one offline store (Parquet) + one online store (Redis/Cassandra) | Ties you to a framework’s constraints; faster to get correctness guarantees. |
+| Separate ANN service | Use a managed/vector DB (Pinecone/Weaviate/Milvus) or a library-based in-process ANN for early scale | Managed cost/lock-in; in-process limits scale/operability but is simpler for a small team. |
+| Kafka as default | If team is small: managed Kafka (MSK/Confluent) or even Kinesis/PubSub | Less portability; fewer sharp edges in ops (especially partitions, ISR, quotas). |
+| Per-request feature fanout | Precompute more “request bundles” (user embedding + top aggregates) via streaming jobs; fetch 1–2 blobs at serve time | Increased pipeline work; reduced online p99 risk and hot-key amplification. |
+| Exploration slice in Rec Service | Use a standardized bandit/exploration service (or library) with logged propensities by default | Slight extra component; avoids ad-hoc exploration logic contaminating training. |
+| “Cache last feed page” | Consider cursor-based pagination with deterministic seeds + short TTL + per-request idempotency keys | Slightly more complex API contract; avoids serving stale/duplicated items under retries. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Kafka/event bus down for 5 minutes**
+   - Design’s answer: local buffering with backpressure limits; replay; freeze training on known-good window
+   - Recommendation: Strengthen — define explicit *drop policy* (what gets dropped first), *local disk vs memory* buffering, and how you preserve “impression completeness” SLO vs serving SLO (they’ll conflict under pressure).
+
+2. **Feature store partial outage or hot-key latency spiral**
+   - Design’s answer: timeouts, degrade to cached embeddings + simpler ranker, shard hot keys
+   - Recommendation: Strengthen — specify a *minimal feature set* required to produce “safe” ranking, and a *two-tier ranking* mode (cheap heuristic rank vs model rank) with clear guardrails so on-call can flip a single switch at 3am.
+
+3. **ANN retrieval slow (not failing) → tail-latency blowup**
+   - Design’s answer: dependency timeouts; “good enough” results
+   - Recommendation: Strengthen — define a strict candidate budget and fallback sources (e.g., “recent-followed” + “global trending”) that are always available, plus a recall proxy SLO so you don’t silently ship low-quality feeds.
+
+4. **Bad config / schema change breaks joins (silent training corruption)**
+   - Design’s answer: schema validation; versioned feature definitions; block incompatible changes
+   - Recommendation: Strengthen — add “dataset canary” checks (e.g., feature null-rate shifts, label delay distributions, leakage sentinels) that gate training and promotion, not just ingestion.
+
+5. **Network partition between Rec Service and dependencies**
+   - Design’s answer: timeouts and graceful degradation implied
+   - Recommendation: Acceptable if made explicit — document circuit breakers, retry budgets (especially “no retries on the critical path” vs hedged requests), and how you prevent cache stampedes when partitions heal.
+
+## Recommendations
+
+### Must Fix
+- Define “correctness” SLOs explicitly: serving success/latency vs impression logging completeness vs feature fetch success; decide what you’re willing to drop under overload.
+- Make the policy filter path fully deterministic and isolated from model logic (and specify ordering): blocks/mutes/privacy/seen-suppression must not be best-effort.
+- Specify idempotency and deduplication for impression logging (retries, timeouts, client reconnects) so you don’t poison training with duplicate impressions.
+- Clarify the online/offline feature contract enforcement mechanism (what fails closed, what fails open) to prevent “quiet skew” during incidents.
+
+### Should Consider
+- Collapse components for a small team: managed Kafka + managed model registry + off-the-shelf feature store framework to reduce bespoke ops.
+- Make fallback ranking a first-class mode with an explicit minimal feature set and observable switches.
+- Add a clear strategy for counterfactual learning/exploration data use (propensity logging, position bias handling) so exploration doesn’t become hand-wavy risk.
+
+### Nice to Have
+- Define an incident playbook: “Serving broken vs Data broken” decision tree with the exact dashboards/alerts referenced in Operational Notes.
+- Add replay/backfill safety limits (rate limiting, isolated clusters, or shadow topics) to avoid replay storms impacting serving.
+- Add privacy/data retention notes for impression logs (PII minimization, hashing strategy, retention windows, access controls).
+
+## What's Working Well
+- The design is honest about the real failure mode: inconsistent feature semantics and leakage, not “model quality.”
+- Impression-level logging with model/version/context is the right backbone for debugging and reproducible training.
+- Timeouts + “good enough” serving acknowledges real p99 behavior and keeps the user experience resilient.
+- Exploration is treated as a product/learning requirement (with tagging), not an afterthought.
+- Operational separation (serving SLOs vs pipeline health) is a strong foundation for on-call sanity and safe rollouts.
+tokens used
+4,712
+## Elegance Check
+
+### The Core Insight
+Treating “recommendations” as two systems with different correctness/latency needs—(1) an OLTP-ish low-latency serving path and (2) an asynchronous learning/data system with strong contracts—anchored by impression-as-ground-truth and point-in-time feature joins to prevent training/serving skew.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Rec Service | Owns latency budgets, merges sources, applies deterministic policy, and logs impressions with serving context. |
+| Immutable Event Log | Enables replay/backfills, deterministic dataset construction, and debugging “why shown” without relying on mutable DB rows. |
+| Point-in-time Feature Pipeline | Prevents leakage/skew; makes offline evaluation and incident RCA credible. |
+| ANN Retrieval | Makes high-recall candidate generation feasible under strict p95/p99 latency and cost. |
+| Model Registry + Rollout Controls | Makes rollback and staged deploy independent from pipeline health; turns model iteration into an operable release process. |
+| Cache | Converts dependency hiccups into staleness rather than outages; absorbs hot users/feeds. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom “Model Registry” concept | Use MLflow/SageMaker Model Registry/Vertex AI + a tiny internal “rollout config” service | Less bespoke flexibility; big reduction in operational surface area. |
+| “Feature store” split online/offline described abstractly | Start with Feast (or managed feature store) + one offline store (Parquet) + one online store (Redis/Cassandra) | Ties you to a framework’s constraints; faster to get correctness guarantees. |
+| Separate ANN service | Use a managed/vector DB (Pinecone/Weaviate/Milvus) or a library-based in-process ANN for early scale | Managed cost/lock-in; in-process limits scale/operability but is simpler for a small team. |
+| Kafka as default | If team is small: managed Kafka (MSK/Confluent) or even Kinesis/PubSub | Less portability; fewer sharp edges in ops (especially partitions, ISR, quotas). |
+| Per-request feature fanout | Precompute more “request bundles” (user embedding + top aggregates) via streaming jobs; fetch 1–2 blobs at serve time | Increased pipeline work; reduced online p99 risk and hot-key amplification. |
+| Exploration slice in Rec Service | Use a standardized bandit/exploration service (or library) with logged propensities by default | Slight extra component; avoids ad-hoc exploration logic contaminating training. |
+| “Cache last feed page” | Consider cursor-based pagination with deterministic seeds + short TTL + per-request idempotency keys | Slightly more complex API contract; avoids serving stale/duplicated items under retries. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Kafka/event bus down for 5 minutes**
+   - Design’s answer: local buffering with backpressure limits; replay; freeze training on known-good window
+   - Recommendation: Strengthen — define explicit *drop policy* (what gets dropped first), *local disk vs memory* buffering, and how you preserve “impression completeness” SLO vs serving SLO (they’ll conflict under pressure).
+
+2. **Feature store partial outage or hot-key latency spiral**
+   - Design’s answer: timeouts, degrade to cached embeddings + simpler ranker, shard hot keys
+   - Recommendation: Strengthen — specify a *minimal feature set* required to produce “safe” ranking, and a *two-tier ranking* mode (cheap heuristic rank vs model rank) with clear guardrails so on-call can flip a single switch at 3am.
+
+3. **ANN retrieval slow (not failing) → tail-latency blowup**
+   - Design’s answer: dependency timeouts; “good enough” results
+   - Recommendation: Strengthen — define a strict candidate budget and fallback sources (e.g., “recent-followed” + “global trending”) that are always available, plus a recall proxy SLO so you don’t silently ship low-quality feeds.
+
+4. **Bad config / schema change breaks joins (silent training corruption)**
+   - Design’s answer: schema validation; versioned feature definitions; block incompatible changes
+   - Recommendation: Strengthen — add “dataset canary” checks (e.g., feature null-rate shifts, label delay distributions, leakage sentinels) that gate training and promotion, not just ingestion.
+
+5. **Network partition between Rec Service and dependencies**
+   - Design’s answer: timeouts and graceful degradation implied
+   - Recommendation: Acceptable if made explicit — document circuit breakers, retry budgets (especially “no retries on the critical path” vs hedged requests), and how you prevent cache stampedes when partitions heal.
+
+## Recommendations
+
+### Must Fix
+- Define “correctness” SLOs explicitly: serving success/latency vs impression logging completeness vs feature fetch success; decide what you’re willing to drop under overload.
+- Make the policy filter path fully deterministic and isolated from model logic (and specify ordering): blocks/mutes/privacy/seen-suppression must not be best-effort.
+- Specify idempotency and deduplication for impression logging (retries, timeouts, client reconnects) so you don’t poison training with duplicate impressions.
+- Clarify the online/offline feature contract enforcement mechanism (what fails closed, what fails open) to prevent “quiet skew” during incidents.
+
+### Should Consider
+- Collapse components for a small team: managed Kafka + managed model registry + off-the-shelf feature store framework to reduce bespoke ops.
+- Make fallback ranking a first-class mode with an explicit minimal feature set and observable switches.
+- Add a clear strategy for counterfactual learning/exploration data use (propensity logging, position bias handling) so exploration doesn’t become hand-wavy risk.
+
+### Nice to Have
+- Define an incident playbook: “Serving broken vs Data broken” decision tree with the exact dashboards/alerts referenced in Operational Notes.
+- Add replay/backfill safety limits (rate limiting, isolated clusters, or shadow topics) to avoid replay storms impacting serving.
+- Add privacy/data retention notes for impression logs (PII minimization, hashing strategy, retention windows, access controls).
+
+## What's Working Well
+- The design is honest about the real failure mode: inconsistent feature semantics and leakage, not “model quality.”
+- Impression-level logging with model/version/context is the right backbone for debugging and reproducible training.
+- Timeouts + “good enough” serving acknowledges real p99 behavior and keeps the user experience resilient.
+- Exploration is treated as a product/learning requirement (with tagging), not an afterthought.
+- Operational separation (serving SLOs vs pipeline health) is a strong foundation for on-call sanity and safe rollouts.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/recommendation-system-infrastructure.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afc-a2a3-7ef0-9604-105f513d8d2b
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "Recommendation System Infrastructure"
+category: "Social & Discovery"
+difficulty: "Hard"
+tags: ["recommendations", "ranking", "ml-infra", "feature-store", "kafka", "serving"]
+---
+
+## Overview
+
+This system produces a personalized ranked feed by splitting the problem into two stages: **cheap, high-recall candidate generation** followed by **expensive, high-precision ranking**. The elegance is in treating “recommendations” as an OLTP service with strict latency/SLOs, while treating “learning” as a separate, asynchronous pipeline with strong data guarantees and clear contracts.
+
+The key insight: most teams fail not because their model is weak, but because their **data and feature semantics are inconsistent across online serving and offline training**. This design makes the feedback loop boring and reliable by anchoring everything on an immutable event log, a point-in-time correct feature pipeline, and a disciplined model lifecycle (registry + staged rollout + observability).
+
+## What Makes This Hard
+
+Naive implementations conflate “show content” with “learn from clicks” and end up with silent corruption:
+- **Training-serving skew**: the model trains on features computed one way, serves on another, then performance degrades with no obvious bug.
+- **Biased labels**: you only observe interactions for items you chose to show; the system trains itself into a popularity echo chamber.
+- **Freshness vs. cost**: the best features are often the freshest (recent follows, recent likes), but recomputing them at request time blows your latency budget.
+
+The trap: treating the pipeline as “ETL + model” instead of a product-critical distributed system with versioning, backfills, and hard correctness boundaries.
+
+## Requirements
+
+### Functional Requirements
+- Generate a ranked list of items per user from multiple sources (social graph, content similarity, popularity).
+- Enforce hard policy constraints (blocks, privacy, seen-content suppression, author mutes) deterministically.
+- Log every impression with enough context to enable point-in-time training and debugging.
+- Support continuous retraining and safe rollout (champion/challenger, gradual ramp, quick rollback).
+- Close the loop: ingest implicit feedback (click/dwell/like/hide/follow) and delayed feedback (unfollow, report).
+
+### Scale Targets
+- **Peak read QPS (feed requests):** 150k QPS (e.g., 15M DAU, 10 feed opens/day, 2-hour peak).
+- **Latency:** p95 150ms end-to-end; p99 300ms. Ranking must usually finish in <60ms to leave headroom for networking and cache misses.
+- **Candidate set sizes:** 2k–10k retrieved per request; rank top 100; return top 20–50.
+- **Event volume:** 5–20M events/min (impressions dominate). This matters because impression logs are the ground truth for unbiased learning and debugging.
+- **Model update cadence:** daily full retrain + hourly/near-real-time calibration updates (to react to drift without destabilizing the whole model).
+
+## Key Design Decisions
+
+- **Two-stage retrieval + ranking**
+  - Chose: ANN-based retrieval + lightweight ranking service.
+  - Rejected: single giant model scoring the entire corpus per request.
+  - Why: retrieval makes latency and cost predictable; ranking focuses compute on the only items that can matter.
+
+- **Immutable event log as the system of record**
+  - Chose: Kafka (or equivalent) for all user actions, impressions, and item updates.
+  - Rejected: “just write rows to a database and batch it later.”
+  - Why: the log gives replay, backfills, and deterministic training datasets; it turns pipeline bugs into fixable engineering problems instead of mystery model regressions.
+
+- **Feature store with point-in-time correctness**
+  - Chose: a single feature definition layer used by both offline and online (e.g., Feast-style contracts), with strict time-travel for training.
+  - Rejected: separate “offline features in Spark” and “online features in Redis” maintained independently.
+  - Why: prevents skew, enables reproducible training, and makes debugging model behavior tractable.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Feed API"] --> B["Rec Service"]
+  B --> C["Cache"]
+  B --> D["ANN Retrieval"]
+  B --> E["Feature Store"]
+  B --> F["Event Bus"]
+  F --> G["Offline Training"]
+  G --> H["Model Registry"]
+  H --> B
+```
+
+### Components
+
+- **Feed API**
+  - Owns request auth, privacy context, and response shaping. Keeps recommendation logic out of edge concerns.
+- **Rec Service**
+  - The latency-critical brain: merges retrieval sources, applies policy filters, fetches features, scores, ranks, and logs impressions.
+  - Runs with strict budgets (timeouts per dependency) and returns “good enough” rather than timing out.
+- **Cache**
+  - Stores short-lived per-user results (e.g., last feed page) and expensive precomputed artifacts (e.g., user embedding).
+  - Earns its place by turning dependency hiccups into slightly stale results instead of outages.
+- **ANN Retrieval**
+  - Serves top-K approximate nearest neighbors over item embeddings (plus optional per-user embedding).
+  - Keeps recall high while making the ranking stage feasible.
+- **Feature Store**
+  - Online: low-latency access to user/item features (Redis/Cassandra-style).
+  - Offline: point-in-time feature materialization for training (Parquet on object storage).
+- **Event Bus**
+  - The source of truth: impressions (with rank position), clicks, dwell, hides, follows, item publishes/edits, graph updates.
+  - Enables replayable training sets and audit/debug of “why was this shown?”
+- **Offline Training**
+  - Builds datasets, computes features, trains retrieval embeddings + ranking model, and validates with offline metrics and guardrails.
+- **Model Registry**
+  - Stores versioned models, schemas, feature contracts, and rollout state; supports canary + rollback.
+
+## Deep Dive: Feedback Loops Without Corrupting Learning
+
+The hardest part is getting a learning loop that improves the product instead of amplifying bias. The core rule: **impressions are the unit of truth**, not clicks. Every ranking response logs an impression record per item with: user_id, item_id, timestamp, rank position, retrieval source, model version, and key feature hashes. This makes the dataset self-describing and debuggable.
+
+Next, training data must be **point-in-time correct**. For each impression at time *t*, the offline pipeline joins features “as-of *t*” (user state, graph state, item state). Without this, you accidentally train on future information (data leakage) and ship a model that looks great offline and fails in production. Practically: store feature values with event-time, build offline feature tables with time travel, and enforce that training joins are constrained to `feature_time <= impression_time`.
+
+Finally, you need controlled exploration to avoid popularity traps. The Rec Service reserves a small slice of the ranked list (e.g., 1–2 positions) for exploration candidates drawn from long-tail sources (fresh content, under-exposed creators). These impressions are tagged with an exploration policy id so the trainer can:
+- avoid contaminating the main model with aggressively exploratory traffic, or
+- explicitly learn from it using debiasing (position features, propensity-aware training).
+This is the difference between “the model learns what we already show” and “the model learns what users actually prefer.”
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Low-latency serving with predictable cost | Perfect global optimal ranking |
+| Reproducible training and debuggability | More upfront logging/feature discipline |
+| Safe model iteration (canary/rollback) | Slightly slower experimentation velocity |
+| High recall via ANN retrieval | Exactness of nearest neighbors |
+
+## Failure Modes
+
+- **Event pipeline lag or outage**
+  - What happens: training freshness degrades; metrics drift; debugging becomes blind.
+  - Detect: consumer lag SLOs, missing impression rate, schema validation failures.
+  - Recover: buffer locally in Rec Service with backpressure limits; replay from Kafka; freeze training on known-good window.
+
+- **Feature store staleness / hot-key overload**
+  - What happens: rankings become generic; latency spikes; timeouts cascade.
+  - Detect: feature fetch p95/p99, timeout rate, “fallback feature” counters, hot-key dashboards.
+  - Recover: strict per-dependency timeouts; degrade gracefully to cached embeddings + simpler ranker; shard hot keys; precompute heavy aggregates.
+
+- **Bad model rollout**
+  - What happens: engagement drops; abuse signals rise; creator distribution skews.
+  - Detect: online guardrails (CTR, hides, reports, diversity), per-slice metrics, canary delta alarms.
+  - Recover: immediate rollback via Model Registry; freeze retraining; root-cause with impression-level replay.
+
+## What I'd Do Differently At...
+
+- **10x scale:** split ANN Retrieval by content type and recency tiers; add regional model replicas with local caches; push more features into streaming aggregates to reduce online fetch cost.
+- **100x scale:** re-architect embeddings/ANN into a dedicated distributed vector service with strict SLAs and autoscaling; move from “daily retrain” to continuous training for fast-moving segments; invest in stronger debiasing and counterfactual evaluation because exploration traffic becomes expensive and risky.
+
+## Operational Notes
+
+- The on-call’s first question is “is this a serving issue or a data issue?” Maintain separate SLOs for Rec Service latency/error, ANN latency/recall proxy, feature fetch success, and event logging completeness.
+- Treat feature definitions as an API: version them, validate schemas at ingestion, and block training/serving on incompatible changes.
+- Keep a “last known good” model and feature snapshot pinned; rollback must not depend on the data pipeline being healthy.
+- Always log: model version, feature schema version, retrieval sources, and timeouts taken—otherwise you can’t explain rankings when a VP asks “why did I see this?”
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Treating “recommendations” as two systems with different correctness/latency needs—(1) an OLTP-ish low-latency serving path and (2) an asynchronous learning/data system with strong contracts—anchored by impression-as-ground-truth and point-in-time feature joins to prevent training/serving skew.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Rec Service | Owns latency budgets, merges sources, applies deterministic policy, and logs impressions with serving context. |
+| Immutable Event Log | Enables replay/backfills, deterministic dataset construction, and debugging “why shown” without relying on mutable DB rows. |
+| Point-in-time Feature Pipeline | Prevents leakage/skew; makes offline evaluation and incident RCA credible. |
+| ANN Retrieval | Makes high-recall candidate generation feasible under strict p95/p99 latency and cost. |
+| Model Registry + Rollout Controls | Makes rollback and staged deploy independent from pipeline health; turns model iteration into an operable release process. |
+| Cache | Converts dependency hiccups into staleness rather than outages; absorbs hot users/feeds. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Custom “Model Registry” concept | Use MLflow/SageMaker Model Registry/Vertex AI + a tiny internal “rollout config” service | Less bespoke flexibility; big reduction in operational surface area. |
+| “Feature store” split online/offline described abstractly | Start with Feast (or managed feature store) + one offline store (Parquet) + one online store (Redis/Cassandra) | Ties you to a framework’s constraints; faster to get correctness guarantees. |
+| Separate ANN service | Use a managed/vector DB (Pinecone/Weaviate/Milvus) or a library-based in-process ANN for early scale | Managed cost/lock-in; in-process limits scale/operability but is simpler for a small team. |
+| Kafka as default | If team is small: managed Kafka (MSK/Confluent) or even Kinesis/PubSub | Less portability; fewer sharp edges in ops (especially partitions, ISR, quotas). |
+| Per-request feature fanout | Precompute more “request bundles” (user embedding + top aggregates) via streaming jobs; fetch 1–2 blobs at serve time | Increased pipeline work; reduced online p99 risk and hot-key amplification. |
+| Exploration slice in Rec Service | Use a standardized bandit/exploration service (or library) with logged propensities by default | Slight extra component; avoids ad-hoc exploration logic contaminating training. |
+| “Cache last feed page” | Consider cursor-based pagination with deterministic seeds + short TTL + per-request idempotency keys | Slightly more complex API contract; avoids serving stale/duplicated items under retries. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Kafka/event bus down for 5 minutes**
+   - Design’s answer: local buffering with backpressure limits; replay; freeze training on known-good window
+   - Recommendation: Strengthen — define explicit *drop policy* (what gets dropped first), *local disk vs memory* buffering, and how you preserve “impression completeness” SLO vs serving SLO (they’ll conflict under pressure).
+
+2. **Feature store partial outage or hot-key latency spiral**
+   - Design’s answer: timeouts, degrade to cached embeddings + simpler ranker, shard hot keys
+   - Recommendation: Strengthen — specify a *minimal feature set* required to produce “safe” ranking, and a *two-tier ranking* mode (cheap heuristic rank vs model rank) with clear guardrails so on-call can flip a single switch at 3am.
+
+3. **ANN retrieval slow (not failing) → tail-latency blowup**
+   - Design’s answer: dependency timeouts; “good enough” results
+   - Recommendation: Strengthen — define a strict candidate budget and fallback sources (e.g., “recent-followed” + “global trending”) that are always available, plus a recall proxy SLO so you don’t silently ship low-quality feeds.
+
+4. **Bad config / schema change breaks joins (silent training corruption)**
+   - Design’s answer: schema validation; versioned feature definitions; block incompatible changes
+   - Recommendation: Strengthen — add “dataset canary” checks (e.g., feature null-rate shifts, label delay distributions, leakage sentinels) that gate training and promotion, not just ingestion.
+
+5. **Network partition between Rec Service and dependencies**
+   - Design’s answer: timeouts and graceful degradation implied
+   - Recommendation: Acceptable if made explicit — document circuit breakers, retry budgets (especially “no retries on the critical path” vs hedged requests), and how you prevent cache stampedes when partitions heal.
+
+## Recommendations
+
+### Must Fix
+- Define “correctness” SLOs explicitly: serving success/latency vs impression logging completeness vs feature fetch success; decide what you’re willing to drop under overload.
+- Make the policy filter path fully deterministic and isolated from model logic (and specify ordering): blocks/mutes/privacy/seen-suppression must not be best-effort.
+- Specify idempotency and deduplication for impression logging (retries, timeouts, client reconnects) so you don’t poison training with duplicate impressions.
+- Clarify the online/offline feature contract enforcement mechanism (what fails closed, what fails open) to prevent “quiet skew” during incidents.
+
+### Should Consider
+- Collapse components for a small team: managed Kafka + managed model registry + off-the-shelf feature store framework to reduce bespoke ops.
+- Make fallback ranking a first-class mode with an explicit minimal feature set and observable switches.
+- Add a clear strategy for counterfactual learning/exploration data use (propensity logging, position bias handling) so exploration doesn’t become hand-wavy risk.
+
+### Nice to Have
+- Define an incident playbook: “Serving broken vs Data broken” decision tree with the exact dashboards/alerts referenced in Operational Notes.
+- Add replay/backfill safety limits (rate limiting, isolated clusters, or shadow topics) to avoid replay storms impacting serving.
+- Add privacy/data retention notes for impression logs (PII minimization, hashing strategy, retention windows, access controls).
+
+## What's Working Well
+- The design is honest about the real failure mode: inconsistent feature semantics and leakage, not “model quality.”
+- Impression-level logging with model/version/context is the right backbone for debugging and reproducible training.
+- Timeouts + “good enough” serving acknowledges real p99 behavior and keeps the user experience resilient.
+- Exploration is treated as a product/learning requirement (with tagging), not an afterthought.
+- Operational separation (serving SLOs vs pipeline health) is a strong foundation for on-call sanity and safe rollouts.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+
+
+thinking
+**Evaluating formatting options**
+
+I’m facing a challenge here: I can't add new sections, but I need to include a "What We Removed" section. Maybe I can take the existing section "What I'd Do Differently At..." and rename it. The instructions say not to modify titles, difficulty, or tags, but they don’t explicitly mention other headings. It sounds like I can keep the same top-level sections but add subsections. I think I'll prioritize the output format requirement while ensuring compliance with the instruction!
+thinking
+**Optimizing section headings**
+
+I’m thinking about renaming the "Architecture" section to include "Minimal Architecture" and then have a bullet list for "What We Removed" without a traditional header. But there's the explicit request for a section, which complicates things. Maybe I can fold "What We Removed" into the existing section for "Key Design Decisions" as a bolded label instead of a formal heading. This keeps everything organized while still respecting the initial format request. Justification details can also flow into the bullet descriptions, keeping it all cohesive!
+thinking
+**Incorporating simplifications**
+
+I need to incorporate critiques while being careful not to add components. For instance, the suggestion to replace custom services with managed ones is okay, but we shouldn't introduce new components. I’m considering merging the Feed API and Recommendation Service into a single "Feed Service" for authorization and recommendation logic since it will simplify the architecture, especially for a small team. 
+
+I’m also thinking of removing the cache, starting without per-user caching as it seems unnecessary. As for the Feature Store, I can use Postgres for feature storage without adding components, but I need to ensure point-in-time correctness.
+thinking
+**Simplifying architecture components**
+
+I’m exploring how to utilize an event log and batch compute features for Parquet while keeping Postgres for minimal feature serving. I see we have three custom components: the Rec API service, candidate retrieval, and the training pipeline. The training pipeline is essential, but I might condense offline training and model registry into one entity: "Training Job + Model Artifacts in Object Storage." 
+
+This way, we can use versioned files in S3 alongside a database table to track the active model version, reducing the component count. I'm thinking the model registry doesn't need to be separate, and I can replace the event bus with an "Append-only log in Postgres," though I must consider potential scaling issues if we're looking at huge event volumes!
+thinking
+**Refining components and simplifications**
+
+I’m really trying to simplify this without changing the requirements! For the event bus, I could suggest a managed streaming service like Kafka or Kinesis, but that still counts as a new component. Merging the ANN retrieval into the Rec Service as an in-process library seems like a good idea; it removes a separate service and helps with embedding updates.
+
+About the database: while I can't add components, I can refer to an "existing product database" instead of naming Postgres directly. I think we could condense things by merging various components like the Feed API into the Rec Service, and by simplifying the Feature Store to just Redis for online features while using Parquet directly for offline storage. 
+
+I need to incorporate failure scenarios into existing operational notes without adding new sections, and I can keep the architecture diagram simplified. Overall, my goal is to streamline while respecting the existing component restrictions!
+thinking
+**Finalizing the design document**
+
+I’m considering removing the "Critique" section entirely since the user wants the simplified design to stand as the final document. It makes sense to condense existing sections without adding any new ones. I plan to keep essential sections like Overview, Requirements, Key Design Decisions, Architecture (including a diagram), Trade-offs, Failure Modes, and Operational Notes. I can also mention managed services for scalability.
+
+For the architecture, I’ll focus on a streamlined structure with components like the Rec Service, a managed Event Bus, and a Feature Store using Feast on Redis for online features. I need to ensure I justify any changes, like merging the ANN Retrieval into the Rec Service to simplify it further. I must outline what I removed in an explicit format, and I’ll condense the Operational Notes without losing clarity. 
+
+I will be careful with the markdown to ensure it’s well-structured while meeting the user's requirements. I'll make sure to phrase removals clearly and keep everything coherent as I finalize the document.
+thinking
+**Outlining the design document**
+
+I’m planning to structure my document into specific sections. First, the Overview will explain the two-stage pipeline, the single Rec Service, and offline training. Then, I’ll condense the "What Makes This Hard" section down to key issues like skew, bias, and freshness, along with the simplest rules. 
+
+Next, I’ll retain the Requirements for functionality and scale. The Key Design Decisions will highlight the retrieval and ranking processes, impressions logging, and rollout via registry. 
+
+The Architecture section will feature a Mermaid diagram showing connections among components like Rec Service, Feature Store, Event Bus, and Offline Training. I’ll emphasize the ANN index in the process, and I’ll include a section titled "**What We Removed**", listing the consolidations.
+
+In the Components list, I’ll provide justifications for each component, including the Rec Service, Feature Store, Event Bus, Offline Training, and Model Registry, explaining their purposes. 
+
+I’ll condense my Deep Dive section to cover feedback loops. For Trade-offs, I’ll simplify the table regarding operational complexity versus flexibility.
+
+The Failure Modes section will include explicit policies addressing various scenarios and operational notes with defined SLOs and mechanisms. 
+
+Finally, I’ll ensure the document maintains minimal verbosity while being comprehensive in all its parts. Now, I’m ready to write up the complete markdown.
+codex
+```markdown
+---
+title: "Recommendation System Infrastructure"
+category: "Social & Discovery"
+difficulty: "Hard"
+tags: ["recommendations", "ranking", "ml-infra", "feature-store", "kafka", "serving"]
+---
+
+## Overview
+
+This system produces a personalized ranked feed with **two stages**: (1) **high-recall candidate generation** and (2) **fast ranking**. Serving is one latency-critical service with strict budgets; learning is an asynchronous pipeline with hard data contracts. The backbone is simple: **log every impression with serving context** and use **point-in-time feature joins** so training and serving compute the same features the same way.
+
+## What Makes This Hard
+
+- **Training-serving skew:** the model trains on one feature definition and serves on another.
+- **Biased labels:** you only observe feedback for what you chose to show.
+- **Freshness vs. latency:** the best signals are recent, but request-time computation is expensive.
+
+The system stays correct by making impressions the unit of truth, enforcing time-travel joins, and keeping the serving path small and deterministic.
+
+## Requirements
+
+### Functional Requirements
+- Generate a ranked list of items per user from multiple sources (social graph, content similarity, popularity).
+- Enforce hard policy constraints (blocks, privacy, seen-content suppression, author mutes) deterministically.
+- Log every impression with enough context to enable point-in-time training and debugging.
+- Support continuous retraining and safe rollout (champion/challenger, gradual ramp, quick rollback).
+- Close the loop: ingest implicit feedback (click/dwell/like/hide/follow) and delayed feedback (unfollow, report).
+
+### Scale Targets
+- **Peak read QPS (feed requests):** 150k QPS (e.g., 15M DAU, 10 feed opens/day, 2-hour peak).
+- **Latency:** p95 150ms end-to-end; p99 300ms. Ranking must usually finish in <60ms to leave headroom for networking and cache misses.
+- **Candidate set sizes:** 2k–10k retrieved per request; rank top 100; return top 20–50.
+- **Event volume:** 5–20M events/min (impressions dominate).
+- **Model update cadence:** daily full retrain + hourly/near-real-time calibration updates.
+
+## Key Design Decisions
+
+- **Two-stage retrieval + ranking**
+  - Candidate generation is approximate and cheap; ranking is fast and bounded.
+  - The Rec Service enforces strict per-dependency timeouts and returns partial-but-safe results.
+
+- **Immutable impression log is the system of record**
+  - Every response emits impression events with serving context for replay, backfills, and debugging.
+  - Logging is schema-validated and deduplicated to protect training data quality.
+
+- **One feature contract for offline + online**
+  - A single feature definition layer produces online lookups and offline time-travel materialization.
+  - Training joins are constrained to `feature_time <= impression_time` to prevent leakage.
+
+- **Rollouts are a config flip, not a deploy**
+  - A versioned registry of model artifacts with an explicit “active model” pointer enables quick rollback independent of pipeline health.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Rec Service"] --> B["Feature Store"]
+  A --> C["Event Bus"]
+  C --> D["Offline Training"]
+  D --> E["Model Registry"]
+  E --> A
+```
+
+**What We Removed**
+- Feed API responsibilities are part of the Rec Service.
+- Standalone ANN Retrieval is an in-process index owned by the Rec Service and refreshed from model artifacts.
+- Cache is not part of the core path; the system relies on strict budgets, bounded fallbacks, and deterministic pagination.
+
+### Components
+
+- **Rec Service**
+  - Handles auth/context, deterministic policy filtering, candidate generation, ranking, response shaping, and impression logging.
+  - Uses an in-process ANN index (refreshed out-of-band) plus always-available fallback candidate sources.
+  - Has an explicit **minimal feature set** required for “safe ranking” and a single switch to enter fallback ranking mode.
+  - Enforces **no retries on the critical path**, strict timeouts, and circuit breakers per dependency.
+  - Emits idempotent impression logs with stable dedup keys to avoid duplicate training rows under retries/reconnects.
+
+- **Feature Store**
+  - Online: low-latency user/item features needed for ranking and fallbacks.
+  - Offline: point-in-time feature materialization used by training.
+  - Feature definitions are versioned; incompatible changes fail closed for training and fail open (with explicit counters) for serving.
+
+- **Event Bus**
+  - Append-only log for impressions, user actions, and item updates.
+  - Supports replay/backfill and schema validation so dataset construction is deterministic.
+
+- **Offline Training**
+  - Builds training datasets from impression logs, joins features as-of impression time, trains retrieval embeddings + ranker, and validates with gates.
+  - Promotes models only if **dataset canaries** (null-rate shifts, label delay distributions, leakage sentinels) pass.
+
+- **Model Registry**
+  - Stores versioned model artifacts, schemas, feature contract version, and rollout state (including quick rollback).
+  - Keeps a pinned last-known-good model independent of current pipeline health.
+
+## Deep Dive: Feedback Loops Without Corrupting Learning
+
+Every ranked response logs an impression record per item with: user_id, item_id, timestamp, rank position, retrieval source, model version, feature contract version, and key feature hashes. Training data is built from impressions, not clicks.
+
+Training joins features **as-of the impression time**. Each training row is produced by joining only feature values with `feature_time <= impression_time`, preventing leakage and making offline evaluation credible.
+
+The Rec Service reserves a small, fixed exploration slice (e.g., 1 position) and logs propensities/exploration policy id on those impressions so training can either exclude that traffic or learn with explicit debiasing signals.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Small operational surface area (few moving pieces) | Less flexibility to independently scale every subsystem |
+| Predictable serving latency (in-process retrieval, strict budgets) | Less “perfect” retrieval than a dedicated vector service |
+| Reproducible training and debuggability (impression log + time travel) | More discipline around schemas, versions, and gating |
+| Fast rollback (registry + active pointer) | Slightly slower ad-hoc experimentation |
+
+## Failure Modes
+
+- **Event bus down or lagging**
+  - What happens: training freshness degrades; debugging loses coverage.
+  - Detect: consumer lag SLOs, missing impression rate, schema validation failures.
+  - Recover: bounded buffering in the Rec Service with an explicit drop policy; when the buffer is exceeded, responses continue but impressions are marked as non-trainable via counters/flags; training freezes on the last known-good window until completeness recovers.
+
+- **Feature store partial outage / hot-key latency spiral**
+  - What happens: latency spikes; rankings degrade.
+  - Detect: feature fetch p95/p99, timeout rate, fallback-feature counters, hot-key dashboards.
+  - Recover: immediate switch to fallback ranking mode using the minimal feature set; strict timeouts + circuit breakers prevent cascades; policy filtering remains fully deterministic.
+
+- **Retrieval path slow → tail-latency blowup**
+  - What happens: candidate generation misses latency budgets.
+  - Detect: candidate-generation latency, candidate count, recall proxy (e.g., fraction from fallback sources).
+  - Recover: strict candidate budget with hard timeouts; fallback candidate sources always available; ranking proceeds on whatever candidates are ready within budget.
+
+- **Bad schema/config change corrupts training silently**
+  - What happens: offline metrics look unstable; production regresses later.
+  - Detect: schema validation, dataset canaries gating training/promotion, drift alarms on feature distributions.
+  - Recover: block promotion; rollback active model; pin feature contract/model to last-known-good.
+
+- **Network partition between Rec Service and dependencies**
+  - What happens: dependency calls hang; retries amplify load when the partition heals.
+  - Detect: timeout/circuit-breaker metrics, dependency error rates, queueing latency inside the Rec Service.
+  - Recover: no retries on the critical path; bounded concurrency per dependency; circuit breakers with cooldowns; serve partial results from ready candidates/features within budget.
+
+## Operational Notes
+
+- Maintain separate SLOs for (1) Rec Service latency/error, (2) feature fetch success/latency, and (3) impression logging completeness; overload behavior is explicit and observable.
+- Deterministic policy filtering runs first and never becomes best-effort: blocks/mutes/privacy/seen-suppression are applied before ranking.
+- Impression logging is idempotent and deduplicated using stable request/session identifiers to prevent duplicate impressions under retries/timeouts/reconnects.
+- Keep “last known good” model + feature contract pinned; rollback does not depend on the data pipeline being healthy.
+- Always log: model version, feature contract version, retrieval sources, and timeouts taken.
+```
+tokens used
+10,335
+```markdown
+---
+title: "Recommendation System Infrastructure"
+category: "Social & Discovery"
+difficulty: "Hard"
+tags: ["recommendations", "ranking", "ml-infra", "feature-store", "kafka", "serving"]
+---
+
+## Overview
+
+This system produces a personalized ranked feed with **two stages**: (1) **high-recall candidate generation** and (2) **fast ranking**. Serving is one latency-critical service with strict budgets; learning is an asynchronous pipeline with hard data contracts. The backbone is simple: **log every impression with serving context** and use **point-in-time feature joins** so training and serving compute the same features the same way.
+
+## What Makes This Hard
+
+- **Training-serving skew:** the model trains on one feature definition and serves on another.
+- **Biased labels:** you only observe feedback for what you chose to show.
+- **Freshness vs. latency:** the best signals are recent, but request-time computation is expensive.
+
+The system stays correct by making impressions the unit of truth, enforcing time-travel joins, and keeping the serving path small and deterministic.
+
+## Requirements
+
+### Functional Requirements
+- Generate a ranked list of items per user from multiple sources (social graph, content similarity, popularity).
+- Enforce hard policy constraints (blocks, privacy, seen-content suppression, author mutes) deterministically.
+- Log every impression with enough context to enable point-in-time training and debugging.
+- Support continuous retraining and safe rollout (champion/challenger, gradual ramp, quick rollback).
+- Close the loop: ingest implicit feedback (click/dwell/like/hide/follow) and delayed feedback (unfollow, report).
+
+### Scale Targets
+- **Peak read QPS (feed requests):** 150k QPS (e.g., 15M DAU, 10 feed opens/day, 2-hour peak).
+- **Latency:** p95 150ms end-to-end; p99 300ms. Ranking must usually finish in <60ms to leave headroom for networking and cache misses.
+- **Candidate set sizes:** 2k–10k retrieved per request; rank top 100; return top 20–50.
+- **Event volume:** 5–20M events/min (impressions dominate).
+- **Model update cadence:** daily full retrain + hourly/near-real-time calibration updates.
+
+## Key Design Decisions
+
+- **Two-stage retrieval + ranking**
+  - Candidate generation is approximate and cheap; ranking is fast and bounded.
+  - The Rec Service enforces strict per-dependency timeouts and returns partial-but-safe results.
+
+- **Immutable impression log is the system of record**
+  - Every response emits impression events with serving context for replay, backfills, and debugging.
+  - Logging is schema-validated and deduplicated to protect training data quality.
+
+- **One feature contract for offline + online**
+  - A single feature definition layer produces online lookups and offline time-travel materialization.
+  - Training joins are constrained to `feature_time <= impression_time` to prevent leakage.
+
+- **Rollouts are a config flip, not a deploy**
+  - A versioned registry of model artifacts with an explicit “active model” pointer enables quick rollback independent of pipeline health.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["Rec Service"] --> B["Feature Store"]
+  A --> C["Event Bus"]
+  C --> D["Offline Training"]
+  D --> E["Model Registry"]
+  E --> A
+```
+
+**What We Removed**
+- Feed API responsibilities are part of the Rec Service.
+- Standalone ANN Retrieval is an in-process index owned by the Rec Service and refreshed from model artifacts.
+- Cache is not part of the core path; the system relies on strict budgets, bounded fallbacks, and deterministic pagination.
+
+### Components
+
+- **Rec Service**
+  - Handles auth/context, deterministic policy filtering, candidate generation, ranking, response shaping, and impression logging.
+  - Uses an in-process ANN index (refreshed out-of-band) plus always-available fallback candidate sources.
+  - Has an explicit **minimal feature set** required for “safe ranking” and a single switch to enter fallback ranking mode.
+  - Enforces **no retries on the critical path**, strict timeouts, and circuit breakers per dependency.
+  - Emits idempotent impression logs with stable dedup keys to avoid duplicate training rows under retries/reconnects.
+
+- **Feature Store**
+  - Online: low-latency user/item features needed for ranking and fallbacks.
+  - Offline: point-in-time feature materialization used by training.
+  - Feature definitions are versioned; incompatible changes fail closed for training and fail open (with explicit counters) for serving.
+
+- **Event Bus**
+  - Append-only log for impressions, user actions, and item updates.
+  - Supports replay/backfill and schema validation so dataset construction is deterministic.
+
+- **Offline Training**
+  - Builds training datasets from impression logs, joins features as-of impression time, trains retrieval embeddings + ranker, and validates with gates.
+  - Promotes models only if **dataset canaries** (null-rate shifts, label delay distributions, leakage sentinels) pass.
+
+- **Model Registry**
+  - Stores versioned model artifacts, schemas, feature contract version, and rollout state (including quick rollback).
+  - Keeps a pinned last-known-good model independent of current pipeline health.
+
+## Deep Dive: Feedback Loops Without Corrupting Learning
+
+Every ranked response logs an impression record per item with: user_id, item_id, timestamp, rank position, retrieval source, model version, feature contract version, and key feature hashes. Training data is built from impressions, not clicks.
+
+Training joins features **as-of the impression time**. Each training row is produced by joining only feature values with `feature_time <= impression_time`, preventing leakage and making offline evaluation credible.
+
+The Rec Service reserves a small, fixed exploration slice (e.g., 1 position) and logs propensities/exploration policy id on those impressions so training can either exclude that traffic or learn with explicit debiasing signals.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Small operational surface area (few moving pieces) | Less flexibility to independently scale every subsystem |
+| Predictable serving latency (in-process retrieval, strict budgets) | Less “perfect” retrieval than a dedicated vector service |
+| Reproducible training and debuggability (impression log + time travel) | More discipline around schemas, versions, and gating |
+| Fast rollback (registry + active pointer) | Slightly slower ad-hoc experimentation |
+
+## Failure Modes
+
+- **Event bus down or lagging**
+  - What happens: training freshness degrades; debugging loses coverage.
+  - Detect: consumer lag SLOs, missing impression rate, schema validation failures.
+  - Recover: bounded buffering in the Rec Service with an explicit drop policy; when the buffer is exceeded, responses continue but impressions are marked as non-trainable via counters/flags; training freezes on the last known-good window until completeness recovers.
+
+- **Feature store partial outage / hot-key latency spiral**
+  - What happens: latency spikes; rankings degrade.
+  - Detect: feature fetch p95/p99, timeout rate, fallback-feature counters, hot-key dashboards.
+  - Recover: immediate switch to fallback ranking mode using the minimal feature set; strict timeouts + circuit breakers prevent cascades; policy filtering remains fully deterministic.
+
+- **Retrieval path slow → tail-latency blowup**
+  - What happens: candidate generation misses latency budgets.
+  - Detect: candidate-generation latency, candidate count, recall proxy (e.g., fraction from fallback sources).
+  - Recover: strict candidate budget with hard timeouts; fallback candidate sources always available; ranking proceeds on whatever candidates are ready within budget.
+
+- **Bad schema/config change corrupts training silently**
+  - What happens: offline metrics look unstable; production regresses later.
+  - Detect: schema validation, dataset canaries gating training/promotion, drift alarms on feature distributions.
+  - Recover: block promotion; rollback active model; pin feature contract/model to last-known-good.
+
+- **Network partition between Rec Service and dependencies**
+  - What happens: dependency calls hang; retries amplify load when the partition heals.
+  - Detect: timeout/circuit-breaker metrics, dependency error rates, queueing latency inside the Rec Service.
+  - Recover: no retries on the critical path; bounded concurrency per dependency; circuit breakers with cooldowns; serve partial results from ready candidates/features within budget.
+
+## Operational Notes
+
+- Maintain separate SLOs for (1) Rec Service latency/error, (2) feature fetch success/latency, and (3) impression logging completeness; overload behavior is explicit and observable.
+- Deterministic policy filtering runs first and never becomes best-effort: blocks/mutes/privacy/seen-suppression are applied before ranking.
+- Impression logging is idempotent and deduplicated using stable request/session identifiers to prevent duplicate impressions under retries/timeouts/reconnects.
+- Keep “last known good” model + feature contract pinned; rollback does not depend on the data pipeline being healthy.
+- Always log: model version, feature contract version, retrieval sources, and timeouts taken.
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/05-social-discovery/recommendation-system-infrastructure.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): Recommendation System Infrastructure
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/recommendation-system-infrastructure.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/recommendation-system-infrastructure.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/05-social-discovery/recommendation-system-infrastructure.md

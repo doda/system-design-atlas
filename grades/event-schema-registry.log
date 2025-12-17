@@ -1,0 +1,412 @@
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2a95-aba4-7463-a424-206f9b730565
+--------
+user
+You are a senior systems architect reviewing a system design document.
+
+Grade this solution on three dimensions (1-10 scale):
+
+1. **Strength** (1-10): How technically sound, complete, and production-ready is the design?
+   - Does it address scalability, reliability, and failure modes?
+   - Are the trade-offs well-reasoned?
+   - Would this actually work at scale?
+
+2. **Interestingness** (1-10): How engaging and educational is the content?
+   - Does it teach useful concepts?
+   - Are there insights that aren't obvious?
+   - Would an engineer learn something valuable?
+
+3. **Novelty** (1-10): How unique or creative is the approach?
+   - Does it go beyond textbook solutions?
+   - Are there clever simplifications or unconventional choices?
+   - Does it challenge common assumptions?
+
+Also note any major issues or particularly strong aspects.
+
+Output ONLY valid JSON in this exact format:
+{
+  "slug": "event-schema-registry",
+  "strength": <1-10>,
+  "interestingness": <1-10>,
+  "novelty": <1-10>,
+  "overall": <average of three scores, 1 decimal>,
+  "summary": "<2-3 sentence summary of the design>",
+  "strengths": ["<strength 1>", "<strength 2>"],
+  "weaknesses": ["<weakness 1>", "<weakness 2>"],
+  "verdict": "<one of: exceptional, strong, adequate, weak>"
+}
+
+---
+
+## Solution to Grade
+
+---
+title: "Event Schema Registry"
+category: "Strategic Problems"
+difficulty: "Hard"
+tags:
+  - "schema-registry"
+  - "event-driven"
+  - "governance"
+  - "kafka"
+  - "avro"
+  - "protobuf"
+---
+
+## Overview
+
+An event schema registry is the control plane for event contracts in an event-driven organization. Its core job is preventing unsafe schema evolution across independently deployed producers and consumers, while enabling teams to move quickly with clear feedback, approvals, and auditability.
+
+This registry provides:
+- A system of record for schemas (Avro/Protobuf), versions, references, and lifecycle states.
+- Deterministic compatibility checks and linting integrated into CI/CD.
+- Governance for ownership, approvals, and environment promotion (DEV → STAGE → PROD).
+- Discovery APIs for tools and runtimes, optimized for immutable identifiers (schema ID / fingerprint).
+
+Safety is enforced primarily pre-deploy (CI gates + promotion approvals). Runtime lookups are designed to be rare, cacheable by clients, and resilient.
+
+---
+
+## Goals, Non-goals, and Glossary
+
+### Goals
+- Prevent breaking changes from reaching production topics/streams.
+- Enable teams to evolve schemas safely with deterministic feedback and reproducible checks.
+- Support multi-environment promotion with governance and separation of duties where required.
+- Provide runtime/tooling discovery by immutable identifiers.
+
+### Non-goals
+- Providing the event broker itself.
+- Enforcing business semantics correctness (only structural/contract compatibility).
+- Rewriting existing producer/consumer code (provide SDK patterns).
+
+### Glossary
+- **Subject**: A named schema stream/contract, e.g., `payments.TransactionCreated`.
+- **Version**: Monotonic per subject (1, 2, 3…), immutable.
+- **Schema ID**: Stable identifier for a specific schema artifact.
+- **Fingerprint**: Content hash of a canonicalized schema (e.g., `sha256:<hex>`).
+- **Compatibility mode**: Backward/Forward/Full/None.
+- **Promotion**: Moving a version to a higher environment with required approvals.
+
+---
+
+## Requirements
+
+### Functional Requirements
+- Register and version schemas per subject:
+  - Avro `.avsc` and Protobuf `.proto` (via descriptor sets or source bundles).
+- Deterministically resolve schema references/imports using pinned versions/fingerprints.
+- Enforce configurable compatibility rules per subject and environment.
+- Integrate with CI/CD for pre-merge checks and post-merge registration/promotion.
+- Support lifecycle states across environments: `DRAFT` (DEV), `STAGED` (STAGE), `PROD`, `DEPRECATED` (optional `RETIRED`).
+- Discovery APIs:
+  - Fetch by subject+version, subject+env latest, schema ID, and fingerprint.
+- Provide diff and explanation for compatibility outcomes.
+- Governance and audit:
+  - Ownership, approvals, separation of duties for PROD, immutable audit exportable to SIEM/WORM.
+- Tooling:
+  - UI/CLI for browsing, diffing, searching, approvals, and policy inspection.
+
+### Non-Functional Requirements (Targets)
+#### Scale
+- Tenants: up to **200**
+- Teams: up to **5,000**
+- Subjects: **50,000**
+- Total versions: **1,000,000**
+- Peak request rates:
+  - Reads: **2,000 RPS**
+  - Writes: **50 RPS**
+  - CI checks: **200 RPS** bursty
+
+#### Latency (single-region)
+- `GET` (by ID/fingerprint): **P50 5–15ms**, **P99 50ms**
+- `GET latest` (subject+env): **P50 5–20ms**, **P99 75ms**
+- Compatibility check (parse + resolution + diff):
+  - **P50 75ms**, **P99 500ms** typical schemas
+  - Size/complexity limits; async option for heavy graphs
+
+#### Availability
+- Reads: **99.99%**
+- Writes: **99.9%**
+
+#### Consistency
+- Strong consistency for registration, promotion, approvals, policy updates, and env “latest” pointers.
+- Eventual consistency acceptable for UI activity feeds and analytics.
+
+#### Durability & DR
+- Metadata RPO: **≤ 5 minutes**
+- RTO: **≤ 30 minutes**
+- Schema artifacts: stored in object storage with very high durability.
+
+---
+
+## Simplified Architecture
+
+This design uses a single “Registry Service” (a modular monolith) that contains:
+- HTTP APIs (UI/CLI + CI + runtime reads)
+- Compatibility + lint engine
+- Governance evaluation (declarative policy rules)
+- Background jobs (optional) for heavy compatibility checks and audit export
+
+It relies on two managed dependencies:
+- **Postgres** for all transactional metadata, approvals, pointers, and audit log
+- **Object storage** for immutable artifacts (raw/canonical/descriptor bundles)
+
+```mermaid
+flowchart TB
+  Dev[Developer] --> CI[CI Pipeline]
+  Dev --> UI[UI / CLI]
+
+  CI --> API["Registry Service"]
+  UI --> API
+
+  API --> PG[(Postgres)]
+  API --> OBJ[(Object Storage)]
+  API --> SIEM["SIEM / WORM Export"]
+```
+
+**Major simplifications captured in the architecture**
+- Governance evaluation runs inside the Registry Service using versioned, declarative rules stored in Postgres (policy inspection remains in UI/CLI).
+- Compatibility checks run synchronously by default; the same service can process async jobs from Postgres for heavy workloads.
+- Search is served from Postgres (indexes + full-text search) to keep operational footprint small.
+- Audit is written transactionally to Postgres and exported (batched) to SIEM/WORM on a schedule with checkpoints.
+
+---
+
+## Core Workflows
+
+### 1) CI Compatibility Check (Pre-merge)
+1. CI submits candidate schema plus pinned references (subject+version or fingerprint).
+2. Registry resolves a deterministic bundle (candidate + pinned dependencies).
+3. Registry computes diff vs the baseline (typically latest in target environment).
+4. Registry evaluates governance rules for the action and environment and returns a structured report.
+5. CI surfaces blocking vs warning outcomes as required by policy.
+
+### 2) Register New Version (Post-merge)
+1. CI registers schema to DEV (or directly to STAGE if configured).
+2. Registry canonicalizes and fingerprints, stores artifacts, and allocates a new version number in a single Postgres transaction.
+3. Registry updates the DEV environment pointer atomically and appends an audit record.
+
+### 3) Promotion (DEV → STAGE → PROD)
+1. A requester proposes promotion with reason/ticket.
+2. Registry evaluates required approvals (including separation-of-duties constraints).
+3. Approvers approve/reject; once satisfied, registry atomically updates the environment pointer and lifecycle state and appends audit records.
+
+### 4) Runtime Resolution (Preferred Pattern)
+- Producer writes `schema_id` (or fingerprint) with the event (header or envelope).
+- Consumer fetches schema by ID on cache miss, then caches locally for deterministic decoding.
+- Tooling may use “latest in env”; runtimes should prefer immutable IDs.
+
+---
+
+## Registry Service
+
+### Responsibilities
+- AuthN/AuthZ for humans and CI/workloads.
+- Schema registration, reference resolution, version allocation.
+- Compatibility + lint checks with deterministic inputs.
+- Promotion and approvals workflow.
+- Discovery APIs for immutable identifiers.
+- Audit append + export.
+
+### Determinism and reproducibility
+- Every check and registration is based on a **resolved bundle**:
+  - Candidate schema + pinned dependency versions/fingerprints
+  - Normalized canonical form and stable fingerprint
+- Registry stores the bundle metadata used for checks to ensure CI results match production.
+
+### Bounded complexity
+- Limits enforced with clear errors:
+  - Max schema size (raw and resolved bundle)
+  - Max dependency graph size
+  - Max CPU time for sync checks
+- Async checks (optional) use a Postgres-backed job table processed by background workers in the same deployment artifact.
+
+---
+
+## Governance (Policy + Approvals)
+
+### Model
+Governance is implemented as versioned, declarative rules:
+- Ownership and roles (namespace/subject owner groups; `reader`, `publisher`, `approver`, `admin`)
+- Environment-specific constraints (e.g., PROD requires separation of duties and N approvals)
+- Compatibility classification gates (blocking vs warning)
+- Required metadata (ticket/reason) for high-risk promotions
+
+Policies are stored and versioned in Postgres and exposed via UI/CLI for inspection. Policy changes are audited and can be rolled back by selecting a previous version.
+
+---
+
+## Storage
+
+### Postgres (system of record)
+Postgres stores:
+- Tenants, namespaces, subjects
+- Schema versions and their immutable identifiers
+- Environment pointers (latest in DEV/STAGE/PROD)
+- Approvals and promotion requests
+- Audit log (append-only) and export checkpoints
+- Optional: small canonical artifacts inline (size-bounded) to reduce object-store reads during incidents
+
+Key indexing patterns:
+- `(subject_id, version_number)` unique for immutability
+- `(subject_id, environment)` unique for pointers
+- Partial/indexed queries for “latest by env”
+- Full-text search on subject names, namespaces, and tags
+
+### Object storage (immutable artifacts)
+Object storage holds immutable blobs keyed by fingerprint/schema ID:
+- raw schema
+- canonical schema
+- Protobuf descriptors / bundles (when applicable)
+
+Artifacts can be served via the Registry Service or via signed URLs for large payloads.
+
+---
+
+## Data Model (Core Tables)
+
+- `tenants(tenant_id pk, name, created_at)`
+- `namespaces(namespace_id pk, tenant_id fk, name, owner_group, created_at)`
+- `subjects(subject_id pk, tenant_id fk, namespace_id fk, name, schema_type, default_compat_mode, created_at)`
+  - Unique `(tenant_id, namespace_id, name)`
+- `schema_artifacts(schema_id pk, tenant_id fk, schema_type, fingerprint, raw_uri, canonical_uri, descriptor_uri null, created_at)`
+  - Unique `(tenant_id, fingerprint, schema_type)`
+- `schema_versions(version_id pk, tenant_id fk, subject_id fk, version_number int, schema_id fk, created_by, created_at, message)`
+  - Unique `(subject_id, version_number)`
+- `schema_references(version_id fk, ref_subject_id fk, ref_version_number int, ref_schema_id fk, ref_fingerprint)`
+- `subject_env_pointers(subject_id fk, environment, version_id fk, updated_at, updated_by)`
+  - Unique `(subject_id, environment)`
+- `promotion_requests(request_id pk, tenant_id, subject_id, version_id, to_environment, state, requested_by, reason, ticket, created_at)`
+- `approvals(approval_id pk, request_id fk, tenant_id, state, requested_by, approved_by, reason, created_at, decided_at)`
+- `policies(policy_version_id pk, tenant_id, name, version, document_json, created_by, created_at, active bool)`
+- `audit_log(event_id pk, tenant_id, actor, action, resource_type, resource_id, payload_json, created_at, prev_event_hash, event_hash)`
+- `audit_export_checkpoint(tenant_id pk, last_exported_event_id, updated_at)`
+
+---
+
+## API Design (Minimal Surface)
+
+### AuthN/AuthZ
+- Humans (UI/CLI): OIDC login → short-lived JWT
+- CI/workloads: OIDC client credentials or mTLS workload identity
+- Authorization: role + ownership + policy evaluation
+
+### Key endpoints
+- Compatibility check (CI):
+  - `POST /v1/compatibility/check`
+- Register version:
+  - `POST /v1/subjects/{subjectId}/versions`
+- Promote version:
+  - `POST /v1/subjects/{subjectId}/versions/{version}/promote`
+- Approvals:
+  - `POST /v1/promotion-requests/{requestId}:approve`
+  - `POST /v1/promotion-requests/{requestId}:reject`
+- Fetch immutable schema:
+  - `GET /v1/schemas/{schemaId}`
+  - `GET /v1/schemas/{schemaId}/canonical`
+- Fetch by subject/version:
+  - `GET /v1/subjects/{subjectId}/versions/{version}`
+- Latest by environment (tooling):
+  - `GET /v1/subjects/{subjectId}/versions/latest?environment=PROD`
+- Search (tooling):
+  - `GET /v1/search?query=...`
+
+### Idempotency and concurrency
+- Idempotency key for write endpoints: `(tenant, key, endpoint) -> stored response` (24h)
+- Strong consistency on pointer updates within Postgres transactions
+- Optional `If-Match`/ETag on pointer resources for tooling workflows that want optimistic concurrency
+
+---
+
+## Performance and Scaling
+
+### Expected hot paths
+- Reads by schema ID/fingerprint: served from Postgres metadata + object storage (or inline canonical when enabled)
+- “Latest” reads: one indexed Postgres query on `subject_env_pointers`
+
+### Compatibility checks
+- CPU-bound and parallelizable:
+  - Worker pool inside the Registry Service
+  - Memoization keyed by `(tenant, subject, old_fp, new_fp, compat_mode, policy_version)`
+  - Async jobs for oversized bundles (stored in Postgres, processed by background workers)
+
+### Scaling plan
+- Registry Service: stateless replicas behind a load balancer
+- Postgres: managed HA primary; add read replicas when read load grows
+- Object storage: managed, scales independently
+- Client caching: SDKs cache schemas by ID; CI caches baseline artifacts by fingerprint
+
+---
+
+## Audit and Compliance
+
+### Append-only audit
+- Every state transition writes an audit record in the same transaction as the change:
+  - register, check, approve/reject, promote, deprecate, policy change
+- Tamper-evidence via per-tenant hash chaining (`prev_event_hash`, `event_hash`)
+
+### Export to SIEM/WORM
+- Background exporter reads `audit_log` in order and writes batched records to:
+  - SIEM ingestion endpoint and/or WORM object storage bucket
+- Export uses a checkpoint table for at-least-once delivery with idempotent batch keys.
+
+---
+
+## Failure Modes and Mitigations (Essentials)
+
+- Registry Service outage: CI checks and promotions fail; runtime ID fetch fails on cache miss.
+  - Mitigation: multiple replicas, timeouts/retries, client-side schema cache.
+- Postgres failover: writes unavailable during failover; reads may degrade.
+  - Mitigation: managed HA, connection pooling, graceful read-only mode.
+- Object storage degradation: registrations and uncached artifact reads fail.
+  - Mitigation: retries/circuit breakers; optional inline canonical for small schemas; client caching.
+- Policy misconfiguration: promotions blocked.
+  - Mitigation: versioned policies, staged activation per environment, quick rollback, audited overrides when required.
+
+---
+
+## Disaster Recovery
+
+- Postgres: PITR + WAL archiving; restore drills; RPO ≤ 5 minutes, RTO ≤ 30 minutes.
+- Object storage: versioning + replication (as required by compliance).
+- Audit: export stream continues independently; reconciliation verifies `audit_export_checkpoint` against `audit_log`.
+
+---
+
+## Operations
+
+### SLOs (example)
+- `GET /v1/schemas/{schemaId}` availability: **99.99%**
+- Read latency P99: **≤ 75ms**
+- Compatibility check P99 (sync typical): **≤ 500ms**
+- Audit export lag P99: **≤ 5 minutes** (batch cadence)
+
+### Monitoring
+- API: latency, 4xx/5xx, auth failures, request rates
+- Compatibility: CPU/check, timeout rate, cache hit rate, async job backlog
+- Postgres: replication lag, slow queries, lock waits, pool saturation, disk growth
+- Object storage: error rate, latency, throttling
+- Governance: approvals backlog, time-to-promote, override usage
+
+---
+
+## Simplification Notes
+
+- Removed `Redis` and served hot reads via Postgres indexes plus client-side (SDK) caching keyed by `schema_id` and fingerprint; this matches the “runtime by immutable ID” pattern and keeps cache consistency simple.
+- Removed `Kafka/PubSub` audit stream and stored audit events append-only in Postgres with hash chaining, exporting batches to `SIEM / WORM` with checkpoints for reliable delivery.
+- Removed separate `Work Queue` and separate `Compatibility Workers`; heavy checks run as Postgres-backed async jobs processed by background workers within the same Registry Service deployment artifact.
+- Removed `OpenSearch/ES` and implemented search with Postgres full-text search and conventional indexes for subject/namespace queries.
+- Merged the policy engine into the Registry Service using versioned, declarative policy documents stored in Postgres, preserving inspection, auditability, and rollback while keeping the runtime footprint small.
+- Kept complexity around strong transactions (version allocation, env pointers, approvals) and immutable artifacts (object storage) because correctness and governance depend on these guarantees.
+mcp startup: no servers
+ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Dec 17th, 2025 1:06 AM.
+Warning: no last agent message; wrote empty content to /Users/dominikdabrowski/pr/system-design-atlas/grades/event-schema-registry.json

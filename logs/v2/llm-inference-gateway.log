@@ -1,0 +1,1726 @@
+==========================================
+Generating (v2): LLM Inference Gateway
+==========================================
+
+[Pass 1/4] Generating initial design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af7-2c69-7d91-bc94-745e8e09824a
+--------
+user
+# System Design Document Generator (v2)
+
+You are a **seasoned senior architect** who has built and operated large-scale systems. Your job is to produce system design documents that are **insightful and elegant**, not just thorough.
+
+## Core Philosophy
+
+**A great design:**
+- Identifies the 1-2 genuinely hard subproblems and solves them elegantly
+- Uses boring, proven technology for everything else
+- Makes clear, defensible trade-off decisions
+- Teaches something non-obvious
+- Is simple enough that a small team could build and operate it
+
+**A weak design:**
+- Lists components without explaining why
+- Over-engineers with custom solutions when standard tools work fine
+- Hedges on trade-offs instead of taking positions
+- Is comprehensive but doesn't teach anything new
+
+## Output Format
+
+```markdown
+---
+title: "{title}"
+category: "{category}"
+difficulty: "{difficulty}"
+tags: [...]
+---
+
+## Overview
+
+[2-3 paragraphs: What is this system? What's the key insight that makes this design elegant?]
+
+## What Makes This Hard
+
+[What do naive implementations get wrong? What's the trap that catches most teams?]
+
+## Requirements
+
+### Functional Requirements
+[Focus on the non-obvious requirements that drive architectural decisions.]
+
+### Scale Targets
+[Concrete numbers with reasoning. Why these numbers matter.]
+
+## Key Design Decisions
+
+[The 2-3 architectural choices that define this system. For each:]
+- What we chose
+- What we rejected
+- Why
+
+## Architecture
+
+```mermaid
+[Simple diagram - max 8 nodes. Elegance over completeness.]
+```
+
+### Components
+
+[For each component, explain its purpose and why it earns its place in the design.]
+
+## Deep Dive: [The Hardest Part]
+
+[Pick the most interesting/difficult aspect and go deep. Show your reasoning.]
+
+## Trade-offs
+
+[Be explicit about what this design optimizes for and what it sacrifices.]
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| ... | ... |
+
+## Failure Modes
+
+[The 2-3 failure scenarios that matter most. For each: what happens, how you detect it, how you recover.]
+
+## What I'd Do Differently At...
+
+- **10x scale:** [What changes?]
+- **100x scale:** [What breaks and needs rearchitecting?]
+
+## Operational Notes
+
+[The non-obvious things an on-call engineer needs to know.]
+```
+
+## Writing Guidelines
+
+### Be Opinionated
+- **Bad:** "You could use Postgres or MySQL or MongoDB depending on your needs"
+- **Good:** "Use Postgres. Its JSONB and strong consistency make it the right choice here."
+
+### Explain the Why
+- **Bad:** "Use a message queue for decoupling"
+- **Good:** "The queue absorbs traffic spikes during flash sales, letting us size the order service for average load, not peak"
+
+### Go Deep on Hard Parts
+- **Bad:** "Implement leader election using a consensus algorithm"
+- **Good:** [3 paragraphs explaining the specific approach, edge cases, and failure modes]
+
+### Stay Practical
+- **Bad:** "Implement a custom distributed consensus protocol"
+- **Good:** "Use etcd for leader election—it's battle-tested and one less thing to debug at 3am"
+
+## Mermaid Guidelines
+
+1. **Max 6-8 nodes** - elegance means knowing what to leave out
+2. **Short labels** (2-4 words)
+3. **One level of subgraphs** max
+4. **Quote special characters**: `A["Load Balancer (L7)"]`
+
+## Anti-Patterns
+
+1. **Component soup** - listing every possible service without justification
+2. **Hedge words** - "could", "might", "optionally", "depending on requirements"
+3. **Textbook regurgitation** - explaining what Kafka/Redis/K8s does (assume the reader knows)
+4. **Future-proofing** - solving problems you don't have yet
+5. **Complexity theater** - making things complicated to seem thorough
+
+---
+
+## Problem to Solve
+
+**Title**: LLM Inference Gateway
+**Category**: AI/ML Infrastructure
+
+**Problem Statement**:
+Design a proxy for LLMs handling prompt caching, token streaming, cost quotas, and safety moderation filters.
+
+Generate the system design document now.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+codex
+```markdown
+---
+title: "LLM Inference Gateway"
+category: "AI/ML Infrastructure"
+difficulty: "Advanced"
+tags: ["llm", "gateway", "streaming", "caching", "quotas", "moderation", "observability"]
+---
+
+## Overview
+
+This system is a gateway that sits between product traffic and one or more LLM providers. It standardizes APIs, streams tokens to clients, enforces cost and safety policies, and opportunistically serves responses from a prompt cache. The goal is to make LLM usage feel like a reliable internal platform primitive: predictable cost, predictable latency, and predictable governance.
+
+The key insight is to treat *tokens as the unit of admission control* and to make streaming a first-class citizen. Naive gateways bolt quotas, caching, and moderation on the side; this design makes them part of the request lifecycle with explicit “reserve → stream → settle” accounting, and with moderation that can safely interrupt a stream without corrupting downstream state.
+
+Everything else stays boring: stateless gateway instances, Redis for hot-path state (rate limits, reservations, cache), Postgres for durable billing/audit, and a simple async log pipeline for analytics.
+
+## What Makes This Hard
+
+Naive implementations get trapped by three interacting realities:
+
+1. **Streaming breaks “request/response” assumptions.** You need to start sending tokens before you know total cost, before post-moderation is possible, and while clients may disconnect mid-stream.
+2. **Caching is only useful if it is correct.** “Same prompt” is not a string match; model, params, tools, safety settings, and even system prompts must be in the cache key or you will serve the wrong answer.
+3. **Quotas must be enforceable under retries and partial failures.** Providers time out, clients retry, and streams drop. If you don’t make accounting idempotent, you either leak spend (undercharge) or block legitimate traffic (overcharge).
+
+## Requirements
+
+### Functional Requirements
+- Normalize a single API surface (chat/completions + tool calls) over multiple providers.
+- Token streaming to clients (SSE) with low added latency (<50ms p50 gateway overhead).
+- Prompt/result caching with correctness guarantees (no cross-tenant leakage; no param mismatch).
+- Cost quotas:
+  - Per API key: RPM/TPM limits.
+  - Per org/project: daily token budget and dollar budget.
+  - Hard fail on budget exhaustion (no “best effort” overspend).
+- Safety moderation:
+  - Pre-moderation on user input (block before calling providers).
+  - Streaming-time moderation on output (interrupt stream on policy violation).
+  - Durable audit log of decisions and rationale.
+- Idempotency across retries (client retries and gateway/provider retries).
+
+### Scale Targets
+- **Traffic:** 1,000 RPS steady, 3,000 RPS burst (product launches).
+- **Tokens:** avg 800 prompt tokens + 1,200 completion tokens → ~2,000 tokens/request.
+  - Steady: ~2M tokens/sec at 1,000 RPS is unrealistic for most orgs; the real pressure is burstiness and concurrency. Design for **150k tokens/sec** sustained with headroom and backpressure.
+- **Latency:** added gateway overhead p50 < 50ms, p95 < 150ms (excluding provider time).
+- **Cache:** 20% hit rate is meaningful; higher hit rates happen in agent/tool loops and repetitive workflows.
+- These numbers matter because Redis hot-path ops must stay O(1) and because quota checks must not add extra network round-trips per streamed token.
+
+## Key Design Decisions
+
+- **Decision: Token reservation + settlement (two-phase accounting)**
+  - Chose: Reserve estimated worst-case tokens up front; stream; settle with actual usage; release unused reservation.
+  - Rejected: Charge only after completion (allows budget overshoot during bursts) and charge per streamed token (too chatty and fragile).
+  - Why: This is the simplest model that prevents overspend while keeping streaming fast.
+
+- **Decision: Exact-match canonical cache keys + in-flight request coalescing**
+  - Chose: Canonicalize the full normalized request (model+params+tools+system+messages) and hash it; cache only after finalization; coalesce identical in-flight requests.
+  - Rejected: “Semantic cache” by embeddings as the default path.
+  - Why: Correctness beats cleverness. Exact-match gives deterministic behavior and is easy to debug; coalescing captures much of the benefit without serving “close enough” answers.
+
+- **Decision: Output moderation that can cut a stream**
+  - Chose: Pre-moderate inputs; run a lightweight streaming classifier on the output; if triggered, terminate the provider stream, send a policy error frame, and settle accounting.
+  - Rejected: Only post-moderation after full output (too late) and only regex rules (too brittle).
+  - Why: The gateway must be able to stop harmful output mid-flight without leaving quotas, cache, or audits inconsistent.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> G["Inference Gateway"]
+  G --> R["Redis (quota+cache)"]
+  G --> P["Policy Engine"]
+  G --> O["Provider Adapter"]
+  O --> L["LLM Providers"]
+  G --> K["Event Log"]
+  K --> D["Postgres (billing/audit)"]
+```
+
+### Components
+
+- **Inference Gateway**
+  - Stateless service handling auth, normalization, SSE streaming, and orchestration of cache/quota/policy checks.
+  - Earns its place by being the only component on the critical path that understands “reserve → stream → settle”.
+
+- **Redis (quota+cache)**
+  - Hot-path state: rate limits, token reservations, idempotency keys, cache entries, and in-flight coalescing.
+  - Earns its place because these operations must be single-digit milliseconds and atomic.
+
+- **Policy Engine**
+  - Single responsibility: decide allow/block/transform for prompts and streamed outputs; emits structured reasons.
+  - Earns its place by isolating governance logic so gateway code stays small and auditable.
+
+- **Provider Adapter**
+  - Translates normalized requests to provider-specific APIs; normalizes provider events into a single stream format; enforces provider timeouts/retries.
+  - Earns its place because provider quirks otherwise leak into every client.
+
+- **LLM Providers**
+  - External dependencies; treated as unreliable and variable-latency.
+
+- **Event Log**
+  - Append-only stream of decisions (quota, moderation, cache hit/miss, provider latency) for debugging and billing.
+  - Earns its place by decoupling analytics from the online path.
+
+- **Postgres (billing/audit)**
+  - Durable ledger of finalized usage, policy decisions, and admin configuration.
+  - Earns its place because money and governance require strong consistency and clear history.
+
+## Deep Dive: Token Quotas Under Streaming (Reserve → Stream → Settle)
+
+The hardest part is enforcing spend limits *before* you know the final token usage, while still streaming tokens immediately. The gateway uses a two-phase model:
+
+1. **Reserve (admission control)**
+   - Canonicalize request and compute an *estimated token cost*:
+     - `prompt_tokens_est` from a tokenizer library compatible with the target model family.
+     - `completion_tokens_max` from `max_tokens` (or a configured cap if the client omits it).
+   - Compute `reserve_tokens = prompt_tokens_est + completion_tokens_max`.
+   - Atomically in Redis:
+     - Check RPM/TPM windows for the API key.
+     - Check daily remaining token and dollar budgets for org/project.
+     - If allowed, increment “reserved_tokens_today” and store a reservation record keyed by `request_id` (idempotency key).
+   - If the client retries with the same idempotency key, return the prior decision and do not double-reserve.
+
+2. **Stream (low overhead, failure-safe)**
+   - Start provider stream immediately after reservation.
+   - The gateway never performs per-token Redis writes. It maintains local counters for streamed output size and runs moderation on a sliding window buffer.
+   - If the client disconnects, the gateway cancels the provider request and proceeds to settlement; cancellations still cost tokens and must be accounted for.
+
+3. **Settle (finalize truth)**
+   - At stream end (normal end, cancellation, moderation stop, or provider error), finalize usage:
+     - Prefer provider-reported `usage` if available.
+     - Otherwise compute best-effort from token counts (and mark as “estimated” in the ledger).
+   - Atomically in Redis:
+     - Convert reservation to final usage: decrement reserved, increment consumed.
+     - Record terminal state for `request_id` so retries return a consistent outcome.
+   - Emit a billing event and write a durable ledger row in Postgres asynchronously. Redis is the enforcer; Postgres is the source of truth for reconciliation.
+
+This model is non-obvious but crucial: it prevents overspend during bursts without turning the stream into a distributed transaction. The elegance is that the online path needs only *two* Redis atomic operations per request (reserve + settle), regardless of output length.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Hard spend caps under burst traffic | Occasional over-reservation (temporary headroom consumed) |
+| Low-latency streaming | Fine-grained per-token quota precision |
+| Cache correctness and debuggability | Semantic cache hit rate |
+| Simple operations (Redis + Postgres) | Global “exactly-once” billing across all failures |
+
+## Failure Modes
+
+- **Redis outage or high latency**
+  - What happens: Admission control and cache become unavailable; gateway risks either blocking all traffic or allowing unbounded spend.
+  - Detect: Redis latency/error SLOs; sudden drop in cache hit rate; spike in “quota check failed” errors.
+  - Recover: Fail closed for paid/budgeted orgs (protect money); fail open only for explicitly whitelisted internal/testing keys with a strict global circuit breaker. Restore by promoting Redis replica / switching to a hot standby.
+
+- **Provider stream stalls or flakes mid-response**
+  - What happens: Clients hang; retries risk double-charging; partial outputs may be cached incorrectly.
+  - Detect: Provider p95 latency, stream “no token for N seconds” watchdog, elevated retry rates.
+  - Recover: Gateway enforces a token-stall timeout; cancels provider call; settles with observed usage; never writes cache unless stream finalized successfully.
+
+- **Moderation false positive cuts valid streams**
+  - What happens: User experience breaks and support load spikes.
+  - Detect: Rate of moderation stops per policy/version; sampled transcripts for review (with PII controls).
+  - Recover: Versioned policy rollout with canaries; fast rollback; store decision reasons and classifier scores for postmortems; allow per-org overrides with explicit audit trails.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Split Redis into dedicated clusters (quota/idempotency vs cache), add shard-aware routing in the gateway, and move Policy Engine to its own autoscaled service with strict latency budgets and cached model weights.
+- **100x scale:** Introduce a dedicated high-throughput cache tier (SSD-backed) with cache-aware routing and stronger coalescing (fanout to many subscribers), and move from “best-effort usage estimation” to provider-side metering + signed usage receipts for reconciliation.
+
+## Operational Notes
+
+- Cache keys must include: tenant/org, model, temperature/top_p, tool schemas, system prompt, message list, and safety mode; missing any of these creates silent correctness bugs.
+- Idempotency is mandatory: require `Idempotency-Key` for non-trivial requests; store terminal outcome for a bounded TTL to control Redis growth.
+- Log redaction: never store raw prompts by default; store hashes + selective samples behind an explicit allowlist and retention policy.
+- Backpressure: enforce max concurrent streams per API key/org to avoid “slow client” resource exhaustion; shed load before the gateway becomes the bottleneck.
+- Runbooks should start with: Redis health, provider health, moderation policy version, and reservation/settlement mismatch dashboards.
+```
+tokens used
+4,457
+```markdown
+---
+title: "LLM Inference Gateway"
+category: "AI/ML Infrastructure"
+difficulty: "Advanced"
+tags: ["llm", "gateway", "streaming", "caching", "quotas", "moderation", "observability"]
+---
+
+## Overview
+
+This system is a gateway that sits between product traffic and one or more LLM providers. It standardizes APIs, streams tokens to clients, enforces cost and safety policies, and opportunistically serves responses from a prompt cache. The goal is to make LLM usage feel like a reliable internal platform primitive: predictable cost, predictable latency, and predictable governance.
+
+The key insight is to treat *tokens as the unit of admission control* and to make streaming a first-class citizen. Naive gateways bolt quotas, caching, and moderation on the side; this design makes them part of the request lifecycle with explicit “reserve → stream → settle” accounting, and with moderation that can safely interrupt a stream without corrupting downstream state.
+
+Everything else stays boring: stateless gateway instances, Redis for hot-path state (rate limits, reservations, cache), Postgres for durable billing/audit, and a simple async log pipeline for analytics.
+
+## What Makes This Hard
+
+Naive implementations get trapped by three interacting realities:
+
+1. **Streaming breaks “request/response” assumptions.** You need to start sending tokens before you know total cost, before post-moderation is possible, and while clients may disconnect mid-stream.
+2. **Caching is only useful if it is correct.** “Same prompt” is not a string match; model, params, tools, safety settings, and even system prompts must be in the cache key or you will serve the wrong answer.
+3. **Quotas must be enforceable under retries and partial failures.** Providers time out, clients retry, and streams drop. If you don’t make accounting idempotent, you either leak spend (undercharge) or block legitimate traffic (overcharge).
+
+## Requirements
+
+### Functional Requirements
+- Normalize a single API surface (chat/completions + tool calls) over multiple providers.
+- Token streaming to clients (SSE) with low added latency (<50ms p50 gateway overhead).
+- Prompt/result caching with correctness guarantees (no cross-tenant leakage; no param mismatch).
+- Cost quotas:
+  - Per API key: RPM/TPM limits.
+  - Per org/project: daily token budget and dollar budget.
+  - Hard fail on budget exhaustion (no “best effort” overspend).
+- Safety moderation:
+  - Pre-moderation on user input (block before calling providers).
+  - Streaming-time moderation on output (interrupt stream on policy violation).
+  - Durable audit log of decisions and rationale.
+- Idempotency across retries (client retries and gateway/provider retries).
+
+### Scale Targets
+- **Traffic:** 1,000 RPS steady, 3,000 RPS burst (product launches).
+- **Tokens:** avg 800 prompt tokens + 1,200 completion tokens → ~2,000 tokens/request.
+  - Steady: ~2M tokens/sec at 1,000 RPS is unrealistic for most orgs; the real pressure is burstiness and concurrency. Design for **150k tokens/sec** sustained with headroom and backpressure.
+- **Latency:** added gateway overhead p50 < 50ms, p95 < 150ms (excluding provider time).
+- **Cache:** 20% hit rate is meaningful; higher hit rates happen in agent/tool loops and repetitive workflows.
+- These numbers matter because Redis hot-path ops must stay O(1) and because quota checks must not add extra network round-trips per streamed token.
+
+## Key Design Decisions
+
+- **Decision: Token reservation + settlement (two-phase accounting)**
+  - Chose: Reserve estimated worst-case tokens up front; stream; settle with actual usage; release unused reservation.
+  - Rejected: Charge only after completion (allows budget overshoot during bursts) and charge per streamed token (too chatty and fragile).
+  - Why: This is the simplest model that prevents overspend while keeping streaming fast.
+
+- **Decision: Exact-match canonical cache keys + in-flight request coalescing**
+  - Chose: Canonicalize the full normalized request (model+params+tools+system+messages) and hash it; cache only after finalization; coalesce identical in-flight requests.
+  - Rejected: “Semantic cache” by embeddings as the default path.
+  - Why: Correctness beats cleverness. Exact-match gives deterministic behavior and is easy to debug; coalescing captures much of the benefit without serving “close enough” answers.
+
+- **Decision: Output moderation that can cut a stream**
+  - Chose: Pre-moderate inputs; run a lightweight streaming classifier on the output; if triggered, terminate the provider stream, send a policy error frame, and settle accounting.
+  - Rejected: Only post-moderation after full output (too late) and only regex rules (too brittle).
+  - Why: The gateway must be able to stop harmful output mid-flight without leaving quotas, cache, or audits inconsistent.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> G["Inference Gateway"]
+  G --> R["Redis (quota+cache)"]
+  G --> P["Policy Engine"]
+  G --> O["Provider Adapter"]
+  O --> L["LLM Providers"]
+  G --> K["Event Log"]
+  K --> D["Postgres (billing/audit)"]
+```
+
+### Components
+
+- **Inference Gateway**
+  - Stateless service handling auth, normalization, SSE streaming, and orchestration of cache/quota/policy checks.
+  - Earns its place by being the only component on the critical path that understands “reserve → stream → settle”.
+
+- **Redis (quota+cache)**
+  - Hot-path state: rate limits, token reservations, idempotency keys, cache entries, and in-flight coalescing.
+  - Earns its place because these operations must be single-digit milliseconds and atomic.
+
+- **Policy Engine**
+  - Single responsibility: decide allow/block/transform for prompts and streamed outputs; emits structured reasons.
+  - Earns its place by isolating governance logic so gateway code stays small and auditable.
+
+- **Provider Adapter**
+  - Translates normalized requests to provider-specific APIs; normalizes provider events into a single stream format; enforces provider timeouts/retries.
+  - Earns its place because provider quirks otherwise leak into every client.
+
+- **LLM Providers**
+  - External dependencies; treated as unreliable and variable-latency.
+
+- **Event Log**
+  - Append-only stream of decisions (quota, moderation, cache hit/miss, provider latency) for debugging and billing.
+  - Earns its place by decoupling analytics from the online path.
+
+- **Postgres (billing/audit)**
+  - Durable ledger of finalized usage, policy decisions, and admin configuration.
+  - Earns its place because money and governance require strong consistency and clear history.
+
+## Deep Dive: Token Quotas Under Streaming (Reserve → Stream → Settle)
+
+The hardest part is enforcing spend limits *before* you know the final token usage, while still streaming tokens immediately. The gateway uses a two-phase model:
+
+1. **Reserve (admission control)**
+   - Canonicalize request and compute an *estimated token cost*:
+     - `prompt_tokens_est` from a tokenizer library compatible with the target model family.
+     - `completion_tokens_max` from `max_tokens` (or a configured cap if the client omits it).
+   - Compute `reserve_tokens = prompt_tokens_est + completion_tokens_max`.
+   - Atomically in Redis:
+     - Check RPM/TPM windows for the API key.
+     - Check daily remaining token and dollar budgets for org/project.
+     - If allowed, increment “reserved_tokens_today” and store a reservation record keyed by `request_id` (idempotency key).
+   - If the client retries with the same idempotency key, return the prior decision and do not double-reserve.
+
+2. **Stream (low overhead, failure-safe)**
+   - Start provider stream immediately after reservation.
+   - The gateway never performs per-token Redis writes. It maintains local counters for streamed output size and runs moderation on a sliding window buffer.
+   - If the client disconnects, the gateway cancels the provider request and proceeds to settlement; cancellations still cost tokens and must be accounted for.
+
+3. **Settle (finalize truth)**
+   - At stream end (normal end, cancellation, moderation stop, or provider error), finalize usage:
+     - Prefer provider-reported `usage` if available.
+     - Otherwise compute best-effort from token counts (and mark as “estimated” in the ledger).
+   - Atomically in Redis:
+     - Convert reservation to final usage: decrement reserved, increment consumed.
+     - Record terminal state for `request_id` so retries return a consistent outcome.
+   - Emit a billing event and write a durable ledger row in Postgres asynchronously. Redis is the enforcer; Postgres is the source of truth for reconciliation.
+
+This model is non-obvious but crucial: it prevents overspend during bursts without turning the stream into a distributed transaction. The elegance is that the online path needs only *two* Redis atomic operations per request (reserve + settle), regardless of output length.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Hard spend caps under burst traffic | Occasional over-reservation (temporary headroom consumed) |
+| Low-latency streaming | Fine-grained per-token quota precision |
+| Cache correctness and debuggability | Semantic cache hit rate |
+| Simple operations (Redis + Postgres) | Global “exactly-once” billing across all failures |
+
+## Failure Modes
+
+- **Redis outage or high latency**
+  - What happens: Admission control and cache become unavailable; gateway risks either blocking all traffic or allowing unbounded spend.
+  - Detect: Redis latency/error SLOs; sudden drop in cache hit rate; spike in “quota check failed” errors.
+  - Recover: Fail closed for paid/budgeted orgs (protect money); fail open only for explicitly whitelisted internal/testing keys with a strict global circuit breaker. Restore by promoting Redis replica / switching to a hot standby.
+
+- **Provider stream stalls or flakes mid-response**
+  - What happens: Clients hang; retries risk double-charging; partial outputs may be cached incorrectly.
+  - Detect: Provider p95 latency, stream “no token for N seconds” watchdog, elevated retry rates.
+  - Recover: Gateway enforces a token-stall timeout; cancels provider call; settles with observed usage; never writes cache unless stream finalized successfully.
+
+- **Moderation false positive cuts valid streams**
+  - What happens: User experience breaks and support load spikes.
+  - Detect: Rate of moderation stops per policy/version; sampled transcripts for review (with PII controls).
+  - Recover: Versioned policy rollout with canaries; fast rollback; store decision reasons and classifier scores for postmortems; allow per-org overrides with explicit audit trails.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Split Redis into dedicated clusters (quota/idempotency vs cache), add shard-aware routing in the gateway, and move Policy Engine to its own autoscaled service with strict latency budgets and cached model weights.
+- **100x scale:** Introduce a dedicated high-throughput cache tier (SSD-backed) with cache-aware routing and stronger coalescing (fanout to many subscribers), and move from “best-effort usage estimation” to provider-side metering + signed usage receipts for reconciliation.
+
+## Operational Notes
+
+- Cache keys must include: tenant/org, model, temperature/top_p, tool schemas, system prompt, message list, and safety mode; missing any of these creates silent correctness bugs.
+- Idempotency is mandatory: require `Idempotency-Key` for non-trivial requests; store terminal outcome for a bounded TTL to control Redis growth.
+- Log redaction: never store raw prompts by default; store hashes + selective samples behind an explicit allowlist and retention policy.
+- Backpressure: enforce max concurrent streams per API key/org to avoid “slow client” resource exhaustion; shed load before the gateway becomes the bottleneck.
+- Runbooks should start with: Redis health, provider health, moderation policy version, and reservation/settlement mismatch dashboards.
+```
+[Pass 1/4] Draft saved to: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/llm-inference-gateway.md
+
+[Pass 2/4] Challenging the design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2af8-65c4-7a83-9a02-e3ddc68b5c3f
+--------
+user
+# System Design Challenger (v2) - The Constructive Critic
+
+You are a **constructive critic** reviewing a system design. Your goal is to make it more **elegant**, not tear it down.
+
+## Your Mindset
+
+You're the senior engineer who reviews designs before they go to architecture review. You want the design to succeed, so you:
+- Find simpler alternatives the author might have missed
+- Stress-test the failure modes
+- Ensure every component earns its place
+- Push for clarity and honesty in trade-offs
+
+## Your Questions
+
+### "Is There a Simpler Path?"
+For each custom component, consider proven alternatives:
+- Could **Postgres** handle this with JSONB/LISTEN-NOTIFY/advisory locks?
+- Could **Redis** solve this with its built-in data structures?
+- Could **etcd/ZooKeeper** handle the coordination needs?
+- Could **Kafka/SQS** replace a custom queue?
+- Could **S3** replace custom storage?
+- Could an **existing open-source project** (Temporal, Litmus, etc.) be used instead?
+
+The goal isn't to reject custom solutions—it's to ensure they're justified.
+
+### "What Happens When...?"
+Stress-test the design:
+- What happens when the database is down for 5 minutes?
+- What happens when there's a network partition between services?
+- What happens when one component is slow but not failing?
+- What happens when you deploy a bad config?
+- What happens when traffic 10x's unexpectedly?
+- What happens when an engineer makes a mistake at 3am?
+
+### "What's the Elegant Core?"
+Identify what makes this design special:
+- What's the key insight that makes this design work?
+- Which 1-2 components are genuinely custom and interesting?
+- What boring parts could be simplified to highlight the interesting parts?
+
+### "Can a Small Team Own This?"
+Challenge operational complexity:
+- How many services does on-call need to understand?
+- What's the deploy story? Can one person deploy this safely?
+- Is the complexity budget appropriate for the team size?
+
+## Output Format
+
+Produce a structured critique:
+
+```markdown
+## Elegance Check
+
+### The Core Insight
+[What's the one thing this design does that's genuinely clever or non-obvious?]
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| ... | ... |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| ... | ... | ... |
+
+## Stress Test
+
+### Failure Scenarios
+For each, note whether the design addresses it and how:
+
+1. **[Scenario]**
+   - Design's answer: [What the doc says, or "not addressed"]
+   - Recommendation: [Strengthen / Acceptable / Overkill]
+
+[3-5 key scenarios]
+
+## Recommendations
+
+### Must Fix
+[Issues that would cause problems in production]
+
+### Should Consider
+[Improvements that would make the design more elegant]
+
+### Nice to Have
+[Polish items for the final version]
+
+## What's Working Well
+[Be specific about what the design gets right—good designs should be praised]
+```
+
+## Remember
+
+Your job is to make the design **better**, not to prove you're smarter than the author. A good critique:
+
+1. Acknowledges what's working
+2. Finds simpler paths without dismissing thoughtful choices
+3. Ensures failure modes are covered
+4. Results in a more elegant final design
+
+The measure of success: the author thinks "that's a better way to do it" not "this reviewer doesn't understand what I'm building."
+
+---
+
+## Design to Challenge
+
+```markdown
+---
+title: "LLM Inference Gateway"
+category: "AI/ML Infrastructure"
+difficulty: "Advanced"
+tags: ["llm", "gateway", "streaming", "caching", "quotas", "moderation", "observability"]
+---
+
+## Overview
+
+This system is a gateway that sits between product traffic and one or more LLM providers. It standardizes APIs, streams tokens to clients, enforces cost and safety policies, and opportunistically serves responses from a prompt cache. The goal is to make LLM usage feel like a reliable internal platform primitive: predictable cost, predictable latency, and predictable governance.
+
+The key insight is to treat *tokens as the unit of admission control* and to make streaming a first-class citizen. Naive gateways bolt quotas, caching, and moderation on the side; this design makes them part of the request lifecycle with explicit “reserve → stream → settle” accounting, and with moderation that can safely interrupt a stream without corrupting downstream state.
+
+Everything else stays boring: stateless gateway instances, Redis for hot-path state (rate limits, reservations, cache), Postgres for durable billing/audit, and a simple async log pipeline for analytics.
+
+## What Makes This Hard
+
+Naive implementations get trapped by three interacting realities:
+
+1. **Streaming breaks “request/response” assumptions.** You need to start sending tokens before you know total cost, before post-moderation is possible, and while clients may disconnect mid-stream.
+2. **Caching is only useful if it is correct.** “Same prompt” is not a string match; model, params, tools, safety settings, and even system prompts must be in the cache key or you will serve the wrong answer.
+3. **Quotas must be enforceable under retries and partial failures.** Providers time out, clients retry, and streams drop. If you don’t make accounting idempotent, you either leak spend (undercharge) or block legitimate traffic (overcharge).
+
+## Requirements
+
+### Functional Requirements
+- Normalize a single API surface (chat/completions + tool calls) over multiple providers.
+- Token streaming to clients (SSE) with low added latency (<50ms p50 gateway overhead).
+- Prompt/result caching with correctness guarantees (no cross-tenant leakage; no param mismatch).
+- Cost quotas:
+  - Per API key: RPM/TPM limits.
+  - Per org/project: daily token budget and dollar budget.
+  - Hard fail on budget exhaustion (no “best effort” overspend).
+- Safety moderation:
+  - Pre-moderation on user input (block before calling providers).
+  - Streaming-time moderation on output (interrupt stream on policy violation).
+  - Durable audit log of decisions and rationale.
+- Idempotency across retries (client retries and gateway/provider retries).
+
+### Scale Targets
+- **Traffic:** 1,000 RPS steady, 3,000 RPS burst (product launches).
+- **Tokens:** avg 800 prompt tokens + 1,200 completion tokens → ~2,000 tokens/request.
+  - Steady: ~2M tokens/sec at 1,000 RPS is unrealistic for most orgs; the real pressure is burstiness and concurrency. Design for **150k tokens/sec** sustained with headroom and backpressure.
+- **Latency:** added gateway overhead p50 < 50ms, p95 < 150ms (excluding provider time).
+- **Cache:** 20% hit rate is meaningful; higher hit rates happen in agent/tool loops and repetitive workflows.
+- These numbers matter because Redis hot-path ops must stay O(1) and because quota checks must not add extra network round-trips per streamed token.
+
+## Key Design Decisions
+
+- **Decision: Token reservation + settlement (two-phase accounting)**
+  - Chose: Reserve estimated worst-case tokens up front; stream; settle with actual usage; release unused reservation.
+  - Rejected: Charge only after completion (allows budget overshoot during bursts) and charge per streamed token (too chatty and fragile).
+  - Why: This is the simplest model that prevents overspend while keeping streaming fast.
+
+- **Decision: Exact-match canonical cache keys + in-flight request coalescing**
+  - Chose: Canonicalize the full normalized request (model+params+tools+system+messages) and hash it; cache only after finalization; coalesce identical in-flight requests.
+  - Rejected: “Semantic cache” by embeddings as the default path.
+  - Why: Correctness beats cleverness. Exact-match gives deterministic behavior and is easy to debug; coalescing captures much of the benefit without serving “close enough” answers.
+
+- **Decision: Output moderation that can cut a stream**
+  - Chose: Pre-moderate inputs; run a lightweight streaming classifier on the output; if triggered, terminate the provider stream, send a policy error frame, and settle accounting.
+  - Rejected: Only post-moderation after full output (too late) and only regex rules (too brittle).
+  - Why: The gateway must be able to stop harmful output mid-flight without leaving quotas, cache, or audits inconsistent.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> G["Inference Gateway"]
+  G --> R["Redis (quota+cache)"]
+  G --> P["Policy Engine"]
+  G --> O["Provider Adapter"]
+  O --> L["LLM Providers"]
+  G --> K["Event Log"]
+  K --> D["Postgres (billing/audit)"]
+```
+
+### Components
+
+- **Inference Gateway**
+  - Stateless service handling auth, normalization, SSE streaming, and orchestration of cache/quota/policy checks.
+  - Earns its place by being the only component on the critical path that understands “reserve → stream → settle”.
+
+- **Redis (quota+cache)**
+  - Hot-path state: rate limits, token reservations, idempotency keys, cache entries, and in-flight coalescing.
+  - Earns its place because these operations must be single-digit milliseconds and atomic.
+
+- **Policy Engine**
+  - Single responsibility: decide allow/block/transform for prompts and streamed outputs; emits structured reasons.
+  - Earns its place by isolating governance logic so gateway code stays small and auditable.
+
+- **Provider Adapter**
+  - Translates normalized requests to provider-specific APIs; normalizes provider events into a single stream format; enforces provider timeouts/retries.
+  - Earns its place because provider quirks otherwise leak into every client.
+
+- **LLM Providers**
+  - External dependencies; treated as unreliable and variable-latency.
+
+- **Event Log**
+  - Append-only stream of decisions (quota, moderation, cache hit/miss, provider latency) for debugging and billing.
+  - Earns its place by decoupling analytics from the online path.
+
+- **Postgres (billing/audit)**
+  - Durable ledger of finalized usage, policy decisions, and admin configuration.
+  - Earns its place because money and governance require strong consistency and clear history.
+
+## Deep Dive: Token Quotas Under Streaming (Reserve → Stream → Settle)
+
+The hardest part is enforcing spend limits *before* you know the final token usage, while still streaming tokens immediately. The gateway uses a two-phase model:
+
+1. **Reserve (admission control)**
+   - Canonicalize request and compute an *estimated token cost*:
+     - `prompt_tokens_est` from a tokenizer library compatible with the target model family.
+     - `completion_tokens_max` from `max_tokens` (or a configured cap if the client omits it).
+   - Compute `reserve_tokens = prompt_tokens_est + completion_tokens_max`.
+   - Atomically in Redis:
+     - Check RPM/TPM windows for the API key.
+     - Check daily remaining token and dollar budgets for org/project.
+     - If allowed, increment “reserved_tokens_today” and store a reservation record keyed by `request_id` (idempotency key).
+   - If the client retries with the same idempotency key, return the prior decision and do not double-reserve.
+
+2. **Stream (low overhead, failure-safe)**
+   - Start provider stream immediately after reservation.
+   - The gateway never performs per-token Redis writes. It maintains local counters for streamed output size and runs moderation on a sliding window buffer.
+   - If the client disconnects, the gateway cancels the provider request and proceeds to settlement; cancellations still cost tokens and must be accounted for.
+
+3. **Settle (finalize truth)**
+   - At stream end (normal end, cancellation, moderation stop, or provider error), finalize usage:
+     - Prefer provider-reported `usage` if available.
+     - Otherwise compute best-effort from token counts (and mark as “estimated” in the ledger).
+   - Atomically in Redis:
+     - Convert reservation to final usage: decrement reserved, increment consumed.
+     - Record terminal state for `request_id` so retries return a consistent outcome.
+   - Emit a billing event and write a durable ledger row in Postgres asynchronously. Redis is the enforcer; Postgres is the source of truth for reconciliation.
+
+This model is non-obvious but crucial: it prevents overspend during bursts without turning the stream into a distributed transaction. The elegance is that the online path needs only *two* Redis atomic operations per request (reserve + settle), regardless of output length.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Hard spend caps under burst traffic | Occasional over-reservation (temporary headroom consumed) |
+| Low-latency streaming | Fine-grained per-token quota precision |
+| Cache correctness and debuggability | Semantic cache hit rate |
+| Simple operations (Redis + Postgres) | Global “exactly-once” billing across all failures |
+
+## Failure Modes
+
+- **Redis outage or high latency**
+  - What happens: Admission control and cache become unavailable; gateway risks either blocking all traffic or allowing unbounded spend.
+  - Detect: Redis latency/error SLOs; sudden drop in cache hit rate; spike in “quota check failed” errors.
+  - Recover: Fail closed for paid/budgeted orgs (protect money); fail open only for explicitly whitelisted internal/testing keys with a strict global circuit breaker. Restore by promoting Redis replica / switching to a hot standby.
+
+- **Provider stream stalls or flakes mid-response**
+  - What happens: Clients hang; retries risk double-charging; partial outputs may be cached incorrectly.
+  - Detect: Provider p95 latency, stream “no token for N seconds” watchdog, elevated retry rates.
+  - Recover: Gateway enforces a token-stall timeout; cancels provider call; settles with observed usage; never writes cache unless stream finalized successfully.
+
+- **Moderation false positive cuts valid streams**
+  - What happens: User experience breaks and support load spikes.
+  - Detect: Rate of moderation stops per policy/version; sampled transcripts for review (with PII controls).
+  - Recover: Versioned policy rollout with canaries; fast rollback; store decision reasons and classifier scores for postmortems; allow per-org overrides with explicit audit trails.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Split Redis into dedicated clusters (quota/idempotency vs cache), add shard-aware routing in the gateway, and move Policy Engine to its own autoscaled service with strict latency budgets and cached model weights.
+- **100x scale:** Introduce a dedicated high-throughput cache tier (SSD-backed) with cache-aware routing and stronger coalescing (fanout to many subscribers), and move from “best-effort usage estimation” to provider-side metering + signed usage receipts for reconciliation.
+
+## Operational Notes
+
+- Cache keys must include: tenant/org, model, temperature/top_p, tool schemas, system prompt, message list, and safety mode; missing any of these creates silent correctness bugs.
+- Idempotency is mandatory: require `Idempotency-Key` for non-trivial requests; store terminal outcome for a bounded TTL to control Redis growth.
+- Log redaction: never store raw prompts by default; store hashes + selective samples behind an explicit allowlist and retention policy.
+- Backpressure: enforce max concurrent streams per API key/org to avoid “slow client” resource exhaustion; shed load before the gateway becomes the bottleneck.
+- Runbooks should start with: Redis health, provider health, moderation policy version, and reservation/settlement mismatch dashboards.
+```
+
+---
+
+Review this design constructively. Find simplification opportunities and stress-test the failure modes.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+thinking
+**Considering database structure and logging**
+
+I need to create a "Components that earn place" table and a "Simplification opportunities" table, while also providing critiques. I'm thinking about using Postgres for quotas with "INSERT...ON CONFLICT" and advisory locks, but that might add latency. For daily budgets, caching in Postgres could work with the current design using Redis. 
+
+It might be simpler to unify the reservation and consumed data in one Redis key with a Lua script or embed the policy engine service. The event log could just write to an append-only Postgres table, using `LISTEN/NOTIFY` for analytics. If scaling is a concern, Kafka might be an option, but it seems the requirement is for a simple async log pipeline using a managed queue. I'll keep a constructive tone, avoid code changes, and focus on markdown outputs while crafting 3-5 failure scenarios.
+codex
+## Elegance Check
+
+### The Core Insight
+Treating *tokens as the unit of admission control* with a strict `reserve → stream → settle` lifecycle is the right abstraction: it makes hard spend caps compatible with streaming without per-token coordination, and it creates a natural place to hang idempotency, caching eligibility, and “safe stream interruption” semantics.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Inference Gateway | Owns the only truly “custom” lifecycle (`reserve → stream → settle`) and the streaming contract to clients. |
+| Redis (quota+idempotency+coalescing+cache) | Enables atomic admission + fast idempotency/coalescing; you need single-digit ms for the hot path. |
+| Provider Adapter | Prevents provider quirks from leaking into every client and keeps the gateway’s control flow stable. |
+| Postgres (billing/audit/config) | Money + governance need an immutable history and reconcilable source of truth. |
+| Event Log (async) | Decouples analytics/debug from tail latency; critical if you want to keep gateway overhead <50ms. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Separate “Policy Engine” service on the critical path | Ship policy as a versioned library/plugin inside the gateway (OPA/Rego/WASM module, or an internal rules DSL) | Less isolation, but removes a network hop + reduces on-call surface area. |
+| Custom “Event Log” component | Use a managed queue/stream (SQS/Kafka/PubSub) or even Postgres append-only table + async consumers | Managed infra cost or Postgres write load; but fewer bespoke moving parts and clearer durability semantics. |
+| Redis as both enforcer and cache store | Split by concern only when needed: start with single Redis, but make keys/DBs clearly separated and migration-ready | Single cluster is simpler initially; later split reduces blast radius and makes scaling predictable. |
+| Exact-match caching implemented in-house | Consider adopting an existing OpenAI-compatible gateway/proxy (e.g., Envoy ext_authz + an LLM proxy like LiteLLM) and focus custom code on reservation/settlement | You’ll still need custom quota/billing semantics; but you avoid reinventing adapters/stream framing. |
+| “Reserve worst-case completion” always | Reserve in two buckets: prompt is exact-ish upfront, completion is a capped “credit line” per org/key tier | Slightly more policy complexity; reduces over-reservation and improves burst behavior for good actors. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Gateway instance dies mid-stream (after reserve, before settle)**
+   - Design’s answer: partially addressed (mentions settlement on disconnect/errors, but not crash recovery)
+   - Recommendation: **Strengthen** — add reservation leases + TTL + a reaper/repair loop. Without this, reserved headroom can stick “forever” and become an outage.
+
+2. **Redis is up but slow (p95 200–500ms)**
+   - Design’s answer: addressed for outage, less so for “brownout”
+   - Recommendation: **Strengthen** — add a Redis latency circuit breaker that sheds/queues *before* threads pile up; consider separating quota keys from cache keys earlier than 10x scale if cache churn causes latency.
+
+3. **Network partition between Gateway and Policy Engine**
+   - Design’s answer: not addressed
+   - Recommendation: **Strengthen** — define a hard stance: fail-closed for paid/org keys, fail-open only for explicitly marked internal keys; cache last-known-good policy bundle locally so “policy evaluation” survives brief partitions.
+
+4. **Client retries with same Idempotency-Key while original stream is still in-flight**
+   - Design’s answer: addressed at a high level (return prior decision), but outcome semantics are unclear
+   - Recommendation: **Strengthen** — explicitly define whether the retry *attaches to* the same stream (fan-out), returns “still processing” with a handle, or returns a deterministic terminal result only. This decision drives coalescing, UX, and double-spend safety.
+
+5. **Bad config/policy rollout blocks legitimate traffic**
+   - Design’s answer: partially addressed (policy canaries/rollback mentioned)
+   - Recommendation: **Acceptable → Strengthen** — add a “safety valve” runbook: per-org bypass flags with mandatory expiry + audit, plus config validation (pricing tables, token caps, provider routing) in CI and at load time.
+
+## Recommendations
+
+### Must Fix
+- Define **reservation expiry + crash recovery**: reservation records need a TTL/lease, a periodic reconciler, and a deterministic rule for “assume consumed vs release” when the stream outcome is unknown.
+- Specify **idempotency semantics for streaming** (especially in-flight retries): whether you support reattachment/fanout or only terminal replay; ambiguity here is a production footgun.
+- Make **policy-path availability** explicit: what happens when moderation models/rules can’t be evaluated (timeout, partition, overload) and how that interacts with streaming interruption.
+- Nail down **pricing/versioning**: dollar budgets require model pricing tables by version/time; otherwise reconciliation and “hard caps” will drift silently.
+
+### Should Consider
+- Collapse the **Policy Engine** into a versioned, locally-evaluated module to remove a network hop and reduce tail latency/on-call complexity.
+- Use **Lua scripts** (or Redis functions) for reserve/settle to guarantee atomic multi-key updates (RPM/TPM windows + daily budgets + idempotency state) without racey multi-round-trips.
+- Add **hedging + timeouts** on provider streams with a clear “no tokens for N seconds” policy, and ensure settlement is triggered even under partial reads/backpressure.
+- Treat cache as **“safe only after terminal state”** (you already do) plus add explicit cache poisoning guards: schema/version in key, tenant isolation, and maximum entry size/TTL.
+
+### Nice to Have
+- A “subscriber fanout” mode for **in-flight coalescing** (one provider call, many client streams) if your product has herd behavior.
+- Optional **semantic cache** as an opt-in tier for specific workflows (agent loops), clearly labeled “approximate.”
+- A reconciliation job that compares **Redis-enforced totals vs Postgres ledger** and alerts on drift (pricing changes, missed settlements, provider usage gaps).
+
+## What's Working Well
+- The design is honest about streaming constraints and correctly avoids per-token quota writes while still enforcing hard caps.
+- Cache correctness is treated as a first-class requirement (canonical keying + no caching on partials), which prevents the most dangerous failure mode: silent wrong answers.
+- The separation of “Redis enforces, Postgres reconciles” is a pragmatic compromise that a small team can operate—especially if you add lease-based crash recovery and clearly defined fail-open/closed rules.
+tokens used
+5,583
+## Elegance Check
+
+### The Core Insight
+Treating *tokens as the unit of admission control* with a strict `reserve → stream → settle` lifecycle is the right abstraction: it makes hard spend caps compatible with streaming without per-token coordination, and it creates a natural place to hang idempotency, caching eligibility, and “safe stream interruption” semantics.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Inference Gateway | Owns the only truly “custom” lifecycle (`reserve → stream → settle`) and the streaming contract to clients. |
+| Redis (quota+idempotency+coalescing+cache) | Enables atomic admission + fast idempotency/coalescing; you need single-digit ms for the hot path. |
+| Provider Adapter | Prevents provider quirks from leaking into every client and keeps the gateway’s control flow stable. |
+| Postgres (billing/audit/config) | Money + governance need an immutable history and reconcilable source of truth. |
+| Event Log (async) | Decouples analytics/debug from tail latency; critical if you want to keep gateway overhead <50ms. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Separate “Policy Engine” service on the critical path | Ship policy as a versioned library/plugin inside the gateway (OPA/Rego/WASM module, or an internal rules DSL) | Less isolation, but removes a network hop + reduces on-call surface area. |
+| Custom “Event Log” component | Use a managed queue/stream (SQS/Kafka/PubSub) or even Postgres append-only table + async consumers | Managed infra cost or Postgres write load; but fewer bespoke moving parts and clearer durability semantics. |
+| Redis as both enforcer and cache store | Split by concern only when needed: start with single Redis, but make keys/DBs clearly separated and migration-ready | Single cluster is simpler initially; later split reduces blast radius and makes scaling predictable. |
+| Exact-match caching implemented in-house | Consider adopting an existing OpenAI-compatible gateway/proxy (e.g., Envoy ext_authz + an LLM proxy like LiteLLM) and focus custom code on reservation/settlement | You’ll still need custom quota/billing semantics; but you avoid reinventing adapters/stream framing. |
+| “Reserve worst-case completion” always | Reserve in two buckets: prompt is exact-ish upfront, completion is a capped “credit line” per org/key tier | Slightly more policy complexity; reduces over-reservation and improves burst behavior for good actors. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Gateway instance dies mid-stream (after reserve, before settle)**
+   - Design’s answer: partially addressed (mentions settlement on disconnect/errors, but not crash recovery)
+   - Recommendation: **Strengthen** — add reservation leases + TTL + a reaper/repair loop. Without this, reserved headroom can stick “forever” and become an outage.
+
+2. **Redis is up but slow (p95 200–500ms)**
+   - Design’s answer: addressed for outage, less so for “brownout”
+   - Recommendation: **Strengthen** — add a Redis latency circuit breaker that sheds/queues *before* threads pile up; consider separating quota keys from cache keys earlier than 10x scale if cache churn causes latency.
+
+3. **Network partition between Gateway and Policy Engine**
+   - Design’s answer: not addressed
+   - Recommendation: **Strengthen** — define a hard stance: fail-closed for paid/org keys, fail-open only for explicitly marked internal keys; cache last-known-good policy bundle locally so “policy evaluation” survives brief partitions.
+
+4. **Client retries with same Idempotency-Key while original stream is still in-flight**
+   - Design’s answer: addressed at a high level (return prior decision), but outcome semantics are unclear
+   - Recommendation: **Strengthen** — explicitly define whether the retry *attaches to* the same stream (fan-out), returns “still processing” with a handle, or returns a deterministic terminal result only. This decision drives coalescing, UX, and double-spend safety.
+
+5. **Bad config/policy rollout blocks legitimate traffic**
+   - Design’s answer: partially addressed (policy canaries/rollback mentioned)
+   - Recommendation: **Acceptable → Strengthen** — add a “safety valve” runbook: per-org bypass flags with mandatory expiry + audit, plus config validation (pricing tables, token caps, provider routing) in CI and at load time.
+
+## Recommendations
+
+### Must Fix
+- Define **reservation expiry + crash recovery**: reservation records need a TTL/lease, a periodic reconciler, and a deterministic rule for “assume consumed vs release” when the stream outcome is unknown.
+- Specify **idempotency semantics for streaming** (especially in-flight retries): whether you support reattachment/fanout or only terminal replay; ambiguity here is a production footgun.
+- Make **policy-path availability** explicit: what happens when moderation models/rules can’t be evaluated (timeout, partition, overload) and how that interacts with streaming interruption.
+- Nail down **pricing/versioning**: dollar budgets require model pricing tables by version/time; otherwise reconciliation and “hard caps” will drift silently.
+
+### Should Consider
+- Collapse the **Policy Engine** into a versioned, locally-evaluated module to remove a network hop and reduce tail latency/on-call complexity.
+- Use **Lua scripts** (or Redis functions) for reserve/settle to guarantee atomic multi-key updates (RPM/TPM windows + daily budgets + idempotency state) without racey multi-round-trips.
+- Add **hedging + timeouts** on provider streams with a clear “no tokens for N seconds” policy, and ensure settlement is triggered even under partial reads/backpressure.
+- Treat cache as **“safe only after terminal state”** (you already do) plus add explicit cache poisoning guards: schema/version in key, tenant isolation, and maximum entry size/TTL.
+
+### Nice to Have
+- A “subscriber fanout” mode for **in-flight coalescing** (one provider call, many client streams) if your product has herd behavior.
+- Optional **semantic cache** as an opt-in tier for specific workflows (agent loops), clearly labeled “approximate.”
+- A reconciliation job that compares **Redis-enforced totals vs Postgres ledger** and alerts on drift (pricing changes, missed settlements, provider usage gaps).
+
+## What's Working Well
+- The design is honest about streaming constraints and correctly avoids per-token quota writes while still enforcing hard caps.
+- Cache correctness is treated as a first-class requirement (canonical keying + no caching on partials), which prevents the most dangerous failure mode: silent wrong answers.
+- The separation of “Redis enforces, Postgres reconciles” is a pragmatic compromise that a small team can operate—especially if you add lease-based crash recovery and clearly defined fail-open/closed rules.
+[Pass 2/4] Challenge saved to: /Users/dominikdabrowski/pr/system-design-atlas/challenges/llm-inference-gateway.md
+
+[Pass 3/4] Refining design...
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /Users/dominikdabrowski/pr/system-design-atlas
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: auto
+session id: 019b2afa-9d1e-79f1-becd-f1c6f71789c9
+--------
+user
+# System Design Simplifier (v2) - The Minimalist
+
+You are a **ruthless simplifier**. Your job is to take a system design and ask: "What's the simplest thing that could possibly work?"
+
+## Your Philosophy
+
+> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry
+
+Every component must justify its existence. If you can't articulate why removing it would break the system, remove it.
+
+## Simplification Checklist
+
+### 1. Component Audit
+For each component, ask:
+- [ ] What breaks if I remove this entirely?
+- [ ] Can this be replaced with a managed service?
+- [ ] Can this be merged with another component?
+- [ ] Is this solving a problem we actually have?
+
+### 2. The "Just Use X" Test
+- Can we just use Postgres instead of [custom database]?
+- Can we just use Redis instead of [custom cache]?
+- Can we just use Kubernetes instead of [custom orchestration]?
+- Can we just use S3 instead of [custom storage]?
+- Can we just use Kafka instead of [custom queue]? (Or skip the queue entirely?)
+
+### 3. Complexity Budget
+A good design has:
+- **1-3 custom components** (the things that make this system unique)
+- **The rest is glue** (off-the-shelf, managed, boring)
+
+If you have more than 3 custom components, you're probably over-engineering.
+
+### 4. The "Startup Test"
+Could a team of 3 engineers build and operate this? If not, simplify until they could.
+
+## What to Simplify
+
+### Replace Custom with Managed
+- Custom metrics pipeline → Datadog/Prometheus
+- Custom queue → SQS/Kafka
+- Custom storage → S3/GCS
+- Custom coordination → etcd/ZooKeeper
+- Custom API gateway → Kong/Envoy
+
+### Merge Components
+- Separate "validator service" → validation in the main service
+- Separate "config service" → config in the database
+- Separate "audit service" → audit log table in the main DB
+
+### Remove Entirely
+- Caches that add complexity without proven benefit
+- Queues that exist "for decoupling" but add failure modes
+- Microservices that should be modules
+
+## Output Format
+
+Rewrite the document with:
+
+1. **Minimal architecture** - only components that are truly necessary
+2. **Clear justification** for each component that remains
+3. **Explicit "What We Removed"** section explaining simplifications
+4. **Honest trade-offs** - what do we give up with this simpler design?
+
+## Rules
+
+- **Do NOT add components** - only remove or merge
+- **Do NOT add sections** - only cut or condense
+- **Do NOT hedge** - if something should be removed, remove it
+- **Do NOT preserve complexity** out of respect for the original
+
+## The Test
+
+After simplification, a reader should think:
+- "Oh, that's surprisingly simple"
+- "Why didn't I think of that?"
+- "I could actually build this"
+
+NOT:
+- "This covers everything"
+- "Very thorough"
+- "Enterprise-ready"
+
+## Output the Complete Simplified Document
+
+Present the simplified design as THE design. No argumentative language like "we don't need X" - just present what remains as if it was always this way.
+
+Do NOT modify the title, difficulty, or tags.
+
+---
+
+## Original Design
+
+```markdown
+---
+title: "LLM Inference Gateway"
+category: "AI/ML Infrastructure"
+difficulty: "Advanced"
+tags: ["llm", "gateway", "streaming", "caching", "quotas", "moderation", "observability"]
+---
+
+## Overview
+
+This system is a gateway that sits between product traffic and one or more LLM providers. It standardizes APIs, streams tokens to clients, enforces cost and safety policies, and opportunistically serves responses from a prompt cache. The goal is to make LLM usage feel like a reliable internal platform primitive: predictable cost, predictable latency, and predictable governance.
+
+The key insight is to treat *tokens as the unit of admission control* and to make streaming a first-class citizen. Naive gateways bolt quotas, caching, and moderation on the side; this design makes them part of the request lifecycle with explicit “reserve → stream → settle” accounting, and with moderation that can safely interrupt a stream without corrupting downstream state.
+
+Everything else stays boring: stateless gateway instances, Redis for hot-path state (rate limits, reservations, cache), Postgres for durable billing/audit, and a simple async log pipeline for analytics.
+
+## What Makes This Hard
+
+Naive implementations get trapped by three interacting realities:
+
+1. **Streaming breaks “request/response” assumptions.** You need to start sending tokens before you know total cost, before post-moderation is possible, and while clients may disconnect mid-stream.
+2. **Caching is only useful if it is correct.** “Same prompt” is not a string match; model, params, tools, safety settings, and even system prompts must be in the cache key or you will serve the wrong answer.
+3. **Quotas must be enforceable under retries and partial failures.** Providers time out, clients retry, and streams drop. If you don’t make accounting idempotent, you either leak spend (undercharge) or block legitimate traffic (overcharge).
+
+## Requirements
+
+### Functional Requirements
+- Normalize a single API surface (chat/completions + tool calls) over multiple providers.
+- Token streaming to clients (SSE) with low added latency (<50ms p50 gateway overhead).
+- Prompt/result caching with correctness guarantees (no cross-tenant leakage; no param mismatch).
+- Cost quotas:
+  - Per API key: RPM/TPM limits.
+  - Per org/project: daily token budget and dollar budget.
+  - Hard fail on budget exhaustion (no “best effort” overspend).
+- Safety moderation:
+  - Pre-moderation on user input (block before calling providers).
+  - Streaming-time moderation on output (interrupt stream on policy violation).
+  - Durable audit log of decisions and rationale.
+- Idempotency across retries (client retries and gateway/provider retries).
+
+### Scale Targets
+- **Traffic:** 1,000 RPS steady, 3,000 RPS burst (product launches).
+- **Tokens:** avg 800 prompt tokens + 1,200 completion tokens → ~2,000 tokens/request.
+  - Steady: ~2M tokens/sec at 1,000 RPS is unrealistic for most orgs; the real pressure is burstiness and concurrency. Design for **150k tokens/sec** sustained with headroom and backpressure.
+- **Latency:** added gateway overhead p50 < 50ms, p95 < 150ms (excluding provider time).
+- **Cache:** 20% hit rate is meaningful; higher hit rates happen in agent/tool loops and repetitive workflows.
+- These numbers matter because Redis hot-path ops must stay O(1) and because quota checks must not add extra network round-trips per streamed token.
+
+## Key Design Decisions
+
+- **Decision: Token reservation + settlement (two-phase accounting)**
+  - Chose: Reserve estimated worst-case tokens up front; stream; settle with actual usage; release unused reservation.
+  - Rejected: Charge only after completion (allows budget overshoot during bursts) and charge per streamed token (too chatty and fragile).
+  - Why: This is the simplest model that prevents overspend while keeping streaming fast.
+
+- **Decision: Exact-match canonical cache keys + in-flight request coalescing**
+  - Chose: Canonicalize the full normalized request (model+params+tools+system+messages) and hash it; cache only after finalization; coalesce identical in-flight requests.
+  - Rejected: “Semantic cache” by embeddings as the default path.
+  - Why: Correctness beats cleverness. Exact-match gives deterministic behavior and is easy to debug; coalescing captures much of the benefit without serving “close enough” answers.
+
+- **Decision: Output moderation that can cut a stream**
+  - Chose: Pre-moderate inputs; run a lightweight streaming classifier on the output; if triggered, terminate the provider stream, send a policy error frame, and settle accounting.
+  - Rejected: Only post-moderation after full output (too late) and only regex rules (too brittle).
+  - Why: The gateway must be able to stop harmful output mid-flight without leaving quotas, cache, or audits inconsistent.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> G["Inference Gateway"]
+  G --> R["Redis (quota+cache)"]
+  G --> P["Policy Engine"]
+  G --> O["Provider Adapter"]
+  O --> L["LLM Providers"]
+  G --> K["Event Log"]
+  K --> D["Postgres (billing/audit)"]
+```
+
+### Components
+
+- **Inference Gateway**
+  - Stateless service handling auth, normalization, SSE streaming, and orchestration of cache/quota/policy checks.
+  - Earns its place by being the only component on the critical path that understands “reserve → stream → settle”.
+
+- **Redis (quota+cache)**
+  - Hot-path state: rate limits, token reservations, idempotency keys, cache entries, and in-flight coalescing.
+  - Earns its place because these operations must be single-digit milliseconds and atomic.
+
+- **Policy Engine**
+  - Single responsibility: decide allow/block/transform for prompts and streamed outputs; emits structured reasons.
+  - Earns its place by isolating governance logic so gateway code stays small and auditable.
+
+- **Provider Adapter**
+  - Translates normalized requests to provider-specific APIs; normalizes provider events into a single stream format; enforces provider timeouts/retries.
+  - Earns its place because provider quirks otherwise leak into every client.
+
+- **LLM Providers**
+  - External dependencies; treated as unreliable and variable-latency.
+
+- **Event Log**
+  - Append-only stream of decisions (quota, moderation, cache hit/miss, provider latency) for debugging and billing.
+  - Earns its place by decoupling analytics from the online path.
+
+- **Postgres (billing/audit)**
+  - Durable ledger of finalized usage, policy decisions, and admin configuration.
+  - Earns its place because money and governance require strong consistency and clear history.
+
+## Deep Dive: Token Quotas Under Streaming (Reserve → Stream → Settle)
+
+The hardest part is enforcing spend limits *before* you know the final token usage, while still streaming tokens immediately. The gateway uses a two-phase model:
+
+1. **Reserve (admission control)**
+   - Canonicalize request and compute an *estimated token cost*:
+     - `prompt_tokens_est` from a tokenizer library compatible with the target model family.
+     - `completion_tokens_max` from `max_tokens` (or a configured cap if the client omits it).
+   - Compute `reserve_tokens = prompt_tokens_est + completion_tokens_max`.
+   - Atomically in Redis:
+     - Check RPM/TPM windows for the API key.
+     - Check daily remaining token and dollar budgets for org/project.
+     - If allowed, increment “reserved_tokens_today” and store a reservation record keyed by `request_id` (idempotency key).
+   - If the client retries with the same idempotency key, return the prior decision and do not double-reserve.
+
+2. **Stream (low overhead, failure-safe)**
+   - Start provider stream immediately after reservation.
+   - The gateway never performs per-token Redis writes. It maintains local counters for streamed output size and runs moderation on a sliding window buffer.
+   - If the client disconnects, the gateway cancels the provider request and proceeds to settlement; cancellations still cost tokens and must be accounted for.
+
+3. **Settle (finalize truth)**
+   - At stream end (normal end, cancellation, moderation stop, or provider error), finalize usage:
+     - Prefer provider-reported `usage` if available.
+     - Otherwise compute best-effort from token counts (and mark as “estimated” in the ledger).
+   - Atomically in Redis:
+     - Convert reservation to final usage: decrement reserved, increment consumed.
+     - Record terminal state for `request_id` so retries return a consistent outcome.
+   - Emit a billing event and write a durable ledger row in Postgres asynchronously. Redis is the enforcer; Postgres is the source of truth for reconciliation.
+
+This model is non-obvious but crucial: it prevents overspend during bursts without turning the stream into a distributed transaction. The elegance is that the online path needs only *two* Redis atomic operations per request (reserve + settle), regardless of output length.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Hard spend caps under burst traffic | Occasional over-reservation (temporary headroom consumed) |
+| Low-latency streaming | Fine-grained per-token quota precision |
+| Cache correctness and debuggability | Semantic cache hit rate |
+| Simple operations (Redis + Postgres) | Global “exactly-once” billing across all failures |
+
+## Failure Modes
+
+- **Redis outage or high latency**
+  - What happens: Admission control and cache become unavailable; gateway risks either blocking all traffic or allowing unbounded spend.
+  - Detect: Redis latency/error SLOs; sudden drop in cache hit rate; spike in “quota check failed” errors.
+  - Recover: Fail closed for paid/budgeted orgs (protect money); fail open only for explicitly whitelisted internal/testing keys with a strict global circuit breaker. Restore by promoting Redis replica / switching to a hot standby.
+
+- **Provider stream stalls or flakes mid-response**
+  - What happens: Clients hang; retries risk double-charging; partial outputs may be cached incorrectly.
+  - Detect: Provider p95 latency, stream “no token for N seconds” watchdog, elevated retry rates.
+  - Recover: Gateway enforces a token-stall timeout; cancels provider call; settles with observed usage; never writes cache unless stream finalized successfully.
+
+- **Moderation false positive cuts valid streams**
+  - What happens: User experience breaks and support load spikes.
+  - Detect: Rate of moderation stops per policy/version; sampled transcripts for review (with PII controls).
+  - Recover: Versioned policy rollout with canaries; fast rollback; store decision reasons and classifier scores for postmortems; allow per-org overrides with explicit audit trails.
+
+## What I'd Do Differently At...
+
+- **10x scale:** Split Redis into dedicated clusters (quota/idempotency vs cache), add shard-aware routing in the gateway, and move Policy Engine to its own autoscaled service with strict latency budgets and cached model weights.
+- **100x scale:** Introduce a dedicated high-throughput cache tier (SSD-backed) with cache-aware routing and stronger coalescing (fanout to many subscribers), and move from “best-effort usage estimation” to provider-side metering + signed usage receipts for reconciliation.
+
+## Operational Notes
+
+- Cache keys must include: tenant/org, model, temperature/top_p, tool schemas, system prompt, message list, and safety mode; missing any of these creates silent correctness bugs.
+- Idempotency is mandatory: require `Idempotency-Key` for non-trivial requests; store terminal outcome for a bounded TTL to control Redis growth.
+- Log redaction: never store raw prompts by default; store hashes + selective samples behind an explicit allowlist and retention policy.
+- Backpressure: enforce max concurrent streams per API key/org to avoid “slow client” resource exhaustion; shed load before the gateway becomes the bottleneck.
+- Runbooks should start with: Redis health, provider health, moderation policy version, and reservation/settlement mismatch dashboards.
+```
+
+---
+
+## Critique to Address
+
+## Elegance Check
+
+### The Core Insight
+Treating *tokens as the unit of admission control* with a strict `reserve → stream → settle` lifecycle is the right abstraction: it makes hard spend caps compatible with streaming without per-token coordination, and it creates a natural place to hang idempotency, caching eligibility, and “safe stream interruption” semantics.
+
+### Components That Earn Their Place
+| Component | Why It's Necessary |
+|-----------|-------------------|
+| Inference Gateway | Owns the only truly “custom” lifecycle (`reserve → stream → settle`) and the streaming contract to clients. |
+| Redis (quota+idempotency+coalescing+cache) | Enables atomic admission + fast idempotency/coalescing; you need single-digit ms for the hot path. |
+| Provider Adapter | Prevents provider quirks from leaking into every client and keeps the gateway’s control flow stable. |
+| Postgres (billing/audit/config) | Money + governance need an immutable history and reconcilable source of truth. |
+| Event Log (async) | Decouples analytics/debug from tail latency; critical if you want to keep gateway overhead <50ms. |
+
+### Simplification Opportunities
+| Current | Simpler Alternative | Trade-off |
+|---------|---------------------|-----------|
+| Separate “Policy Engine” service on the critical path | Ship policy as a versioned library/plugin inside the gateway (OPA/Rego/WASM module, or an internal rules DSL) | Less isolation, but removes a network hop + reduces on-call surface area. |
+| Custom “Event Log” component | Use a managed queue/stream (SQS/Kafka/PubSub) or even Postgres append-only table + async consumers | Managed infra cost or Postgres write load; but fewer bespoke moving parts and clearer durability semantics. |
+| Redis as both enforcer and cache store | Split by concern only when needed: start with single Redis, but make keys/DBs clearly separated and migration-ready | Single cluster is simpler initially; later split reduces blast radius and makes scaling predictable. |
+| Exact-match caching implemented in-house | Consider adopting an existing OpenAI-compatible gateway/proxy (e.g., Envoy ext_authz + an LLM proxy like LiteLLM) and focus custom code on reservation/settlement | You’ll still need custom quota/billing semantics; but you avoid reinventing adapters/stream framing. |
+| “Reserve worst-case completion” always | Reserve in two buckets: prompt is exact-ish upfront, completion is a capped “credit line” per org/key tier | Slightly more policy complexity; reduces over-reservation and improves burst behavior for good actors. |
+
+## Stress Test
+
+### Failure Scenarios
+1. **Gateway instance dies mid-stream (after reserve, before settle)**
+   - Design’s answer: partially addressed (mentions settlement on disconnect/errors, but not crash recovery)
+   - Recommendation: **Strengthen** — add reservation leases + TTL + a reaper/repair loop. Without this, reserved headroom can stick “forever” and become an outage.
+
+2. **Redis is up but slow (p95 200–500ms)**
+   - Design’s answer: addressed for outage, less so for “brownout”
+   - Recommendation: **Strengthen** — add a Redis latency circuit breaker that sheds/queues *before* threads pile up; consider separating quota keys from cache keys earlier than 10x scale if cache churn causes latency.
+
+3. **Network partition between Gateway and Policy Engine**
+   - Design’s answer: not addressed
+   - Recommendation: **Strengthen** — define a hard stance: fail-closed for paid/org keys, fail-open only for explicitly marked internal keys; cache last-known-good policy bundle locally so “policy evaluation” survives brief partitions.
+
+4. **Client retries with same Idempotency-Key while original stream is still in-flight**
+   - Design’s answer: addressed at a high level (return prior decision), but outcome semantics are unclear
+   - Recommendation: **Strengthen** — explicitly define whether the retry *attaches to* the same stream (fan-out), returns “still processing” with a handle, or returns a deterministic terminal result only. This decision drives coalescing, UX, and double-spend safety.
+
+5. **Bad config/policy rollout blocks legitimate traffic**
+   - Design’s answer: partially addressed (policy canaries/rollback mentioned)
+   - Recommendation: **Acceptable → Strengthen** — add a “safety valve” runbook: per-org bypass flags with mandatory expiry + audit, plus config validation (pricing tables, token caps, provider routing) in CI and at load time.
+
+## Recommendations
+
+### Must Fix
+- Define **reservation expiry + crash recovery**: reservation records need a TTL/lease, a periodic reconciler, and a deterministic rule for “assume consumed vs release” when the stream outcome is unknown.
+- Specify **idempotency semantics for streaming** (especially in-flight retries): whether you support reattachment/fanout or only terminal replay; ambiguity here is a production footgun.
+- Make **policy-path availability** explicit: what happens when moderation models/rules can’t be evaluated (timeout, partition, overload) and how that interacts with streaming interruption.
+- Nail down **pricing/versioning**: dollar budgets require model pricing tables by version/time; otherwise reconciliation and “hard caps” will drift silently.
+
+### Should Consider
+- Collapse the **Policy Engine** into a versioned, locally-evaluated module to remove a network hop and reduce tail latency/on-call complexity.
+- Use **Lua scripts** (or Redis functions) for reserve/settle to guarantee atomic multi-key updates (RPM/TPM windows + daily budgets + idempotency state) without racey multi-round-trips.
+- Add **hedging + timeouts** on provider streams with a clear “no tokens for N seconds” policy, and ensure settlement is triggered even under partial reads/backpressure.
+- Treat cache as **“safe only after terminal state”** (you already do) plus add explicit cache poisoning guards: schema/version in key, tenant isolation, and maximum entry size/TTL.
+
+### Nice to Have
+- A “subscriber fanout” mode for **in-flight coalescing** (one provider call, many client streams) if your product has herd behavior.
+- Optional **semantic cache** as an opt-in tier for specific workflows (agent loops), clearly labeled “approximate.”
+- A reconciliation job that compares **Redis-enforced totals vs Postgres ledger** and alerts on drift (pricing changes, missed settlements, provider usage gaps).
+
+## What's Working Well
+- The design is honest about streaming constraints and correctly avoids per-token quota writes while still enforcing hard caps.
+- Cache correctness is treated as a first-class requirement (canonical keying + no caching on partials), which prevents the most dangerous failure mode: silent wrong answers.
+- The separation of “Redis enforces, Postgres reconciles” is a pragmatic compromise that a small team can operate—especially if you add lease-based crash recovery and clearly defined fail-open/closed rules.
+
+---
+
+## Your Task
+
+Produce the **final, elegant design** that:
+1. Incorporates valid simplifications from the critique
+2. Addresses failure scenarios raised
+3. Removes unnecessary complexity
+4. Remains practical and buildable by a small team
+
+The result should make readers think "that's surprisingly simple" not "very thorough."
+
+Output the complete, final markdown document.
+mcp startup: no servers
+warning: Repository snapshot encountered large untracked directories: grades (201 files). This can slow Codex; consider adding these paths to .gitignore or disabling undo in your config.
+
+
+
+
+
+thinking
+**Addressing retry semantics**
+
+I need to think about in-flight retry semantics. The simplest way might be "terminal replay only." If an idempotency key is still in-flight, I could return a 409 Conflict or 202 with a Retry-After header. Attaching adds complexity, so I’ll opt for returning a 409 Conflict with a `Request-In-Progress` response. Clients should avoid retrying while a request is in progress. I also need to consider removing coalescing due to complexity, so I'll simplify by dropping it unless it's essential. I'll just go ahead and remove it.
+thinking
+**Optimizing writes at settle**
+
+I’m considering how to handle writes at settle. We can manage this in around 50ms. If I write directly to Postgres, that’s simpler, although asynchronous writing through a background queue is also an option. I’m leaning towards direct writes with batched inserts. Maintaining Redis on the hot path with double operations plus Postgres afterward is essential, but as long as it’s not latency-critical for token delivery, that’s okay. I need to reuse existing sections while cutting or condensing without adding new ones.
+thinking
+**Streamlining the document**
+
+I’m thinking about how to streamline the document without losing completeness. I can keep essential sections like Overview, Requirements, Key Design Decisions, and others, while cutting sections like "What Makes This Hard." I can't add new sections, so I’ll focus on simplifying existing ones. This includes embedding policies, using Postgres for the event log, and defining reservation lease TTL within the gateway. I know that pricing versioning is necessary, even if it adds complexity. I’ll ensure we store the price per 1k tokens in Postgres for effective tracking.
+thinking
+**Addressing Redis and document structure**
+
+I’m thinking about incorporating Redis Lua scripts by suggesting a single Lua script for reserve and settle. However, that’s just an implementation detail, so I’ll keep it simple. I also need to revise the architecture diagram, removing the Policy Engine and Event Log boxes, and showing the provider adapter inside the gateway. The diagram will show the flow from Client to Inference Gateway to Redis and Postgres. There’s a conflict between needing a "What We Removed" section while also avoiding the addition of new sections. I need to figure that out!
+thinking
+**Revising document structure**
+
+I need to reconcile user instructions. The output format asks for a minimal architecture, clear justifications, an explicit "What We Removed" section, and trade-offs, but without adding new sections. Maybe I can repurpose an existing section like "Operational Notes" for the "What We Removed" content. Renaming "What I'd Do Differently At..." might work. I think I can simplify the document while keeping it practical for a small team. I’ll include failure modes and ensure everything is concise. I should prepare the full markdown document with the necessary sections and justifications.
+codex
+```markdown
+---
+title: "LLM Inference Gateway"
+category: "AI/ML Infrastructure"
+difficulty: "Advanced"
+tags: ["llm", "gateway", "streaming", "caching", "quotas", "moderation", "observability"]
+---
+
+## Overview
+
+This system is a single gateway service that sits between clients and one or more LLM providers. It provides one stable API, streams tokens to clients, enforces hard spend caps, and blocks unsafe content. It treats tokens as the unit of admission control using a strict `reserve → stream → settle` lifecycle so streaming remains fast while budgets remain enforceable.
+
+State is split by what it needs to be:
+- Redis enforces fast, atomic admission control and idempotency.
+- Postgres stores durable configuration and the immutable billing/audit ledger.
+
+## Requirements
+
+### Functional Requirements
+- Normalize a single API surface (chat/completions + tool calls) over multiple providers.
+- Token streaming to clients (SSE) with low added latency.
+- Prompt/result caching with correctness guarantees (no cross-tenant leakage; no param mismatch).
+- Cost quotas:
+  - Per API key: RPM/TPM limits.
+  - Per org/project: daily token budget and dollar budget.
+  - Hard fail on budget exhaustion.
+- Safety moderation:
+  - Pre-moderation on user input (block before calling providers).
+  - Streaming-time moderation on output (interrupt stream on policy violation).
+  - Durable audit log of decisions and rationale.
+- Idempotency across retries (client retries and gateway/provider retries).
+
+### Scale Targets
+- Traffic: 1,000 RPS steady, 3,000 RPS burst.
+- Tokens: design for 150k tokens/sec sustained with backpressure.
+- Latency: added gateway overhead p50 < 50ms, p95 < 150ms (excluding provider time).
+- Cache: treat ~20% hit rate as meaningful.
+
+## Key Design Decisions
+
+- **Decision: Token reservation + settlement (two-phase accounting)**
+  - Reserve worst-case tokens up front; stream; settle with actual usage; release unused reservation.
+  - This enforces hard caps without per-token coordination.
+
+- **Decision: Policy evaluated inside the gateway**
+  - Policy ships as a versioned bundle/module loaded locally by the gateway.
+  - This removes a network hop from the critical path and makes “policy unavailable” a local, deterministic failure.
+
+- **Decision: Exact-match canonical cache keys**
+  - Canonicalize the fully-normalized request (tenant + model + params + tools + system + messages + safety mode) and hash it.
+  - Cache only after terminal success to avoid poisoning.
+
+- **Decision: Streaming moderation can terminate a stream**
+  - Pre-moderate inputs; run a lightweight streaming classifier on output; on trigger: stop upstream, send a policy error frame, settle accounting, do not cache.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> G["Inference Gateway"]
+  G --> R["Redis (quota+idempotency+cache)"]
+  G --> D["Postgres (billing/audit/config)"]
+  G --> L["LLM Providers"]
+```
+
+### Components
+
+- **Inference Gateway**
+  - Handles auth, request normalization, SSE streaming, policy evaluation, provider translation, cache read/write, and the `reserve → stream → settle` lifecycle.
+  - Justification: the only custom component; owns the streaming contract and enforceable spend/safety semantics.
+
+- **Redis (quota+idempotency+cache)**
+  - Stores rate-limit windows, reservation leases, idempotency state, and cache entries.
+  - Justification: admission control must be atomic and single-digit milliseconds.
+
+- **Postgres (billing/audit/config)**
+  - Stores org/project budgets, API keys, model pricing tables (versioned), and the immutable ledger of finalized usage + policy decisions.
+  - Justification: money and governance need durable history and reconciliation.
+
+- **LLM Providers**
+  - External dependencies; variable latency and partial failures are expected.
+  - Justification: where tokens are produced.
+
+## Deep Dive: Token Quotas Under Streaming (Reserve → Stream → Settle)
+
+The online path does exactly two Redis atomic operations per request (reserve + settle), regardless of output length.
+
+1. **Reserve (admission control)**
+   - Normalize the request and compute:
+     - `prompt_tokens_est` via a compatible tokenizer.
+     - `completion_tokens_max` from `max_tokens` (or a server-side cap).
+     - `reserve_tokens = prompt_tokens_est + completion_tokens_max`.
+   - In a single Redis script/transaction:
+     - Enforce RPM/TPM windows.
+     - Enforce org/project daily token and dollar budgets using current-day counters.
+     - Create a reservation record keyed by `request_id` (from `Idempotency-Key`) with:
+       - `status = in_flight`
+       - `reserved_tokens`, `reserved_dollars_est`
+       - a **lease TTL** (reservation expires unless renewed).
+   - Idempotency:
+     - If `request_id` is already terminal, return the stored terminal outcome without re-reserving.
+     - If `request_id` is `in_flight`, return a deterministic “in progress” response without re-reserving.
+
+2. **Stream (fast path)**
+   - Begin provider streaming immediately after reservation.
+   - Maintain counters locally; do not write per token.
+   - Run streaming moderation on a sliding window buffer.
+   - If moderation triggers: cancel provider, send a policy error frame, proceed to settlement, do not cache.
+
+3. **Settle (finalize truth)**
+   - On terminal outcome (complete, client disconnect, moderation stop, provider error/timeout):
+     - Prefer provider-reported `usage`; otherwise estimate and mark as estimated in the ledger.
+     - Compute final dollars using the **pricing row effective at request start** (from Postgres config cached in-memory with a short TTL).
+   - In a single Redis script/transaction:
+     - Convert reservation to terminal: decrement reserved, increment consumed, store terminal state for `request_id`, and release any unused reservation.
+   - Write a single ledger row to Postgres:
+     - request identifiers, tenant, model, token usage, dollars, terminal status, policy decision metadata, and cache eligibility/outcome.
+
+4. **Crash recovery (leases)**
+   - Reservation records are leases, not permanent holds.
+   - Each streaming connection renews its lease periodically while alive.
+   - When a gateway instance dies mid-stream, the lease expires and the reservation is released; the ledger records the request as unknown/abandoned only if it later reappears and is settled via provider usage or best-effort estimation.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Hard spend caps under burst traffic | Temporary over-reservation during long streams |
+| Low-latency streaming | Perfect per-token precision |
+| Correct, debuggable caching | “Close enough” semantic hits |
+| Small-team operability | Some end-of-stream work (ledger write) shifts to the settle path |
+
+## Failure Modes
+
+- **Gateway instance dies mid-stream (after reserve, before settle)**
+  - Behavior: reservation lease expires and releases headroom; request remains non-terminal.
+  - Outcome on retry with same `Idempotency-Key`: deterministic “in progress/unknown” response until the client starts a fresh request ID; no double-reserve occurs.
+
+- **Redis is up but slow**
+  - Behavior: reserve/settle latency threatens tail overhead.
+  - Recovery: gateway enforces a Redis latency circuit breaker; for budgeted keys it fails closed; for explicitly flagged internal keys it fails open with a strict global cap.
+
+- **Policy evaluation unavailable (timeout/overload)**
+  - Behavior: policy evaluation is local; failures are timeouts or load issues, not network partitions.
+  - Recovery: fail closed for paid/budgeted keys; fail open only for explicitly flagged internal/testing keys; policy bundles are versioned and cached on disk so brief restarts don’t require external fetches.
+
+- **Client retries with same Idempotency-Key while original stream is still in-flight**
+  - Behavior: gateway returns a deterministic “in progress” response and does not attach/fan-out.
+  - Recovery: clients back off and retry later or start a new request with a new idempotency key.
+
+- **Provider stream stalls or errors mid-response**
+  - Behavior: gateway enforces “no tokens for N seconds” timeout, cancels upstream, settles with observed usage, and never caches partial output.
+
+- **Bad config/policy rollout blocks legitimate traffic**
+  - Behavior: versioned policy/config with fast rollback.
+  - Recovery: per-org bypass flags with mandatory expiry and audit in Postgres; config validation at load time.
+
+## Operational Notes
+
+- Cache keys include: tenant/org, model, parameters, tool schemas, system prompt, message list, and safety mode.
+- Idempotency is mandatory for non-trivial requests; terminal outcomes stored with bounded TTL.
+- Pricing/versioning lives in Postgres (effective-dated model pricing); settlement uses the price in effect at request start.
+- Prompts are not stored by default; store hashes and tightly controlled samples with retention limits.
+- Backpressure: cap concurrent streams per API key/org to avoid slow-client resource exhaustion.
+
+## What We Removed
+
+- Separate **Policy Engine** service (policy is a versioned module inside the gateway).
+- Separate **Provider Adapter** service (provider translation is a gateway module).
+- Dedicated **Event Log** pipeline/component (billing/audit is a single Postgres ledger write at settlement).
+- In-flight **request coalescing/fan-out** (keeps retry and streaming semantics simple and deterministic).
+- Scale-future split plans (single Redis is the default until it demonstrably cannot carry the workload).
+```
+tokens used
+8,640
+```markdown
+---
+title: "LLM Inference Gateway"
+category: "AI/ML Infrastructure"
+difficulty: "Advanced"
+tags: ["llm", "gateway", "streaming", "caching", "quotas", "moderation", "observability"]
+---
+
+## Overview
+
+This system is a single gateway service that sits between clients and one or more LLM providers. It provides one stable API, streams tokens to clients, enforces hard spend caps, and blocks unsafe content. It treats tokens as the unit of admission control using a strict `reserve → stream → settle` lifecycle so streaming remains fast while budgets remain enforceable.
+
+State is split by what it needs to be:
+- Redis enforces fast, atomic admission control and idempotency.
+- Postgres stores durable configuration and the immutable billing/audit ledger.
+
+## Requirements
+
+### Functional Requirements
+- Normalize a single API surface (chat/completions + tool calls) over multiple providers.
+- Token streaming to clients (SSE) with low added latency.
+- Prompt/result caching with correctness guarantees (no cross-tenant leakage; no param mismatch).
+- Cost quotas:
+  - Per API key: RPM/TPM limits.
+  - Per org/project: daily token budget and dollar budget.
+  - Hard fail on budget exhaustion.
+- Safety moderation:
+  - Pre-moderation on user input (block before calling providers).
+  - Streaming-time moderation on output (interrupt stream on policy violation).
+  - Durable audit log of decisions and rationale.
+- Idempotency across retries (client retries and gateway/provider retries).
+
+### Scale Targets
+- Traffic: 1,000 RPS steady, 3,000 RPS burst.
+- Tokens: design for 150k tokens/sec sustained with backpressure.
+- Latency: added gateway overhead p50 < 50ms, p95 < 150ms (excluding provider time).
+- Cache: treat ~20% hit rate as meaningful.
+
+## Key Design Decisions
+
+- **Decision: Token reservation + settlement (two-phase accounting)**
+  - Reserve worst-case tokens up front; stream; settle with actual usage; release unused reservation.
+  - This enforces hard caps without per-token coordination.
+
+- **Decision: Policy evaluated inside the gateway**
+  - Policy ships as a versioned bundle/module loaded locally by the gateway.
+  - This removes a network hop from the critical path and makes “policy unavailable” a local, deterministic failure.
+
+- **Decision: Exact-match canonical cache keys**
+  - Canonicalize the fully-normalized request (tenant + model + params + tools + system + messages + safety mode) and hash it.
+  - Cache only after terminal success to avoid poisoning.
+
+- **Decision: Streaming moderation can terminate a stream**
+  - Pre-moderate inputs; run a lightweight streaming classifier on output; on trigger: stop upstream, send a policy error frame, settle accounting, do not cache.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[Client] --> G["Inference Gateway"]
+  G --> R["Redis (quota+idempotency+cache)"]
+  G --> D["Postgres (billing/audit/config)"]
+  G --> L["LLM Providers"]
+```
+
+### Components
+
+- **Inference Gateway**
+  - Handles auth, request normalization, SSE streaming, policy evaluation, provider translation, cache read/write, and the `reserve → stream → settle` lifecycle.
+  - Justification: the only custom component; owns the streaming contract and enforceable spend/safety semantics.
+
+- **Redis (quota+idempotency+cache)**
+  - Stores rate-limit windows, reservation leases, idempotency state, and cache entries.
+  - Justification: admission control must be atomic and single-digit milliseconds.
+
+- **Postgres (billing/audit/config)**
+  - Stores org/project budgets, API keys, model pricing tables (versioned), and the immutable ledger of finalized usage + policy decisions.
+  - Justification: money and governance need durable history and reconciliation.
+
+- **LLM Providers**
+  - External dependencies; variable latency and partial failures are expected.
+  - Justification: where tokens are produced.
+
+## Deep Dive: Token Quotas Under Streaming (Reserve → Stream → Settle)
+
+The online path does exactly two Redis atomic operations per request (reserve + settle), regardless of output length.
+
+1. **Reserve (admission control)**
+   - Normalize the request and compute:
+     - `prompt_tokens_est` via a compatible tokenizer.
+     - `completion_tokens_max` from `max_tokens` (or a server-side cap).
+     - `reserve_tokens = prompt_tokens_est + completion_tokens_max`.
+   - In a single Redis script/transaction:
+     - Enforce RPM/TPM windows.
+     - Enforce org/project daily token and dollar budgets using current-day counters.
+     - Create a reservation record keyed by `request_id` (from `Idempotency-Key`) with:
+       - `status = in_flight`
+       - `reserved_tokens`, `reserved_dollars_est`
+       - a **lease TTL** (reservation expires unless renewed).
+   - Idempotency:
+     - If `request_id` is already terminal, return the stored terminal outcome without re-reserving.
+     - If `request_id` is `in_flight`, return a deterministic “in progress” response without re-reserving.
+
+2. **Stream (fast path)**
+   - Begin provider streaming immediately after reservation.
+   - Maintain counters locally; do not write per token.
+   - Run streaming moderation on a sliding window buffer.
+   - If moderation triggers: cancel provider, send a policy error frame, proceed to settlement, do not cache.
+
+3. **Settle (finalize truth)**
+   - On terminal outcome (complete, client disconnect, moderation stop, provider error/timeout):
+     - Prefer provider-reported `usage`; otherwise estimate and mark as estimated in the ledger.
+     - Compute final dollars using the **pricing row effective at request start** (from Postgres config cached in-memory with a short TTL).
+   - In a single Redis script/transaction:
+     - Convert reservation to terminal: decrement reserved, increment consumed, store terminal state for `request_id`, and release any unused reservation.
+   - Write a single ledger row to Postgres:
+     - request identifiers, tenant, model, token usage, dollars, terminal status, policy decision metadata, and cache eligibility/outcome.
+
+4. **Crash recovery (leases)**
+   - Reservation records are leases, not permanent holds.
+   - Each streaming connection renews its lease periodically while alive.
+   - When a gateway instance dies mid-stream, the lease expires and the reservation is released; the ledger records the request as unknown/abandoned only if it later reappears and is settled via provider usage or best-effort estimation.
+
+## Trade-offs
+
+| Optimized For | Sacrificed |
+|--------------|------------|
+| Hard spend caps under burst traffic | Temporary over-reservation during long streams |
+| Low-latency streaming | Perfect per-token precision |
+| Correct, debuggable caching | “Close enough” semantic hits |
+| Small-team operability | Some end-of-stream work (ledger write) shifts to the settle path |
+
+## Failure Modes
+
+- **Gateway instance dies mid-stream (after reserve, before settle)**
+  - Behavior: reservation lease expires and releases headroom; request remains non-terminal.
+  - Outcome on retry with same `Idempotency-Key`: deterministic “in progress/unknown” response until the client starts a fresh request ID; no double-reserve occurs.
+
+- **Redis is up but slow**
+  - Behavior: reserve/settle latency threatens tail overhead.
+  - Recovery: gateway enforces a Redis latency circuit breaker; for budgeted keys it fails closed; for explicitly flagged internal keys it fails open with a strict global cap.
+
+- **Policy evaluation unavailable (timeout/overload)**
+  - Behavior: policy evaluation is local; failures are timeouts or load issues, not network partitions.
+  - Recovery: fail closed for paid/budgeted keys; fail open only for explicitly flagged internal/testing keys; policy bundles are versioned and cached on disk so brief restarts don’t require external fetches.
+
+- **Client retries with same Idempotency-Key while original stream is still in-flight**
+  - Behavior: gateway returns a deterministic “in progress” response and does not attach/fan-out.
+  - Recovery: clients back off and retry later or start a new request with a new idempotency key.
+
+- **Provider stream stalls or errors mid-response**
+  - Behavior: gateway enforces “no tokens for N seconds” timeout, cancels upstream, settles with observed usage, and never caches partial output.
+
+- **Bad config/policy rollout blocks legitimate traffic**
+  - Behavior: versioned policy/config with fast rollback.
+  - Recovery: per-org bypass flags with mandatory expiry and audit in Postgres; config validation at load time.
+
+## Operational Notes
+
+- Cache keys include: tenant/org, model, parameters, tool schemas, system prompt, message list, and safety mode.
+- Idempotency is mandatory for non-trivial requests; terminal outcomes stored with bounded TTL.
+- Pricing/versioning lives in Postgres (effective-dated model pricing); settlement uses the price in effect at request start.
+- Prompts are not stored by default; store hashes and tightly controlled samples with retention limits.
+- Backpressure: cap concurrent streams per API key/org to avoid slow-client resource exhaustion.
+
+## What We Removed
+
+- Separate **Policy Engine** service (policy is a versioned module inside the gateway).
+- Separate **Provider Adapter** service (provider translation is a gateway module).
+- Dedicated **Event Log** pipeline/component (billing/audit is a single Postgres ledger write at settlement).
+- In-flight **request coalescing/fan-out** (keeps retry and streaming semantics simple and deterministic).
+- Scale-future split plans (single Redis is the default until it demonstrably cannot carry the workload).
+```
+[Pass 3/4] Refined design saved to: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/07-ai-ml-infrastructure/llm-inference-gateway.md
+
+[Pass 4/4] Validating Mermaid diagrams...
+
+Generating single mermaid chart
+[Pass 4/4] All Mermaid diagrams valid
+
+==========================================
+Completed (v2): LLM Inference Gateway
+==========================================
+Draft: /Users/dominikdabrowski/pr/system-design-atlas/drafts-v2/llm-inference-gateway.md
+Challenge: /Users/dominikdabrowski/pr/system-design-atlas/challenges/llm-inference-gateway.md
+Final: /Users/dominikdabrowski/pr/system-design-atlas/solutions-v2/07-ai-ml-infrastructure/llm-inference-gateway.md

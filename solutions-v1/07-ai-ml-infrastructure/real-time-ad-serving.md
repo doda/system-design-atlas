@@ -1,0 +1,234 @@
+---
+title: "Real-Time Ad Serving"
+category: "AI/ML Infrastructure"
+difficulty: "Hard"
+tags: ["rtb", "adtech", "low-latency", "budget-pacing", "feature-store"]
+---
+
+## Overview
+
+This system serves OpenRTB bid requests under strict deadlines (typically 80–120ms end-to-end). The design focuses on predictable tail latency and correctness under heavy concurrency: budgets, pacing, frequency caps, and policy constraints must hold even during spikes.
+
+The system has two paths:
+
+- **Serving path (hot)**: validate → enrich → retrieve candidates → score/price → atomically reserve budget/caps → respond.
+- **Event path (cold)**: ingest wins/impressions/clicks → billing ledger + reporting tables → dashboards and model training inputs.
+
+The serving path is region-local and avoids synchronous cross-region calls. Mutable constraints are enforced using region-local atomic operations.
+
+---
+
+## Requirements
+
+### Functional Requirements
+- Accept OpenRTB 2.5 bid requests and return bids or no-bid within the exchange deadline.
+- Enforce targeting: geo, device, app/site, time-of-day, deals, categories, brand safety, audiences, keywords.
+- Enforce spend: daily/lifetime budgets, line-item constraints, pacing (smooth/accelerated).
+- Enforce frequency caps and deduplicate repeated requests.
+- Rank candidates via rules + ML scoring; support experiments and model versioning.
+- Serve valid creatives (format/size/deal/category) with audit status.
+- Ingest win/impression/click events for billing, reporting, and near-real-time dashboards.
+- Provide campaign management APIs (campaigns, line items, creatives, targeting, budgets).
+
+### Non-Functional Requirements
+- **Scale**: 200K QPS avg, 1M QPS peak globally; 0.5–5B billable events/day.
+- **Latency**: server-side P50 ≤ 15ms, P99 ≤ 80ms; hard cutoff at 90ms.
+- **Availability**: bidding endpoint 99.99% monthly; degrade with fast no-bid.
+- **Consistency**: strong consistency for mutable state within a region shard; reporting/billing eventual (seconds–minutes) with reconciliation.
+- **Durability**: billable events RPO ≤ 1 minute; decisions reconstructable via decision logs + config versioning.
+
+### Constraints & Assumptions
+- Multi-region active-active; traffic routed to nearest region.
+- No cross-region synchronous calls on the hot path.
+- Compliance: consent signals (GDPR/CCPA), retention controls, pseudonymized identifiers.
+
+---
+
+## Simplified Architecture
+
+### High-Level
+
+```mermaid
+flowchart LR
+  EX["Exchange SSP"] --> EDGE["Edge LB"]
+  EDGE --> BID["Bidder"]
+  BID --> REDIS["Redis KV Atomic"]
+  REDIS --> BID
+  BID --> PG["Postgres Config"]
+  PG --> BID
+  BID --> KFK["Kafka"]
+  KFK --> EV["Event Workers"]
+  EV --> PG
+  EV --> OLAP["OLAP Store"]
+```
+
+### Component Summary
+- **Edge LB**: TLS termination, deadline enforcement, rate limiting, routing to regional bidder pools.
+- **Bidder** (single service, horizontally scaled): parsing, targeting, candidate retrieval, scoring, pricing, atomic reservations, response assembly, decision logging.
+- **Redis (region-local cluster)**: user/inventory features, frequency caps, idempotency, budgets/pacing holds via atomic scripts.
+- **Postgres**:
+  - **Config DB**: campaigns/line items/creatives/policies; versioned snapshots for bidders.
+  - **Billing ledger**: authoritative accounting tables fed from event processing.
+- **Kafka**: durable event buffer (wins/impressions/clicks + bid decisions) with replay.
+- **Event Workers**: stateless consumers that dedupe, update billing ledger, and write reporting aggregates.
+- **OLAP Store**: near-real-time reporting and dashboards (append/merge-friendly).
+
+---
+
+## Serving Path (Hot)
+
+### Request Handling
+1. **Edge** enforces a hard deadline (e.g., 90ms) and forwards the derived timeout to the bidder.
+2. **Bidder** validates OpenRTB and normalizes fields needed for targeting and pricing.
+3. **Bidder** fetches features from **Redis** under a tight timeout (tiered: required vs optional).
+4. **Bidder** builds a candidate set using **in-process indexes** loaded from the latest config snapshot.
+5. **Bidder** evaluates targeting/policy, then scores candidates using an **embedded ML runtime** (e.g., ONNX).
+6. **Bidder** reserves budgets/pacing/caps in **Redis** using a single atomic operation (Lua/scripted transaction).
+7. **Bidder** returns `BidResponse` or `204 No Content` before the deadline.
+8. **Bidder** asynchronously emits `bid_decision` and counters to Kafka.
+
+### Deadline Discipline
+- Every dependency call uses a derived timeout (e.g., features 3–5ms, atomic reservation 2–3ms).
+- Optional enrichment fails open (skip and continue). Budget/cap enforcement fails closed (fast no-bid).
+
+---
+
+## State and Correctness
+
+### Config (Strongly Versioned)
+- Postgres is the source of truth for campaigns/line items/creatives.
+- A **monotonic `config_version`** is assigned on each publish.
+- Bidders periodically fetch the latest version (or use long-poll) and keep:
+  - In-memory targeting indexes
+  - Creative catalogs and audit status
+  - Experiment and model routing rules
+
+### Budgets & Pacing (Atomic Holds)
+Budgets are enforced using:
+- **Settled spend**: derived from processed billable events.
+- **In-flight holds**: reserved when returning a bid to prevent overspend while win notices are delayed.
+
+Atomic reservation script (per line item per day) updates:
+- `inflight_micros += hold_micros` if limits allow
+- A TTL-backed hold record to ensure eventual release
+
+On events:
+- **Win/Impression**: convert `inflight → settled` (idempotent).
+- **Loss/Timeout/Missing notice**: release holds by TTL expiry.
+
+### Frequency Caps
+- Store a per-user record in Redis with TTL and atomic updates:
+  - `user_caps:{user}` → map `{campaign_id: (count, window_end)}`
+- Cap enforcement is included in the same atomic reservation flow when feasible (single shard/key strategy per user).
+
+### Idempotency
+- `idempotency:{request_id}` stored in Redis with TTL (5–15 minutes) to return the same response and prevent duplicate holds.
+
+---
+
+## Data Model
+
+### Postgres (Config)
+- `advertiser(advertiser_id, status, billing_profile_id, created_at)`
+- `campaign(campaign_id, advertiser_id, status, start_ts, end_ts, daily_budget_micros, lifetime_budget_micros, pacing_mode, updated_at)`
+- `line_item(line_item_id, campaign_id, bid_cpm_micros, targeting_json, freq_cap_json, priority, status, updated_at)`
+- `creative(creative_id, advertiser_id, format, width, height, markup, categories, audit_status, status, updated_at)`
+- `config_publish(config_version, published_at, snapshot_blob_ref)`
+
+### Redis (Serving KV + Atomic)
+- `user_profile:{user}` → segments/consent/device signals (schema versioned)
+- `inventory_profile:{inv}` → brand safety tier, historical stats
+- `budget:{line_item_id}:{yyyymmdd}` → `{settled_micros, inflight_micros, limit_micros}`
+- `hold:{request_id}` → `{line_item_id, hold_micros, expiry_ts}` (TTL)
+- `user_caps:{user}` → `{campaign_id: (count, window_end)}` (TTL)
+- `idempotency:{request_id}` → `{response_hash, expiry_ts}` (TTL)
+
+### Kafka (Events)
+- `bid_decision`: `{ts, request_id, auction_id, region, config_version, chosen, bid_cpm_micros, hold_micros, reason_codes[]}`
+- `win`: `{event_id, ts, request_id, auction_id, price_micros, line_item_id, creative_id}`
+- `impression`: `{event_id, ts, request_id, auction_id, line_item_id, creative_id}`
+- `click`: `{event_id, ts, request_id, auction_id, line_item_id, creative_id}`
+- Optional `loss`: `{event_id, ts, request_id, auction_id}`
+
+Event processing is **at-least-once**; sinks are idempotent using `event_id`.
+
+---
+
+## API Design
+
+### External: OpenRTB Bidding
+- `POST /openrtb2/bid`
+  - Request: OpenRTB 2.5 `BidRequest` JSON
+  - Response: OpenRTB `BidResponse` JSON or `204 No Content`
+  - Behavior:
+    - `400` malformed/invalid request
+    - `429` rate limited
+    - Prefer `204` under overload when safe
+  - Idempotency: repeated `request.id` within TTL returns the same outcome
+
+### External/Internal: Event Ingestion (if needed)
+- `POST /v1/events` → `202 Accepted`
+  - Body: `{event_id, type, ts, request_id, auction_id, line_item_id, creative_id, price_micros, user_key_hash}`
+  - Dedupe enforced by `event_id` in the event workers and ledger tables
+
+### Internal: Campaign Management
+- `POST /v1/campaigns`, `PATCH /v1/campaigns/{id}`
+- `POST /v1/line-items`, `PATCH /v1/line-items/{id}`
+- `POST /v1/creatives`, `PATCH /v1/creatives/{id}`
+- Validation is synchronous; publishing increments `config_version`
+
+---
+
+## Scaling & Performance
+
+### Regional Sizing (Starting Point)
+Peak 1M QPS across 10 regions → ~100K QPS/region.
+
+- **Bidder**: scale horizontally; keep per-request work bounded (early exits, top-K scoring).
+- **Redis**: shard by keyspace; keep atomic operations single-round-trip; use short TTLs to bound memory.
+- **Kafka**: partition by `request_id`/`auction_id` for balanced consumption.
+
+### Caching Strategy
+- In-process: config snapshot, inverted indices, creative catalogs, hot inventory caches.
+- Redis: authoritative for serving features and atomic constraints; avoid synchronous SQL reads on the hot path.
+
+### Overload Handling
+- Edge rate limiting per SSP and global concurrency caps.
+- Bidder fast no-bid when:
+  - deadline budget is too small
+  - Redis is unhealthy or timing out for required operations
+  - CPU saturation threatens P99 latency
+
+---
+
+## Failure Modes & Resilience
+
+- **Redis partial outage/latency**: bidders fail closed for affected reservations (fast no-bid); circuit breakers; multi-AZ Redis with client-side timeouts.
+- **Kafka lag**: reporting and hold conversions delay; TTL-based hold release prevents permanent holds; autoscale event workers.
+- **Bad config publish**: versioned snapshots allow rollback by pinning a prior `config_version`; validation gates before publish.
+- **Region outage**: traffic shifts to other regions; budgets remain region-local with bounded drift; ledger reconciles from events.
+
+---
+
+## Operations
+
+### Key SLIs/SLOs
+- Bid responses before deadline (availability) ≥ 99.99% monthly
+- Server-side latency P99 ≤ 80ms, timeout rate ≤ 0.5%
+- Budget correctness: overspend incidents = 0; inflight hold age within TTL expectations
+- Event freshness: win/impression processing lag P95 within target (seconds–minutes)
+
+### Minimum Runbooks
+- Redis incident: enable fail-closed reservations, verify no overspend, recover shards, monitor hold release.
+- KV latency spike: drop optional feature reads, tighten candidate set, confirm deadline propagation.
+- Kafka lag: scale consumers, confirm idempotent sinks, monitor billing freshness and hold conversions.
+
+---
+
+## Simplification Notes
+
+- **Removed**: separate feature store, separate atomic store, separate candidate index service; Redis serves both low-latency feature reads and atomic constraints with region-local sharding.
+- **Removed**: dedicated stream processing frameworks; event handling runs as simple stateless consumers that write idempotently to Postgres and the OLAP store.
+- **Merged**: bidder orchestration, candidate retrieval, rule evaluation, and ML scoring into a single horizontally scaled bidder service with in-process indexes.
+- **Merged**: campaign management, validation, and config publishing into one control-plane flow backed by Postgres and versioned snapshots.
+- **Complexity retained**: hard deadline propagation, atomic budget/cap enforcement, and durable event buffering (Kafka) to meet latency, correctness, and RPO requirements at peak scale.

@@ -1,0 +1,225 @@
+---
+title: "High-Cardinality Metrics Pipeline"
+category: "Observability & Reliability"
+difficulty: "Hard"
+tags: ["metrics", "tsdb", "promql", "cardinality", "object-storage", "multi-tenant", "caching"]
+---
+
+## Overview
+
+This system ingests Prometheus `remote_write` at very high volume across many tenants, enforces strict cardinality controls, and serves low-latency PromQL over recent (“hot”) data while keeping long retention (“cold”) data cost-efficient in object storage.
+
+Key goals:
+- Predictable cost and performance under high cardinality and tenant skew.
+- Strong isolation: one tenant cannot take down ingest or queries for others.
+- Durable writes with `RPO ~0` for acknowledged samples.
+- Efficient long-term retention (months to years) with immutable TSDB blocks.
+
+## Requirements
+
+### Functional Requirements
+- Ingest via **Prometheus `remote_write`**; optionally accept **OTLP** via an OpenTelemetry Collector that converts to `remote_write`.
+- Serve **Prometheus-compatible PromQL APIs** (instant, range, label APIs).
+- **Multi-tenancy** with authn/authz, per-tenant limits, per-tenant retention, tenant lifecycle ops.
+- **Long-term retention** using TSDB blocks, compaction, retention enforcement, and deletes (tombstones).
+- **HA remote_write deduplication** at query time (multiple scrapers sending the same targets).
+- **Recording rules** and **alerting rules** evaluation at scale.
+- **Cardinality visibility** (top contributors) and **cardinality enforcement** (reject/drop/roll up).
+- Admin ops: backfills (bounded), deletes, tenant quarantine/disable, configuration rollouts.
+
+### Non-Functional Requirements
+- Example scale: up to **50k tenants**, **120–200M active series**, **20–40M samples/sec**, **13 months retention**.
+- Availability: **99.95%** ingest/query API; degraded historical queries during object-store incidents are acceptable if hot data remains available.
+- Durability: **quorum replication + WAL fsync before ack** for acknowledged writes.
+
+## Simplified Architecture
+
+### High-Level Diagram
+
+```mermaid
+graph TB
+  A["Agents (Prom/OTel)"] -->|remote_write| API["API Layer (Auth+Limits)"]
+
+  API -->|quorum write| ING["Ingester Pool (WAL+Head TSDB)"]
+  ING -->|ship blocks| OS["Object Storage (TSDB Blocks)"]
+
+  API -->|PromQL| Q["Query Engine (Hot+Cold)"]
+  Q -->|hot read| ING
+  Q -->|cold read| OS
+
+  Q --- PG["Postgres (Tenants+Rules+Deletes)"]
+  API --- PG
+
+  C["Compactor (Retention+Deletes)"] --> OS
+  R["Rules Runner"] -->|queries+writes| Q
+  R --> AM["Alertmanager"]
+```
+
+### What This Architecture Optimizes For
+- A small number of always-on service types: API, ingesters, query engine, compactor, rules runner.
+- One primary control-plane datastore (**Postgres**) for tenant config, limits, rules, and delete requests.
+- Hot/cold reads handled by the query engine directly (object-store reads use local caches).
+
+## Components
+
+### API Layer (Ingest + Query Entry)
+**Responsibilities**
+- TLS termination and tenant authentication (mTLS/JWT/API key).
+- Enforce coarse rate limits and request shaping (per-tenant token buckets).
+- Validate requests and attach tenant identity (`X-Scope-OrgID`).
+- Route ingestion to the correct ingesters using a consistent-hash ring.
+- Route query requests to the query engine with per-tenant fairness controls.
+
+**Key design points**
+- Stateless and horizontally scalable behind an L7 load balancer.
+- Tenant config is read from Postgres and cached in-memory with fast refresh (polling or notify).
+
+### Ingest Ring (Routing + Replication)
+**Responsibilities**
+- Maintain ingester membership and token ownership for sharding series consistently.
+- Support shuffle sharding: each tenant maps to a stable subset of ingesters to limit blast radius.
+
+**Implementation**
+- Gossip-based membership (memberlist-style) for ring state.
+- Token persistence on local disk so restarts do not reshuffle series unnecessarily.
+
+### Ingester Pool (Hot TSDB + WAL)
+**Responsibilities**
+- Own and ingest the “head” (recent mutable data) for assigned series.
+- Append samples to WAL and checkpoint for fast recovery.
+- Cut immutable TSDB blocks (e.g., 2h) and upload to object storage.
+- Serve low-latency reads for recent time ranges.
+
+**Durability contract**
+- **Quorum ack**: a write is acknowledged only after **2 of 3** ingesters confirm **WAL append + fsync** (zone-aware placement).
+
+**Cardinality controls (first line)**
+- Hard limits per tenant:
+  - max labels per series, max label length, max samples/sec, max active series, max new series/sec
+- Policy enforcement:
+  - label allow/deny rules (including PII patterns), normalization, and optional rollups for risky dimensions
+- Overload mode:
+  - prioritize rejecting **new series** first to stabilize memory
+
+### Query Engine (PromQL + Hot/Cold Reads)
+**Responsibilities**
+- Prometheus-compatible read APIs: `/api/v1/query`, `/api/v1/query_range`, label APIs.
+- Enforce query budgets (time range, bytes scanned, series returned, max wall time).
+- Query splitting for large range queries and controlled parallelism.
+- Query-time HA deduplication using external labels (`cluster`, `replica`).
+
+**Cold-read strategy (object storage)**
+- Read blocks directly from object storage using:
+  - in-memory LRU for small metadata and postings hotsets
+  - local disk cache for fetched index/chunk segments (bounded, evictable)
+
+### Compactor (Blocks + Retention + Deletes)
+**Responsibilities**
+- Compact smaller blocks into larger blocks for efficient scans and fewer object-store requests.
+- Apply retention per tenant and enforce deletes by rewriting blocks.
+- Validate block metadata and handle partial/corrupt uploads safely.
+
+**Key design points**
+- Single-writer per tenant (or tenant shard) to avoid conflicting block mutations.
+- Backlog monitoring is treated as an SLO dependency for long-range queries.
+
+### Postgres (Tenant Control Plane)
+**What lives here**
+- Tenants, authz metadata, and per-tenant limits/retention.
+- Rules (recording/alerting) and evaluation settings.
+- Delete requests (tombstones) and audit trail.
+- Optional: block inventory index (tenant, block ULID, minTime/maxTime, stats) to avoid expensive object-store listings.
+
+**Why Postgres works**
+- Strong consistency for admin operations and tenant isolation policies.
+- Operationally standard, supports HA with well-known patterns.
+
+### Rules Runner (Recording + Alerting)
+**Responsibilities**
+- Evaluate rules per tenant with strict budgets (max groups, min interval, max query cost).
+- Write recording results back via `remote_write`.
+- Send alerts to Alertmanager.
+
+## Data Model
+
+### Core Concepts
+- **Series**: metric name + label set (cardinality driver).
+- **Sample**: `(timestamp, value)` stored in the head and later compacted into blocks.
+- **Block**: immutable TSDB segment stored in object storage, referenced by ULID and time bounds.
+
+### Object Storage Layout (per tenant)
+- `/<tenant>/blocks/<ulid>/meta.json`
+- `/<tenant>/blocks/<ulid>/index`
+- `/<tenant>/blocks/<ulid>/chunks/<segment>`
+- `/<tenant>/blocks/<ulid>/tombstones` (if used for delete markers)
+
+## API
+
+### Ingestion (Prometheus remote_write)
+**POST `/api/v1/push`** (alias `/api/v1/write`)
+- Headers:
+  - `X-Scope-OrgID: <tenant>`
+  - `Content-Encoding: snappy`
+  - `Content-Type: application/x-protobuf`
+- Body: `prometheus.remote.WriteRequest` (snappy-compressed)
+- Responses:
+  - `200 OK`: accepted (quorum durable)
+  - `400`: invalid payload/labels/timestamps
+  - `401/403`: auth failure
+  - `429`: per-tenant limits exceeded (include `Retry-After` where possible)
+  - `503`: ring unhealthy or insufficient quorum
+
+**At-least-once ingestion**
+- Clients retry; duplicates are tolerated.
+- Query-time HA dedup handles replicated scrapes.
+
+### Query (Prometheus-compatible)
+- **GET `/api/v1/query`**
+- **GET `/api/v1/query_range`**
+- **GET `/api/v1/series`** (strict time bounds required)
+- **GET `/api/v1/labels`**, **GET `/api/v1/label/{name}/values`** (time-bounded by default, aggressively limited)
+
+## Scaling & Performance
+
+### Primary sizing levers
+- **Ingester memory** scales with active series in the head; enforce hard per-tenant caps and reject-new-series under pressure.
+- **Ingester WAL I/O** scales with samples/sec; keep WAL on NVMe and tune fsync batching within durability constraints.
+- **Query CPU** scales with fanout and bytes scanned; use query splitting, per-tenant concurrency limits, and strict label-API constraints.
+- **Object-store efficiency** depends on compaction and caching; compactor backlog is a first-class signal.
+
+### Fairness and isolation
+- Per-tenant ingest and query budgets (rate, concurrency, max cost).
+- Shuffle sharding to reduce noisy-neighbor impact.
+- Tiered limits (interactive dashboards vs. background label calls vs. ad-hoc heavy queries).
+
+## Failure Modes & Mitigations
+
+- **Ingester crash / AZ loss**: RF=3, quorum ack, zone-aware placement; hot reads may partially degrade but remain available when quorum is healthy.
+- **Object store degradation**: hot reads continue from ingesters; cold reads are protected with local caches, bounded concurrency, and circuit breakers.
+- **Cardinality explosion**: deny/allow label policies, hard caps on new series/sec and active series, and tenant quarantine controls.
+- **Query storms**: per-tenant concurrency caps, strict label API defaults, max bytes scanned, and recording rules promotion.
+
+## Operations
+
+### Minimum observability
+- Ingest: ack latency, quorum failure rate, WAL fsync latency, rejected samples by reason, per-tenant top talkers.
+- Query: P50/P99 latency, timeouts, bytes scanned, per-tenant concurrency, cache hit rates.
+- Storage: block upload lag, compactor backlog age, object-store errors/latency.
+
+### Deployment
+- API/query engine: rolling deploy with per-tenant safeguards.
+- Ingester: drain from ring, deploy, rejoin; enforce max unavailable to preserve quorum.
+- Compactor: canary and watch object-store request patterns and backlog.
+
+### Security & compliance
+- Tenant auth enforced at the edge; admin APIs strictly authorized and audited.
+- Encrypt in transit; encrypt at rest for disks and object storage.
+- Label hygiene policies to prevent PII in labels, with enforcement and reporting.
+
+## Simplification Notes
+- Removed: separate ingest gateway and distributor; consolidated into the API layer so auth, validation, and limits are applied once per request.
+- Removed: dedicated query frontend/scheduler services; query splitting and per-tenant fairness are handled directly in the query engine.
+- Removed: standalone store gateway and external cache tiers; the query engine reads blocks from object storage with bounded in-memory and local disk caches.
+- Replaced: separate KV/ring store with gossip-based membership and persisted tokens to keep sharding stable while reducing control-plane dependencies.
+- Merged: tenant limits, rules, deletes, and admin metadata into Postgres to centralize control-plane state with strong consistency.
+- Complexity retained: quorum replication + WAL fsync (durability), immutable blocks + compaction (retention and cost), strict per-tenant limits + shuffle sharding (multi-tenant stability), and HA dedup at query time (correctness with replicated scrapes).
